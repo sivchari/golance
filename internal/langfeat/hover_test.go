@@ -1,6 +1,7 @@
 package langfeat_test
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -79,7 +80,7 @@ func TestHover_NoIdentifier(t *testing.T) {
 // text, failing the test if substr is not found.
 func mustIndex(t *testing.T, text []byte, substr string) int {
 	t.Helper()
-	i := strings.Index(string(text), substr)
+	i := bytes.Index(text, []byte(substr))
 	if i < 0 {
 		t.Fatalf("substring %q not found in:\n%s", substr, text)
 	}

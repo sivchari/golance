@@ -72,15 +72,9 @@ func processUnit(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSou
 	trusted := haveOld && old.ToolchainFingerprint == opts.ToolchainFingerprint
 
 	statOK := trustStat && trusted && len(old.Files) > 0 && filesStatMatch(pkg.GoFiles, old.Files, root, opts.RelativePaths)
-	var ownHash uint64
-	if statOK {
-		ownHash = old.ContentHash
-	} else {
-		h, err := contentHash(pkg.GoFiles, opts.BuildFlagsFingerprint, reader, root, opts.RelativePaths)
-		if err != nil {
-			return nil, false, err
-		}
-		ownHash = h
+	ownHash, err := resolveOwnHash(pkg, opts, reader, root, statOK, old.ContentHash)
+	if err != nil {
+		return nil, false, err
 	}
 
 	deps, err := directDepExports(snap, keys, pkg)
@@ -90,75 +84,115 @@ func processUnit(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSou
 	combined := computeUnitKey(ownHash, deps)
 
 	if trusted && combined == old.BlobKey {
-		keys.set(path, unitKeyRecord{blobKey: old.BlobKey, exportHash: old.ExportHash})
-		if statOK {
-			return nil, true, nil
-		}
-		if !trustStat {
-			// The content hash (computed through reader, possibly an editor
-			// overlay) confirmed nothing changed, but disk's own stat cannot
-			// be trusted here (see trustStat's doc): recording a disk-based
-			// Files snapshot now, while reader's content might still differ
-			// from disk, could make a later disk-trusting Build wrongly
-			// skip a package whose real disk content has diverged. Leave
-			// the existing pointer (and its Files) untouched; the only cost
-			// is one future content-hash recheck instead of a stat-only
-			// skip, never correctness.
-			return nil, true, nil
-		}
-		// The content-hash fallback confirmed nothing changed; refresh the
-		// stat snapshot so a later run can skip by stat alone again.
-		if files, sErr := statFiles(pkg.GoFiles, root, opts.RelativePaths); sErr == nil {
-			refreshed := old
-			refreshed.Files = files
-			return &unitOutcome{pkgHash: pkgHash, ptrRefresh: &refreshed}, true, nil
-		}
-		return nil, true, nil
+		return unchangedOutcome(pkgHash, path, old, pkg, opts, root, statOK, trustStat, keys), true, nil
 	}
 
 	// The combined key differs from what was last recorded (or there is no
 	// trusted previous pointer at all): try the CAS first. A hit needs no
 	// type-check — this exact content-plus-dependency-API combination was
 	// already built before, e.g. switching back to a previously-visited
-	// branch (see the package doc's "本命パス").
+	// branch (this is the common, fast-path case; see the package doc).
 	if blob, ok, err := cas.Get(combined); err != nil {
 		return nil, false, err
 	} else if ok {
-		u, err := store.DecodeUnitBlob(blob)
+		outcome, err := casHitOutcome(pkgHash, path, combined, ownHash, blob, opts, exp, keys)
 		if err != nil {
 			return nil, false, err
 		}
-		exp.Put(path, u.Export)
-		eh := hashExport(u.Export)
-		keys.set(path, unitKeyRecord{blobKey: combined, exportHash: eh})
-		pointer := store.UnitPointer{BlobKey: combined, ContentHash: ownHash, ExportHash: eh, ToolchainFingerprint: opts.ToolchainFingerprint, Files: u.Files}
-		return &unitOutcome{pkgHash: pkgHash, entry: &store.UnitEntry{PkgHash: pkgHash, Pointer: pointer, Index: u.Index}}, false, nil
+		return outcome, false, nil
 	}
 
 	// Miss: nobody has ever built this exact combination. Actually
 	// parse/type-check it.
-	result, err := checkOnePackage(fset, imp, path, pkg.GoFiles, reader, root, opts.RelativePaths)
+	outcome, err := checkAndStoreOutcome(fset, imp, cas, exp, keys, pkgHash, path, pkg, combined, ownHash, opts, reader, root, trustStat)
 	if err != nil {
 		return nil, false, err
 	}
+	return outcome, false, nil
+}
+
+// resolveOwnHash returns pkg's own content hash: the already-recorded
+// old.ContentHash when statOK confirms nothing on disk has moved, or a
+// fresh recompute through reader otherwise.
+func resolveOwnHash(pkg *graph.Package, opts Options, reader FileReader, root string, statOK bool, oldContentHash uint64) (uint64, error) {
+	if statOK {
+		return oldContentHash, nil
+	}
+	return contentHash(pkg.GoFiles, opts.BuildFlagsFingerprint, reader, root, opts.RelativePaths)
+}
+
+// unchangedOutcome handles the case where the combined key still matches
+// what db last recorded for path: nothing needs writing except possibly a
+// refreshed stat snapshot, and the package is always skipped either way.
+func unchangedOutcome(pkgHash uint64, path string, old store.UnitPointer, pkg *graph.Package, opts Options, root string, statOK, trustStat bool, keys *keyTable) *unitOutcome {
+	keys.set(path, unitKeyRecord{blobKey: old.BlobKey, exportHash: old.ExportHash})
+	if statOK {
+		return nil
+	}
+	if !trustStat {
+		// The content hash (computed through reader, possibly an editor
+		// overlay) confirmed nothing changed, but disk's own stat cannot
+		// be trusted here (see processUnit's trustStat doc): recording a
+		// disk-based Files snapshot now, while reader's content might
+		// still differ from disk, could make a later disk-trusting Build
+		// wrongly skip a package whose real disk content has diverged.
+		// Leave the existing pointer (and its Files) untouched; the only
+		// cost is one future content-hash recheck instead of a stat-only
+		// skip, never correctness.
+		return nil
+	}
+	// The content-hash fallback confirmed nothing changed; refresh the
+	// stat snapshot so a later run can skip by stat alone again.
+	files, sErr := statFiles(pkg.GoFiles, root, opts.RelativePaths)
+	if sErr != nil {
+		return nil
+	}
+	refreshed := old
+	refreshed.Files = files
+	return &unitOutcome{pkgHash: pkgHash, ptrRefresh: &refreshed}
+}
+
+// casHitOutcome decodes a CAS hit for combined and folds it into the
+// outcome processUnit returns, recording path's export in exp and its blob
+// key in keys along the way.
+func casHitOutcome(pkgHash uint64, path string, combined, ownHash uint64, blob []byte, opts Options, exp *casExportSource, keys *keyTable) (*unitOutcome, error) {
+	u, err := store.DecodeUnitBlob(blob)
+	if err != nil {
+		return nil, err
+	}
+	exp.Put(path, u.Export)
+	eh := hashExport(u.Export)
+	keys.set(path, unitKeyRecord{blobKey: combined, exportHash: eh})
+	pointer := store.UnitPointer{BlobKey: combined, ContentHash: ownHash, ExportHash: eh, ToolchainFingerprint: opts.ToolchainFingerprint, Files: u.Files}
+	return &unitOutcome{pkgHash: pkgHash, entry: &store.UnitEntry{PkgHash: pkgHash, Pointer: pointer, Index: u.Index}}, nil
+}
+
+// checkAndStoreOutcome type-checks pkg, writes the result to cas under
+// combined, and folds it into the outcome processUnit returns.
+func checkAndStoreOutcome(fset *token.FileSet, imp *typecheck.Importer, cas *store.CAS, exp *casExportSource, keys *keyTable, pkgHash uint64, path string, pkg *graph.Package, combined, ownHash uint64, opts Options, reader FileReader, root string, trustStat bool) (*unitOutcome, error) {
+	result, err := checkOnePackage(fset, imp, path, pkg.GoFiles, reader, root, opts.RelativePaths)
+	if err != nil {
+		return nil, err
+	}
 	// A disk-based stat snapshot is only trustworthy when reader itself
-	// reads from disk (see trustStat's doc) — otherwise leave Files nil,
-	// costing a future content-hash recheck instead of risking a later
-	// disk-trusting Build wrongly skipping genuinely-changed content.
+	// reads from disk (see processUnit's trustStat doc) — otherwise leave
+	// Files nil, costing a future content-hash recheck instead of risking
+	// a later disk-trusting Build wrongly skipping genuinely-changed
+	// content.
 	var files []store.FileStat
 	if trustStat {
 		if f, sErr := statFiles(pkg.GoFiles, root, opts.RelativePaths); sErr == nil {
 			files = f
 		}
 	}
-	if err := cas.Put(combined, store.EncodeUnitBlob(store.UnitBlob{Facts: result.Facts, Export: result.Export, Files: files, Index: result.Index})); err != nil {
-		return nil, false, err
+	if err := cas.Put(combined, store.EncodeUnitBlob(&store.UnitBlob{Facts: result.Facts, Export: result.Export, Files: files, Index: result.Index})); err != nil {
+		return nil, err
 	}
 	exp.Put(path, result.Export)
 	eh := hashExport(result.Export)
 	keys.set(path, unitKeyRecord{blobKey: combined, exportHash: eh})
 	pointer := store.UnitPointer{BlobKey: combined, ContentHash: ownHash, ExportHash: eh, ToolchainFingerprint: opts.ToolchainFingerprint, Files: files}
-	return &unitOutcome{pkgHash: pkgHash, entry: &store.UnitEntry{PkgHash: pkgHash, Pointer: pointer, Index: result.Index}}, false, nil
+	return &unitOutcome{pkgHash: pkgHash, entry: &store.UnitEntry{PkgHash: pkgHash, Pointer: pointer, Index: result.Index}}, nil
 }
 
 // directDepExports returns pkg's direct workspace (root) dependencies'

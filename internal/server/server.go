@@ -12,6 +12,7 @@ import (
 
 	"go.lsp.dev/protocol"
 
+	golance "github.com/sivchari/golance"
 	"github.com/sivchari/golance/internal/check"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/overlay"
@@ -21,8 +22,10 @@ import (
 )
 
 // Version is golance's user-visible version string, reported in
-// InitializeResult.ServerInfo and by cmd/golance's -version flag.
-const Version = "0.1.0-dev"
+// InitializeResult.ServerInfo and by cmd/golance's -version flag. The
+// canonical value lives in the repo-root version.go, which tagpr bumps on
+// release.
+const Version = golance.Version
 
 // Options configures a Server.
 type Options struct {

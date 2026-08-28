@@ -77,14 +77,13 @@ func goFile(t *testing.T, snap *graph.Snapshot, pkgPath, base string) string {
 	return ""
 }
 
-// identOccurrence parses path and returns the (line, col) of the
-// occurrence-th (1-based) identifier named name, in source order. Using the
-// parser (rather than a text search) means comments and substrings of
-// longer identifiers (e.g. "Person" inside "NewPerson") can never produce a
-// false match.
-func identOccurrence(t *testing.T, path, name string, occurrence int) (line, col int) {
+// identOccurrence parses path and returns the (line, col) of the first
+// identifier named name, in source order. Using the parser (rather than a
+// text search) means comments and substrings of longer identifiers (e.g.
+// "Person" inside "NewPerson") can never produce a false match.
+func identOccurrence(t *testing.T, path, name string) (line, col int) {
 	t.Helper()
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
@@ -101,10 +100,10 @@ func identOccurrence(t *testing.T, path, name string, occurrence int) (line, col
 		}
 		return true
 	})
-	if occurrence < 1 || occurrence > len(positions) {
-		t.Fatalf("%s: found %d occurrences of %q, want at least %d", path, len(positions), name, occurrence)
+	if len(positions) < 1 {
+		t.Fatalf("%s: found no occurrences of %q", path, name)
 	}
-	p := positions[occurrence-1]
+	p := positions[0]
 	return p.Line, p.Column
 }
 
@@ -112,7 +111,7 @@ func TestDefinition_CrossPackage(t *testing.T) {
 	r, snap := newTestResolver(t)
 
 	userFile := goFile(t, snap, pkgUser, "user.go")
-	line, col := identOccurrence(t, userFile, "Person", 1) // impl.Person in Declare's return type
+	line, col := identOccurrence(t, userFile, "Person") // impl.Person in Declare's return type
 
 	locs, err := r.Definition(userFile, line, col)
 	if err != nil {
@@ -123,7 +122,7 @@ func TestDefinition_CrossPackage(t *testing.T) {
 	}
 
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
-	wantLine, wantCol := identOccurrence(t, implFile, "Person", 1) // the struct decl
+	wantLine, wantCol := identOccurrence(t, implFile, "Person") // the struct decl
 	got := locs[0]
 	if got.File != implFile || int(got.Line) != wantLine || int(got.Col) != wantCol {
 		t.Errorf("Definition = %+v, want {%s %d %d}", got, implFile, wantLine, wantCol)
@@ -134,7 +133,7 @@ func TestDefinition_OnDeclarationResolvesToItself(t *testing.T) {
 	r, snap := newTestResolver(t)
 
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
-	line, col := identOccurrence(t, implFile, "Person", 1)
+	line, col := identOccurrence(t, implFile, "Person")
 
 	locs, err := r.Definition(implFile, line, col)
 	if err != nil {
@@ -153,7 +152,7 @@ func TestReferences_SpansDefiningAndReferencingPackages(t *testing.T) {
 	r, snap := newTestResolver(t)
 
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
-	line, col := identOccurrence(t, implFile, "Person", 1) // the declaration
+	line, col := identOccurrence(t, implFile, "Person") // the declaration
 
 	locs, err := r.References(implFile, line, col, true)
 	if err != nil {
@@ -187,7 +186,7 @@ func TestReferences_ExcludesDeclarationWhenNotIncluded(t *testing.T) {
 	r, snap := newTestResolver(t)
 
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
-	declLine, declCol := identOccurrence(t, implFile, "Person", 1)
+	declLine, declCol := identOccurrence(t, implFile, "Person")
 
 	locs, err := r.References(implFile, declLine, declCol, false)
 	if err != nil {
@@ -207,7 +206,7 @@ func TestImplementation_InterfaceToImplementer(t *testing.T) {
 	r, snap := newTestResolver(t)
 
 	ifaceFile := goFile(t, snap, pkgIface, "iface.go")
-	line, col := identOccurrence(t, ifaceFile, "Greeter", 1)
+	line, col := identOccurrence(t, ifaceFile, "Greeter")
 
 	locs, err := r.Implementation(ifaceFile, line, col)
 	if err != nil {
@@ -218,7 +217,7 @@ func TestImplementation_InterfaceToImplementer(t *testing.T) {
 	}
 
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
-	wantLine, wantCol := identOccurrence(t, implFile, "Person", 1)
+	wantLine, wantCol := identOccurrence(t, implFile, "Person")
 	got := locs[0]
 	if got.File != implFile || int(got.Line) != wantLine || int(got.Col) != wantCol {
 		t.Errorf("Implementation = %+v, want Person at %s:%d:%d", got, implFile, wantLine, wantCol)
@@ -229,7 +228,7 @@ func TestImplementation_ConcreteTypeToInterface(t *testing.T) {
 	r, snap := newTestResolver(t)
 
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
-	line, col := identOccurrence(t, implFile, "Person", 1)
+	line, col := identOccurrence(t, implFile, "Person")
 
 	locs, err := r.Implementation(implFile, line, col)
 	if err != nil {
@@ -240,7 +239,7 @@ func TestImplementation_ConcreteTypeToInterface(t *testing.T) {
 	}
 
 	ifaceFile := goFile(t, snap, pkgIface, "iface.go")
-	wantLine, wantCol := identOccurrence(t, ifaceFile, "Greeter", 1)
+	wantLine, wantCol := identOccurrence(t, ifaceFile, "Greeter")
 	got := locs[0]
 	if got.File != ifaceFile || int(got.Line) != wantLine || int(got.Col) != wantCol {
 		t.Errorf("Implementation = %+v, want Greeter at %s:%d:%d", got, ifaceFile, wantLine, wantCol)
@@ -256,7 +255,7 @@ func TestWorkspaceSymbol_PrefixMatch(t *testing.T) {
 	}
 
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
-	wantLine, wantCol := identOccurrence(t, implFile, "Person", 1)
+	wantLine, wantCol := identOccurrence(t, implFile, "Person")
 
 	found := false
 	for _, s := range results {
@@ -295,7 +294,7 @@ func TestRename_EditsEveryReferenceAcrossFiles(t *testing.T) {
 	r, snap := newTestResolver(t)
 
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
-	line, col := identOccurrence(t, implFile, "Person", 1)
+	line, col := identOccurrence(t, implFile, "Person")
 
 	edits, err := r.Rename(implFile, line, col, "Human")
 	if err != nil {

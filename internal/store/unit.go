@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 )
 
 // UnitBlob is the immutable, content-addressed record for one package's
@@ -23,7 +24,7 @@ const (
 	unitVersion = 1
 )
 
-// encodeUnitBlob serializes u as:
+// EncodeUnitBlob serializes u as:
 //
 //	[4]magic [2]version [2]reserved
 //	[4]factsLen [4]exportLen [4]fileCount [4]namesCount [4]methodsCount [4]symstrCount
@@ -32,7 +33,7 @@ const (
 //	namesCount * { [4]nameLen [nameLen]name [8]idHash }
 //	methodsCount * { [4]nameLen [nameLen]name [8]pkgHash [8]typeSymbolIDHash }
 //	symstrCount * { [8]idHash [4]symbolIDLen [symbolIDLen]symbolID }
-func EncodeUnitBlob(u UnitBlob) []byte {
+func EncodeUnitBlob(u *UnitBlob) []byte {
 	size := 24 + 8 + len(u.Facts) + len(u.Export) // +8: methodsCount, symstrCount (see putIndexEntries)
 	for _, f := range u.Files {
 		size += 4 + len(f.Path) + 16
@@ -61,9 +62,20 @@ func EncodeUnitBlob(u UnitBlob) []byte {
 		binary.LittleEndian.PutUint32(b[off:], uint32(len(f.Path)))
 		off += 4
 		off += copy(b[off:], f.Path)
-		binary.LittleEndian.PutUint64(b[off:], uint64(f.Size))
+		// os.FileInfo never reports a negative size or mtime in practice;
+		// clamp defensively rather than let a nonsensical negative value
+		// wrap around when reinterpreted as unsigned.
+		size := f.Size
+		if size < 0 {
+			size = 0
+		}
+		binary.LittleEndian.PutUint64(b[off:], uint64(size))
 		off += 8
-		binary.LittleEndian.PutUint64(b[off:], uint64(f.ModTimeNanos))
+		mtime := f.ModTimeNanos
+		if mtime < 0 {
+			mtime = 0
+		}
+		binary.LittleEndian.PutUint64(b[off:], uint64(mtime))
 		off += 8
 	}
 	off = putIndexEntries(b, off, u.Index)
@@ -105,7 +117,7 @@ func putIndexEntries(b []byte, off int, idx PackageIndexEntries) int {
 	return off
 }
 
-// decodeUnitBlob parses b as encodeUnitBlob produced it. Facts and Export
+// DecodeUnitBlob parses b as EncodeUnitBlob produced it. Facts and Export
 // alias b (no copy); callers that need them to outlive b's own lifetime
 // (e.g. a []byte returned from [CAS.Get], safe to retain since it is a fresh
 // os.ReadFile result, not a memory-mapped transaction view) may keep them as
@@ -133,80 +145,21 @@ func DecodeUnitBlob(b []byte) (UnitBlob, error) {
 		return UnitBlob{}, fmt.Errorf("store: unit blob export: %w", err)
 	}
 
-	files := make([]FileStat, fileCount)
-	for i := range files {
-		var path string
-		path, off, err = takeString(b, off)
-		if err != nil {
-			return UnitBlob{}, fmt.Errorf("store: unit blob file %d: %w", i, err)
-		}
-		var size, mtime uint64
-		size, off, err = takeUint64(b, off)
-		if err != nil {
-			return UnitBlob{}, fmt.Errorf("store: unit blob file %d size: %w", i, err)
-		}
-		mtime, off, err = takeUint64(b, off)
-		if err != nil {
-			return UnitBlob{}, fmt.Errorf("store: unit blob file %d mtime: %w", i, err)
-		}
-		files[i] = FileStat{Path: path, Size: int64(size), ModTimeNanos: int64(mtime)}
-	}
-
-	names := make([]NameEntry, nameCount)
-	for i := range names {
-		var name string
-		name, off, err = takeString(b, off)
-		if err != nil {
-			return UnitBlob{}, fmt.Errorf("store: unit blob name %d: %w", i, err)
-		}
-		var idHash uint64
-		idHash, off, err = takeUint64(b, off)
-		if err != nil {
-			return UnitBlob{}, fmt.Errorf("store: unit blob name %d idHash: %w", i, err)
-		}
-		names[i] = NameEntry{Name: name, IDHash: idHash}
-	}
-
-	methodCount, off, err := takeUint32(b, off)
+	files, off, err := decodeFileStats(b, off, fileCount)
 	if err != nil {
-		return UnitBlob{}, fmt.Errorf("store: unit blob method count: %w", err)
+		return UnitBlob{}, err
 	}
-	methods := make([]MethodSymbolEntry, methodCount)
-	for i := range methods {
-		var name string
-		name, off, err = takeString(b, off)
-		if err != nil {
-			return UnitBlob{}, fmt.Errorf("store: unit blob method %d: %w", i, err)
-		}
-		var pkgHash, typeIDHash uint64
-		pkgHash, off, err = takeUint64(b, off)
-		if err != nil {
-			return UnitBlob{}, fmt.Errorf("store: unit blob method %d pkgHash: %w", i, err)
-		}
-		typeIDHash, off, err = takeUint64(b, off)
-		if err != nil {
-			return UnitBlob{}, fmt.Errorf("store: unit blob method %d typeIDHash: %w", i, err)
-		}
-		methods[i] = MethodSymbolEntry{Name: name, Entry: MethodEntry{PkgHash: pkgHash, TypeSymbolIDHash: typeIDHash}}
-	}
-
-	symStrCount, off, err := takeUint32(b, off)
+	names, off, err := decodeNameEntries(b, off, nameCount)
 	if err != nil {
-		return UnitBlob{}, fmt.Errorf("store: unit blob symstr count: %w", err)
+		return UnitBlob{}, err
 	}
-	symStrs := make([]SymStrEntry, symStrCount)
-	for i := range symStrs {
-		var idHash uint64
-		idHash, off, err = takeUint64(b, off)
-		if err != nil {
-			return UnitBlob{}, fmt.Errorf("store: unit blob symstr %d idHash: %w", i, err)
-		}
-		var sid string
-		sid, off, err = takeString(b, off)
-		if err != nil {
-			return UnitBlob{}, fmt.Errorf("store: unit blob symstr %d: %w", i, err)
-		}
-		symStrs[i] = SymStrEntry{IDHash: idHash, SymbolID: sid}
+	methods, off, err := decodeMethodEntries(b, off)
+	if err != nil {
+		return UnitBlob{}, err
+	}
+	symStrs, _, err := decodeSymStrEntries(b, off)
+	if err != nil {
+		return UnitBlob{}, err
 	}
 
 	return UnitBlob{
@@ -215,6 +168,107 @@ func DecodeUnitBlob(b []byte) (UnitBlob, error) {
 		Files:  files,
 		Index:  PackageIndexEntries{Names: names, Methods: methods, SymStrs: symStrs},
 	}, nil
+}
+
+// decodeFileStats decodes count fixed-format FileStat records starting at
+// off (see EncodeUnitBlob's doc).
+func decodeFileStats(b []byte, off, count int) ([]FileStat, int, error) {
+	files := make([]FileStat, count)
+	var err error
+	for i := range files {
+		var path string
+		path, off, err = takeString(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob file %d: %w", i, err)
+		}
+		var rawSize, rawMtime uint64
+		rawSize, off, err = takeUint64(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob file %d size: %w", i, err)
+		}
+		rawMtime, off, err = takeUint64(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob file %d mtime: %w", i, err)
+		}
+		if rawSize > math.MaxInt64 || rawMtime > math.MaxInt64 {
+			return nil, 0, fmt.Errorf("store: unit blob file %d: size/mtime out of range", i)
+		}
+		files[i] = FileStat{Path: path, Size: int64(rawSize), ModTimeNanos: int64(rawMtime)}
+	}
+	return files, off, nil
+}
+
+// decodeNameEntries decodes count fixed-format NameEntry records starting
+// at off.
+func decodeNameEntries(b []byte, off, count int) ([]NameEntry, int, error) {
+	names := make([]NameEntry, count)
+	var err error
+	for i := range names {
+		var name string
+		name, off, err = takeString(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob name %d: %w", i, err)
+		}
+		var idHash uint64
+		idHash, off, err = takeUint64(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob name %d idHash: %w", i, err)
+		}
+		names[i] = NameEntry{Name: name, IDHash: idHash}
+	}
+	return names, off, nil
+}
+
+// decodeMethodEntries decodes the methodsCount-prefixed MethodSymbolEntry
+// section starting at off.
+func decodeMethodEntries(b []byte, off int) ([]MethodSymbolEntry, int, error) {
+	methodCount, off, err := takeUint32(b, off)
+	if err != nil {
+		return nil, 0, fmt.Errorf("store: unit blob method count: %w", err)
+	}
+	methods := make([]MethodSymbolEntry, methodCount)
+	for i := range methods {
+		var name string
+		name, off, err = takeString(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob method %d: %w", i, err)
+		}
+		var pkgHash, typeIDHash uint64
+		pkgHash, off, err = takeUint64(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob method %d pkgHash: %w", i, err)
+		}
+		typeIDHash, off, err = takeUint64(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob method %d typeIDHash: %w", i, err)
+		}
+		methods[i] = MethodSymbolEntry{Name: name, Entry: MethodEntry{PkgHash: pkgHash, TypeSymbolIDHash: typeIDHash}}
+	}
+	return methods, off, nil
+}
+
+// decodeSymStrEntries decodes the symstrCount-prefixed SymStrEntry section
+// starting at off.
+func decodeSymStrEntries(b []byte, off int) ([]SymStrEntry, int, error) {
+	symStrCount, off, err := takeUint32(b, off)
+	if err != nil {
+		return nil, 0, fmt.Errorf("store: unit blob symstr count: %w", err)
+	}
+	symStrs := make([]SymStrEntry, symStrCount)
+	for i := range symStrs {
+		var idHash uint64
+		idHash, off, err = takeUint64(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob symstr %d idHash: %w", i, err)
+		}
+		var sid string
+		sid, off, err = takeString(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob symstr %d: %w", i, err)
+		}
+		symStrs[i] = SymStrEntry{IDHash: idHash, SymbolID: sid}
+	}
+	return symStrs, off, nil
 }
 
 func takeBytes(b []byte, off, n int) ([]byte, int, error) {
@@ -229,7 +283,7 @@ func takeString(b []byte, off int) (string, int, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	raw, off, err := takeBytes(b, off, int(n))
+	raw, off, err := takeBytes(b, off, n)
 	if err != nil {
 		return "", 0, err
 	}

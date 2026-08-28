@@ -78,6 +78,12 @@ func (s *Server) handleDefinition(_ context.Context, params json.RawMessage) (an
 	}
 	locs, err := resolver.Definition(path, line, col)
 	if err != nil {
+		// Most errors here mean "no symbol at this position" — a routine
+		// outcome the LSP client already handles as an empty result, not
+		// something to surface as a protocol error. Log it so a genuine
+		// facts-read failure is still visible, rather than silently
+		// indistinguishable from an ordinary miss.
+		s.logger.Printf("server: definition at %s:%d:%d: %v", path, line, col, err)
 		return protocol.LocationSlice(nil), nil
 	}
 	return s.toLSPLocations(locs), nil
@@ -99,6 +105,10 @@ func (s *Server) handleReferences(_ context.Context, params json.RawMessage) (an
 	}
 	locs, err := resolver.References(path, line, col, p.Context.IncludeDeclaration)
 	if err != nil {
+		// See handleDefinition's comment: most errors here are an ordinary
+		// "no symbol at this position" miss, but log it anyway so a
+		// genuine facts-read failure does not vanish silently.
+		s.logger.Printf("server: references at %s:%d:%d: %v", path, line, col, err)
 		return protocol.LocationSlice(nil), nil
 	}
 	return s.toLSPLocations(locs), nil
@@ -120,6 +130,10 @@ func (s *Server) handleImplementation(_ context.Context, params json.RawMessage)
 	}
 	locs, err := resolver.Implementation(path, line, col)
 	if err != nil {
+		// See handleDefinition's comment: most errors here are an ordinary
+		// "no symbol at this position" miss, but log it anyway so a
+		// genuine facts-read failure does not vanish silently.
+		s.logger.Printf("server: implementation at %s:%d:%d: %v", path, line, col, err)
 		return protocol.LocationSlice(nil), nil
 	}
 	return s.toLSPLocations(locs), nil
@@ -136,6 +150,11 @@ func (s *Server) handleWorkspaceSymbol(_ context.Context, params json.RawMessage
 	}
 	infos, err := resolver.WorkspaceSymbol(p.Query)
 	if err != nil {
+		// Unlike Definition/References/Implementation, a WorkspaceSymbol
+		// error is never an ordinary "nothing at this position" miss (it
+		// takes no position at all) — it always means a genuine DB lookup
+		// failure, so it is always worth logging.
+		s.logger.Printf("server: workspace symbol %q: %v", p.Query, err)
 		return protocol.SymbolInformationSlice(nil), nil
 	}
 	out := make(protocol.SymbolInformationSlice, 0, len(infos))

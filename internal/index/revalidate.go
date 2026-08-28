@@ -2,6 +2,8 @@ package index
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -35,8 +37,18 @@ func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolcha
 	// Cheap whole-database short-circuit: if db was never fully built under
 	// the running toolchain at all (see index.Build's PutBuildFingerprint),
 	// every package needs rechecking, so there is no point fanning out a
-	// per-package comparison that would find exactly that.
-	if fp, err := db.BuildFingerprint(); err != nil || fp != toolchainFP {
+	// per-package comparison that would find exactly that. A genuine read
+	// error (as opposed to store.ErrNotFound, the expected not-yet-built
+	// state) is not the same thing and must propagate, so the caller's own
+	// conservative fallback (keep serving what is already open rather than
+	// force a rebuild on a transient error — see
+	// internal/server.indexNeedsRebuild) applies instead of masking the
+	// error as "everything changed."
+	fp, err := db.BuildFingerprint()
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return false, fmt.Errorf("index: revalidate: read build fingerprint: %w", err)
+	}
+	if err != nil || fp != toolchainFP {
 		return true, nil
 	}
 
@@ -44,8 +56,7 @@ func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolcha
 	keys := newKeyTable(db)
 	sem := semaphore.NewWeighted(int64(max(1, runtime.NumCPU()*2)))
 	var changed atomic.Bool
-	var mu sync.Mutex
-	var firstErr error
+	var firstErr firstErrRecorder
 	var wg sync.WaitGroup
 	for path, pkg := range snap.Packages {
 		if !pkg.Root || len(pkg.GoFiles) == 0 {
@@ -55,14 +66,14 @@ func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolcha
 		go func(path string, pkg *graph.Package) {
 			defer wg.Done()
 			if err := sem.Acquire(ctx, 1); err != nil {
-				recordFirstErr(&mu, &firstErr, err)
+				firstErr.record(err)
 				return
 			}
 			defer sem.Release(1)
 
 			pkgChanged, err := packageChanged(db, keys, snap, pkg, path, toolchainFP, buildFlagsFP, root, relative)
 			if err != nil {
-				recordFirstErr(&mu, &firstErr, err)
+				firstErr.record(err)
 				return
 			}
 			if pkgChanged {
@@ -71,8 +82,8 @@ func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolcha
 		}(path, pkg)
 	}
 	wg.Wait()
-	if firstErr != nil {
-		return false, firstErr
+	if err := firstErr.get(); err != nil {
+		return false, err
 	}
 	return changed.Load(), nil
 }
@@ -85,7 +96,10 @@ func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolcha
 func packageChanged(db *store.DB, keys *keyTable, snap *graph.Snapshot, pkg *graph.Package, path, toolchainFP, buildFlagsFP, root string, relative bool) (bool, error) {
 	old, err := db.GetUnit(store.Hash(path))
 	if err != nil {
-		return true, nil
+		if errors.Is(err, store.ErrNotFound) {
+			return true, nil
+		}
+		return false, fmt.Errorf("index: revalidate: get unit for %s: %w", path, err)
 	}
 	if old.ToolchainFingerprint != toolchainFP {
 		return true, nil
@@ -118,10 +132,23 @@ func packageChanged(db *store.DB, keys *keyTable, snap *graph.Snapshot, pkg *gra
 	return computeUnitKey(ownHash, deps) != old.BlobKey, nil
 }
 
-func recordFirstErr(mu *sync.Mutex, firstErr *error, err error) {
-	mu.Lock()
-	defer mu.Unlock()
-	if *firstErr == nil {
-		*firstErr = err
+// firstErrRecorder keeps the first non-nil error reported to it by any
+// number of concurrent goroutines.
+type firstErrRecorder struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (r *firstErrRecorder) record(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err == nil {
+		r.err = err
 	}
+}
+
+func (r *firstErrRecorder) get() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
 }

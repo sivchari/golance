@@ -50,8 +50,8 @@ func NewBuilder() *Builder {
 
 // AddSymbol appends a symbol definition. Symbols are kept in the order
 // added; [View.SymbolAt] enumerates them in that same order.
-func (b *Builder) AddSymbol(s SymbolInput) {
-	b.symbols = append(b.symbols, s)
+func (b *Builder) AddSymbol(s *SymbolInput) {
+	b.symbols = append(b.symbols, *s)
 }
 
 // AddRef appends a reference. Build sorts refs by (FileIdx, Line, Col)
@@ -94,14 +94,17 @@ func (b *Builder) Build() ([]byte, error) {
 		return off, uint32(len(s)), nil
 	}
 
-	if len(b.symbols) > math.MaxUint32 {
-		return nil, fmt.Errorf("store: too many symbols: %d", len(b.symbols))
+	nSymbols := len(b.symbols)
+	if nSymbols > math.MaxUint32 {
+		return nil, fmt.Errorf("store: too many symbols: %d", nSymbols)
 	}
-	if len(refs) > math.MaxUint32 {
-		return nil, fmt.Errorf("store: too many refs: %d", len(refs))
+	nRefs := len(refs)
+	if nRefs > math.MaxUint32 {
+		return nil, fmt.Errorf("store: too many refs: %d", nRefs)
 	}
-	if len(b.files) > math.MaxUint32 {
-		return nil, fmt.Errorf("store: too many files: %d", len(b.files))
+	nFiles := len(b.files)
+	if nFiles > math.MaxUint32 {
+		return nil, fmt.Errorf("store: too many files: %d", nFiles)
 	}
 
 	fileTable := make([]byte, len(b.files)*fileRecordSize)
@@ -164,9 +167,9 @@ func (b *Builder) Build() ([]byte, error) {
 	blob := make([]byte, total)
 	copy(blob[offMagic:offMagic+blobMagicLen], blobMagic)
 	binary.LittleEndian.PutUint16(blob[offVersion:], currentVersion)
-	binary.LittleEndian.PutUint32(blob[offSymbolCount:], uint32(len(b.symbols)))
-	binary.LittleEndian.PutUint32(blob[offRefsCount:], uint32(len(refs)))
-	binary.LittleEndian.PutUint32(blob[offFileCount:], uint32(len(b.files)))
+	binary.LittleEndian.PutUint32(blob[offSymbolCount:], uint32(nSymbols))
+	binary.LittleEndian.PutUint32(blob[offRefsCount:], uint32(nRefs))
+	binary.LittleEndian.PutUint32(blob[offFileCount:], uint32(nFiles))
 	binary.LittleEndian.PutUint64(blob[offSymTblOff:], symOff)
 	binary.LittleEndian.PutUint64(blob[offSymTblLen:], uint64(len(symTable)))
 	binary.LittleEndian.PutUint64(blob[offRefsTblOff:], refsOff)

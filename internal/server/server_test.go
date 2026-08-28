@@ -78,14 +78,14 @@ func newTestServer(t *testing.T) (*Server, *graph.Snapshot, string) {
 }
 
 // identPosition parses path's on-disk content and returns the LSP Position
-// of the occurrence-th (1-based) identifier named name, in source order.
-func identPosition(t *testing.T, path, name string, occurrence int) protocol.Position {
+// of the occurrence-th (1-based) identifier named "Hello", in source order.
+func identPosition(t *testing.T, path string, occurrence int) protocol.Position {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
-	return identPositionIn(t, path, data, name, occurrence)
+	return identPositionIn(t, path, data, "Hello", occurrence)
 }
 
 // identPositionIn parses data as path's content (without touching disk)
@@ -130,7 +130,7 @@ func mustMarshal(t *testing.T, v any) json.RawMessage {
 func TestHandleHover(t *testing.T) {
 	s, snap, _ := newTestServer(t)
 	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
-	pos := identPosition(t, file, "Hello", 2) // call site in useHello
+	pos := identPosition(t, file, 2) // call site in useHello
 
 	result, err := s.handleHover(context.Background(), mustMarshal(t, &protocol.HoverParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
@@ -157,7 +157,7 @@ func TestHandleHover(t *testing.T) {
 func TestHandleDefinition(t *testing.T) {
 	s, snap, _ := newTestServer(t)
 	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
-	pos := identPosition(t, file, "Hello", 2) // call site in useHello
+	pos := identPosition(t, file, 2) // call site in useHello
 
 	result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
@@ -172,7 +172,7 @@ func TestHandleDefinition(t *testing.T) {
 	if !ok || len(locs) != 1 {
 		t.Fatalf("handleDefinition: result = %#v, want a single location", result)
 	}
-	declPos := identPosition(t, file, "Hello", 1) // func Hello(...) declaration
+	declPos := identPosition(t, file, 1) // func Hello(...) declaration
 	if locs[0].Range.Start != declPos {
 		t.Fatalf("definition start = %+v, want %+v", locs[0].Range.Start, declPos)
 	}
@@ -181,7 +181,7 @@ func TestHandleDefinition(t *testing.T) {
 func TestHandleReferences(t *testing.T) {
 	s, snap, _ := newTestServer(t)
 	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
-	pos := identPosition(t, file, "Hello", 1) // declaration
+	pos := identPosition(t, file, 1) // declaration
 
 	result, err := s.handleReferences(context.Background(), mustMarshal(t, &protocol.ReferenceParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
@@ -197,7 +197,7 @@ func TestHandleReferences(t *testing.T) {
 	if !ok || len(locs) != 1 {
 		t.Fatalf("handleReferences: result = %#v, want a single reference", result)
 	}
-	callPos := identPosition(t, file, "Hello", 2)
+	callPos := identPosition(t, file, 2)
 	if locs[0].Range.Start != callPos {
 		t.Fatalf("reference start = %+v, want %+v", locs[0].Range.Start, callPos)
 	}

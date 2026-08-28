@@ -51,7 +51,7 @@ func (s *Server) handleDidChange(_ context.Context, params json.RawMessage) erro
 // handleDidSave refreshes the document's overlay with the saved text (if
 // the client included it), schedules a recheck, and — if the facts index
 // is ready — reindexes the saved package in the background.
-func (s *Server) handleDidSave(_ context.Context, params json.RawMessage) error {
+func (s *Server) handleDidSave(ctx context.Context, params json.RawMessage) error {
 	var p protocol.DidSaveTextDocumentParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return err
@@ -71,7 +71,12 @@ func (s *Server) handleDidSave(_ context.Context, params json.RawMessage) error 
 	if !ok || idx == nil {
 		return nil
 	}
-	go s.reindex(ws, idx, pkgPath)
+	// ctx is the server's own session-lifetime context (notifications are
+	// not individually cancelable — see internal/rpc.Server.dispatchNotification),
+	// not the DidSave notification's, so using it here bounds this
+	// detached reindex goroutine to the LSP session's own lifetime instead
+	// of running past shutdown with an unbounded context.Background().
+	go s.reindex(ctx, ws, idx, pkgPath)
 	return nil
 }
 
@@ -97,8 +102,8 @@ func (s *Server) handleDidClose(_ context.Context, params json.RawMessage) error
 // at the first hop whose export data didn't actually change): it is sound
 // either way, and avoids needing Reindex to report exactly which hops in
 // the closure changed.
-func (s *Server) reindex(ws *workspace, idx *indexState, pkgPath string) {
-	if _, err := index.Reindex(context.Background(), ws.snap, idx.db, idx.cas, pkgPath, s.overlay.ReadFile, index.Options{RelativePaths: RelativeIndexPaths(ws.root)}); err != nil {
+func (s *Server) reindex(ctx context.Context, ws *workspace, idx *indexState, pkgPath string) {
+	if _, err := index.Reindex(ctx, ws.snap, idx.db, idx.cas, pkgPath, s.overlay.ReadFile, index.Options{RelativePaths: RelativeIndexPaths(ws.root)}); err != nil {
 		s.logger.Printf("server: reindex %s: %v", pkgPath, err)
 		return
 	}

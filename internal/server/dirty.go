@@ -14,7 +14,7 @@ import (
 // top-down line diff: every line above the first point of divergence is
 // unchanged, and every line at or below it shifts by the constant
 // line-count delta between from and to (plan-feat-v0.1.md, "4. incremental
-// 再索引", step 4: a plain line-count-shift position correction). This is
+// reindex", step 4: a plain line-count-shift position correction). This is
 // not a real diff — edits in different parts of the same file produce one
 // boundary at the first divergence found from the top, not a minimal edit
 // script. ok is false if the mapped line falls outside to's range, in

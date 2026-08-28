@@ -44,8 +44,8 @@ func (s *memExportSource) ExportData(pkgPath string) ([]byte, bool, error) {
 //
 // This laziness is what makes an untouched run (nothing changed anywhere)
 // cost zero CAS reads: a chain of skipped packages never needs its export
-// data at all, since nothing is re-type-checking against it. See the
-// package doc's "無変更再起動" goal.
+// data at all, since nothing is re-type-checking against it — the goal
+// being a no-op restart with no changes on disk.
 type casExportSource struct {
 	mem  *memExportSource
 	cas  *store.CAS

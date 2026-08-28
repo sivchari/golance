@@ -7,17 +7,23 @@ import (
 	"path/filepath"
 	"testing"
 
-	"golang.org/x/tools/go/gcexportdata"
+	"golang.org/x/tools/go/packages"
 )
 
-// stdlibExportFiles resolves stdlib packages via `go list -export`
-// (gcexportdata.Find), independent of the module this test runs in — it
+// stdlibExportFiles resolves stdlib packages via a scoped go/packages.Load
+// (the same non-deprecated mechanism internal/graph.Snapshot's own
+// reloadExportFile uses), independent of the module this test runs in — it
 // exercises the same GOCACHE export-file path internal/graph.Snapshot uses,
 // without depending on internal/graph.
 type stdlibExportFiles struct{}
 
 func (stdlibExportFiles) ExportFile(pkgPath string) (string, bool) {
-	file, _ := gcexportdata.Find(pkgPath, "")
+	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedExportFile}
+	pkgs, err := packages.Load(cfg, pkgPath)
+	if err != nil || len(pkgs) != 1 || len(pkgs[0].Errors) > 0 {
+		return "", false
+	}
+	file := pkgs[0].ExportFile
 	return file, file != ""
 }
 

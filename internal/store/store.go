@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"go.etcd.io/bbolt"
@@ -133,9 +134,20 @@ func encodeUnitPointer(p UnitPointer) []byte {
 		binary.LittleEndian.PutUint32(b[off:], uint32(len(f.Path)))
 		off += 4
 		off += copy(b[off:], f.Path)
-		binary.LittleEndian.PutUint64(b[off:], uint64(f.Size))
+		// os.FileInfo never reports a negative size or mtime in practice;
+		// clamp defensively rather than let a nonsensical negative value
+		// wrap around when reinterpreted as unsigned.
+		size := f.Size
+		if size < 0 {
+			size = 0
+		}
+		binary.LittleEndian.PutUint64(b[off:], uint64(size))
 		off += 8
-		binary.LittleEndian.PutUint64(b[off:], uint64(f.ModTimeNanos))
+		mtime := f.ModTimeNanos
+		if mtime < 0 {
+			mtime = 0
+		}
+		binary.LittleEndian.PutUint64(b[off:], uint64(mtime))
 		off += 8
 	}
 	return b
@@ -174,11 +186,14 @@ func decodeUnitPointer(b []byte) (UnitPointer, error) {
 		}
 		path := string(b[off : off+pathLen])
 		off += pathLen
-		size := int64(binary.LittleEndian.Uint64(b[off:]))
+		rawSize := binary.LittleEndian.Uint64(b[off:])
 		off += 8
-		mtime := int64(binary.LittleEndian.Uint64(b[off:]))
+		rawMtime := binary.LittleEndian.Uint64(b[off:])
 		off += 8
-		files = append(files, FileStat{Path: path, Size: size, ModTimeNanos: mtime})
+		if rawSize > math.MaxInt64 || rawMtime > math.MaxInt64 {
+			return UnitPointer{}, fmt.Errorf("store: unit pointer record: file %d size/mtime out of range", i)
+		}
+		files = append(files, FileStat{Path: path, Size: int64(rawSize), ModTimeNanos: int64(rawMtime)})
 	}
 	p.Files = files
 	return p, nil
@@ -214,8 +229,8 @@ type UnitEntry struct {
 
 // PutUnit atomically stores e's pointer and index entries in a single
 // transaction.
-func (db *DB) PutUnit(e UnitEntry) error {
-	return db.PutUnitsBatch([]UnitEntry{e})
+func (db *DB) PutUnit(e *UnitEntry) error {
+	return db.PutUnitsBatch([]UnitEntry{*e})
 }
 
 // PutUnitsBatch atomically stores every entry's pointer and index entries in
@@ -224,7 +239,8 @@ func (db *DB) PutUnit(e UnitEntry) error {
 func (db *DB) PutUnitsBatch(entries []UnitEntry) error {
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
 		unitB := tx.Bucket(bucketUnit)
-		for _, e := range entries {
+		for i := range entries {
+			e := &entries[i]
 			if err := unitB.Put(hashKey(e.PkgHash), encodeUnitPointer(e.Pointer)); err != nil {
 				return err
 			}

@@ -49,14 +49,14 @@ func runGit(t *testing.T, dir string, args ...string) {
 
 // definitionAt requests textDocument/definition at pos in file and returns
 // the (non-empty) result, failing t otherwise.
-func definitionAt(t *testing.T, c *lspClient, file string, pos protocol.Position, timeout time.Duration) protocol.LocationSlice {
+func definitionAt(t *testing.T, c *lspClient, file string, pos protocol.Position) protocol.LocationSlice {
 	t.Helper()
 	return c.waitForNonEmptyLocations(t, protocol.MethodTextDocumentDefinition, &protocol.DefinitionParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
 			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
 			Position:     pos,
 		},
-	}, timeout)
+	}, e2eRequestBudget)
 }
 
 // startAndAwaitIndex starts a golance session for root (sharing fakeHome),
@@ -92,17 +92,13 @@ func TestE2E_WorktreeSharesIndex(t *testing.T) {
 
 	mainRoot, otherRoot, locs := gitWorktreeModule(t)
 
-	fakeHome, err := os.MkdirTemp("", "golance-e2e-home")
-	if err != nil {
-		t.Fatalf("create fake home: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(fakeHome) })
+	fakeHome := t.TempDir()
 
 	// Worktree A: an ordinary cold-start session that builds its own
 	// per-root index (and populates the shared CAS) from scratch.
 	a, _ := startAndAwaitIndex(t, mainRoot, fakeHome, locs.appFile, e2eIndexBudget)
 
-	got := definitionAt(t, a, locs.appFile, locs.sumCallInApp, e2eRequestBudget)
+	got := definitionAt(t, a, locs.appFile, locs.sumCallInApp)
 	if len(got) != 1 {
 		t.Fatalf("worktree A: want exactly 1 definition location, got %d: %+v", len(got), got)
 	}
@@ -119,7 +115,7 @@ func TestE2E_WorktreeSharesIndex(t *testing.T) {
 	b, elapsed := startAndAwaitIndex(t, otherRoot, fakeHome, otherAppFile, e2eFastBuildBudget)
 	t.Logf("worktree B: CAS-hit-only build finished in %s", elapsed)
 
-	got = definitionAt(t, b, otherAppFile, locs.sumCallInApp, e2eRequestBudget)
+	got = definitionAt(t, b, otherAppFile, locs.sumCallInApp)
 	if len(got) != 1 {
 		t.Fatalf("worktree B: want exactly 1 definition location from the shared CAS, got %d: %+v", len(got), got)
 	}
@@ -179,11 +175,7 @@ func TestE2E_WorktreeSimultaneousStartup(t *testing.T) {
 	mainRoot, otherRoot, locs := gitWorktreeModule(t)
 	otherAppFile := strings.Replace(locs.appFile, mainRoot, otherRoot, 1)
 
-	fakeHome, err := os.MkdirTemp("", "golance-e2e-home")
-	if err != nil {
-		t.Fatalf("create fake home: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(fakeHome) })
+	fakeHome := t.TempDir()
 
 	// Start both sessions concurrently — neither waits for the other to
 	// initialize, open a file, or finish indexing.
@@ -198,11 +190,11 @@ func TestE2E_WorktreeSimultaneousStartup(t *testing.T) {
 	resB := make(chan protocol.LocationSlice, 1)
 	go func() {
 		a.waitForIndexReady(t, e2eIndexBudget)
-		resA <- definitionAt(t, a, locs.appFile, locs.sumCallInApp, e2eRequestBudget)
+		resA <- definitionAt(t, a, locs.appFile, locs.sumCallInApp)
 	}()
 	go func() {
 		b.waitForIndexReady(t, e2eIndexBudget)
-		resB <- definitionAt(t, b, otherAppFile, locs.sumCallInApp, e2eRequestBudget)
+		resB <- definitionAt(t, b, otherAppFile, locs.sumCallInApp)
 	}()
 
 	deadline := time.After(e2eIndexBudget)
@@ -258,18 +250,10 @@ func TestE2E_BranchSwitchNoRetypecheck(t *testing.T) {
 	skipUnlessE2E(t)
 
 	root, locs := writeE2EModule(t)
-	heavyFile := writeHeavyPackage(t, root, "heavy", 500)
-	fakeHome, err := os.MkdirTemp("", "golance-e2e-home")
-	if err != nil {
-		t.Fatalf("create fake home: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(fakeHome) })
+	heavyFile, originalHeavySrc := writeHeavyPackage(t, root, "heavy", 500)
+	fakeHome := t.TempDir()
 
-	originalHeavySrc, err := os.ReadFile(heavyFile)
-	if err != nil {
-		t.Fatalf("read %s: %v", heavyFile, err)
-	}
-	editedHeavySrc := []byte(strings.Replace(string(originalHeavySrc), "package heavy", "package heavy\n\n// edited marks a real content change.\nvar edited = true", 1))
+	editedHeavySrc := strings.Replace(originalHeavySrc, "package heavy", "package heavy\n\n// edited marks a real content change.\nvar edited = true", 1)
 
 	// Session A: original content, a genuine first-ever build. This also
 	// primes the graph cache (go.mod/go.sum unchanged for the rest of this
@@ -278,19 +262,19 @@ func TestE2E_BranchSwitchNoRetypecheck(t *testing.T) {
 	// only variable between them.
 	a, firstElapsed := startAndAwaitIndex(t, root, fakeHome, locs.appFile, e2eIndexBudget)
 	t.Logf("session A: first build (real type-check, cold graph cache) finished in %s", firstElapsed)
-	if got := definitionAt(t, a, locs.appFile, locs.sumCallInApp, e2eRequestBudget); len(got) != 1 {
+	if got := definitionAt(t, a, locs.appFile, locs.sumCallInApp); len(got) != 1 {
 		t.Fatalf("session A: want exactly 1 definition location, got %d: %+v", len(got), got)
 	}
 	a.stop(t)
 
 	// Session B: a genuine edit to the heavy package — new content this
 	// CAS has never seen, forcing a real re-type-check of all 150 files.
-	if err := os.WriteFile(heavyFile, editedHeavySrc, 0o600); err != nil {
+	if err := os.WriteFile(heavyFile, []byte(editedHeavySrc), 0o600); err != nil {
 		t.Fatalf("edit %s: %v", heavyFile, err)
 	}
 	b, editElapsed := startAndAwaitIndex(t, root, fakeHome, locs.appFile, e2eIndexBudget)
 	t.Logf("session B: real re-type-check of the heavy package finished in %s", editElapsed)
-	if got := definitionAt(t, b, locs.appFile, locs.sumCallInApp, e2eRequestBudget); len(got) != 1 {
+	if got := definitionAt(t, b, locs.appFile, locs.sumCallInApp); len(got) != 1 {
 		t.Fatalf("session B: want exactly 1 definition location, got %d: %+v", len(got), got)
 	}
 	b.stop(t)
@@ -299,12 +283,12 @@ func TestE2E_BranchSwitchNoRetypecheck(t *testing.T) {
 	// content. Its (content, dependency-API) combination now matches
 	// exactly what session A already built, so this must resolve via a
 	// CAS hit alone — no type-check.
-	if err := os.WriteFile(heavyFile, originalHeavySrc, 0o600); err != nil {
+	if err := os.WriteFile(heavyFile, []byte(originalHeavySrc), 0o600); err != nil {
 		t.Fatalf("revert %s: %v", heavyFile, err)
 	}
 	c, revertElapsed := startAndAwaitIndex(t, root, fakeHome, locs.appFile, e2eIndexBudget)
 	t.Logf("session A (reverted): CAS-hit-only build finished in %s (session B's real recheck was %s)", revertElapsed, editElapsed)
-	if got := definitionAt(t, c, locs.appFile, locs.sumCallInApp, e2eRequestBudget); len(got) != 1 {
+	if got := definitionAt(t, c, locs.appFile, locs.sumCallInApp); len(got) != 1 {
 		t.Fatalf("session A (reverted): want exactly 1 definition location, got %d: %+v", len(got), got)
 	}
 

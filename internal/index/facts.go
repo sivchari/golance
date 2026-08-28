@@ -106,7 +106,7 @@ func addDef(fset *token.FileSet, pkgHash uint64, tpkg *types.Package, fileIdx ma
 	idHash := store.Hash(sid)
 	kind, flags := classify(obj)
 
-	b.AddSymbol(store.SymbolInput{
+	b.AddSymbol(&store.SymbolInput{
 		IDHash:  idHash,
 		Kind:    kind,
 		Flags:   flags,

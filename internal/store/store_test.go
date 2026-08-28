@@ -37,7 +37,7 @@ func TestDBUnitPointerRoundTrip(t *testing.T) {
 			{Path: "/b.go", Size: 0, ModTimeNanos: 5678},
 		},
 	}
-	if err := db.PutUnit(UnitEntry{PkgHash: pkgHash, Pointer: want}); err != nil {
+	if err := db.PutUnit(&UnitEntry{PkgHash: pkgHash, Pointer: want}); err != nil {
 		t.Fatalf("PutUnit() error = %v", err)
 	}
 
@@ -61,7 +61,7 @@ func TestDBPutUnitAppliesIndexEntries(t *testing.T) {
 			SymStrs: []SymStrEntry{{IDHash: 100, SymbolID: "pkg#Foo"}},
 		},
 	}
-	if err := db.PutUnit(entry); err != nil {
+	if err := db.PutUnit(&entry); err != nil {
 		t.Fatalf("PutUnit() error = %v", err)
 	}
 
@@ -98,7 +98,7 @@ func TestDBPutUnitsBatch(t *testing.T) {
 
 func TestDBPutUnitPointersBatchLeavesIndexUntouched(t *testing.T) {
 	db := openTestDB(t)
-	if err := db.PutUnit(UnitEntry{
+	if err := db.PutUnit(&UnitEntry{
 		PkgHash: 1,
 		Pointer: UnitPointer{BlobKey: 10, ContentHash: 1},
 		Index:   PackageIndexEntries{Names: []NameEntry{{Name: "Foo", IDHash: 100}}},

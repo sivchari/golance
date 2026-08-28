@@ -1,5 +1,5 @@
 // Package store implements golance's on-disk facts index as two layers (see
-// plan-feat-v0.1.md and research-feat-v0.1.md's "追記 3" for the design
+// plan-feat-v0.1.md and research-feat-v0.1.md's "Addendum 3" for the design
 // rationale):
 //
 //   - [CAS]: a shared, lock-free, content-addressed blob store, one per
@@ -24,7 +24,8 @@
 // RefsTo) by computing offsets into the blob directly, so a single
 // hover/definition query touches only the bytes it needs, regardless of how
 // many symbols the package has. This is what keeps query latency
-// independent of package or workspace size (see plan-feat-v0.1.md, "9秒問題").
+// independent of package or workspace size (see plan-feat-v0.1.md, "the
+// 9-second problem").
 // A blob returned by [CAS.Get] is an ordinary heap-allocated []byte
 // (os.ReadFile's result, not a memory-mapped bbolt transaction view), so —
 // unlike DB's own small posting-list buckets — it carries no

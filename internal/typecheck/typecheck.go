@@ -8,12 +8,14 @@ package typecheck
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"golang.org/x/sync/singleflight"
@@ -181,7 +183,7 @@ func (imp *Importer) resolve(path string) (*types.Package, error) {
 	if !ok {
 		return nil, fmt.Errorf("typecheck: no export data for %s", path)
 	}
-	f, err := os.Open(file)
+	f, err := os.Open(filepath.Clean(file))
 	if err != nil {
 		return nil, fmt.Errorf("typecheck: open export file for %s: %w", path, err)
 	}
@@ -225,7 +227,8 @@ func CheckPackage(fset *token.FileSet, files []*ast.File, pkgPath string, imp ty
 	conf := types.Config{
 		Importer: imp,
 		Error: func(err error) {
-			if terr, ok := err.(types.Error); ok {
+			var terr types.Error
+			if errors.As(err, &terr) {
 				errs = append(errs, terr)
 			}
 		},

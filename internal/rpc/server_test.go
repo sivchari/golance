@@ -55,10 +55,10 @@ func frameForID(t *testing.T, frames []map[string]any, id float64) map[string]an
 	return nil
 }
 
-func newTestServer(t *testing.T, opts ...Option) *Server {
+func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	logger := log.New(&testWriter{t}, "", 0)
-	return NewServer(append([]Option{WithLogger(logger)}, opts...)...)
+	return NewServer(WithLogger(logger))
 }
 
 type testWriter struct{ t *testing.T }
@@ -70,7 +70,7 @@ func (w *testWriter) Write(p []byte) (int, error) {
 
 func TestServeDispatchesRequestAndWritesResult(t *testing.T) {
 	s := newTestServer(t)
-	s.Handle("initialize", Interactive, func(ctx context.Context, params json.RawMessage) (any, error) {
+	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) {
 		return map[string]string{"ok": "true"}, nil
 	})
 
@@ -111,7 +111,8 @@ func TestUnknownMethodReturnsMethodNotFound(t *testing.T) {
 	if errObj == nil {
 		t.Fatalf("frame = %v, want error", f)
 	}
-	if int32(errObj["code"].(float64)) != methodNotFoundCode {
+	code, ok := errObj["code"].(float64)
+	if !ok || int32(code) != methodNotFoundCode {
 		t.Fatalf("code = %v, want %d", errObj["code"], methodNotFoundCode)
 	}
 }
@@ -131,7 +132,8 @@ func TestLifecycleRejectsRequestsBeforeInitialize(t *testing.T) {
 		t.Fatalf("got %d frames, want 1", len(frames))
 	}
 	errObj, _ := frames[0]["error"].(map[string]any)
-	if errObj == nil || int32(errObj["code"].(float64)) != serverNotInitializedCode {
+	code, ok := errObj["code"].(float64)
+	if errObj == nil || !ok || int32(code) != serverNotInitializedCode {
 		t.Fatalf("frame = %v, want ServerNotInitialized", frames[0])
 	}
 }
@@ -157,7 +159,8 @@ func TestLifecycleRejectsRequestsAfterShutdown(t *testing.T) {
 	}
 	f := frameForID(t, frames, 3)
 	errObj, _ := f["error"].(map[string]any)
-	if errObj == nil || int32(errObj["code"].(float64)) != invalidRequestCode {
+	code, ok := errObj["code"].(float64)
+	if errObj == nil || !ok || int32(code) != invalidRequestCode {
 		t.Fatalf("frame = %v, want InvalidRequest", f)
 	}
 }
@@ -204,7 +207,7 @@ func TestCancelRequestCancelsHandlerContext(t *testing.T) {
 	s := newTestServer(t)
 	started := make(chan struct{})
 	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
-	s.Handle("slow", Background, func(ctx context.Context, params json.RawMessage) (any, error) {
+	s.Handle("slow", Background, func(ctx context.Context, _ json.RawMessage) (any, error) {
 		close(started)
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -234,7 +237,8 @@ func TestCancelRequestCancelsHandlerContext(t *testing.T) {
 	}
 	f := frameForID(t, frames, 2)
 	errObj, _ := f["error"].(map[string]any)
-	if errObj == nil || int32(errObj["code"].(float64)) != requestCancelledCode {
+	code, ok := errObj["code"].(float64)
+	if errObj == nil || !ok || int32(code) != requestCancelledCode {
 		t.Fatalf("frame = %v, want RequestCancelled", f)
 	}
 }
@@ -255,14 +259,14 @@ func TestNotificationsForSameURIRunInOrder(t *testing.T) {
 	var order []int
 	release := make(chan struct{})
 	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
-	s.HandleNotification("first", func(ctx context.Context, params json.RawMessage) error {
+	s.HandleNotification("first", func(context.Context, json.RawMessage) error {
 		<-release // force the second notification to queue behind this one
 		mu.Lock()
 		order = append(order, 1)
 		mu.Unlock()
 		return nil
 	})
-	s.HandleNotification("second", func(ctx context.Context, params json.RawMessage) error {
+	s.HandleNotification("second", func(context.Context, json.RawMessage) error {
 		mu.Lock()
 		order = append(order, 2)
 		mu.Unlock()
@@ -320,7 +324,8 @@ func TestPlainErrorIsReportedAsInternalError(t *testing.T) {
 	}
 	frames := readFrames(t, out.Bytes())
 	errObj, _ := frames[0]["error"].(map[string]any)
-	if errObj == nil || int32(errObj["code"].(float64)) != internalErrorCode {
+	code, ok := errObj["code"].(float64)
+	if errObj == nil || !ok || int32(code) != internalErrorCode {
 		t.Fatalf("frame = %v, want InternalError", frames[0])
 	}
 	if errObj["message"] != "boom" {
@@ -340,7 +345,8 @@ func TestHandlerReturnedErrorPreservesCode(t *testing.T) {
 	}
 	frames := readFrames(t, out.Bytes())
 	errObj, _ := frames[0]["error"].(map[string]any)
-	if errObj == nil || int32(errObj["code"].(float64)) != invalidRequestCode {
+	code, ok := errObj["code"].(float64)
+	if errObj == nil || !ok || int32(code) != invalidRequestCode {
 		t.Fatalf("frame = %v, want InvalidRequest", frames[0])
 	}
 }

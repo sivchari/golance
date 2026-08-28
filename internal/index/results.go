@@ -47,24 +47,33 @@ func (r *buildResults) record(outcome *unitOutcome, skipped bool, err error) int
 	default:
 		r.stats.Processed++
 	}
-	if outcome != nil {
-		if outcome.entry != nil {
-			r.pending = append(r.pending, *outcome.entry)
-			if len(r.pending) >= r.batchSize {
-				r.flushPendingLocked()
-			}
-		}
-		if outcome.ptrRefresh != nil {
-			if r.pendingPtrs == nil {
-				r.pendingPtrs = make(map[uint64]store.UnitPointer, r.batchSize)
-			}
-			r.pendingPtrs[outcome.pkgHash] = *outcome.ptrRefresh
-			if len(r.pendingPtrs) >= r.batchSize {
-				r.flushPtrsLocked()
-			}
+	r.queueOutcomeLocked(outcome)
+	return r.stats.Processed + r.stats.Skipped + r.stats.Errors
+}
+
+// queueOutcomeLocked queues outcome's entry and/or pointer-only refresh for
+// the next batch flush, flushing early once either batch reaches
+// r.batchSize. outcome may be nil (a skip or a package-level error, neither
+// of which produces anything to write).
+func (r *buildResults) queueOutcomeLocked(outcome *unitOutcome) {
+	if outcome == nil {
+		return
+	}
+	if outcome.entry != nil {
+		r.pending = append(r.pending, *outcome.entry)
+		if len(r.pending) >= r.batchSize {
+			r.flushPendingLocked()
 		}
 	}
-	return r.stats.Processed + r.stats.Skipped + r.stats.Errors
+	if outcome.ptrRefresh != nil {
+		if r.pendingPtrs == nil {
+			r.pendingPtrs = make(map[uint64]store.UnitPointer, r.batchSize)
+		}
+		r.pendingPtrs[outcome.pkgHash] = *outcome.ptrRefresh
+		if len(r.pendingPtrs) >= r.batchSize {
+			r.flushPtrsLocked()
+		}
+	}
 }
 
 // recordFatal records a systemic failure — e.g. sem.Acquire returning

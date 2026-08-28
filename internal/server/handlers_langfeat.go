@@ -13,28 +13,38 @@ import (
 	"github.com/sivchari/golance/internal/overlay"
 )
 
-// checkedFile resolves an LSP TextDocumentPositionParams-style request to
-// the package's CheckedPackage, the document's current buffer content, and
-// the query's byte offset into it. ok is false (with a nil error) when the
-// workspace is not loaded yet or pos does not resolve to a valid offset in
-// text — both are "no result", not request failures. err is non-nil only
-// for a hard failure such as a read or type-check error.
-func (s *Server) checkedFile(ctx context.Context, u uri.URI, pos protocol.Position) (cp *check.CheckedPackage, path string, text []byte, offset int, ok bool, err error) {
-	path = u.FsPath()
+// checkedFileResult is checkedFile's result: the package's CheckedPackage,
+// the document's current buffer content, and the query's byte offset into
+// it. Ok is false when the workspace is not loaded yet or pos does not
+// resolve to a valid offset in Text — both are "no result", not request
+// failures.
+type checkedFileResult struct {
+	cp     *check.CheckedPackage
+	path   string
+	text   []byte
+	offset int
+	ok     bool
+}
+
+// checkedFile resolves an LSP TextDocumentPositionParams-style request to a
+// checkedFileResult. err is non-nil only for a hard failure such as a read
+// or type-check error.
+func (s *Server) checkedFile(ctx context.Context, u uri.URI, pos protocol.Position) (checkedFileResult, error) {
+	path := u.FsPath()
 	ws := s.workspace()
 	if ws == nil {
-		return nil, path, nil, 0, false, nil
+		return checkedFileResult{path: path}, nil
 	}
-	cp, err = ws.engine.Get(ctx, path)
+	cp, err := ws.engine.Get(ctx, path)
 	if err != nil {
-		return nil, path, nil, 0, false, err
+		return checkedFileResult{path: path}, err
 	}
-	text, err = s.overlay.ReadFile(path)
+	text, err := s.overlay.ReadFile(path)
 	if err != nil {
-		return nil, path, nil, 0, false, err
+		return checkedFileResult{path: path}, err
 	}
-	offset, ok = byteOffsetForPosition(text, pos)
-	return cp, path, text, offset, ok, nil
+	offset, ok := byteOffsetForPosition(text, pos)
+	return checkedFileResult{cp: cp, path: path, text: text, offset: offset, ok: ok}, nil
 }
 
 func (s *Server) handleHover(ctx context.Context, params json.RawMessage) (any, error) {
@@ -42,15 +52,15 @@ func (s *Server) handleHover(ctx context.Context, params json.RawMessage) (any, 
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	cp, path, text, offset, ok, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
-	if err != nil || !ok {
+	cf, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
+	if err != nil || !cf.ok {
 		return nil, err
 	}
-	info, err := langfeat.Hover(cp, path, offset)
+	info, err := langfeat.Hover(cf.cp, cf.path, cf.offset)
 	if err != nil || info == nil {
 		return nil, err
 	}
-	rng, ok := offsetRangeToLSP(text, info.Range.StartOffset, info.Range.EndOffset)
+	rng, ok := offsetRangeToLSP(cf.text, info.Range.StartOffset, info.Range.EndOffset)
 	if !ok {
 		return nil, nil
 	}
@@ -73,11 +83,11 @@ func (s *Server) handleCompletion(ctx context.Context, params json.RawMessage) (
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	cp, path, _, offset, ok, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
-	if err != nil || !ok {
+	cf, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
+	if err != nil || !cf.ok {
 		return protocol.CompletionItemSlice(nil), err
 	}
-	items, err := langfeat.Completion(cp, s.overlay, path, offset)
+	items, err := langfeat.Completion(cf.cp, s.overlay, cf.path, cf.offset)
 	if err != nil {
 		return nil, err
 	}
@@ -98,11 +108,11 @@ func (s *Server) handleSignatureHelp(ctx context.Context, params json.RawMessage
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	cp, path, _, offset, ok, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
-	if err != nil || !ok {
+	cf, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
+	if err != nil || !cf.ok {
 		return nil, err
 	}
-	info, err := langfeat.SignatureHelp(cp, path, offset)
+	info, err := langfeat.SignatureHelp(cf.cp, cf.path, cf.offset)
 	if err != nil || info == nil {
 		return nil, err
 	}
@@ -216,7 +226,11 @@ func (s *Server) handleFormatting(_ context.Context, params json.RawMessage) (an
 	formatted, err := langfeat.OrganizeImports(path, text)
 	if err != nil {
 		// A file with syntax errors cannot be formatted; report no edits
-		// rather than failing the request.
+		// rather than failing the request. Logged (not just discarded) so
+		// an unexpectedly persistent failure is still visible in server
+		// logs rather than silently indistinguishable from "nothing to
+		// format."
+		s.logger.Printf("server: organize imports for %s: %v", path, err)
 		return []protocol.TextEdit{}, nil
 	}
 	if bytes.Equal(text, formatted) {
