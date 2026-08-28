@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"strconv"
@@ -43,19 +44,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() > 0 {
-		fmt.Fprintf(stderr, "golance: unexpected arguments: %v\n", fs.Args())
+		_, _ = fmt.Fprintf(stderr, "golance: unexpected arguments: %v\n", fs.Args())
 		return 2
 	}
 	if *version {
-		fmt.Fprintln(stdout, "golance "+server.Version)
+		_, _ = fmt.Fprintln(stdout, "golance "+server.Version)
 		return 0
 	}
 
 	logOut := stderr
 	if *logPath != "" {
-		f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		f, err := os.OpenFile(filepath.Clean(*logPath), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
-			fmt.Fprintf(stderr, "golance: open log file: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "golance: open log file: %v\n", err)
 			return 1
 		}
 		defer func() { _ = f.Close() }()
@@ -76,7 +77,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if errors.As(err, &exitErr) {
 			return exitErr.Code
 		}
-		fmt.Fprintf(logOut, "golance: serve: %v\n", err)
+		_, _ = fmt.Fprintf(logOut, "golance: serve: %v\n", err)
 		return 1
 	}
 	return 0
@@ -104,65 +105,98 @@ func runIndexer(stdout, stderr io.Writer) int {
 	dbPath := os.Getenv(server.EnvDB)
 	casPath := os.Getenv(server.EnvCAS)
 	if root == "" || dbPath == "" || casPath == "" {
-		fmt.Fprintf(stderr, "golance: indexer mode requires %s, %s, and %s\n", server.EnvRoot, server.EnvDB, server.EnvCAS)
+		_, _ = fmt.Fprintf(stderr, "golance: indexer mode requires %s, %s, and %s\n", server.EnvRoot, server.EnvDB, server.EnvCAS)
 		return 1
 	}
 
+	stopProfiling, ok := setupProfiling(stderr)
+	defer stopProfiling()
+	if !ok {
+		return 1
+	}
+
+	return buildIndex(stdout, stderr, root, dbPath, casPath)
+}
+
+// setupProfiling enables the runtime/pprof profiles requested via
+// GOLANCE_CPUPROFILE, GOLANCE_MEMPROFILE, GOLANCE_MUTEXPROFILE, and
+// GOLANCE_BLOCKPROFILE, and returns a stop function that writes out
+// whichever of them were enabled, in reverse order of setup. The caller
+// must defer stop() even when ok is false, since a CPU profile may
+// already have been started before a later step failed.
+func setupProfiling(stderr io.Writer) (stop func(), ok bool) {
+	var stops []func()
+	stop = func() {
+		for i := len(stops) - 1; i >= 0; i-- {
+			stops[i]()
+		}
+	}
+
 	if path := os.Getenv("GOLANCE_CPUPROFILE"); path != "" {
-		f, err := os.Create(path)
+		f, err := os.Create(filepath.Clean(path))
 		if err != nil {
-			fmt.Fprintf(stderr, "golance: indexer: create cpu profile: %v\n", err)
-			return 1
+			_, _ = fmt.Fprintf(stderr, "golance: indexer: create cpu profile: %v\n", err)
+			return stop, false
 		}
-		defer func() { _ = f.Close() }()
+		stops = append(stops, func() { _ = f.Close() })
 		if err := pprof.StartCPUProfile(f); err != nil {
-			fmt.Fprintf(stderr, "golance: indexer: start cpu profile: %v\n", err)
-			return 1
+			_, _ = fmt.Fprintf(stderr, "golance: indexer: start cpu profile: %v\n", err)
+			return stop, false
 		}
-		defer pprof.StopCPUProfile()
+		stops = append(stops, pprof.StopCPUProfile)
 	}
 	if path := os.Getenv("GOLANCE_MEMPROFILE"); path != "" {
-		defer func() {
-			f, err := os.Create(path)
-			if err != nil {
-				fmt.Fprintf(stderr, "golance: indexer: create mem profile: %v\n", err)
-				return
-			}
-			defer func() { _ = f.Close() }()
-			if err := pprof.WriteHeapProfile(f); err != nil {
-				fmt.Fprintf(stderr, "golance: indexer: write mem profile: %v\n", err)
-			}
-		}()
+		stops = append(stops, func() { writeHeapProfile(stderr, path) })
 	}
 	if path := os.Getenv("GOLANCE_MUTEXPROFILE"); path != "" {
 		runtime.SetMutexProfileFraction(1)
-		defer writeNamedProfile(stderr, "mutex", path)
+		stops = append(stops, func() { writeNamedProfile(stderr, "mutex", path) })
 	}
 	if path := os.Getenv("GOLANCE_BLOCKPROFILE"); path != "" {
 		runtime.SetBlockProfileRate(1)
-		defer writeNamedProfile(stderr, "block", path)
+		stops = append(stops, func() { writeNamedProfile(stderr, "block", path) })
 	}
+	return stop, true
+}
 
+// writeHeapProfile writes a heap profile to path, reporting any error to
+// stderr.
+func writeHeapProfile(stderr io.Writer, path string) {
+	f, err := os.Create(filepath.Clean(path))
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "golance: indexer: create mem profile: %v\n", err)
+		return
+	}
+	defer func() { _ = f.Close() }()
+	if err := pprof.WriteHeapProfile(f); err != nil {
+		_, _ = fmt.Fprintf(stderr, "golance: indexer: write mem profile: %v\n", err)
+	}
+}
+
+// buildIndex loads the import graph, opens the on-disk database and CAS,
+// and runs index.Build, reporting progress to stdout and errors to
+// stderr. It returns runIndexer's exit code.
+func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath string) int {
 	loadStart := time.Now()
 	patterns := []string{"./..."}
 	loadOpts := graph.Options{Dir: root, Offline: envBool(server.EnvOffline, false)}
 	snap, fromCache, err := loadGraph(loadOpts, patterns, stderr)
 	if err != nil {
-		fmt.Fprintf(stderr, "golance: indexer: load graph: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "golance: indexer: load graph: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stderr, "golance: indexer: graph load (cache=%v) took %s for %d packages\n", fromCache, time.Since(loadStart), len(snap.Packages))
+	_, _ = fmt.Fprintf(stderr, "golance: indexer: graph load (cache=%v) took %s for %d packages\n", fromCache, time.Since(loadStart), len(snap.Packages))
 
 	db, err := store.Open(dbPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "golance: indexer: open db: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "golance: indexer: open db: %v\n", err)
 		return 1
 	}
 	defer func() { _ = db.Close() }()
 
 	cas, err := store.OpenCAS(casPath)
 	if err != nil {
-		fmt.Fprintf(stderr, "golance: indexer: open CAS: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "golance: indexer: open CAS: %v\n", err)
 		return 1
 	}
 
@@ -178,15 +212,15 @@ func runIndexer(stdout, stderr io.Writer) int {
 		Parallelism:   envInt(server.EnvIndexJobs, 0),
 		RelativePaths: server.RelativeIndexPaths(root),
 		Progress: func(done, total int) {
-			fmt.Fprintf(stdout, "PROGRESS %d %d\n", done, total)
+			_, _ = fmt.Fprintf(stdout, "PROGRESS %d %d\n", done, total)
 		},
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "golance: indexer: build: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "golance: indexer: build: %v\n", err)
 		return 1
 	}
 	if stats.Errors > 0 {
-		fmt.Fprintf(stderr, "golance: indexer: %d package(s) failed to type-check\n", stats.Errors)
+		_, _ = fmt.Fprintf(stderr, "golance: indexer: %d package(s) failed to type-check\n", stats.Errors)
 	}
 
 	// Low-frequency GC of unused CAS blobs (see store.CAS.MaybeTrim's doc):
@@ -195,7 +229,7 @@ func runIndexer(stdout, stderr io.Writer) int {
 	// process's startup path. Best effort: a failed trim only costs disk
 	// space, never correctness.
 	if err := cas.MaybeTrim(time.Now()); err != nil {
-		fmt.Fprintf(stderr, "golance: indexer: trim CAS: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "golance: indexer: trim CAS: %v\n", err)
 	}
 	return 0
 }
@@ -224,7 +258,7 @@ func loadGraph(opts graph.Options, patterns []string, stderr io.Writer) (snap *g
 	if err := graph.SaveCache(opts.Dir, patterns, opts.BuildFlags, snap); err != nil {
 		// Best-effort: a failed cache write just means the next indexer run
 		// falls back to `go list` again, not a correctness problem.
-		fmt.Fprintf(stderr, "golance: indexer: save graph cache: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "golance: indexer: save graph cache: %v\n", err)
 	}
 	return snap, false, nil
 }
@@ -232,14 +266,14 @@ func loadGraph(opts graph.Options, patterns []string, stderr io.Writer) (snap *g
 // writeNamedProfile writes the named runtime/pprof profile (e.g. "mutex",
 // "block") to path, reporting any error to stderr.
 func writeNamedProfile(stderr io.Writer, name, path string) {
-	f, err := os.Create(path)
+	f, err := os.Create(filepath.Clean(path))
 	if err != nil {
-		fmt.Fprintf(stderr, "golance: indexer: create %s profile: %v\n", name, err)
+		_, _ = fmt.Fprintf(stderr, "golance: indexer: create %s profile: %v\n", name, err)
 		return
 	}
 	defer func() { _ = f.Close() }()
 	if err := pprof.Lookup(name).WriteTo(f, 0); err != nil {
-		fmt.Fprintf(stderr, "golance: indexer: write %s profile: %v\n", name, err)
+		_, _ = fmt.Fprintf(stderr, "golance: indexer: write %s profile: %v\n", name, err)
 	}
 }
 

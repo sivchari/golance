@@ -2,9 +2,51 @@ package store
 
 import (
 	"fmt"
-	"math/rand"
+	"math"
 	"testing"
 )
+
+// benchRand is a small, fast, deterministic PRNG (splitmix64) for
+// generating synthetic benchmark corpora — reproducible across runs from a
+// fixed seed, without depending on math/rand's specific algorithm (which is
+// free to change between Go versions) or math/rand's non-cryptographic
+// randomness, which is irrelevant here: this is deterministic benchmark
+// data generation, not a security-sensitive use.
+type benchRand struct{ state uint64 }
+
+func newBenchRand(seed uint64) *benchRand { return &benchRand{state: seed} }
+
+// next returns the generator's next uint64.
+func (r *benchRand) next() uint64 {
+	r.state += 0x9E3779B97F4A7C15
+	z := r.state
+	z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+	return z ^ (z >> 31)
+}
+
+// intn returns a deterministic pseudo-random int in [0, n).
+func (r *benchRand) intn(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	v := r.next() % uint64(n)
+	if v > math.MaxInt {
+		return 0
+	}
+	return int(v)
+}
+
+// u32n returns a value in [1, n] as uint32; the modulo bound keeps the
+// result far below math.MaxUint32, and the explicit guard makes that
+// dominance visible to static range analysis.
+func (r *benchRand) u32n(n int) uint32 {
+	v := r.intn(n) + 1
+	if v < 0 || v > math.MaxUint32 {
+		return 1
+	}
+	return uint32(v)
+}
 
 // syntheticPackage holds one package's inputs plus enough bookkeeping to
 // drive lookups against it once encoded and stored.
@@ -18,7 +60,7 @@ type syntheticPackage struct {
 // symbols and refsPerPkg refs each, deterministically (fixed seed) so
 // benchmark runs are reproducible.
 func generateCorpus(numPkgs, symbolsPerPkg, refsPerPkg int) []syntheticPackage {
-	rng := rand.New(rand.NewSource(1))
+	rng := newBenchRand(1)
 	corpus := make([]syntheticPackage, numPkgs)
 	for p := 0; p < numPkgs; p++ {
 		pkgPath := fmt.Sprintf("example.com/corpus/pkg%d", p)
@@ -33,7 +75,7 @@ func generateCorpus(numPkgs, symbolsPerPkg, refsPerPkg int) []syntheticPackage {
 			name := fmt.Sprintf("Symbol%d", s)
 			id := Hash(BuildSymbolID(pkgPath, name))
 			symIDHashes[s] = id
-			b.AddSymbol(SymbolInput{
+			b.AddSymbol(&SymbolInput{
 				IDHash:  id,
 				Kind:    uint8(s % 8),
 				Name:    name,
@@ -45,12 +87,12 @@ func generateCorpus(numPkgs, symbolsPerPkg, refsPerPkg int) []syntheticPackage {
 			})
 		}
 		for r := 0; r < refsPerPkg; r++ {
-			target := symIDHashes[rng.Intn(symbolsPerPkg)]
+			target := symIDHashes[rng.intn(symbolsPerPkg)]
 			b.AddRef(RefInput{
 				FileIdx:        0,
-				Line:           uint32(rng.Intn(symbolsPerPkg) + 1),
-				Col:            uint32(rng.Intn(40) + 1),
-				EndCol:         uint32(rng.Intn(40) + 41),
+				Line:           rng.u32n(symbolsPerPkg),
+				Col:            rng.u32n(40),
+				EndCol:         rng.u32n(40) + 40,
 				ToSymbolIDHash: target,
 				ToPkgHash:      pkgHash,
 			})
@@ -84,7 +126,7 @@ func BenchmarkFullBuild(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			unit := EncodeUnitBlob(UnitBlob{Facts: blob})
+			unit := EncodeUnitBlob(&UnitBlob{Facts: blob})
 			if err := cas.Put(pkg.pkgHash, unit); err != nil {
 				b.Fatal(err)
 			}
@@ -105,7 +147,7 @@ func buildBenchCAS(b *testing.B, corpus []syntheticPackage) *CAS {
 		if err != nil {
 			b.Fatal(err)
 		}
-		unit := EncodeUnitBlob(UnitBlob{Facts: blob})
+		unit := EncodeUnitBlob(&UnitBlob{Facts: blob})
 		if err := cas.Put(pkg.pkgHash, unit); err != nil {
 			b.Fatal(err)
 		}
@@ -121,11 +163,11 @@ func BenchmarkRandomSymbolLookup(b *testing.B) {
 	corpus := generateCorpus(benchNumPkgs, benchSymbolsPerPkg, benchRefsPerPkg)
 	cas := buildBenchCAS(b, corpus)
 
-	rng := rand.New(rand.NewSource(2))
+	rng := newBenchRand(2)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pkg := corpus[rng.Intn(len(corpus))]
-		idHash := pkg.symIDHashes[rng.Intn(len(pkg.symIDHashes))]
+		pkg := corpus[rng.intn(len(corpus))]
+		idHash := pkg.symIDHashes[rng.intn(len(pkg.symIDHashes))]
 
 		blob, ok, err := cas.Get(pkg.pkgHash)
 		if err != nil || !ok {
@@ -157,11 +199,11 @@ func BenchmarkRefsTo(b *testing.B) {
 	corpus := generateCorpus(benchNumPkgs, benchSymbolsPerPkg, benchRefsPerPkg)
 	cas := buildBenchCAS(b, corpus)
 
-	rng := rand.New(rand.NewSource(3))
+	rng := newBenchRand(3)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pkg := corpus[rng.Intn(len(corpus))]
-		idHash := pkg.symIDHashes[rng.Intn(len(pkg.symIDHashes))]
+		pkg := corpus[rng.intn(len(corpus))]
+		idHash := pkg.symIDHashes[rng.intn(len(pkg.symIDHashes))]
 
 		blob, ok, err := cas.Get(pkg.pkgHash)
 		if err != nil || !ok {

@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"math"
 	"sort"
 
 	"golang.org/x/tools/go/types/objectpath"
@@ -106,7 +107,7 @@ func addDef(fset *token.FileSet, pkgHash uint64, tpkg *types.Package, fileIdx ma
 	idHash := store.Hash(sid)
 	kind, flags := classify(obj)
 
-	b.AddSymbol(store.SymbolInput{
+	b.AddSymbol(&store.SymbolInput{
 		IDHash:  idHash,
 		Kind:    kind,
 		Flags:   flags,
@@ -114,8 +115,8 @@ func addDef(fset *token.FileSet, pkgHash uint64, tpkg *types.Package, fileIdx ma
 		Doc:     docs[ident],
 		Sig:     types.ObjectString(obj, qualifier(tpkg)),
 		FileIdx: fi,
-		Line:    uint32(pos.Line),
-		Col:     uint32(pos.Column),
+		Line:    u32pos(pos.Line),
+		Col:     u32pos(pos.Column),
 	})
 
 	idx.SymStrs = append(idx.SymStrs, store.SymStrEntry{IDHash: idHash, SymbolID: sid})
@@ -136,6 +137,20 @@ func addDef(fset *token.FileSet, pkgHash uint64, tpkg *types.Package, fileIdx ma
 		return
 	}
 	registerMethodSet(idx, pkgHash, idHash, named)
+}
+
+// u32pos converts a go/token.Position field (Line, Column) — always
+// non-negative and never remotely close to 4 GiB for a valid position —
+// to uint32, clamping to 0 instead of wrapping around if it is somehow
+// out of range.
+func u32pos(n int) uint32 {
+	if n < 0 {
+		return 0
+	}
+	if n > math.MaxUint32 {
+		return 0
+	}
+	return uint32(n)
 }
 
 // addRefs adds one store ref per outgoing identifier and selector-field/method
@@ -161,9 +176,9 @@ func addRef(fset *token.FileSet, fileIdx map[string]uint32, enc *objectpath.Enco
 	idHash := store.Hash(sid)
 	b.AddRef(store.RefInput{
 		FileIdx:        fi,
-		Line:           uint32(pos.Line),
-		Col:            uint32(pos.Column),
-		EndCol:         uint32(end.Column),
+		Line:           u32pos(pos.Line),
+		Col:            u32pos(pos.Column),
+		EndCol:         u32pos(end.Column),
 		ToSymbolIDHash: idHash,
 		ToPkgHash:      store.Hash(obj.Pkg().Path()),
 	})

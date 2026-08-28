@@ -69,7 +69,7 @@ func TestResolver_RelativePaths_RoundTripsAcrossRoots(t *testing.T) {
 	r := New(db, cas, snapB, true)
 
 	userFile := goFile(t, snapB, pkgUser, "user.go")
-	line, col := identOccurrence(t, userFile, "Person", 1) // "impl.Person" return type in Declare
+	line, col := identOccurrence(t, userFile, "Person") // "impl.Person" return type in Declare
 
 	locs, err := r.Definition(userFile, line, col)
 	if err != nil {
@@ -83,7 +83,7 @@ func TestResolver_RelativePaths_RoundTripsAcrossRoots(t *testing.T) {
 	if locs[0].File != wantFile {
 		t.Errorf("Definition().File = %s, want %s (rootB's own absolute path, not rootA's)", locs[0].File, wantFile)
 	}
-	if filepath.IsAbs(locs[0].File) != true {
+	if !filepath.IsAbs(locs[0].File) {
 		t.Errorf("Definition().File = %s, want an absolute path", locs[0].File)
 	}
 }

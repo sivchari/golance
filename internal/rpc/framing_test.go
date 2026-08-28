@@ -115,7 +115,7 @@ func TestConnWriteRoundTripsThroughReadFrame(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readFrame() error = %v", err)
 	}
-	if string(got) != string(body) {
+	if !bytes.Equal(got, body) {
 		t.Fatalf("round-tripped frame = %q, want %q", got, body)
 	}
 }

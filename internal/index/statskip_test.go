@@ -41,12 +41,8 @@ func TestBuild_UnchangedStatSkipsWithoutReadingContent(t *testing.T) {
 
 	leafPath := filepath.Join(dir, "leaf", "leaf.go")
 	before := statOf(t, leafPath)
-	original, err := os.ReadFile(leafPath)
-	if err != nil {
-		t.Fatalf("read leaf.go: %v", err)
-	}
 
-	garbage := bytes.Repeat([]byte("X"), len(original)) // same length, unparseable
+	garbage := bytes.Repeat([]byte("X"), int(before.Size())) // same length, unparseable
 	if err := os.WriteFile(leafPath, garbage, 0o600); err != nil {
 		t.Fatalf("corrupt leaf.go: %v", err)
 	}
@@ -264,7 +260,7 @@ func TestBuild_NoStatSnapshotFallsBackToContentHash(t *testing.T) {
 	// Simulate a pointer with no stat snapshot recorded.
 	noStat := ptr
 	noStat.Files = nil
-	if err := db.PutUnit(store.UnitEntry{PkgHash: store.Hash(pkgLeaf), Pointer: noStat}); err != nil {
+	if err := db.PutUnit(&store.UnitEntry{PkgHash: store.Hash(pkgLeaf), Pointer: noStat}); err != nil {
 		t.Fatalf("PutUnit(noStat): %v", err)
 	}
 

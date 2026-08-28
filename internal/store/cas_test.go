@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"sync"
@@ -40,7 +41,7 @@ func TestCASPutGetRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("Get() ok = false after Put, want true")
 	}
-	if string(got) != string(want) {
+	if !bytes.Equal(got, want) {
 		t.Errorf("Get() = %q, want %q", got, want)
 	}
 	if !cas.Has(key) {
@@ -83,7 +84,7 @@ func TestCASConcurrentPutSameKeySameContent(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Get() after concurrent Put = (%v, %v, %v), want (data, true, nil)", got, ok, err)
 	}
-	if string(got) != string(content) {
+	if !bytes.Equal(got, content) {
 		t.Error("Get() after concurrent Put returned corrupted content")
 	}
 

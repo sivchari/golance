@@ -102,7 +102,7 @@ func reindexOne(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSour
 		return nil
 	}
 	if outcome.entry != nil {
-		if err := db.PutUnit(*outcome.entry); err != nil {
+		if err := db.PutUnit(outcome.entry); err != nil {
 			stats.Errors++
 			return fmt.Errorf("index: reindex: persist %s: %w", path, err)
 		}

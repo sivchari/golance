@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"go.etcd.io/bbolt"
@@ -73,6 +74,22 @@ func hashKey(h uint64) []byte {
 	return k
 }
 
+// u32len returns n — always a len() of something this package is about to
+// write as a fixed-width uint32 field (a string, a slice of records) — as
+// a uint32, panicking if n is negative or exceeds math.MaxUint32. Every
+// caller either already checked a size bound before calling this (in which
+// case the panic path is unreachable) or is encoding a value (a name, a
+// path, a symbol count) that can never plausibly approach 4 GiB: either
+// way, hitting the panic means an encode invariant this package's own
+// format is supposed to guarantee was violated — a programmer error, not
+// recoverable untrusted input.
+func u32len(n int) uint32 {
+	if n < 0 || n > math.MaxUint32 {
+		panic(fmt.Sprintf("store: length %d out of uint32 range", n))
+	}
+	return uint32(n)
+}
+
 // FileStat is a lightweight (size, modification time) snapshot of one
 // source file, taken the last time [UnitPointer] was recorded for it. It
 // lets a later revalidation pass rule out an unchanged file by stat alone,
@@ -124,18 +141,29 @@ func encodeUnitPointer(p UnitPointer) []byte {
 	binary.LittleEndian.PutUint64(b[0:8], p.BlobKey)
 	binary.LittleEndian.PutUint64(b[8:16], p.ContentHash)
 	binary.LittleEndian.PutUint64(b[16:24], p.ExportHash)
-	binary.LittleEndian.PutUint32(b[24:28], uint32(len(p.ToolchainFingerprint)))
+	binary.LittleEndian.PutUint32(b[24:28], u32len(len(p.ToolchainFingerprint)))
 	off := 28
 	off += copy(b[off:], p.ToolchainFingerprint)
-	binary.LittleEndian.PutUint32(b[off:], uint32(len(p.Files)))
+	binary.LittleEndian.PutUint32(b[off:], u32len(len(p.Files)))
 	off += 4
 	for _, f := range p.Files {
-		binary.LittleEndian.PutUint32(b[off:], uint32(len(f.Path)))
+		binary.LittleEndian.PutUint32(b[off:], u32len(len(f.Path)))
 		off += 4
 		off += copy(b[off:], f.Path)
-		binary.LittleEndian.PutUint64(b[off:], uint64(f.Size))
+		// os.FileInfo never reports a negative size or mtime in practice;
+		// clamp defensively rather than let a nonsensical negative value
+		// wrap around when reinterpreted as unsigned.
+		size := f.Size
+		if size < 0 {
+			size = 0
+		}
+		binary.LittleEndian.PutUint64(b[off:], uint64(size))
 		off += 8
-		binary.LittleEndian.PutUint64(b[off:], uint64(f.ModTimeNanos))
+		mtime := f.ModTimeNanos
+		if mtime < 0 {
+			mtime = 0
+		}
+		binary.LittleEndian.PutUint64(b[off:], uint64(mtime))
 		off += 8
 	}
 	return b
@@ -174,11 +202,14 @@ func decodeUnitPointer(b []byte) (UnitPointer, error) {
 		}
 		path := string(b[off : off+pathLen])
 		off += pathLen
-		size := int64(binary.LittleEndian.Uint64(b[off:]))
+		rawSize := binary.LittleEndian.Uint64(b[off:])
 		off += 8
-		mtime := int64(binary.LittleEndian.Uint64(b[off:]))
+		rawMtime := binary.LittleEndian.Uint64(b[off:])
 		off += 8
-		files = append(files, FileStat{Path: path, Size: size, ModTimeNanos: mtime})
+		if rawSize > math.MaxInt64 || rawMtime > math.MaxInt64 {
+			return UnitPointer{}, fmt.Errorf("store: unit pointer record: file %d size/mtime out of range", i)
+		}
+		files = append(files, FileStat{Path: path, Size: int64(rawSize), ModTimeNanos: int64(rawMtime)})
 	}
 	p.Files = files
 	return p, nil
@@ -214,8 +245,8 @@ type UnitEntry struct {
 
 // PutUnit atomically stores e's pointer and index entries in a single
 // transaction.
-func (db *DB) PutUnit(e UnitEntry) error {
-	return db.PutUnitsBatch([]UnitEntry{e})
+func (db *DB) PutUnit(e *UnitEntry) error {
+	return db.PutUnitsBatch([]UnitEntry{*e})
 }
 
 // PutUnitsBatch atomically stores every entry's pointer and index entries in
@@ -224,7 +255,8 @@ func (db *DB) PutUnit(e UnitEntry) error {
 func (db *DB) PutUnitsBatch(entries []UnitEntry) error {
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
 		unitB := tx.Bucket(bucketUnit)
-		for _, e := range entries {
+		for i := range entries {
+			e := &entries[i]
 			if err := unitB.Put(hashKey(e.PkgHash), encodeUnitPointer(e.Pointer)); err != nil {
 				return err
 			}
@@ -568,7 +600,7 @@ func containsMethodEntry(list []byte, e MethodEntry) bool {
 func appendStringList(list []byte, s string) []byte {
 	out := make([]byte, len(list)+4+len(s))
 	copy(out, list)
-	binary.LittleEndian.PutUint32(out[len(list):], uint32(len(s)))
+	binary.LittleEndian.PutUint32(out[len(list):], u32len(len(s)))
 	copy(out[len(list)+4:], s)
 	return out
 }

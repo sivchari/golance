@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go/token"
 	"go/types"
+	"math"
 	"strings"
 
 	"github.com/sivchari/golance/internal/graph"
@@ -176,7 +177,7 @@ func (r *Resolver) symbolByHash(pkgHash, idHash uint64) (name string, kind uint8
 	if err != nil {
 		return "", 0, Location{}, false
 	}
-	loc = Location{File: absPath(r.root, path, r.relative), Line: s.Line(), Col: s.Col(), EndCol: s.Col() + uint32(len(s.Name()))}
+	loc = Location{File: absPath(r.root, path, r.relative), Line: s.Line(), Col: s.Col(), EndCol: s.Col() + u32len(len(s.Name()))}
 	return s.Name(), s.Kind(), loc, true
 }
 
@@ -234,12 +235,25 @@ func symbolAtPosition(v *store.View, fileIdx, line, col uint32) (store.Symbol, b
 		if s.FileIdx() != fileIdx || s.Line() != line {
 			continue
 		}
-		end := s.Col() + uint32(len(s.Name()))
+		end := s.Col() + u32len(len(s.Name()))
 		if col >= s.Col() && col < end {
 			return s, true
 		}
 	}
 	return store.Symbol{}, false
+}
+
+// u32len returns n — always a len() of a symbol name, a source identifier
+// that can never plausibly approach 4 GiB — as a uint32, panicking if n is
+// negative or exceeds math.MaxUint32. Hitting the panic would mean facts
+// data violates an invariant enforced when it was written (see
+// internal/store's own u32len), a programmer error rather than
+// recoverable untrusted input.
+func u32len(n int) uint32 {
+	if n < 0 || n > math.MaxUint32 {
+		panic(fmt.Sprintf("xref: length %d out of uint32 range", n))
+	}
+	return uint32(n)
 }
 
 // splitSymbolID splits a SymbolID string (as built by [store.BuildSymbolID])

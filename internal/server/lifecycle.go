@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"go.lsp.dev/protocol"
+	"go.lsp.dev/uri"
 
 	"github.com/sivchari/golance/internal/graph"
 )
@@ -23,7 +24,7 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, fmt.Errorf("server: initialize: unmarshal params: %w", err)
 	}
-	root, err := rootFromInitializeParams(&p)
+	root, err := rootFromInitializeParams(&p, params)
 	if err != nil {
 		return nil, err
 	}
@@ -66,13 +67,20 @@ func (s *Server) handleShutdown(context.Context, json.RawMessage) (any, error) {
 
 // rootFromInitializeParams resolves the workspace root directory from an
 // initialize request: the first workspace folder if the client sent any,
-// otherwise the deprecated rootUri.
-func rootFromInitializeParams(p *protocol.InitializeParams) (string, error) {
+// otherwise the deprecated rootUri, read directly from the raw params
+// rather than through protocol.InitializeParams.RootURI (deprecated in
+// favour of workspaceFolders) — the LSP spec still requires servers to
+// fall back to it for clients that predate workspaceFolders, so it cannot
+// simply be dropped.
+func rootFromInitializeParams(p *protocol.InitializeParams, params json.RawMessage) (string, error) {
 	if folders, ok := p.WorkspaceFolders.Get(); ok && len(folders) > 0 {
 		return folders[0].URI.FsPath(), nil
 	}
-	if p.RootURI != nil {
-		return p.RootURI.FsPath(), nil
+	var legacy struct {
+		RootURI *uri.URI `json:"rootUri"`
+	}
+	if err := json.Unmarshal(params, &legacy); err == nil && legacy.RootURI != nil {
+		return legacy.RootURI.FsPath(), nil
 	}
 	return "", fmt.Errorf("server: initialize: no rootUri or workspaceFolders in params")
 }

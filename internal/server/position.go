@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"math"
 	"unicode/utf8"
 
 	"go.lsp.dev/protocol"
@@ -74,7 +75,17 @@ func lineColForByteOffset(text []byte, offset int) (line, col uint32) {
 			lineStart = i + 1
 		}
 	}
-	return line, uint32(offset-lineStart) + 1
+	// lineStart <= offset always holds here (the loop only ever sets
+	// lineStart to i+1 for an i < offset), so this is never negative in
+	// practice; guarded explicitly rather than relying on that invariant.
+	d := offset - lineStart
+	if d < 0 {
+		d = 0
+	}
+	if d > math.MaxUint32 {
+		d = math.MaxUint32
+	}
+	return line, uint32(d) + 1
 }
 
 // byteOffsetForLineCol converts a 1-based line number and 1-based byte

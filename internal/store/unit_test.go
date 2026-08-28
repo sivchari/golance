@@ -1,6 +1,9 @@
 package store
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
 
 func TestUnitBlobRoundTrip(t *testing.T) {
 	want := UnitBlob{
@@ -25,16 +28,16 @@ func TestUnitBlobRoundTrip(t *testing.T) {
 		},
 	}
 
-	encoded := EncodeUnitBlob(want)
+	encoded := EncodeUnitBlob(&want)
 	got, err := DecodeUnitBlob(encoded)
 	if err != nil {
 		t.Fatalf("DecodeUnitBlob() error = %v", err)
 	}
 
-	if string(got.Facts) != string(want.Facts) {
+	if !bytes.Equal(got.Facts, want.Facts) {
 		t.Errorf("Facts = %q, want %q", got.Facts, want.Facts)
 	}
-	if string(got.Export) != string(want.Export) {
+	if !bytes.Equal(got.Export, want.Export) {
 		t.Errorf("Export = %q, want %q", got.Export, want.Export)
 	}
 	if len(got.Files) != len(want.Files) {
@@ -62,7 +65,7 @@ func TestUnitBlobRoundTrip(t *testing.T) {
 }
 
 func TestUnitBlobEmpty(t *testing.T) {
-	encoded := EncodeUnitBlob(UnitBlob{})
+	encoded := EncodeUnitBlob(&UnitBlob{})
 	got, err := DecodeUnitBlob(encoded)
 	if err != nil {
 		t.Fatalf("DecodeUnitBlob() error = %v", err)
@@ -73,7 +76,7 @@ func TestUnitBlobEmpty(t *testing.T) {
 }
 
 func TestUnitBlobTruncatedErrors(t *testing.T) {
-	encoded := EncodeUnitBlob(UnitBlob{Facts: []byte("hello"), Files: []FileStat{{Path: "a.go", Size: 1, ModTimeNanos: 2}}})
+	encoded := EncodeUnitBlob(&UnitBlob{Facts: []byte("hello"), Files: []FileStat{{Path: "a.go", Size: 1, ModTimeNanos: 2}}})
 	if _, err := DecodeUnitBlob(encoded[:len(encoded)-2]); err == nil {
 		t.Error("DecodeUnitBlob(truncated) = nil error, want an error")
 	}

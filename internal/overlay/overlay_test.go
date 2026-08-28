@@ -133,7 +133,10 @@ func TestDidChangeWithInvalidRangeReturnsError(t *testing.T) {
 		t.Fatal("DidChange() error = nil, want error")
 	}
 	// The overlay content must be left untouched by a failed change.
-	text, _, _, _ := o.Get(u)
+	text, _, _, ok := o.Get(u)
+	if !ok {
+		t.Fatal("Get() ok = false, want true")
+	}
 	if string(text) != "short" {
 		t.Fatalf("text after failed change = %q, want unchanged %q", text, "short")
 	}
@@ -152,7 +155,10 @@ func TestDidSaveRefreshesTextWhenIncluded(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("DidSave() error = %v", err)
 	}
-	text, _, _, _ := o.Get(u)
+	text, _, _, ok := o.Get(u)
+	if !ok {
+		t.Fatal("Get() ok = false, want true")
+	}
 	if string(text) != "after" {
 		t.Fatalf("text = %q, want %q", text, "after")
 	}
@@ -169,7 +175,10 @@ func TestDidSaveWithoutTextIsNoop(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("DidSave() error = %v", err)
 	}
-	text, _, _, _ := o.Get(u)
+	text, _, _, ok := o.Get(u)
+	if !ok {
+		t.Fatal("Get() ok = false, want true")
+	}
 	if string(text) != "unchanged" {
 		t.Fatalf("text = %q, want %q", text, "unchanged")
 	}
@@ -200,7 +209,7 @@ func TestDidCloseRemovesOverlay(t *testing.T) {
 	}
 }
 
-func TestDidCloseUntrackedDocumentIsNoop(t *testing.T) {
+func TestDidCloseUntrackedDocumentIsNoop(_ *testing.T) {
 	o := New()
 	o.DidClose(&protocol.DidCloseTextDocumentParams{
 		TextDocument: protocol.TextDocumentIdentifier{URI: uri.File("/virtual/never-opened.go")},
@@ -243,7 +252,10 @@ func TestHashChangesWithContent(t *testing.T) {
 	o.DidOpen(&protocol.DidOpenTextDocumentParams{TextDocument: protocol.TextDocumentItem{
 		URI: u, LanguageID: "go", Version: 1, Text: "one",
 	}})
-	_, _, hash1, _ := o.Get(u)
+	_, _, hash1, ok := o.Get(u)
+	if !ok {
+		t.Fatal("Get() ok = false, want true")
+	}
 
 	if err := o.DidChange(&protocol.DidChangeTextDocumentParams{
 		TextDocument: protocol.VersionedTextDocumentIdentifier{TextDocumentIdentifier: protocol.TextDocumentIdentifier{URI: u}, Version: 2},
@@ -253,7 +265,10 @@ func TestHashChangesWithContent(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("DidChange() error = %v", err)
 	}
-	_, _, hash2, _ := o.Get(u)
+	_, _, hash2, ok := o.Get(u)
+	if !ok {
+		t.Fatal("Get() ok = false, want true")
+	}
 
 	if hash1 == hash2 {
 		t.Fatal("hash unchanged after content changed")

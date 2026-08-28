@@ -286,15 +286,19 @@ func (s *Server) respondResult(id json.RawMessage, result any) {
 		s.respondError(id, NewError(internalErrorCode, err.Error()))
 		return
 	}
-	s.writeMessage(&message{JSONRPC: jsonrpcVersion, ID: id, Result: b})
+	if err := s.writeMessage(&message{JSONRPC: jsonrpcVersion, ID: id, Result: b}); err != nil {
+		s.logger.Printf("rpc: write result for %v: %v", id, err)
+	}
 }
 
 func (s *Server) respondError(id json.RawMessage, e *Error) {
-	s.writeMessage(&message{
+	if err := s.writeMessage(&message{
 		JSONRPC: jsonrpcVersion,
 		ID:      id,
 		Error:   &wireError{Code: e.Code, Message: e.Message, Data: e.Data},
-	})
+	}); err != nil {
+		s.logger.Printf("rpc: write error for %v: %v", id, err)
+	}
 }
 
 // Notify sends a server-initiated notification to the client, marshaling

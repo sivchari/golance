@@ -38,7 +38,7 @@ func CacheFile(root string) string {
 // is false when there is no cache file, it is corrupt, or it was built for
 // different patterns or BuildFlags than requested.
 func LoadCache(root string, patterns, buildFlags []string) (snap *Snapshot, ok bool) {
-	data, err := os.ReadFile(CacheFile(root))
+	data, err := os.ReadFile(filepath.Clean(CacheFile(root)))
 	if err != nil {
 		return nil, false
 	}

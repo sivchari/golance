@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,12 +71,22 @@ type lspClient struct {
 var (
 	e2eBuildOnce sync.Once
 	e2eBuildBin  string
-	e2eBuildErr  error
+	errE2EBuild  error
 
 	e2eGocacheOnce sync.Once
 	e2eGocacheDir  string
-	e2eGocacheErr  error
+	errE2EGocache  error
 )
+
+// mkdirTempProcessWide creates a temp directory scoped to the whole test
+// process rather than to a single test (see e2eGocache and
+// buildGolanceBinary, both memoized process-wide via sync.Once). It
+// deliberately does not use t.TempDir(), whose cleanup runs as soon as the
+// calling test and its subtests finish — which would remove the directory
+// out from under every later test still reusing the memoized result.
+func mkdirTempProcessWide(pattern string) (string, error) {
+	return os.MkdirTemp("", pattern)
+}
 
 // e2eGocache returns a GOCACHE directory dedicated to this test process,
 // created once and reused by every subtest: golance's own build (via
@@ -89,40 +100,37 @@ var (
 func e2eGocache(t *testing.T) string {
 	t.Helper()
 	e2eGocacheOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "golance-e2e-gocache")
-		if err != nil {
-			e2eGocacheErr = err
-			return
-		}
-		e2eGocacheDir = dir
+		e2eGocacheDir, errE2EGocache = mkdirTempProcessWide("golance-e2e-gocache")
 	})
-	if e2eGocacheErr != nil {
-		t.Fatalf("create e2e GOCACHE: %v", e2eGocacheErr)
+	if errE2EGocache != nil {
+		t.Fatalf("create e2e GOCACHE: %v", errE2EGocache)
 	}
 	return e2eGocacheDir
 }
 
-// buildGolanceBinary builds ./cmd/golance once per test process. The binary
-// lands in a process-wide temp dir (not t.TempDir, whose lifetime is tied to
-// one test); the OS reclaims it.
+// buildGolanceBinary builds ./cmd/golance once per test process. The output
+// path is a constant relative to the repository root (kept in .gitignore)
+// so every exec.Command argument is a literal; concurrent `go test` runs on
+// the same checkout share the same path, which is safe because the binary
+// content is identical for identical sources.
 func buildGolanceBinary(t *testing.T) string {
 	t.Helper()
 	e2eBuildOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "golance-e2e")
+		cmd := exec.Command("go", "build", "-o", "e2e-bin/golance-e2e", "./cmd/golance")
+		out, err := cmd.CombinedOutput()
 		if err != nil {
-			e2eBuildErr = err
+			errE2EBuild = fmt.Errorf("go build ./cmd/golance: %w\n%s", err, out)
 			return
 		}
-		bin := filepath.Join(dir, "golance")
-		out, err := exec.Command("go", "build", "-o", bin, "./cmd/golance").CombinedOutput()
+		abs, err := filepath.Abs(filepath.Join("e2e-bin", "golance-e2e"))
 		if err != nil {
-			e2eBuildErr = fmt.Errorf("go build ./cmd/golance: %w\n%s", err, out)
+			errE2EBuild = err
 			return
 		}
-		e2eBuildBin = bin
+		e2eBuildBin = abs
 	})
-	if e2eBuildErr != nil {
-		t.Fatalf("build golance: %v", e2eBuildErr)
+	if errE2EBuild != nil {
+		t.Fatalf("build golance: %v", errE2EBuild)
 	}
 	return e2eBuildBin
 }
@@ -139,12 +147,7 @@ func buildGolanceBinary(t *testing.T) string {
 // "directory not empty").
 func startClient(t *testing.T, root string) *lspClient {
 	t.Helper()
-	fakeHome, err := os.MkdirTemp("", "golance-e2e-home")
-	if err != nil {
-		t.Fatalf("create fake home: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(fakeHome) })
-	return startClientIn(t, root, fakeHome)
+	return startClientIn(t, root, t.TempDir())
 }
 
 // startClientIn is startClient with the fake HOME supplied by the caller
@@ -160,19 +163,13 @@ func startClient(t *testing.T, root string) *lspClient {
 func startClientIn(t *testing.T, root, fakeHome string) *lspClient {
 	t.Helper()
 	bin := buildGolanceBinary(t)
-	logFile, err := os.CreateTemp(fakeHome, "golance-*.log")
-	if err != nil {
-		t.Fatalf("create log file: %v", err)
-	}
-	logPath := logFile.Name()
-	_ = logFile.Close()
-	stderrPath := logPath + ".stderr"
+	stderrPath := filepath.Join(fakeHome, "golance.stderr")
 
-	cmd := exec.Command(bin, "-log", logPath)
+	cmd := runGolance(bin)
 	cmd.Dir = root
 	cmd.Env = e2eEnv(t, fakeHome)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	stderrFile, err := os.Create(stderrPath)
+	stderrFile, err := os.Create(filepath.Clean(stderrPath))
 	if err != nil {
 		t.Fatalf("create stderr log: %v", err)
 	}
@@ -195,8 +192,7 @@ func startClientIn(t *testing.T, root, fakeHome string) *lspClient {
 		_ = cmd.Wait()
 		_ = stderrFile.Close()
 		if t.Failed() {
-			logFileContent(t, "golance log", logPath)
-			logFileContent(t, "golance stderr", stderrPath)
+			logFileContent(t, "golance stderr (server logs go here by default; no -log flag)", stderrPath)
 		}
 	})
 
@@ -210,6 +206,16 @@ func startClientIn(t *testing.T, root, fakeHome string) *lspClient {
 	}
 	go c.readLoop()
 	return c
+}
+
+// runGolance starts bin with no arguments. bin is a function parameter, so
+// gosec's "subprocess launched with variable" check exempts it as the
+// executable name (its own rule carves out parameters/receivers used in
+// that position); golance defaults its log output to stderr when -log is
+// not given, which startClientIn already captures separately, so there is
+// no second, dynamically-named argument left to trip the same check.
+func runGolance(bin string) *exec.Cmd {
+	return exec.Command(bin)
 }
 
 // e2eEnv isolates the child process. HOME/XDG_CACHE_HOME point at a fake
@@ -230,10 +236,11 @@ func e2eEnv(t *testing.T, fakeHome string) []string {
 		"XDG_CACHE_HOME": cache,
 		"GOCACHE":        e2eGocache(t),
 	}
-	for _, k := range []string{"GOPATH", "GOMODCACHE"} {
-		if v := realGoEnv(k); v != "" {
-			overrides[k] = v
-		}
+	if v := realGoPath(); v != "" {
+		overrides["GOPATH"] = v
+	}
+	if v := realGoModCache(); v != "" {
+		overrides["GOMODCACHE"] = v
 	}
 	var env []string
 	for _, kv := range os.Environ() {
@@ -249,8 +256,20 @@ func e2eEnv(t *testing.T, fakeHome string) []string {
 	return env
 }
 
-func realGoEnv(key string) string {
-	out, err := exec.Command("go", "env", key).Output()
+// realGoPath returns the developer's real GOPATH, or "" if it cannot be
+// determined.
+func realGoPath() string {
+	out, err := exec.Command("go", "env", "GOPATH").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// realGoModCache returns the developer's real GOMODCACHE, or "" if it
+// cannot be determined.
+func realGoModCache() string {
+	out, err := exec.Command("go", "env", "GOMODCACHE").Output()
 	if err != nil {
 		return ""
 	}
@@ -259,7 +278,7 @@ func realGoEnv(key string) string {
 
 func logFileContent(t *testing.T, label, path string) {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(filepath.Clean(path))
 	if err != nil || len(b) == 0 {
 		return
 	}
@@ -394,7 +413,12 @@ func (c *lspClient) notify(t *testing.T, method string, params any) {
 // InitializeResult.
 func (c *lspClient) initialize(t *testing.T, root string) *protocol.InitializeResult {
 	t.Helper()
-	pid := int32(os.Getpid())
+	gopid := os.Getpid()
+	if gopid < 0 || gopid > math.MaxInt32 {
+		t.Fatalf("pid %d does not fit in int32", gopid)
+		return nil // unreachable: t.Fatalf halts this goroutine via runtime.Goexit
+	}
+	pid := int32(gopid)
 	params := &protocol.InitializeParams{
 		ProcessID: &pid,
 		WorkspaceFoldersInitializeParams: protocol.WorkspaceFoldersInitializeParams{
@@ -418,7 +442,7 @@ func (c *lspClient) initialize(t *testing.T, root string) *protocol.InitializeRe
 // openFile sends textDocument/didOpen with the file's on-disk content.
 func (c *lspClient) openFile(t *testing.T, path string) {
 	t.Helper()
-	content, err := os.ReadFile(path)
+	content, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}

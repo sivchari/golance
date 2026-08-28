@@ -60,7 +60,7 @@ func (o *Overlay) ReadFile(path string) ([]byte, error) {
 	if ok {
 		return doc.text, nil
 	}
-	return os.ReadFile(path)
+	return os.ReadFile(filepath.Clean(path))
 }
 
 // Get returns the tracked overlay content, version, and content hash for u,

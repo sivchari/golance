@@ -8,12 +8,14 @@ package typecheck
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"golang.org/x/sync/singleflight"
@@ -148,7 +150,11 @@ func (imp *Importer) ImportFrom(path, _ string, _ types.ImportMode) (*types.Pack
 	if err != nil {
 		return nil, err
 	}
-	return v.(*types.Package), nil
+	pkg, ok := v.(*types.Package)
+	if !ok {
+		return nil, fmt.Errorf("typecheck: singleflight for %s returned %T, want *types.Package", path, v)
+	}
+	return pkg, nil
 }
 
 // cacheGet returns path's cached, fully-decoded *types.Package, if any.
@@ -181,7 +187,7 @@ func (imp *Importer) resolve(path string) (*types.Package, error) {
 	if !ok {
 		return nil, fmt.Errorf("typecheck: no export data for %s", path)
 	}
-	f, err := os.Open(file)
+	f, err := os.Open(filepath.Clean(file))
 	if err != nil {
 		return nil, fmt.Errorf("typecheck: open export file for %s: %w", path, err)
 	}
@@ -225,7 +231,8 @@ func CheckPackage(fset *token.FileSet, files []*ast.File, pkgPath string, imp ty
 	conf := types.Config{
 		Importer: imp,
 		Error: func(err error) {
-			if terr, ok := err.(types.Error); ok {
+			var terr types.Error
+			if errors.As(err, &terr) {
 				errs = append(errs, terr)
 			}
 		},

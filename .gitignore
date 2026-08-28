@@ -4,3 +4,4 @@ bin/
 dist/
 plan-*.md
 research-*.md
+/e2e-bin/

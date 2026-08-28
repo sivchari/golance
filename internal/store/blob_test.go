@@ -9,12 +9,12 @@ import (
 func TestBuilderRoundTrip(t *testing.T) {
 	b := NewBuilder()
 	b.SetFiles([]string{"a.go", "b.go"})
-	b.AddSymbol(SymbolInput{
+	b.AddSymbol(&SymbolInput{
 		IDHash: Hash("pkg#Foo"), Kind: 1, Flags: 0,
 		Name: "Foo", Doc: "Foo does things.", Sig: "func Foo()",
 		FileIdx: 0, Line: 10, Col: 6,
 	})
-	b.AddSymbol(SymbolInput{
+	b.AddSymbol(&SymbolInput{
 		IDHash: Hash("pkg#Bar"), Kind: 2, Flags: 1,
 		Name: "Bar", Doc: "", Sig: "func Bar() int",
 		FileIdx: 1, Line: 3, Col: 6,
@@ -32,6 +32,16 @@ func TestBuilderRoundTrip(t *testing.T) {
 		t.Fatalf("NewView() error = %v", err)
 	}
 
+	checkBuilderRoundTripCounts(t, v)
+	checkBuilderRoundTripFoo(t, v)
+	checkBuilderRoundTripBar(t, v)
+	checkBuilderRoundTripLookup(t, v)
+	checkBuilderRoundTripFiles(t, v)
+	checkBuilderRoundTripRefsSorted(t, v)
+}
+
+func checkBuilderRoundTripCounts(t *testing.T, v *View) {
+	t.Helper()
 	if got, want := v.SymbolCount(), 2; got != want {
 		t.Fatalf("SymbolCount() = %d, want %d", got, want)
 	}
@@ -41,7 +51,10 @@ func TestBuilderRoundTrip(t *testing.T) {
 	if got, want := v.FileCount(), 2; got != want {
 		t.Fatalf("FileCount() = %d, want %d", got, want)
 	}
+}
 
+func checkBuilderRoundTripFoo(t *testing.T, v *View) {
+	t.Helper()
 	foo, err := v.SymbolAt(0)
 	if err != nil {
 		t.Fatalf("SymbolAt(0) error = %v", err)
@@ -61,7 +74,10 @@ func TestBuilderRoundTrip(t *testing.T) {
 	if got, want := foo.Line(), uint32(10); got != want {
 		t.Errorf("SymbolAt(0).Line() = %d, want %d", got, want)
 	}
+}
 
+func checkBuilderRoundTripBar(t *testing.T, v *View) {
+	t.Helper()
 	bar, err := v.SymbolAt(1)
 	if err != nil {
 		t.Fatalf("SymbolAt(1) error = %v", err)
@@ -69,7 +85,10 @@ func TestBuilderRoundTrip(t *testing.T) {
 	if got, want := bar.Doc(), ""; got != want {
 		t.Errorf("SymbolAt(1).Doc() = %q, want empty", got)
 	}
+}
 
+func checkBuilderRoundTripLookup(t *testing.T, v *View) {
+	t.Helper()
 	sym, ok := v.LookupSymbol(Hash("pkg#Bar"))
 	if !ok {
 		t.Fatal("LookupSymbol(Bar) not found")
@@ -77,18 +96,23 @@ func TestBuilderRoundTrip(t *testing.T) {
 	if got, want := sym.Name(), "Bar"; got != want {
 		t.Errorf("LookupSymbol(Bar).Name() = %q, want %q", got, want)
 	}
-
 	if _, ok := v.LookupSymbol(Hash("pkg#DoesNotExist")); ok {
 		t.Error("LookupSymbol(unknown) = found, want not found")
 	}
+}
 
+func checkBuilderRoundTripFiles(t *testing.T, v *View) {
+	t.Helper()
 	f0, err := v.FileAt(0)
 	if err != nil || f0 != "a.go" {
 		t.Errorf("FileAt(0) = %q, %v, want %q, nil", f0, err, "a.go")
 	}
+}
 
-	// Refs table must come back sorted by (fileIdx, line, col) regardless of
-	// insertion order.
+// checkBuilderRoundTripRefsSorted verifies the refs table comes back sorted
+// by (fileIdx, line, col) regardless of insertion order.
+func checkBuilderRoundTripRefsSorted(t *testing.T, v *View) {
+	t.Helper()
 	r0, err := v.RefAt(0)
 	if err != nil {
 		t.Fatalf("RefAt(0) error = %v", err)
@@ -203,7 +227,7 @@ func TestBuilderHugeString(t *testing.T) {
 	huge := strings.Repeat("x", 4*1024*1024) // 4 MiB doc comment
 	b := NewBuilder()
 	b.SetFiles([]string{"a.go"})
-	b.AddSymbol(SymbolInput{IDHash: 1, Name: "Big", Doc: huge, FileIdx: 0, Line: 1, Col: 1})
+	b.AddSymbol(&SymbolInput{IDHash: 1, Name: "Big", Doc: huge, FileIdx: 0, Line: 1, Col: 1})
 
 	blob, err := b.Build()
 	if err != nil {
@@ -226,8 +250,8 @@ func TestBuilderStringInterning(t *testing.T) {
 	b := NewBuilder()
 	b.SetFiles([]string{"a.go"})
 	sig := "func Shared()"
-	b.AddSymbol(SymbolInput{IDHash: 1, Name: "A", Sig: sig, FileIdx: 0, Line: 1, Col: 1})
-	b.AddSymbol(SymbolInput{IDHash: 2, Name: "B", Sig: sig, FileIdx: 0, Line: 2, Col: 1})
+	b.AddSymbol(&SymbolInput{IDHash: 1, Name: "A", Sig: sig, FileIdx: 0, Line: 1, Col: 1})
+	b.AddSymbol(&SymbolInput{IDHash: 2, Name: "B", Sig: sig, FileIdx: 0, Line: 2, Col: 1})
 
 	blob, err := b.Build()
 	if err != nil {
@@ -235,10 +259,10 @@ func TestBuilderStringInterning(t *testing.T) {
 	}
 	// The string table should hold "a.go" + "A" + "B" + sig exactly once
 	// each: len(sig) must appear only once, not twice, if interning works.
-	strTblLen := int(binary.LittleEndian.Uint64(blob[offStrTblLen:]))
-	wantDeduped := len("a.go") + len("A") + len("B") + len(sig)
+	strTblLen := binary.LittleEndian.Uint64(blob[offStrTblLen:])
+	wantDeduped := uint64(len("a.go") + len("A") + len("B") + len(sig))
 	if strTblLen != wantDeduped {
-		t.Errorf("string table length = %d, want %d (sig interned once); a non-deduped table would be %d", strTblLen, wantDeduped, wantDeduped+len(sig))
+		t.Errorf("string table length = %d, want %d (sig interned once); a non-deduped table would be %d", strTblLen, wantDeduped, wantDeduped+uint64(len(sig)))
 	}
 }
 
@@ -266,7 +290,7 @@ func TestNewViewRejectsMalformedBlob(t *testing.T) {
 		{"truncated section", func() []byte {
 			b := NewBuilder()
 			b.SetFiles([]string{"a.go"})
-			b.AddSymbol(SymbolInput{IDHash: 1, Name: "A", FileIdx: 0, Line: 1, Col: 1})
+			b.AddSymbol(&SymbolInput{IDHash: 1, Name: "A", FileIdx: 0, Line: 1, Col: 1})
 			blob, err := b.Build()
 			if err != nil {
 				t.Fatalf("Build() error = %v", err)

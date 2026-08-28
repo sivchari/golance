@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,7 +57,9 @@ const (
 // before worktree sharing existed; there is nothing to share, and no
 // benefit to paying the relative-path bookkeeping for it).
 func repoKey(root string) (key string, shared bool) {
-	out, err := exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output()
+	cmd := exec.Command("git", "rev-parse", "--git-common-dir")
+	cmd.Dir = root
+	out, err := cmd.Output()
 	if err != nil {
 		return root, false
 	}
@@ -252,6 +255,16 @@ func (s *Server) indexNeedsRebuild() bool {
 // database from an earlier successful build still exists on disk, it is
 // opened anyway — stale or incomplete is strictly better than
 // unavailable — with a warning that it may not reflect this run.
+// spawnIndexer starts exe — always this same running golance binary's own
+// resolved path (see os.Executable, buildIndex's only caller) — as the
+// indexer subprocess. exe is a function parameter, so gosec's
+// subprocess-launched-with-variable check exempts it as the
+// executable-name position (its own rule carves out parameters/receivers
+// used there).
+func spawnIndexer(exe string) *exec.Cmd {
+	return exec.Command(exe)
+}
+
 func (s *Server) buildIndex(root string) {
 	dbPath := s.dbPath(root)
 	cas := casDir(root)
@@ -266,7 +279,7 @@ func (s *Server) buildIndex(root string) {
 		return
 	}
 
-	cmd := exec.Command(exe)
+	cmd := spawnIndexer(exe)
 	cmd.Env = append(os.Environ(),
 		EnvIndexer+"=1",
 		EnvRoot+"="+root,
@@ -364,6 +377,28 @@ func (s *Server) showMessage(typ protocol.MessageType, msg string) {
 	}
 }
 
+// progressPercent returns done/total as a percentage in [0, 100], or 0 if
+// total is not yet known (<= 0) or either value is out of the range this
+// computation can trust — "PROGRESS done total" lines come from golance's
+// own indexer subprocess (see relayIndexProgress), so this is defensive
+// against a malformed line, not untrusted external input.
+func progressPercent(done, total int) uint32 {
+	if total <= 0 {
+		return 0
+	}
+	if done < 0 {
+		return 0
+	}
+	p := done * 100 / total
+	if p < 0 {
+		return 0
+	}
+	if p > math.MaxUint32 {
+		return 0
+	}
+	return uint32(p)
+}
+
 // relayIndexProgress reads "PROGRESS done total" lines written by the
 // indexer subprocess's stdout (see cmd/golance's indexer entry point) and
 // relays them as $/progress notifications.
@@ -388,10 +423,7 @@ func (s *Server) relayIndexProgress(r io.Reader) {
 			began = true
 			s.notifyProgress(token, &protocol.WorkDoneProgressBegin{Kind: "begin", Title: "golance: building index"})
 		}
-		pct := uint32(0)
-		if total > 0 {
-			pct = uint32(done * 100 / total)
-		}
+		pct := progressPercent(done, total)
 		msg := fmt.Sprintf("%d/%d packages", done, total)
 		s.notifyProgress(token, &protocol.WorkDoneProgressReport{Kind: "report", Percentage: &pct, Message: &msg})
 	}

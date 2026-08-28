@@ -2,6 +2,7 @@ package golance_test
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,23 +155,25 @@ func TestNothing(t *testing.T) {}
 // long enough to dominate e2e process/IPC overhead — the property
 // TestE2E_BranchSwitchNoRetypecheck needs for a reliable timing
 // comparison between "real re-type-check" and "CAS hit, no type-check at
-// all". It returns the path of the package's first file, a safe edit
-// target (editing any one file forces the whole package to be rechecked).
-func writeHeavyPackage(t *testing.T, root, pkgName string, numFiles int) string {
+// all". It returns the path of the package's first file (a safe edit
+// target: editing any one file forces the whole package to be rechecked)
+// together with that file's own content, so a caller that wants to edit it
+// doesn't need to read it back from disk.
+func writeHeavyPackage(t *testing.T, root, pkgName string, numFiles int) (firstFile, firstFileSrc string) {
 	t.Helper()
-	var firstFile string
 	for i := 0; i < numFiles; i++ {
 		var b strings.Builder
-		fmt.Fprintf(&b, "package %s\n\n", pkgName)
+		_, _ = fmt.Fprintf(&b, "package %s\n\n", pkgName)
 		for j := 0; j < 8; j++ {
-			fmt.Fprintf(&b, "// F%d_%d does a little arithmetic.\nfunc F%d_%d(x int) int {\n\treturn x*%d + %d\n}\n\n", i, j, i, j, i+1, j)
+			_, _ = fmt.Fprintf(&b, "// F%d_%d does a little arithmetic.\nfunc F%d_%d(x int) int {\n\treturn x*%d + %d\n}\n\n", i, j, i, j, i+1, j)
 		}
-		path := writeE2EFile(t, root, fmt.Sprintf("%s/f%d.go", pkgName, i), b.String())
+		src := b.String()
+		path := writeE2EFile(t, root, fmt.Sprintf("%s/f%d.go", pkgName, i), src)
 		if i == 0 {
-			firstFile = path
+			firstFile, firstFileSrc = path, src
 		}
 	}
-	return firstFile
+	return firstFile, firstFileSrc
 }
 
 func writeE2EFile(t *testing.T, root, rel, content string) string {
@@ -196,7 +199,14 @@ func mustPos(t *testing.T, content, lineSubstr, token string) protocol.Position 
 		}
 		col := strings.Index(line, token)
 		if col < 0 {
+			// The explicit returns give static analysis the early-exit edges
+			// t.Fatalf's runtime.Goexit does not.
 			t.Fatalf("token %q not found on line %q", token, line)
+			return protocol.Position{}
+		}
+		if col > math.MaxUint32 {
+			t.Fatalf("column %d exceeds uint32", col)
+			return protocol.Position{}
 		}
 		return protocol.Position{Line: uint32(i), Character: uint32(col)}
 	}

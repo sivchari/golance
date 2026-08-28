@@ -67,7 +67,7 @@ func (c *CAS) Has(key uint64) bool {
 // use. ok is false if no blob is stored for key.
 func (c *CAS) Get(key uint64) (blob []byte, ok bool, err error) {
 	path := c.blobPath(key)
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(filepath.Clean(path))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
 	}

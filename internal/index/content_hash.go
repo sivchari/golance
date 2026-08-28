@@ -48,7 +48,7 @@ func contentHash(goFiles []string, buildFlagsFP string, readFile func(string) ([
 }
 
 func readFileDisk(path string) ([]byte, error) {
-	return os.ReadFile(path)
+	return os.ReadFile(filepath.Clean(path))
 }
 
 // statFiles stats every file in goFiles and returns their (path, size,
