@@ -198,7 +198,10 @@ func mustPos(t *testing.T, content, lineSubstr, token string) protocol.Position 
 		}
 		col := strings.Index(line, token)
 		if col < 0 {
+			// The explicit return gives static analysis the early-exit edge
+			// t.Fatalf's runtime.Goexit does not.
 			t.Fatalf("token %q not found on line %q", token, line)
+			return protocol.Position{}
 		}
 		return protocol.Position{Line: uint32(i), Character: uint32(col)}
 	}
