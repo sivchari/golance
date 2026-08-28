@@ -1,0 +1,134 @@
+package graph
+
+import (
+	"os"
+	"path/filepath"
+	"slices"
+	"testing"
+)
+
+const (
+	modA = "example.com/simple/a"
+	modB = "example.com/simple/b"
+	modC = "example.com/simple/c"
+)
+
+func loadTestdata(t *testing.T) *Snapshot {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("testdata", "simple"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	snap, err := Load(Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	return snap
+}
+
+func TestLoad_TopoOrder(t *testing.T) {
+	snap := loadTestdata(t)
+
+	for _, path := range []string{modA, modB, modC} {
+		if _, ok := snap.Package(path); !ok {
+			t.Errorf("Packages missing %s", path)
+		}
+	}
+
+	idx := make(map[string]int, len(snap.Order))
+	for i, path := range snap.Order {
+		idx[path] = i
+	}
+	if idx[modA] >= idx[modB] {
+		t.Errorf("topo order: want a before b, got order %v", snap.Order)
+	}
+	if idx[modB] >= idx[modC] {
+		t.Errorf("topo order: want b before c, got order %v", snap.Order)
+	}
+}
+
+func TestSnapshot_ClosureUnits(t *testing.T) {
+	snap := loadTestdata(t)
+
+	got := snap.ClosureUnits(modA)
+	want := []string{modA, modB, modC}
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("ClosureUnits(%s) = %v, want %v", modA, got, want)
+	}
+
+	got = snap.ClosureUnits(modC)
+	want = []string{modC}
+	if !slices.Equal(got, want) {
+		t.Errorf("ClosureUnits(%s) = %v, want %v", modC, got, want)
+	}
+}
+
+func TestSnapshot_ExportFile(t *testing.T) {
+	snap := loadTestdata(t)
+
+	file, ok := snap.ExportFile(modA)
+	if !ok || file == "" {
+		t.Errorf("ExportFile(%s) = %q, %v; want a non-empty GOCACHE path", modA, file, ok)
+	}
+	if _, ok := snap.ExportFile("example.com/simple/nonexistent"); ok {
+		t.Error("ExportFile for an unknown package should report ok=false")
+	}
+}
+
+// TestSnapshot_ExportFile_RecoversStalePath covers ExportFile's recovery
+// path: a Package whose ExportFile no longer points at a real file (as
+// happens when GOCACHE evicts it, or go list never populated it — see
+// ExportFile's doc) should still resolve, via a fresh single-package
+// packages.Load, instead of permanently reporting ok=false.
+func TestSnapshot_ExportFile_RecoversStalePath(t *testing.T) {
+	snap := loadTestdata(t)
+
+	stale := *snap.Packages[modA]
+	stale.ExportFile = filepath.Join(t.TempDir(), "does-not-exist-d")
+	snap.Packages[modA] = &stale
+
+	file, ok := snap.ExportFile(modA)
+	if !ok || file == "" {
+		t.Fatalf("ExportFile(%s) with a stale path = %q, %v; want recovery to a non-empty GOCACHE path", modA, file, ok)
+	}
+	if file == stale.ExportFile {
+		t.Errorf("ExportFile(%s) returned the stale path unchanged: %s", modA, file)
+	}
+	if _, err := os.Stat(file); err != nil {
+		t.Errorf("recovered ExportFile(%s) = %s does not exist: %v", modA, file, err)
+	}
+}
+
+func TestCache_RoundTrip(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("testdata", "simple"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	snap := loadTestdata(t)
+	patterns := []string{"./..."}
+	if err := SaveCache(root, patterns, nil, snap); err != nil {
+		t.Fatalf("SaveCache: %v", err)
+	}
+
+	loaded, ok := LoadCache(root, patterns, nil)
+	if !ok {
+		t.Fatal("LoadCache: ok=false after SaveCache")
+	}
+	if len(loaded.Packages) != len(snap.Packages) {
+		t.Errorf("LoadCache package count = %d, want %d", len(loaded.Packages), len(snap.Packages))
+	}
+	if !slices.Equal(loaded.Order, snap.Order) {
+		t.Errorf("LoadCache order = %v, want %v", loaded.Order, snap.Order)
+	}
+
+	if _, ok := LoadCache(root, []string{"./other"}, nil); ok {
+		t.Error("LoadCache should miss for a different patterns key")
+	}
+
+	if Stale(root) {
+		t.Error("Stale should be false right after SaveCache with no module file changes")
+	}
+}
