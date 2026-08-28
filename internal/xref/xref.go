@@ -1,0 +1,171 @@
+package xref
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+
+	"github.com/sivchari/golance/internal/store"
+)
+
+// Definition returns the declaration location of the symbol at (file, line,
+// col). If the cursor is already on the declaration, it resolves to itself.
+func (r *Resolver) Definition(file string, line, col int) ([]Location, error) {
+	target, err := r.resolveAt(file, uint32(line), uint32(col))
+	if err != nil {
+		return nil, err
+	}
+	_, _, loc, ok := r.symbolByHash(target.PkgHash, target.IDHash)
+	if !ok {
+		return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
+	}
+	return []Location{loc}, nil
+}
+
+// References returns every reference to the symbol at (file, line, col),
+// searching only the defining package plus its reverse-dependency closure
+// (see package doc). includeDecl controls whether the declaration itself is
+// included.
+func (r *Resolver) References(file string, line, col int, includeDecl bool) ([]Location, error) {
+	target, err := r.resolveAt(file, uint32(line), uint32(col))
+	if err != nil {
+		return nil, err
+	}
+	return r.locationsFor(target, includeDecl)
+}
+
+// locationsFor collects every location referencing target across its
+// defining package's reverse-dependency closure.
+func (r *Resolver) locationsFor(target resolvedSymbol, includeDecl bool) ([]Location, error) {
+	defPkgPath, ok := r.pkgPathByHash[target.PkgHash]
+	if !ok {
+		return nil, fmt.Errorf("xref: unknown defining package for hash %d", target.PkgHash)
+	}
+
+	var out []Location
+	if includeDecl {
+		_, _, loc, ok := r.symbolByHash(target.PkgHash, target.IDHash)
+		if !ok {
+			return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
+		}
+		out = append(out, loc)
+	}
+
+	for _, p := range r.snap.ClosureUnits(defPkgPath) {
+		pkgHash := store.Hash(p)
+		u, err := r.unitBlob(pkgHash)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		v, err := store.NewView(u.Facts)
+		if err != nil {
+			return nil, err
+		}
+		for _, ref := range v.RefsTo(target.IDHash) {
+			if ref.ToPkgHash() != target.PkgHash {
+				continue // idHash collision with an unrelated symbol
+			}
+			path, err := v.FileAt(int(ref.FileIdx()))
+			if err != nil {
+				continue
+			}
+			out = append(out, Location{File: absPath(r.root, path, r.relative), Line: ref.Line(), Col: ref.Col(), EndCol: ref.EndCol()})
+		}
+	}
+
+	sortLocations(out)
+	return out, nil
+}
+
+// WorkspaceSymbol returns every symbol whose name starts with query
+// (case-insensitive), up to defaultWorkspaceSymbolLimit results.
+func (r *Resolver) WorkspaceSymbol(query string) ([]SymbolInfo, error) {
+	matches, err := r.db.LookupNamePrefix(query)
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(matches))
+	for n := range matches {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	var out []SymbolInfo
+	for _, n := range names {
+		for _, idHash := range matches[n] {
+			if len(out) >= defaultWorkspaceSymbolLimit {
+				return out, nil
+			}
+			info, ok, err := r.symbolInfoFromIDHash(idHash)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				out = append(out, info)
+			}
+		}
+	}
+	return out, nil
+}
+
+const defaultWorkspaceSymbolLimit = 100
+
+// symbolInfoFromIDHash resolves idHash to a SymbolInfo by recovering its
+// defining package from the strings recorded via [store.DB.PutSymbolIDString].
+func (r *Resolver) symbolInfoFromIDHash(idHash uint64) (SymbolInfo, bool, error) {
+	strs, err := r.db.SymbolIDStrings(idHash)
+	if err != nil {
+		return SymbolInfo{}, false, err
+	}
+	for _, s := range strs {
+		pkgPath, _, ok := splitSymbolID(s)
+		if !ok {
+			continue
+		}
+		name, kind, loc, ok := r.symbolByHash(store.Hash(pkgPath), idHash)
+		if !ok {
+			continue
+		}
+		return SymbolInfo{Name: name, Kind: kind, Container: pkgPath, Location: loc}, true, nil
+	}
+	return SymbolInfo{}, false, nil
+}
+
+// Rename returns the edits needed to rename the symbol at (file, line, col)
+// to newName, grouped by file. It includes every reference across the
+// defining package's reverse-dependency closure plus the declaration itself.
+//
+// TODO(v0.1): no collision check against an existing newName in scope.
+func (r *Resolver) Rename(file string, line, col int, newName string) (map[string][]Edit, error) {
+	target, err := r.resolveAt(file, uint32(line), uint32(col))
+	if err != nil {
+		return nil, err
+	}
+	locs, err := r.locationsFor(target, true)
+	if err != nil {
+		return nil, err
+	}
+
+	edits := make(map[string][]Edit)
+	for _, loc := range locs {
+		edits[loc.File] = append(edits[loc.File], Edit{Line: loc.Line, Col: loc.Col, EndCol: loc.EndCol, NewText: newName})
+	}
+	return edits, nil
+}
+
+func sortLocations(locs []Location) {
+	sort.Slice(locs, func(i, j int) bool {
+		a, b := locs[i], locs[j]
+		if a.File != b.File {
+			return a.File < b.File
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		return a.Col < b.Col
+	})
+}

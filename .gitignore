@@ -1,0 +1,6 @@
+.DS_Store
+*.log
+bin/
+dist/
+plan-*.md
+research-*.md

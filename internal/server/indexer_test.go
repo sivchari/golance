@@ -1,0 +1,263 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/sivchari/golance/internal/graph"
+	"github.com/sivchari/golance/internal/index"
+	"github.com/sivchari/golance/internal/rpc"
+	"github.com/sivchari/golance/internal/store"
+)
+
+// newWorkspaceOnlyServer builds a Server with its workspace populated (so
+// s.workspace() is non-nil, as it is by the time handleInitialize calls
+// tryWarmOpen/buildIndex) but with no facts index open yet.
+func newWorkspaceOnlyServer(t *testing.T) *Server {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("testdata", "module"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	s.setWorkspace(root, snap)
+	return s
+}
+
+// openTestCAS returns a fresh CAS under a temp directory.
+func openTestCAS(t *testing.T) *store.CAS {
+	t.Helper()
+	cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	return cas
+}
+
+// buildTestIndexDB runs a full index.Build for snap into a fresh database
+// at dbPath and cas (recording its build fingerprint on success) and
+// closes the database.
+func buildTestIndexDB(t *testing.T, snap *graph.Snapshot, dbPath string, cas *store.CAS) {
+	t.Helper()
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if _, err := index.Build(context.Background(), snap, db, cas, index.Options{RelativePaths: RelativeIndexPaths(snap.Dir())}); err != nil {
+		t.Fatalf("index.Build: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+}
+
+// TestOpenIndexAfterBuild_FallsBackToExistingDBOnFailure verifies that an
+// indexer failure (waitErr != nil) does not leave the facts index
+// unavailable when a database from an earlier successful build already
+// exists on disk: it is opened anyway, stale or incomplete being strictly
+// better than unavailable.
+func TestOpenIndexAfterBuild_FallsBackToExistingDBOnFailure(t *testing.T) {
+	s := newWorkspaceOnlyServer(t)
+	snap := s.workspace().snap
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	buildTestIndexDB(t, snap, dbPath, openTestCAS(t))
+
+	s.openIndexAfterBuild(dbPath, errors.New("boom"), "indexer stderr")
+
+	idx := s.idx.Load()
+	if idx == nil {
+		t.Fatal("idx is nil; want the existing database opened despite the indexer's failure")
+	}
+	if err := idx.db.Close(); err != nil {
+		t.Errorf("db.Close: %v", err)
+	}
+}
+
+// TestOpenIndexAfterBuild_NoDatabaseStaysUnavailable verifies that an
+// indexer failure with no database ever built for this root (the common
+// case: a failed graph load or database open, before any package was
+// indexed) leaves the facts index unavailable rather than opening (and
+// thereby creating) an empty database.
+func TestOpenIndexAfterBuild_NoDatabaseStaysUnavailable(t *testing.T) {
+	s := newWorkspaceOnlyServer(t)
+	dbPath := filepath.Join(t.TempDir(), "never-built.db")
+
+	s.openIndexAfterBuild(dbPath, errors.New("boom"), "indexer stderr")
+
+	if idx := s.idx.Load(); idx != nil {
+		t.Fatal("idx is non-nil; want nil when the indexer failed and no database was ever built")
+	}
+}
+
+// TestOpenIndexAfterBuild_Success verifies the ordinary path: no error,
+// database opens, idx is installed.
+func TestOpenIndexAfterBuild_Success(t *testing.T) {
+	s := newWorkspaceOnlyServer(t)
+	snap := s.workspace().snap
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	buildTestIndexDB(t, snap, dbPath, openTestCAS(t))
+
+	s.openIndexAfterBuild(dbPath, nil, "")
+
+	idx := s.idx.Load()
+	if idx == nil {
+		t.Fatal("idx is nil after a successful build")
+	}
+	if err := idx.db.Close(); err != nil {
+		t.Errorf("db.Close: %v", err)
+	}
+}
+
+// TestTryWarmOpen_MatchingFingerprintOpensDirectly verifies that a
+// database already built with the running toolchain is opened directly,
+// without the caller needing to launch the indexer subprocess.
+func TestTryWarmOpen_MatchingFingerprintOpensDirectly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newWorkspaceOnlyServer(t)
+	root := s.workspace().root
+	snap := s.workspace().snap
+
+	if idx, ok := s.tryWarmOpen(root); ok || idx != nil {
+		t.Fatalf("tryWarmOpen() before any build = (%v, %v), want (nil, false)", idx, ok)
+	}
+
+	dbPath := indexDBFile(root)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+	cas, err := store.OpenCAS(casDir(root))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	buildTestIndexDB(t, snap, dbPath, cas)
+
+	idx, ok := s.tryWarmOpen(root)
+	if !ok || idx == nil {
+		t.Fatal("tryWarmOpen() after a matching-fingerprint build = not ok, want ok")
+	}
+	if err := idx.db.Close(); err != nil {
+		t.Errorf("db.Close: %v", err)
+	}
+}
+
+// TestTryWarmOpen_OpensRegardlessOfFingerprint verifies that a database
+// recorded under a different toolchain fingerprint is still opened
+// directly: tryWarmOpen no longer gates on the fingerprint (revalidateIndex
+// is what catches this and triggers a rebuild, see indexer_test.go's
+// TestRevalidateIndex_* below).
+func TestTryWarmOpen_OpensRegardlessOfFingerprint(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newWorkspaceOnlyServer(t)
+	root := s.workspace().root
+
+	dbPath := indexDBFile(root)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if err := db.PutBuildFingerprint("not-the-running-toolchain"); err != nil {
+		t.Fatalf("PutBuildFingerprint: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	idx, ok := s.tryWarmOpen(root)
+	if !ok || idx == nil {
+		t.Fatal("tryWarmOpen() with a mismatched fingerprint = not ok, want ok")
+	}
+	if err := idx.db.Close(); err != nil {
+		t.Errorf("db.Close: %v", err)
+	}
+}
+
+// TestRevalidateIndex_UnchangedKeepsWarmOpenHandle verifies that when
+// nothing has changed since the database was built, revalidateIndex leaves
+// the warm-opened *indexState installed (same pointer identity — no
+// close-and-rebuild churn) rather than launching a rebuild.
+func TestRevalidateIndex_UnchangedKeepsWarmOpenHandle(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newWorkspaceOnlyServer(t)
+	root := s.workspace().root
+	snap := s.workspace().snap
+
+	dbPath := indexDBFile(root)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+	cas, err := store.OpenCAS(casDir(root))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	buildTestIndexDB(t, snap, dbPath, cas)
+
+	idx, ok := s.tryWarmOpen(root)
+	if !ok {
+		t.Fatal("tryWarmOpen() = not ok, want ok")
+	}
+	s.idx.Store(idx)
+	t.Cleanup(func() { _ = idx.db.Close() })
+
+	s.revalidateIndex(root)
+
+	got := s.idx.Load()
+	if got != idx {
+		t.Errorf("s.idx after revalidateIndex = %p, want the original warm-opened %p (unchanged should not rebuild)", got, idx)
+	}
+}
+
+// TestIndexNeedsRebuild_MismatchedFingerprint verifies that a stale
+// database (here, a mismatched toolchain fingerprint, which forces every
+// package to be treated as changed) is flagged for a rebuild by
+// indexNeedsRebuild — the check revalidateIndex uses before closing the
+// warm-opened handle and delegating to buildIndex (not exercised directly
+// here: buildIndex launches a real subprocess, which is out of scope for a
+// unit test — see the e2e suite for full-process coverage).
+func TestIndexNeedsRebuild_MismatchedFingerprint(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newWorkspaceOnlyServer(t)
+	root := s.workspace().root
+	snap := s.workspace().snap
+
+	dbPath := indexDBFile(root)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+	cas, err := store.OpenCAS(casDir(root))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	buildTestIndexDB(t, snap, dbPath, cas)
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if err := db.PutBuildFingerprint("not-the-running-toolchain"); err != nil {
+		t.Fatalf("PutBuildFingerprint: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+
+	idx, ok := s.tryWarmOpen(root)
+	if !ok {
+		t.Fatal("tryWarmOpen() = not ok, want ok")
+	}
+	s.idx.Store(idx)
+	t.Cleanup(func() { _ = idx.db.Close() })
+
+	if !s.indexNeedsRebuild() {
+		t.Error("indexNeedsRebuild() = false, want true for a mismatched toolchain fingerprint")
+	}
+}

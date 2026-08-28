@@ -1,0 +1,141 @@
+// Package server wires golance's independent internal packages (rpc,
+// overlay, graph, check, langfeat, xref, index, store) into a running LSP
+// server: handler registration, coordinate conversion between the LSP wire
+// protocol and each package's own coordinate system, and process lifecycle
+// (workspace load, indexer subprocess, incremental reindex).
+package server
+
+import (
+	"log"
+	"sync"
+	"sync/atomic"
+
+	"go.lsp.dev/protocol"
+
+	"github.com/sivchari/golance/internal/check"
+	"github.com/sivchari/golance/internal/graph"
+	"github.com/sivchari/golance/internal/overlay"
+	"github.com/sivchari/golance/internal/rpc"
+	"github.com/sivchari/golance/internal/store"
+	"github.com/sivchari/golance/internal/xref"
+)
+
+// Version is golance's user-visible version string, reported in
+// InitializeResult.ServerInfo and by cmd/golance's -version flag.
+const Version = "0.1.0-dev"
+
+// Options configures a Server.
+type Options struct {
+	// Logger receives diagnostic log lines. Defaults to log.Default().
+	Logger *log.Logger
+	// IndexJobs bounds index build parallelism (index.Options.Parallelism)
+	// in the indexer subprocess. 0 uses index's own default.
+	IndexJobs int
+	// MemLimit is forwarded to the indexer subprocess as GOMEMLIMIT. Empty
+	// leaves the Go runtime's default memory limit in place.
+	MemLimit string
+	// Offline forbids the initial graph load and the indexer subprocess
+	// from downloading modules (GOPROXY=off).
+	Offline bool
+}
+
+// workspace bundles every value that depends on the current import graph
+// snapshot, so a workspace/didChangeWatchedFiles-triggered reload can swap
+// them in atomically without a lock on the read path.
+type workspace struct {
+	root      string
+	snap      *graph.Snapshot
+	engine    *check.Engine
+	depCache  *depCacheHolder
+	fileToPkg map[string]string
+}
+
+// indexState bundles the per-root index database, the CAS its facts and
+// export data live in, and the Resolver over both. It is nil until the
+// indexer subprocess completes a build successfully.
+type indexState struct {
+	db       *store.DB
+	cas      *store.CAS
+	resolver *xref.Resolver
+}
+
+// Server wires golance's independent internal packages into a running LSP
+// server. Construct with New, which registers every handler on rpcServer;
+// call rpcServer.Serve to run it.
+type Server struct {
+	opts    Options
+	logger  *log.Logger
+	rpc     *rpc.Server
+	overlay *overlay.Overlay
+
+	ws  atomic.Pointer[workspace]
+	idx atomic.Pointer[indexState]
+
+	diagMu    sync.Mutex
+	diagFiles map[string]map[string]bool // package dir -> files last published with diagnostics
+
+	indexBuildingWarned atomic.Bool // one-time window/showMessage while the index is still building
+	indexFailedWarned   atomic.Bool // one-time window/showMessage after an indexer failure
+}
+
+// New constructs a Server and registers its LSP handlers on rpcServer.
+// Handlers reject cross-reference and interactive requests gracefully
+// until the "initialize" request populates the workspace.
+func New(rpcServer *rpc.Server, opts Options) *Server {
+	logger := opts.Logger
+	if logger == nil {
+		logger = log.Default()
+	}
+	s := &Server{
+		opts:      opts,
+		logger:    logger,
+		rpc:       rpcServer,
+		overlay:   overlay.New(),
+		diagFiles: make(map[string]map[string]bool),
+	}
+	s.wire()
+	return s
+}
+
+// wire registers every LSP method this Server answers on s.rpc. Definition,
+// references, implementation, workspace/symbol, and rename run on the
+// Background pool (see internal/rpc.Priority) since they are workspace-wide
+// queries; every other request is Interactive.
+func (s *Server) wire() {
+	s.rpc.Handle(protocol.MethodInitialize, rpc.Interactive, s.handleInitialize)
+	s.rpc.Handle(protocol.MethodShutdown, rpc.Interactive, s.handleShutdown)
+
+	s.rpc.HandleNotification(protocol.MethodTextDocumentDidOpen, s.handleDidOpen)
+	s.rpc.HandleNotification(protocol.MethodTextDocumentDidChange, s.handleDidChange)
+	s.rpc.HandleNotification(protocol.MethodTextDocumentDidSave, s.handleDidSave)
+	s.rpc.HandleNotification(protocol.MethodTextDocumentDidClose, s.handleDidClose)
+	s.rpc.HandleNotification(protocol.MethodWorkspaceDidChangeWatchedFiles, s.handleDidChangeWatchedFiles)
+
+	s.rpc.Handle(protocol.MethodTextDocumentHover, rpc.Interactive, s.handleHover)
+	s.rpc.Handle(protocol.MethodTextDocumentCompletion, rpc.Interactive, s.handleCompletion)
+	s.rpc.Handle(protocol.MethodTextDocumentSignatureHelp, rpc.Interactive, s.handleSignatureHelp)
+	s.rpc.Handle(protocol.MethodTextDocumentDocumentSymbol, rpc.Interactive, s.handleDocumentSymbol)
+	s.rpc.Handle(protocol.MethodTextDocumentInlayHint, rpc.Interactive, s.handleInlayHint)
+	s.rpc.Handle(protocol.MethodTextDocumentFormatting, rpc.Interactive, s.handleFormatting)
+
+	s.rpc.Handle(protocol.MethodTextDocumentDefinition, rpc.Background, s.handleDefinition)
+	s.rpc.Handle(protocol.MethodTextDocumentReferences, rpc.Background, s.handleReferences)
+	s.rpc.Handle(protocol.MethodTextDocumentImplementation, rpc.Background, s.handleImplementation)
+	s.rpc.Handle(protocol.MethodWorkspaceSymbol, rpc.Background, s.handleWorkspaceSymbol)
+	s.rpc.Handle(protocol.MethodTextDocumentRename, rpc.Background, s.handleRename)
+}
+
+// workspace returns the current workspace bundle, or nil before the
+// "initialize" request has completed.
+func (s *Server) workspace() *workspace { return s.ws.Load() }
+
+// pkgPathForFile returns the import path of the package containing path, if
+// path is part of the loaded workspace.
+func (s *Server) pkgPathForFile(path string) (string, bool) {
+	ws := s.workspace()
+	if ws == nil {
+		return "", false
+	}
+	p, ok := ws.fileToPkg[path]
+	return p, ok
+}

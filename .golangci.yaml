@@ -1,0 +1,89 @@
+version: "2"
+linters:
+  default: none
+  enable:
+    - asciicheck
+    - bidichk
+    - cyclop
+    - dogsled
+    - durationcheck
+    - errcheck
+    - errname
+    - errorlint
+    - forcetypeassert
+    - gocognit
+    - goconst
+    - gocritic
+    - gocyclo
+    - godot
+    - goprintffuncname
+    - gosec
+    - govet
+    - ineffassign
+    - makezero
+    - misspell
+    - nakedret
+    - nestif
+    - nilerr
+    - nolintlint
+    - predeclared
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+    - usetesting
+    - wastedassign
+    - whitespace
+  settings:
+    gocritic:
+      enable-all: true
+      disabled-checks:
+        - importShadow
+        - unnamedResult
+    nolintlint:
+      require-specific: true
+      require-explanation: true
+    cyclop:
+      max-complexity: 15
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: if-return
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unused-parameter
+        - name: unreachable-code
+        - name: redefines-builtin-id
+        - name: bool-literal-in-expr
+  exclusions:
+    rules:
+      # Test files naturally repeat string literals in table-driven tests.
+      - path: "_test\\.go"
+        linters:
+          - goconst
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/sivchari/gopls-lazy
