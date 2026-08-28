@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"strconv"
@@ -53,7 +54,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	logOut := stderr
 	if *logPath != "" {
-		f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		f, err := os.OpenFile(filepath.Clean(*logPath), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "golance: open log file: %v\n", err)
 			return 1
@@ -132,7 +133,7 @@ func setupProfiling(stderr io.Writer) (stop func(), ok bool) {
 	}
 
 	if path := os.Getenv("GOLANCE_CPUPROFILE"); path != "" {
-		f, err := os.Create(path)
+		f, err := os.Create(filepath.Clean(path))
 		if err != nil {
 			_, _ = fmt.Fprintf(stderr, "golance: indexer: create cpu profile: %v\n", err)
 			return stop, false
@@ -161,7 +162,7 @@ func setupProfiling(stderr io.Writer) (stop func(), ok bool) {
 // writeHeapProfile writes a heap profile to path, reporting any error to
 // stderr.
 func writeHeapProfile(stderr io.Writer, path string) {
-	f, err := os.Create(path)
+	f, err := os.Create(filepath.Clean(path))
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "golance: indexer: create mem profile: %v\n", err)
 		return
@@ -265,7 +266,7 @@ func loadGraph(opts graph.Options, patterns []string, stderr io.Writer) (snap *g
 // writeNamedProfile writes the named runtime/pprof profile (e.g. "mutex",
 // "block") to path, reporting any error to stderr.
 func writeNamedProfile(stderr io.Writer, name, path string) {
-	f, err := os.Create(path)
+	f, err := os.Create(filepath.Clean(path))
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "golance: indexer: create %s profile: %v\n", name, err)
 		return

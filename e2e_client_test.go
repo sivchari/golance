@@ -169,7 +169,7 @@ func startClientIn(t *testing.T, root, fakeHome string) *lspClient {
 	cmd.Dir = root
 	cmd.Env = e2eEnv(t, fakeHome)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	stderrFile, err := os.Create(stderrPath)
+	stderrFile, err := os.Create(filepath.Clean(stderrPath))
 	if err != nil {
 		t.Fatalf("create stderr log: %v", err)
 	}
@@ -278,7 +278,7 @@ func realGoModCache() string {
 
 func logFileContent(t *testing.T, label, path string) {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(filepath.Clean(path))
 	if err != nil || len(b) == 0 {
 		return
 	}
@@ -416,6 +416,7 @@ func (c *lspClient) initialize(t *testing.T, root string) *protocol.InitializeRe
 	gopid := os.Getpid()
 	if gopid < 0 || gopid > math.MaxInt32 {
 		t.Fatalf("pid %d does not fit in int32", gopid)
+		return nil // unreachable: t.Fatalf halts this goroutine via runtime.Goexit
 	}
 	pid := int32(gopid)
 	params := &protocol.InitializeParams{
@@ -441,7 +442,7 @@ func (c *lspClient) initialize(t *testing.T, root string) *protocol.InitializeRe
 // openFile sends textDocument/didOpen with the file's on-disk content.
 func (c *lspClient) openFile(t *testing.T, path string) {
 	t.Helper()
-	content, err := os.ReadFile(path)
+	content, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}

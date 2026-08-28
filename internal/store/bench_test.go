@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"math"
 	"testing"
 )
 
@@ -26,7 +27,14 @@ func (r *benchRand) next() uint64 {
 
 // intn returns a deterministic pseudo-random int in [0, n).
 func (r *benchRand) intn(n int) int {
-	return int(r.next() % uint64(n))
+	if n <= 0 {
+		return 0
+	}
+	v := r.next() % uint64(n)
+	if v > math.MaxInt {
+		return 0
+	}
+	return int(v)
 }
 
 // syntheticPackage holds one package's inputs plus enough bookkeeping to

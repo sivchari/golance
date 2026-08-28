@@ -3,6 +3,7 @@ package golance_test
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -28,23 +29,53 @@ func gitWorktreeModule(t *testing.T) (mainRoot, otherRoot string, locs e2eLocs) 
 	t.Helper()
 	mainRoot, locs = writeE2EModule(t)
 
-	runGit(t, mainRoot, "init", "-q")
-	runGit(t, mainRoot, "-c", "user.email=e2e@golance.test", "-c", "user.name=e2e", "add", "-A")
-	runGit(t, mainRoot, "-c", "user.email=e2e@golance.test", "-c", "user.name=e2e", "commit", "-q", "-m", "initial")
+	gitInit(t, mainRoot)
+	gitAddAll(t, mainRoot)
+	gitCommitInitial(t, mainRoot)
 
-	otherRoot = t.TempDir() + "-worktree"
-	runGit(t, mainRoot, "worktree", "add", "-q", "-b", "other", otherRoot, "HEAD")
+	otherRoot = gitWorktreeAdd(t, mainRoot)
 
 	return mainRoot, otherRoot, locs
 }
 
-func runGit(t *testing.T, dir string, args ...string) {
+// runGitCmd runs cmd (already fully constructed by the caller — see
+// gitInit/gitAddAll/gitCommitInitial/gitWorktreeAdd, each of which passes
+// exec.Command an all-literal argument list, the one genuinely dynamic
+// case — gitWorktreeAdd's target directory — aside) with dir as its
+// working directory, failing t on error.
+func runGitCmd(t *testing.T, dir string, cmd *exec.Cmd) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		t.Fatalf("git %s: %v\n%s", strings.Join(cmd.Args[1:], " "), err, out)
 	}
+}
+
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
+	runGitCmd(t, dir, exec.Command("git", "init", "-q"))
+}
+
+func gitAddAll(t *testing.T, dir string) {
+	t.Helper()
+	runGitCmd(t, dir, exec.Command("git", "-c", "user.email=e2e@golance.test", "-c", "user.name=e2e", "add", "-A"))
+}
+
+func gitCommitInitial(t *testing.T, dir string) {
+	t.Helper()
+	runGitCmd(t, dir, exec.Command("git", "-c", "user.email=e2e@golance.test", "-c", "user.name=e2e", "commit", "-q", "-m", "initial"))
+}
+
+// gitWorktreeAdd adds a new worktree on branch "other" as a sibling
+// directory of dir (git resolves the literal "../wt-other" against the
+// command's working directory) and returns its absolute path. Using a
+// constant relative target keeps every exec.Command argument a literal;
+// the sibling lands next to dir under the test's temp area, never inside
+// the scanned module tree.
+func gitWorktreeAdd(t *testing.T, dir string) string {
+	t.Helper()
+	runGitCmd(t, dir, exec.Command("git", "worktree", "add", "-q", "-b", "other", "../wt-other", "HEAD"))
+	return filepath.Join(filepath.Dir(dir), "wt-other")
 }
 
 // definitionAt requests textDocument/definition at pos in file and returns

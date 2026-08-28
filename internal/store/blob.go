@@ -82,16 +82,21 @@ func (b *Builder) Build() ([]byte, error) {
 		if s == "" {
 			return 0, 0, nil
 		}
-		if off, ok := interned[s]; ok {
-			return off, uint32(len(s)), nil
+		n := len(s)
+		if uint64(n) > math.MaxUint32 {
+			return 0, 0, fmt.Errorf("store: interned string exceeds %d bytes", uint32(math.MaxUint32))
 		}
-		if uint64(len(strTable))+uint64(len(s)) > math.MaxUint32 {
+		if off, ok := interned[s]; ok {
+			return off, uint32(n), nil
+		}
+		curLen := len(strTable)
+		if uint64(curLen)+uint64(n) > math.MaxUint32 {
 			return 0, 0, fmt.Errorf("store: string table exceeds %d bytes", uint32(math.MaxUint32))
 		}
-		off = uint32(len(strTable))
+		off = uint32(curLen)
 		strTable = append(strTable, s...)
 		interned[s] = off
-		return off, uint32(len(s)), nil
+		return off, uint32(n), nil
 	}
 
 	nSymbols := len(b.symbols)

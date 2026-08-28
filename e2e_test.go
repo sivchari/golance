@@ -46,7 +46,7 @@ func TestE2E(t *testing.T) {
 	})
 
 	t.Run("diagnostics_on_open", func(t *testing.T) {
-		checkE2EDiagnosticsOnOpen(t, c, locs)
+		checkE2EDiagnosticsOnOpen(t, c, &locs)
 	})
 
 	// diagnostics_on_open_clean_file covers a file that never had any
@@ -54,7 +54,7 @@ func TestE2E(t *testing.T) {
 	// open file in a checked package (not just files with something to
 	// report), a client had no way to learn such a file is clean.
 	t.Run("diagnostics_on_open_clean_file", func(t *testing.T) {
-		checkE2EDiagnosticsOnOpenCleanFile(t, c, locs)
+		checkE2EDiagnosticsOnOpenCleanFile(t, c, &locs)
 	})
 
 	// Cross-reference queries need the facts index; opening a file starts
@@ -67,15 +67,15 @@ func TestE2E(t *testing.T) {
 	c.waitForIndexReady(t, e2eIndexBudget)
 
 	t.Run("definition_cross_package", func(t *testing.T) {
-		checkE2EDefinitionCrossPackage(t, c, locs)
+		checkE2EDefinitionCrossPackage(t, c, &locs)
 	})
 
 	t.Run("references_cross_file", func(t *testing.T) {
-		checkE2EReferencesCrossFile(t, c, locs)
+		checkE2EReferencesCrossFile(t, c, &locs)
 	})
 
 	t.Run("completion_selector", func(t *testing.T) {
-		checkE2ECompletionSelector(t, c, locs)
+		checkE2ECompletionSelector(t, c, &locs)
 	})
 
 	// hover_reflects_unsaved_edit sends a didChange without a following
@@ -84,7 +84,7 @@ func TestE2E(t *testing.T) {
 	// either), so this polls a bounded number of times instead of relying on
 	// a single racy request right after the notification.
 	t.Run("hover_reflects_unsaved_edit", func(t *testing.T) {
-		checkE2EHoverReflectsUnsavedEdit(t, c, locs)
+		checkE2EHoverReflectsUnsavedEdit(t, c, &locs)
 	})
 }
 
@@ -111,7 +111,7 @@ func checkE2EInitializeCapabilities(t *testing.T, result *protocol.InitializeRes
 	}
 }
 
-func checkE2EDiagnosticsOnOpen(t *testing.T, c *lspClient, locs e2eLocs) {
+func checkE2EDiagnosticsOnOpen(t *testing.T, c *lspClient, locs *e2eLocs) {
 	t.Helper()
 	c.openFile(t, locs.brokenFile)
 	diags := c.waitForDiagnostics(t, locs.brokenFile, e2eRequestBudget)
@@ -123,7 +123,7 @@ func checkE2EDiagnosticsOnOpen(t *testing.T, c *lspClient, locs e2eLocs) {
 	}
 }
 
-func checkE2EDiagnosticsOnOpenCleanFile(t *testing.T, c *lspClient, locs e2eLocs) {
+func checkE2EDiagnosticsOnOpenCleanFile(t *testing.T, c *lspClient, locs *e2eLocs) {
 	t.Helper()
 	c.openFile(t, locs.extraFile)
 	diags := c.waitForDiagnostics(t, locs.extraFile, e2eRequestBudget)
@@ -132,7 +132,7 @@ func checkE2EDiagnosticsOnOpenCleanFile(t *testing.T, c *lspClient, locs e2eLocs
 	}
 }
 
-func checkE2EDefinitionCrossPackage(t *testing.T, c *lspClient, locs e2eLocs) {
+func checkE2EDefinitionCrossPackage(t *testing.T, c *lspClient, locs *e2eLocs) {
 	t.Helper()
 	got := c.waitForNonEmptyLocations(t, protocol.MethodTextDocumentDefinition, &protocol.DefinitionParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
@@ -148,7 +148,7 @@ func checkE2EDefinitionCrossPackage(t *testing.T, c *lspClient, locs e2eLocs) {
 	}
 }
 
-func checkE2EReferencesCrossFile(t *testing.T, c *lspClient, locs e2eLocs) {
+func checkE2EReferencesCrossFile(t *testing.T, c *lspClient, locs *e2eLocs) {
 	t.Helper()
 	got := c.waitForNonEmptyLocations(t, protocol.MethodTextDocumentReferences, &protocol.ReferenceParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
@@ -168,7 +168,7 @@ func checkE2EReferencesCrossFile(t *testing.T, c *lspClient, locs e2eLocs) {
 	}
 }
 
-func checkE2ECompletionSelector(t *testing.T, c *lspClient, locs e2eLocs) {
+func checkE2ECompletionSelector(t *testing.T, c *lspClient, locs *e2eLocs) {
 	t.Helper()
 	c.openFile(t, locs.usepkgFile)
 	resp := c.call(t, protocol.MethodTextDocumentCompletion, &protocol.CompletionParams{
@@ -185,8 +185,8 @@ func checkE2ECompletionSelector(t *testing.T, c *lspClient, locs e2eLocs) {
 		t.Fatalf("unmarshal completion result: %v", err)
 	}
 	found := false
-	for _, it := range items {
-		if it.Label == "Get" {
+	for i := range items {
+		if items[i].Label == "Get" {
 			found = true
 			break
 		}
@@ -196,7 +196,7 @@ func checkE2ECompletionSelector(t *testing.T, c *lspClient, locs e2eLocs) {
 	}
 }
 
-func checkE2EHoverReflectsUnsavedEdit(t *testing.T, c *lspClient, locs e2eLocs) {
+func checkE2EHoverReflectsUnsavedEdit(t *testing.T, c *lspClient, locs *e2eLocs) {
 	t.Helper()
 	c.openFile(t, locs.utilFile)
 	newText := strings.Replace(locs.utilSrc, "adds two ints", "adds two ints, edited", 1)

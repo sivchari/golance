@@ -150,7 +150,11 @@ func (imp *Importer) ImportFrom(path, _ string, _ types.ImportMode) (*types.Pack
 	if err != nil {
 		return nil, err
 	}
-	return v.(*types.Package), nil
+	pkg, ok := v.(*types.Package)
+	if !ok {
+		return nil, fmt.Errorf("typecheck: singleflight for %s returned %T, want *types.Package", path, v)
+	}
+	return pkg, nil
 }
 
 // cacheGet returns path's cached, fully-decoded *types.Package, if any.

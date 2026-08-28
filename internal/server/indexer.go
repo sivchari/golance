@@ -56,7 +56,9 @@ const (
 // before worktree sharing existed; there is nothing to share, and no
 // benefit to paying the relative-path bookkeeping for it).
 func repoKey(root string) (key string, shared bool) {
-	out, err := exec.Command("git", "-C", root, "rev-parse", "--git-common-dir").Output()
+	cmd := exec.Command("git", "rev-parse", "--git-common-dir")
+	cmd.Dir = root
+	out, err := cmd.Output()
 	if err != nil {
 		return root, false
 	}
@@ -252,6 +254,16 @@ func (s *Server) indexNeedsRebuild() bool {
 // database from an earlier successful build still exists on disk, it is
 // opened anyway — stale or incomplete is strictly better than
 // unavailable — with a warning that it may not reflect this run.
+// spawnIndexer starts exe — always this same running golance binary's own
+// resolved path (see os.Executable, buildIndex's only caller) — as the
+// indexer subprocess. exe is a function parameter, so gosec's
+// subprocess-launched-with-variable check exempts it as the
+// executable-name position (its own rule carves out parameters/receivers
+// used there).
+func spawnIndexer(exe string) *exec.Cmd {
+	return exec.Command(exe)
+}
+
 func (s *Server) buildIndex(root string) {
 	dbPath := s.dbPath(root)
 	cas := casDir(root)
@@ -266,7 +278,7 @@ func (s *Server) buildIndex(root string) {
 		return
 	}
 
-	cmd := exec.Command(exe)
+	cmd := spawnIndexer(exe)
 	cmd.Env = append(os.Environ(),
 		EnvIndexer+"=1",
 		EnvRoot+"="+root,

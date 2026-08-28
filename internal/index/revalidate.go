@@ -45,10 +45,14 @@ func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolcha
 	// internal/server.indexNeedsRebuild) applies instead of masking the
 	// error as "everything changed."
 	fp, err := db.BuildFingerprint()
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
+	notFound := errors.Is(err, store.ErrNotFound)
+	if err != nil && !notFound {
 		return false, fmt.Errorf("index: revalidate: read build fingerprint: %w", err)
 	}
-	if err != nil || fp != toolchainFP {
+	// notFound and a genuine fingerprint mismatch both mean the same thing
+	// here: nothing trustworthy to compare packages against, so report
+	// changed without a per-package fan-out.
+	if notFound || fp != toolchainFP {
 		return true, nil
 	}
 
