@@ -37,6 +37,17 @@ func (r *benchRand) intn(n int) int {
 	return int(v)
 }
 
+// u32n returns a value in [1, n] as uint32; the modulo bound keeps the
+// result far below math.MaxUint32, and the explicit guard makes that
+// dominance visible to static range analysis.
+func (r *benchRand) u32n(n int) uint32 {
+	v := r.intn(n) + 1
+	if v < 0 || v > math.MaxUint32 {
+		return 1
+	}
+	return uint32(v)
+}
+
 // syntheticPackage holds one package's inputs plus enough bookkeeping to
 // drive lookups against it once encoded and stored.
 type syntheticPackage struct {
@@ -79,9 +90,9 @@ func generateCorpus(numPkgs, symbolsPerPkg, refsPerPkg int) []syntheticPackage {
 			target := symIDHashes[rng.intn(symbolsPerPkg)]
 			b.AddRef(RefInput{
 				FileIdx:        0,
-				Line:           uint32(rng.intn(symbolsPerPkg) + 1),
-				Col:            uint32(rng.intn(40) + 1),
-				EndCol:         uint32(rng.intn(40) + 41),
+				Line:           rng.u32n(symbolsPerPkg),
+				Col:            rng.u32n(40),
+				EndCol:         rng.u32n(40) + 40,
 				ToSymbolIDHash: target,
 				ToPkgHash:      pkgHash,
 			})
