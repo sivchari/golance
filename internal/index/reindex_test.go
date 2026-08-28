@@ -21,7 +21,7 @@ func overlayReader(t *testing.T, path string, content []byte) FileReader {
 		if p == abs {
 			return content, nil
 		}
-		return os.ReadFile(p)
+		return os.ReadFile(filepath.Clean(p))
 	}
 }
 

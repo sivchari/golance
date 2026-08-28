@@ -4,16 +4,40 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-func runGit(t *testing.T, dir string, args ...string) {
+// runGitCmd runs cmd (already fully constructed by the caller with a
+// literal argument list — see gitInit/gitCommitEmpty/gitWorktreeAddOther)
+// with dir as its working directory, failing t on error.
+func runGitCmd(t *testing.T, dir string, cmd *exec.Cmd) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %v: %v\n%s", args, err, out)
+		t.Fatalf("git %s: %v\n%s", strings.Join(cmd.Args[1:], " "), err, out)
 	}
+}
+
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
+	runGitCmd(t, dir, exec.Command("git", "init", "-q"))
+}
+
+func gitCommitEmpty(t *testing.T, dir string) {
+	t.Helper()
+	runGitCmd(t, dir, exec.Command("git", "-c", "user.email=test@golance.test", "-c", "user.name=test", "commit", "-q", "--allow-empty", "-m", "init"))
+}
+
+// gitWorktreeAddOther adds a new worktree on branch "other" as a sibling
+// directory of dir (git resolves the literal "../wt-other" against the
+// command's working directory) and returns its absolute path — the same
+// constant-relative-target scheme as e2e_worktree_test.go's own
+// gitWorktreeAdd, so every exec.Command argument here is a literal.
+func gitWorktreeAddOther(t *testing.T, dir string) string {
+	t.Helper()
+	runGitCmd(t, dir, exec.Command("git", "worktree", "add", "-q", "-b", "other", "../wt-other", "HEAD"))
+	return filepath.Join(filepath.Dir(dir), "wt-other")
 }
 
 // gitRepoWithWorktree creates a fresh git repository with one commit and a
@@ -30,10 +54,9 @@ func gitRepoWithWorktree(t *testing.T) (mainRoot, otherRoot string) {
 	if err := os.MkdirAll(mainRoot, 0o750); err != nil {
 		t.Fatalf("mkdir %s: %v", mainRoot, err)
 	}
-	runGit(t, mainRoot, "init", "-q")
-	runGit(t, mainRoot, "-c", "user.email=test@golance.test", "-c", "user.name=test", "commit", "-q", "--allow-empty", "-m", "init")
-	otherRoot = filepath.Join(base, "other")
-	runGit(t, mainRoot, "worktree", "add", "-q", "-b", "other", otherRoot, "HEAD")
+	gitInit(t, mainRoot)
+	gitCommitEmpty(t, mainRoot)
+	otherRoot = gitWorktreeAddOther(t, mainRoot)
 	return mainRoot, otherRoot
 }
 
@@ -96,8 +119,8 @@ func TestRepoKey_DistinctReposDontShare(t *testing.T) {
 		if err := os.MkdirAll(r, 0o750); err != nil {
 			t.Fatalf("mkdir %s: %v", r, err)
 		}
-		runGit(t, r, "init", "-q")
-		runGit(t, r, "-c", "user.email=test@golance.test", "-c", "user.name=test", "commit", "-q", "--allow-empty", "-m", "init")
+		gitInit(t, r)
+		gitCommitEmpty(t, r)
 	}
 	if casDir(rootA) == casDir(rootB) {
 		t.Error("casDir is the same for two unrelated repositories")

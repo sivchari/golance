@@ -76,29 +76,6 @@ func (b *Builder) Build() ([]byte, error) {
 		return refLess(refs[i], refs[j])
 	})
 
-	strTable := make([]byte, 0, 4096)
-	interned := make(map[string]uint32)
-	intern := func(s string) (off, ln uint32, err error) {
-		if s == "" {
-			return 0, 0, nil
-		}
-		n := len(s)
-		if uint64(n) > math.MaxUint32 {
-			return 0, 0, fmt.Errorf("store: interned string exceeds %d bytes", uint32(math.MaxUint32))
-		}
-		if off, ok := interned[s]; ok {
-			return off, uint32(n), nil
-		}
-		curLen := len(strTable)
-		if uint64(curLen)+uint64(n) > math.MaxUint32 {
-			return 0, 0, fmt.Errorf("store: string table exceeds %d bytes", uint32(math.MaxUint32))
-		}
-		off = uint32(curLen)
-		strTable = append(strTable, s...)
-		interned[s] = off
-		return off, uint32(n), nil
-	}
-
 	nSymbols := len(b.symbols)
 	if nSymbols > math.MaxUint32 {
 		return nil, fmt.Errorf("store: too many symbols: %d", nSymbols)
@@ -112,9 +89,91 @@ func (b *Builder) Build() ([]byte, error) {
 		return nil, fmt.Errorf("store: too many files: %d", nFiles)
 	}
 
-	fileTable := make([]byte, len(b.files)*fileRecordSize)
-	for i, f := range b.files {
-		off, ln, err := intern(f)
+	it := newInterner()
+	fileTable, err := buildFileTable(b.files, it)
+	if err != nil {
+		return nil, err
+	}
+	symTable, err := buildSymTable(b.symbols, it)
+	if err != nil {
+		return nil, err
+	}
+	refsTable := buildRefsTable(refs)
+
+	symOff := uint64(headerSize)
+	refsOff := symOff + uint64(len(symTable))
+	fileOff := refsOff + uint64(len(refsTable))
+	strOff := fileOff + uint64(len(fileTable))
+	total := strOff + uint64(len(it.table))
+
+	blob := make([]byte, total)
+	copy(blob[offMagic:offMagic+blobMagicLen], blobMagic)
+	binary.LittleEndian.PutUint16(blob[offVersion:], currentVersion)
+	binary.LittleEndian.PutUint32(blob[offSymbolCount:], uint32(nSymbols))
+	binary.LittleEndian.PutUint32(blob[offRefsCount:], uint32(nRefs))
+	binary.LittleEndian.PutUint32(blob[offFileCount:], uint32(nFiles))
+	binary.LittleEndian.PutUint64(blob[offSymTblOff:], symOff)
+	binary.LittleEndian.PutUint64(blob[offSymTblLen:], uint64(len(symTable)))
+	binary.LittleEndian.PutUint64(blob[offRefsTblOff:], refsOff)
+	binary.LittleEndian.PutUint64(blob[offRefsTblLen:], uint64(len(refsTable)))
+	binary.LittleEndian.PutUint64(blob[offFileTblOff:], fileOff)
+	binary.LittleEndian.PutUint64(blob[offFileTblLen:], uint64(len(fileTable)))
+	binary.LittleEndian.PutUint64(blob[offStrTblOff:], strOff)
+	binary.LittleEndian.PutUint64(blob[offStrTblLen:], uint64(len(it.table)))
+
+	copy(blob[symOff:], symTable)
+	copy(blob[refsOff:], refsTable)
+	copy(blob[fileOff:], fileTable)
+	copy(blob[strOff:], it.table)
+
+	return blob, nil
+}
+
+// interner deduplicates strings into one shared table, returning each
+// string's (offset, length) the first time it's seen and reusing that
+// offset for repeats.
+type interner struct {
+	table []byte
+	seen  map[string]uint32
+}
+
+func newInterner() *interner {
+	return &interner{table: make([]byte, 0, 4096), seen: make(map[string]uint32)}
+}
+
+func (it *interner) intern(s string) (off, ln uint32, err error) {
+	if s == "" {
+		return 0, 0, nil
+	}
+	n := len(s)
+	if uint64(n) > math.MaxUint32 {
+		return 0, 0, fmt.Errorf("store: interned string exceeds %d bytes", uint32(math.MaxUint32))
+	}
+	if off, ok := it.seen[s]; ok {
+		return off, uint32(n), nil
+	}
+	curLen := len(it.table)
+	if uint64(curLen)+uint64(n) > math.MaxUint32 {
+		return 0, 0, fmt.Errorf("store: string table exceeds %d bytes", uint32(math.MaxUint32))
+	}
+	// curLen alone is already bounded by the compound check above (n >=
+	// 0), spelled out as its own guard so the conversion below is
+	// provably safe on its own, not just as a consequence of it.
+	if curLen > math.MaxUint32 {
+		return 0, 0, fmt.Errorf("store: string table exceeds %d bytes", uint32(math.MaxUint32))
+	}
+	off = uint32(curLen)
+	it.table = append(it.table, s...)
+	it.seen[s] = off
+	return off, uint32(n), nil
+}
+
+// buildFileTable encodes files' interned paths into the fixed-width file
+// table.
+func buildFileTable(files []string, it *interner) ([]byte, error) {
+	fileTable := make([]byte, len(files)*fileRecordSize)
+	for i, f := range files {
+		off, ln, err := it.intern(f)
 		if err != nil {
 			return nil, err
 		}
@@ -122,18 +181,23 @@ func (b *Builder) Build() ([]byte, error) {
 		binary.LittleEndian.PutUint32(rec[fileOffPathOff:], off)
 		binary.LittleEndian.PutUint32(rec[fileOffPathLen:], ln)
 	}
+	return fileTable, nil
+}
 
-	symTable := make([]byte, len(b.symbols)*symbolRecordSize)
-	for i, s := range b.symbols {
-		nameOff, nameLen, err := intern(s.Name)
+// buildSymTable encodes symbols (with their Name/Doc/Sig interned) into the
+// fixed-width symbol table.
+func buildSymTable(symbols []SymbolInput, it *interner) ([]byte, error) {
+	symTable := make([]byte, len(symbols)*symbolRecordSize)
+	for i, s := range symbols {
+		nameOff, nameLen, err := it.intern(s.Name)
 		if err != nil {
 			return nil, err
 		}
-		docOff, docLen, err := intern(s.Doc)
+		docOff, docLen, err := it.intern(s.Doc)
 		if err != nil {
 			return nil, err
 		}
-		sigOff, sigLen, err := intern(s.Sig)
+		sigOff, sigLen, err := it.intern(s.Sig)
 		if err != nil {
 			return nil, err
 		}
@@ -151,7 +215,12 @@ func (b *Builder) Build() ([]byte, error) {
 		binary.LittleEndian.PutUint32(rec[symOffLine:], s.Line)
 		binary.LittleEndian.PutUint32(rec[symOffCol:], s.Col)
 	}
+	return symTable, nil
+}
 
+// buildRefsTable encodes refs (already sorted by (FileIdx, Line, Col)) into
+// the fixed-width refs table.
+func buildRefsTable(refs []RefInput) []byte {
 	refsTable := make([]byte, len(refs)*refsRecordSize)
 	for i, r := range refs {
 		rec := refsTable[i*refsRecordSize : (i+1)*refsRecordSize]
@@ -162,34 +231,7 @@ func (b *Builder) Build() ([]byte, error) {
 		binary.LittleEndian.PutUint64(rec[refOffToSymbolIDHash:], r.ToSymbolIDHash)
 		binary.LittleEndian.PutUint64(rec[refOffToPkgHash:], r.ToPkgHash)
 	}
-
-	symOff := uint64(headerSize)
-	refsOff := symOff + uint64(len(symTable))
-	fileOff := refsOff + uint64(len(refsTable))
-	strOff := fileOff + uint64(len(fileTable))
-	total := strOff + uint64(len(strTable))
-
-	blob := make([]byte, total)
-	copy(blob[offMagic:offMagic+blobMagicLen], blobMagic)
-	binary.LittleEndian.PutUint16(blob[offVersion:], currentVersion)
-	binary.LittleEndian.PutUint32(blob[offSymbolCount:], uint32(nSymbols))
-	binary.LittleEndian.PutUint32(blob[offRefsCount:], uint32(nRefs))
-	binary.LittleEndian.PutUint32(blob[offFileCount:], uint32(nFiles))
-	binary.LittleEndian.PutUint64(blob[offSymTblOff:], symOff)
-	binary.LittleEndian.PutUint64(blob[offSymTblLen:], uint64(len(symTable)))
-	binary.LittleEndian.PutUint64(blob[offRefsTblOff:], refsOff)
-	binary.LittleEndian.PutUint64(blob[offRefsTblLen:], uint64(len(refsTable)))
-	binary.LittleEndian.PutUint64(blob[offFileTblOff:], fileOff)
-	binary.LittleEndian.PutUint64(blob[offFileTblLen:], uint64(len(fileTable)))
-	binary.LittleEndian.PutUint64(blob[offStrTblOff:], strOff)
-	binary.LittleEndian.PutUint64(blob[offStrTblLen:], uint64(len(strTable)))
-
-	copy(blob[symOff:], symTable)
-	copy(blob[refsOff:], refsTable)
-	copy(blob[fileOff:], fileTable)
-	copy(blob[strOff:], strTable)
-
-	return blob, nil
+	return refsTable
 }
 
 // refLess reports whether a sorts before b by (FileIdx, Line, Col).

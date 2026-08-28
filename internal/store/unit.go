@@ -51,15 +51,15 @@ func EncodeUnitBlob(u *UnitBlob) []byte {
 	b := make([]byte, size)
 	copy(b[0:4], unitMagic)
 	binary.LittleEndian.PutUint16(b[4:6], unitVersion)
-	binary.LittleEndian.PutUint32(b[8:12], uint32(len(u.Facts)))
-	binary.LittleEndian.PutUint32(b[12:16], uint32(len(u.Export)))
-	binary.LittleEndian.PutUint32(b[16:20], uint32(len(u.Files)))
-	binary.LittleEndian.PutUint32(b[20:24], uint32(len(u.Index.Names)))
+	binary.LittleEndian.PutUint32(b[8:12], u32len(len(u.Facts)))
+	binary.LittleEndian.PutUint32(b[12:16], u32len(len(u.Export)))
+	binary.LittleEndian.PutUint32(b[16:20], u32len(len(u.Files)))
+	binary.LittleEndian.PutUint32(b[20:24], u32len(len(u.Index.Names)))
 	off := 24
 	off += copy(b[off:], u.Facts)
 	off += copy(b[off:], u.Export)
 	for _, f := range u.Files {
-		binary.LittleEndian.PutUint32(b[off:], uint32(len(f.Path)))
+		binary.LittleEndian.PutUint32(b[off:], u32len(len(f.Path)))
 		off += 4
 		off += copy(b[off:], f.Path)
 		// os.FileInfo never reports a negative size or mtime in practice;
@@ -88,16 +88,16 @@ func EncodeUnitBlob(u *UnitBlob) []byte {
 // are folded into the trailing sections themselves (see decodeUnitBlob).
 func putIndexEntries(b []byte, off int, idx PackageIndexEntries) int {
 	for _, n := range idx.Names {
-		binary.LittleEndian.PutUint32(b[off:], uint32(len(n.Name)))
+		binary.LittleEndian.PutUint32(b[off:], u32len(len(n.Name)))
 		off += 4
 		off += copy(b[off:], n.Name)
 		binary.LittleEndian.PutUint64(b[off:], n.IDHash)
 		off += 8
 	}
-	binary.LittleEndian.PutUint32(b[off:], uint32(len(idx.Methods)))
+	binary.LittleEndian.PutUint32(b[off:], u32len(len(idx.Methods)))
 	off += 4
 	for _, m := range idx.Methods {
-		binary.LittleEndian.PutUint32(b[off:], uint32(len(m.Name)))
+		binary.LittleEndian.PutUint32(b[off:], u32len(len(m.Name)))
 		off += 4
 		off += copy(b[off:], m.Name)
 		binary.LittleEndian.PutUint64(b[off:], m.Entry.PkgHash)
@@ -105,12 +105,12 @@ func putIndexEntries(b []byte, off int, idx PackageIndexEntries) int {
 		binary.LittleEndian.PutUint64(b[off:], m.Entry.TypeSymbolIDHash)
 		off += 8
 	}
-	binary.LittleEndian.PutUint32(b[off:], uint32(len(idx.SymStrs)))
+	binary.LittleEndian.PutUint32(b[off:], u32len(len(idx.SymStrs)))
 	off += 4
 	for _, s := range idx.SymStrs {
 		binary.LittleEndian.PutUint64(b[off:], s.IDHash)
 		off += 8
-		binary.LittleEndian.PutUint32(b[off:], uint32(len(s.SymbolID)))
+		binary.LittleEndian.PutUint32(b[off:], u32len(len(s.SymbolID)))
 		off += 4
 		off += copy(b[off:], s.SymbolID)
 	}

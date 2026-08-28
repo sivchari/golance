@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"math"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
@@ -120,11 +121,18 @@ func (s *Server) handleSignatureHelp(ctx context.Context, params json.RawMessage
 	for i, ps := range info.Params {
 		sigParams[i] = protocol.ParameterInformation{Label: protocol.String(ps)}
 	}
+	activeParam := info.ActiveParam
+	if activeParam < 0 {
+		activeParam = 0
+	}
+	if activeParam > math.MaxUint32 {
+		activeParam = math.MaxUint32
+	}
 	return &protocol.SignatureHelp{
 		Signatures: []protocol.SignatureInformation{{
 			Label:           info.Label,
 			Parameters:      sigParams,
-			ActiveParameter: protocol.NewNullable(uint32(info.ActiveParam)),
+			ActiveParameter: protocol.NewNullable(uint32(activeParam)),
 		}},
 	}, nil
 }

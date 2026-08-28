@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"math"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
@@ -38,6 +39,12 @@ func (s *Server) xrefPosition(path string, pos protocol.Position) (line, col int
 	l, c, ok := positionToXref(text, pos)
 	if !ok {
 		return 0, 0, false
+	}
+	if l < 0 {
+		l = 0
+	}
+	if l > math.MaxUint32 {
+		l = math.MaxUint32
 	}
 	return int(s.correctQueryLine(path, uint32(l))), c, true
 }

@@ -3,15 +3,41 @@ package xref
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/sivchari/golance/internal/store"
 )
 
+// toUint32Pos converts line and col — always non-negative in practice, an
+// LSP client's own byte-offset-derived position (see
+// internal/server.xrefPosition) — to the uint32 coordinates resolveAt
+// takes, erroring instead of silently wrapping around if either is
+// somehow negative.
+func toUint32Pos(line, col int) (uint32, uint32, error) {
+	if line < 0 {
+		return 0, 0, fmt.Errorf("xref: negative line %d", line)
+	}
+	if line > math.MaxUint32 {
+		return 0, 0, fmt.Errorf("xref: line %d exceeds uint32 range", line)
+	}
+	if col < 0 {
+		return 0, 0, fmt.Errorf("xref: negative col %d", col)
+	}
+	if col > math.MaxUint32 {
+		return 0, 0, fmt.Errorf("xref: col %d exceeds uint32 range", col)
+	}
+	return uint32(line), uint32(col), nil
+}
+
 // Definition returns the declaration location of the symbol at (file, line,
 // col). If the cursor is already on the declaration, it resolves to itself.
 func (r *Resolver) Definition(file string, line, col int) ([]Location, error) {
-	target, err := r.resolveAt(file, uint32(line), uint32(col))
+	l, c, err := toUint32Pos(line, col)
+	if err != nil {
+		return nil, err
+	}
+	target, err := r.resolveAt(file, l, c)
 	if err != nil {
 		return nil, err
 	}
@@ -27,7 +53,11 @@ func (r *Resolver) Definition(file string, line, col int) ([]Location, error) {
 // (see package doc). includeDecl controls whether the declaration itself is
 // included.
 func (r *Resolver) References(file string, line, col int, includeDecl bool) ([]Location, error) {
-	target, err := r.resolveAt(file, uint32(line), uint32(col))
+	l, c, err := toUint32Pos(line, col)
+	if err != nil {
+		return nil, err
+	}
+	target, err := r.resolveAt(file, l, c)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +171,11 @@ func (r *Resolver) symbolInfoFromIDHash(idHash uint64) (SymbolInfo, bool, error)
 //
 // TODO(v0.1): no collision check against an existing newName in scope.
 func (r *Resolver) Rename(file string, line, col int, newName string) (map[string][]Edit, error) {
-	target, err := r.resolveAt(file, uint32(line), uint32(col))
+	l, c, err := toUint32Pos(line, col)
+	if err != nil {
+		return nil, err
+	}
+	target, err := r.resolveAt(file, l, c)
 	if err != nil {
 		return nil, err
 	}

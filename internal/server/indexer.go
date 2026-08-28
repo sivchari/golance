@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -376,6 +377,28 @@ func (s *Server) showMessage(typ protocol.MessageType, msg string) {
 	}
 }
 
+// progressPercent returns done/total as a percentage in [0, 100], or 0 if
+// total is not yet known (<= 0) or either value is out of the range this
+// computation can trust — "PROGRESS done total" lines come from golance's
+// own indexer subprocess (see relayIndexProgress), so this is defensive
+// against a malformed line, not untrusted external input.
+func progressPercent(done, total int) uint32 {
+	if total <= 0 {
+		return 0
+	}
+	if done < 0 {
+		return 0
+	}
+	p := done * 100 / total
+	if p < 0 {
+		return 0
+	}
+	if p > math.MaxUint32 {
+		return 0
+	}
+	return uint32(p)
+}
+
 // relayIndexProgress reads "PROGRESS done total" lines written by the
 // indexer subprocess's stdout (see cmd/golance's indexer entry point) and
 // relays them as $/progress notifications.
@@ -400,10 +423,7 @@ func (s *Server) relayIndexProgress(r io.Reader) {
 			began = true
 			s.notifyProgress(token, &protocol.WorkDoneProgressBegin{Kind: "begin", Title: "golance: building index"})
 		}
-		pct := uint32(0)
-		if total > 0 {
-			pct = uint32(done * 100 / total)
-		}
+		pct := progressPercent(done, total)
 		msg := fmt.Sprintf("%d/%d packages", done, total)
 		s.notifyProgress(token, &protocol.WorkDoneProgressReport{Kind: "report", Percentage: &pct, Message: &msg})
 	}

@@ -81,7 +81,7 @@ func newTestServer(t *testing.T) (*Server, *graph.Snapshot, string) {
 // of the occurrence-th (1-based) identifier named "Hello", in source order.
 func identPosition(t *testing.T, path string, occurrence int) protocol.Position {
 	t.Helper()
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
@@ -269,7 +269,7 @@ func TestHandleWorkspaceSymbol(t *testing.T) {
 func TestDidOpenDidChangeReflectedInHover(t *testing.T) {
 	s, snap, _ := newTestServer(t)
 	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
-	disk, err := os.ReadFile(file)
+	disk, err := os.ReadFile(filepath.Clean(file))
 	if err != nil {
 		t.Fatalf("read %s: %v", file, err)
 	}

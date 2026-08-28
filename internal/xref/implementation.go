@@ -14,7 +14,11 @@ import (
 // a sound name-based first pass over the method index followed by a
 // types.Implements confirmation against export data (see package doc).
 func (r *Resolver) Implementation(file string, line, col int) ([]Location, error) {
-	target, err := r.resolveAt(file, uint32(line), uint32(col))
+	l, c, err := toUint32Pos(line, col)
+	if err != nil {
+		return nil, err
+	}
+	target, err := r.resolveAt(file, l, c)
 	if err != nil {
 		return nil, err
 	}

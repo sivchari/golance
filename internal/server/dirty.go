@@ -3,7 +3,9 @@ package server
 import (
 	"bytes"
 	"crypto/sha256"
+	"math"
 	"os"
+	"path/filepath"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
@@ -37,7 +39,23 @@ func dirtyLineMap(from, to []byte, line uint32) (uint32, bool) {
 	}
 
 	mapped := idx + (len(toLines) - len(fromLines))
-	if mapped < boundary || mapped >= len(toLines) {
+	return mappedLine(mapped, boundary, len(toLines))
+}
+
+// mappedLine converts mapped to a 1-based uint32 line number, if it falls
+// within [boundary, toLineCount) — a plain sequence of early returns (no
+// compound conditions) so each one is independently provable.
+func mappedLine(mapped, boundary, toLineCount int) (uint32, bool) {
+	if mapped < boundary {
+		return 0, false
+	}
+	if mapped >= toLineCount {
+		return 0, false
+	}
+	if mapped < 0 {
+		return 0, false
+	}
+	if mapped > math.MaxUint32 {
 		return 0, false
 	}
 	return uint32(mapped) + 1, true
@@ -49,7 +67,7 @@ func dirtyLineMap(from, to []byte, line uint32) (uint32, bool) {
 // trust boundary os.ReadFile-based file reading elsewhere in this server
 // (and in overlay.Overlay.ReadFile) already relies on.
 func diskReadFile(path string) ([]byte, error) {
-	return os.ReadFile(path)
+	return os.ReadFile(filepath.Clean(path))
 }
 
 // dirtyLines returns path's on-disk (saved) and editor-buffer (overlay)

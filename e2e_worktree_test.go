@@ -184,7 +184,7 @@ func TestE2E_WorktreeSharesIndex(t *testing.T) {
 
 	// The original worktree A file on disk is untouched: worktree A's own
 	// database entry for lib/util must still be the pre-edit content.
-	mainUtilSrc, err := os.ReadFile(locs.utilFile)
+	mainUtilSrc, err := os.ReadFile(filepath.Clean(locs.utilFile))
 	if err != nil {
 		t.Fatalf("read worktree A util.go: %v", err)
 	}
