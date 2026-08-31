@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 
 	"go.etcd.io/bbolt"
@@ -28,6 +29,24 @@ var allBuckets = [][]byte{bucketUnit, bucketMeta, bucketName, bucketMethod, buck
 // database's build fingerprint (see PutBuildFingerprint).
 var buildFingerprintKey = []byte("\x00golance:fingerprint")
 
+// schemaVersion is the on-disk layout version of the unit/name/method/
+// symstr buckets (see UnitPointer's encoding in encodeUnitPointer). Bump it
+// whenever that encoding changes incompatibly; Open discards and recreates
+// any database it finds recorded under a different version, or under none
+// at all (see discardStale's doc) — the same byte layout has been used
+// since before this check existed, so a stale database's "unit" records
+// decode without error; they are just silently wrong once the [CAS] blobs
+// their BlobKey fields point at are no longer the ones that were current
+// when those records were written (e.g. after a schema change, or a CAS
+// directory that was never populated from the same build that wrote this
+// database — see casDir's doc in internal/server). A decode-error check
+// alone cannot catch that; this version marker can.
+const schemaVersion uint16 = 1
+
+// schemaVersionKey is a reserved bucketMeta key recording the schemaVersion
+// the database's buckets were last (re)written under.
+var schemaVersionKey = []byte("\x00golance:schema")
+
 // DB is a handle to golance's per-root index: a small bbolt database mapping
 // each workspace package to its current [CAS] blob key (see [UnitPointer]),
 // plus the name/method/SymbolID-string lookup indices built from those
@@ -45,10 +64,30 @@ type DB struct {
 // all buckets exist. Unlike the pre-CAS design, this is always a per-root
 // file: nothing about it is ever shared across worktrees, so there is
 // nothing to lock or wait for.
+//
+// A database found at path but recorded under a different schemaVersion (or
+// none at all — see discardStale) is discarded and recreated empty rather
+// than opened as-is: it is a regenerable cache, not user data, and the
+// caller's usual "nothing indexed yet" recovery path (index.Revalidate
+// reports every package as not-yet-in-db, triggering a full rebuild — see
+// internal/server.indexNeedsRebuild) already handles an empty database
+// correctly.
 func Open(path string) (*DB, error) {
 	bdb, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
+	}
+	if discardStale(bdb) {
+		if err := bdb.Close(); err != nil {
+			return nil, fmt.Errorf("store: close stale %s: %w", path, err)
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("store: remove stale %s: %w", path, err)
+		}
+		bdb, err = bbolt.Open(path, 0o600, nil)
+		if err != nil {
+			return nil, fmt.Errorf("store: reopen %s: %w", path, err)
+		}
 	}
 	err = bdb.Update(func(tx *bbolt.Tx) error {
 		for _, b := range allBuckets {
@@ -56,13 +95,39 @@ func Open(path string) (*DB, error) {
 				return err
 			}
 		}
-		return nil
+		return tx.Bucket(bucketMeta).Put(schemaVersionKey, schemaVersionBytes())
 	})
 	if err != nil {
 		_ = bdb.Close()
 		return nil, fmt.Errorf("store: init buckets: %w", err)
 	}
 	return &DB{bolt: bdb}, nil
+}
+
+// discardStale reports whether bdb's meta bucket already exists (meaning
+// some earlier Open — old or new code — has run against this file at least
+// once) but does not record the current schemaVersion. A brand new file has
+// no meta bucket yet at all, since nothing has called
+// CreateBucketIfNotExists on it; that case is never stale, as there is
+// nothing in it to distrust.
+func discardStale(bdb *bbolt.DB) bool {
+	var stale bool
+	_ = bdb.View(func(tx *bbolt.Tx) error {
+		meta := tx.Bucket(bucketMeta)
+		if meta == nil {
+			return nil
+		}
+		v := meta.Get(schemaVersionKey)
+		stale = len(v) != 2 || binary.LittleEndian.Uint16(v) != schemaVersion
+		return nil
+	})
+	return stale
+}
+
+func schemaVersionBytes() []byte {
+	b := make([]byte, 2)
+	binary.LittleEndian.PutUint16(b, schemaVersion)
+	return b
 }
 
 // Close closes the underlying database file.

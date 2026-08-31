@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"go/types"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"go.lsp.dev/protocol"
@@ -111,9 +112,23 @@ func (s *Server) revalidateGraph(opts graph.Options, patterns []string) {
 	s.setWorkspace(opts.Dir, snap)
 }
 
-// handleDidChangeWatchedFiles reloads the import graph in the background
-// when go.mod, go.sum, go.work, or go.work.sum changes, since any of those
-// can change what packages.Load would compute.
+// handleDidChangeWatchedFiles keeps the workspace current when files change
+// outside the editor — most notably a `git pull` or branch switch, which a
+// client's own file watcher reports the same way it would a save. Two
+// change classes are handled differently:
+//
+//   - go.mod, go.sum, go.work, or go.work.sum changing reloads the import
+//     graph unconditionally and immediately, in the background: any of
+//     these can change what packages.Load would compute for the whole
+//     workspace, and such a change is comparatively rare.
+//   - .go files changing (created, edited, or deleted) are handed to
+//     s.watch (see watch.go), which debounces and coalesces them — a
+//     `git pull` can touch thousands of files in one burst — into a
+//     single revalidateWorkspace pass once things go quiet.
+//
+// A batch containing both is handled as a go.mod-style reload only: that
+// already implies everything a .go-file-driven revalidation would also
+// find, so there is nothing left for s.watch to do.
 func (s *Server) handleDidChangeWatchedFiles(_ context.Context, params json.RawMessage) error {
 	var p protocol.DidChangeWatchedFilesParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
@@ -129,6 +144,27 @@ func (s *Server) handleDidChangeWatchedFiles(_ context.Context, params json.RawM
 			return nil
 		}
 	}
+
+	sawGoFile := false
+	reload := false
+	var knownDirs map[string]bool
+	for _, ch := range p.Changes {
+		path := ch.URI.FsPath()
+		if !strings.HasSuffix(path, ".go") {
+			continue
+		}
+		sawGoFile = true
+		if knownDirs == nil {
+			knownDirs = packageDirs(ws.snap)
+		}
+		if needsGraphReload(ws, knownDirs, ch) {
+			reload = true
+			break
+		}
+	}
+	if sawGoFile {
+		s.watch.onEvent(ws.root, reload)
+	}
 	return nil
 }
 
@@ -141,4 +177,62 @@ func isModuleFile(path string) bool {
 	default:
 		return false
 	}
+}
+
+// needsGraphReload reports whether ch, a change to a .go file, can only be
+// resolved correctly by reloading the import graph (`go list`) rather than
+// the cheaper path (revalidateIndex against the graph already loaded):
+//
+//   - a file already known to the graph (ws.fileToPkg) being deleted
+//     changes that package's GoFiles, which only a reload can discover —
+//     an edit to a known file does not, since revalidateIndex's own
+//     per-package content hash already covers that case;
+//   - a file not known to the graph landing in a directory that is already
+//     a known package's directory (knownDirs) also changes that package's
+//     GoFiles, whether the event says Created or Changed (some clients
+//     coalesce a create immediately followed by a write into one Changed
+//     event) — same reasoning, only a reload can discover it.
+//
+// A file landing in a directory the graph has never seen at all is a
+// brand-new package. Discovering that would need its own `go list` on
+// every single such event to even find out (unlike the two cases above,
+// where knownDirs/ws.fileToPkg already answer it for free), so this v0.1
+// scope deliberately does not: a brand-new package is picked up on the
+// next restart instead, rather than paying a `go list` per stray Created
+// event (e.g. a scratch file dropped in the workspace outside any package,
+// or transient files an external tool creates and removes in one burst).
+func needsGraphReload(ws *workspace, knownDirs map[string]bool, ch protocol.FileEvent) bool {
+	path := ch.URI.FsPath()
+	if _, known := ws.fileToPkg[path]; known {
+		return ch.Type == protocol.FileChangeTypeDeleted
+	}
+	return knownDirs[filepath.Dir(path)]
+}
+
+// packageDirs returns the set of directories snap already has a package
+// for, used by needsGraphReload to recognize a new file landing inside an
+// already-known package.
+func packageDirs(snap *graph.Snapshot) map[string]bool {
+	dirs := make(map[string]bool, len(snap.Packages))
+	for _, pkg := range snap.Packages {
+		dirs[pkg.Dir] = true
+	}
+	return dirs
+}
+
+// revalidateWorkspace re-checks root's workspace after a debounced batch of
+// external .go file changes (see watch.go). If reload is true, the import
+// graph is reloaded from scratch first (see revalidateGraph) — a
+// new/removed file in an already-known package can only be discovered that
+// way (see needsGraphReload); a brand-new package is not discovered here at
+// all, deferred to the next restart (see needsGraphReload's doc). Either
+// way, the facts index is then revalidated exactly like the once-at-startup
+// check (see revalidateIndex): if it disagrees with what is now on disk,
+// the indexer subprocess rebuilds it in the background exactly as it does
+// on a cold start.
+func (s *Server) revalidateWorkspace(root string, reload bool) {
+	if reload {
+		s.revalidateGraph(graph.Options{Dir: root, Offline: s.opts.Offline}, []string{"./..."})
+	}
+	s.revalidateIndex(root)
 }

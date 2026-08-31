@@ -161,6 +161,85 @@ func TestBuild_CrossPackageRefIdentity(t *testing.T) {
 	}
 }
 
+// TestBuild_CrossPackageMethodRefIdentity verifies that a cross-package call
+// to a method resolves to the exact same SymbolID hash as its own
+// definition. The defining type's method set is declared in an order
+// (Zulu, Alpha, Mike, GetLabel) that differs from alphabetical order: a
+// SymbolID built from a method's objectpath encodes its index within the
+// method's defining *types.Named, so this guards against that index
+// disagreeing between the definer's source-checked type (the definition
+// side) and the caller's export-data-decoded import of it (the reference
+// side) — the same gap that left cross-package method references untested
+// even though TestBuild_CrossPackageRefIdentity covers a plain function.
+// Uses its own synthetic module (rather than testdata/module) so it does
+// not have to share leaf/mid/top's fixed file layout with every other test
+// in this package.
+func TestBuild_CrossPackageMethodRefIdentity(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "go.mod", "module example.com/methodxref\n\ngo 1.23\n")
+	writeFile(t, dir, "defpkg/defpkg.go", `package defpkg
+
+type T struct{}
+
+func (t *T) Zulu() string     { return "z" }
+func (t *T) Alpha() string    { return "a" }
+func (t *T) Mike() string     { return "m" }
+func (t *T) GetLabel() string { return "label" }
+`)
+	writeFile(t, dir, "callerpkg/callerpkg.go", `package callerpkg
+
+import "example.com/methodxref/defpkg"
+
+func Use(t *defpkg.T) string {
+	return t.Zulu() + t.Alpha() + t.Mike() + t.GetLabel()
+}
+`)
+
+	snap := loadSnapshot(t, dir)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+
+	stats, err := Build(context.Background(), snap, db, cas, Options{})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if stats.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", stats.Errors)
+	}
+
+	const defPkgPath = "example.com/methodxref/defpkg"
+	const callerPkgPath = "example.com/methodxref/callerpkg"
+
+	for _, method := range []string{"Zulu", "Alpha", "Mike", "GetLabel"} {
+		idHash := findSymbolByName(t, db, cas, defPkgPath, method)
+
+		var found bool
+		viewFacts(t, db, cas, callerPkgPath, func(v *store.View) {
+			for _, r := range v.RefsTo(idHash) {
+				if r.ToPkgHash() == store.Hash(defPkgPath) {
+					found = true
+				}
+			}
+		})
+		if !found {
+			t.Errorf("caller has no ref resolving to defpkg.T.%s's SymbolID; cross-package method ref identity broken", method)
+		}
+	}
+}
+
+// writeFile writes content to rel under dir, creating parent directories as
+// needed.
+func writeFile(t *testing.T, dir, rel, content string) {
+	t.Helper()
+	full := filepath.Join(dir, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(full), err)
+	}
+	if err := os.WriteFile(full, []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", full, err)
+	}
+}
+
 // TestBuild_SecondRunSkipsAll verifies a second Build over unchanged
 // sources reprocesses nothing.
 func TestBuild_SecondRunSkipsAll(t *testing.T) {

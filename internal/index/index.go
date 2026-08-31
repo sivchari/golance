@@ -70,6 +70,16 @@ type Stats struct {
 	Skipped   int
 	Errors    int
 	Elapsed   time.Duration
+	// TypeChecked is the subset of Processed that required an actual
+	// parse/type-check (checkAndStoreOutcome): a real package rebuild, as
+	// opposed to a CAS hit (Processed-TypeChecked), which resolves a
+	// package's export/facts data from a previously-built blob without
+	// looking at its source at all. Callers that need to verify a build
+	// actually avoided rechecking something (e.g. reverting to
+	// previously-seen content) should assert on this directly rather than
+	// on wall-clock time, which a shared CI runner's load can make an
+	// unreliable proxy for the same fact.
+	TypeChecked int
 }
 
 // Build resolves every root (workspace) package in snap against db and cas,
@@ -144,7 +154,7 @@ func runBuildJob(ctx context.Context, sem *semaphore.Weighted, fset *token.FileS
 	if err := sem.Acquire(ctx, 1); err != nil {
 		return results.recordFatal(err)
 	}
-	outcome, skipped, err := processUnit(fset, imp, exp, snap, db, cas, keys, opts, path, readFileDisk, true)
+	outcome, skipped, typeChecked, err := processUnit(fset, imp, exp, snap, db, cas, keys, opts, path, readFileDisk, true)
 	sem.Release(1)
-	return results.record(outcome, skipped, err)
+	return results.record(outcome, skipped, typeChecked, err)
 }

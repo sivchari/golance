@@ -56,6 +56,10 @@ type Server struct {
 	queuesMu sync.Mutex
 	queues   map[string]*notifQueue
 
+	pendingMu sync.Mutex
+	pending   map[string]chan *message // keyed by the request id Request assigned, awaiting the client's response
+	nextID    atomic.Int64
+
 	// wg tracks in-flight request and notification handler goroutines so
 	// Serve can wait for their responses/side effects to complete before
 	// returning, instead of racing the write of a still-running handler
@@ -97,7 +101,8 @@ func NewServer(opts ...Option) *Server {
 			Interactive: newPool(0),
 			Background:  newPool(4),
 		},
-		queues: make(map[string]*notifQueue),
+		queues:  make(map[string]*notifQueue),
+		pending: make(map[string]chan *message),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -158,6 +163,8 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 			s.dispatchRequest(ctx, &m)
 		case m.isNotification():
 			s.dispatchNotification(ctx, &m)
+		case m.isResponse():
+			s.dispatchResponse(&m)
 		}
 		if lifecycleState(s.state.Load()) == stateExited {
 			return s.exitErr
@@ -235,6 +242,22 @@ func (s *Server) dispatchNotification(ctx context.Context, m *message) {
 	})
 }
 
+// dispatchResponse routes a response to one of our own server-initiated
+// requests (see Request) to the caller awaiting it, keyed by id. A response
+// with no matching pending entry (already delivered, or Request's caller
+// already gave up on ctx) is silently dropped.
+func (s *Server) dispatchResponse(m *message) {
+	key := string(m.ID)
+	s.pendingMu.Lock()
+	ch, ok := s.pending[key]
+	delete(s.pending, key)
+	s.pendingMu.Unlock()
+	if !ok {
+		return
+	}
+	ch <- m
+}
+
 func (s *Server) handleCancelRequest(params json.RawMessage) {
 	var cp struct {
 		ID json.RawMessage `json:"id"`
@@ -310,6 +333,52 @@ func (s *Server) Notify(method string, params any) error {
 		return fmt.Errorf("rpc: marshal notify params for %s: %w", method, err)
 	}
 	return s.writeMessage(&message{JSONRPC: jsonrpcVersion, Method: method, Params: b})
+}
+
+// Request sends a server-initiated JSON-RPC request to the client and
+// blocks until it responds or ctx is done. This is the mechanism for the
+// small set of server-to-client requests LSP defines (e.g.
+// client/registerCapability) that need the client's response; server-
+// initiated notifications that don't use Notify instead.
+func (s *Server) Request(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	b, err := protocol.Marshal(params)
+	if err != nil {
+		return nil, fmt.Errorf("rpc: marshal request params for %s: %w", method, err)
+	}
+	id := s.nextID.Add(1)
+	idJSON, err := json.Marshal(id)
+	if err != nil {
+		return nil, fmt.Errorf("rpc: marshal request id: %w", err)
+	}
+	key := string(idJSON)
+	// Buffered by 1 so dispatchResponse's send never blocks even if this
+	// call has already given up (ctx done) by the time the response
+	// arrives; pendingMu below makes the lookup-and-delete in
+	// dispatchResponse and the delete in this func's defer mutually
+	// exclusive, so at most one of them ever sends/reads on ch.
+	ch := make(chan *message, 1)
+	s.pendingMu.Lock()
+	s.pending[key] = ch
+	s.pendingMu.Unlock()
+	defer func() {
+		s.pendingMu.Lock()
+		delete(s.pending, key)
+		s.pendingMu.Unlock()
+	}()
+
+	if err := s.writeMessage(&message{JSONRPC: jsonrpcVersion, ID: idJSON, Method: method, Params: b}); err != nil {
+		return nil, fmt.Errorf("rpc: write request %s: %w", method, err)
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case resp := <-ch:
+		if resp.Error != nil {
+			return nil, &Error{Code: resp.Error.Code, Message: resp.Error.Message, Data: resp.Error.Data}
+		}
+		return resp.Result, nil
+	}
 }
 
 func (s *Server) writeMessage(m *message) error {

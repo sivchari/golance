@@ -42,12 +42,15 @@ type diagnosticsNotification struct {
 	diags []protocol.Diagnostic
 }
 
-// progressNotification is one $/progress notification's token and kind
-// ("begin", "report", or "end"), decoded and queued by readLoop for
-// waitForIndexReady.
+// progressNotification is one $/progress notification's token, kind
+// ("begin", "report", or "end"), and message, decoded and queued by
+// readLoop for waitForIndexReady. For an "end" notification, message is
+// the indexer subprocess's build-stats summary (see internal/server's
+// indexStatsMessage), when present.
 type progressNotification struct {
-	token string
-	kind  string
+	token   string
+	kind    string
+	message string
 }
 
 // lspClient is a minimal stdio LSP client good enough to drive golance: it
@@ -354,10 +357,15 @@ func (c *lspClient) dispatchProgress(m *message) {
 	}
 	token, _ := p.Token.(protocol.String)
 	var kv struct {
-		Kind string `json:"kind"`
+		Kind    string  `json:"kind"`
+		Message *string `json:"message"`
 	}
 	_ = json.Unmarshal(p.Value, &kv)
-	c.progress <- progressNotification{token: string(token), kind: kv.Kind}
+	var msg string
+	if kv.Message != nil {
+		msg = *kv.Message
+	}
+	c.progress <- progressNotification{token: string(token), kind: kv.Kind, message: msg}
 }
 
 // call sends a request and waits for its response, failing t on timeout.
@@ -491,11 +499,13 @@ func (c *lspClient) waitForDiagnostics(t *testing.T, path string, timeout time.D
 }
 
 // waitForIndexReady blocks until the indexer subprocess's "golance/index"
-// $/progress end notification arrives, or timeout elapses. Cross-reference
-// queries (definition, references, implementation, workspace/symbol,
-// rename) answer empty results until this fires (see
-// internal/server.resolverOrWarn).
-func (c *lspClient) waitForIndexReady(t *testing.T, timeout time.Duration) {
+// $/progress end notification arrives, or timeout elapses, and returns its
+// message (see internal/server's indexStatsMessage) — the build-stats
+// summary a caller can parse via indexStats instead of inferring what
+// happened from wall-clock time. Cross-reference queries (definition,
+// references, implementation, workspace/symbol, rename) answer empty
+// results until this fires (see internal/server.resolverOrWarn).
+func (c *lspClient) waitForIndexReady(t *testing.T, timeout time.Duration) string {
 	t.Helper()
 	const token = "golance/index"
 	deadline := time.After(timeout)
@@ -503,13 +513,33 @@ func (c *lspClient) waitForIndexReady(t *testing.T, timeout time.Duration) {
 		select {
 		case n := <-c.progress:
 			if n.token == token && n.kind == "end" {
-				return
+				return n.message
 			}
 		case <-deadline:
 			t.Fatalf("index did not become ready within %s", timeout)
-			return
+			return ""
 		}
 	}
+}
+
+// indexStats is the build-stats summary parsed from waitForIndexReady's
+// return value (see internal/server's indexStatsMessage, the producer of
+// the exact format this expects).
+type indexStats struct {
+	typeChecked, casHits, unchanged, errors int
+}
+
+// parseIndexStats parses msg (waitForIndexReady's return value) into an
+// indexStats, failing t if msg is not in the expected format — e.g. empty,
+// which means the indexer subprocess exited before ever reaching its final
+// STATS line (see runIndexer's exit-code contract in cmd/golance).
+func parseIndexStats(t *testing.T, msg string) indexStats {
+	t.Helper()
+	var s indexStats
+	if _, err := fmt.Sscanf(msg, "%d type-checked, %d resolved from cache, %d unchanged, %d error(s)", &s.typeChecked, &s.casHits, &s.unchanged, &s.errors); err != nil {
+		t.Fatalf("parse index build stats %q: %v", msg, err)
+	}
+	return s
 }
 
 // waitForNonEmptyLocations polls method (a definition/references-shaped

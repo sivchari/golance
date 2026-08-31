@@ -88,7 +88,7 @@ func orderedReverseClosure(snap *graph.Snapshot, changedPkg string) []string {
 // best-effort, not fatal — see [buildResults.flushPtrsLocked]'s identical
 // rationale.
 func reindexOne(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, opts Options, path string, reader FileReader, trustStat bool, stats *Stats) error {
-	outcome, skipped, err := processUnit(fset, imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
+	outcome, skipped, typeChecked, err := processUnit(fset, imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
 	if err != nil {
 		stats.Errors++
 		return fmt.Errorf("index: reindex: %s: %w", path, err)
@@ -97,6 +97,9 @@ func reindexOne(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSour
 		stats.Skipped++
 	} else {
 		stats.Processed++
+		if typeChecked {
+			stats.TypeChecked++
+		}
 	}
 	if outcome == nil {
 		return nil

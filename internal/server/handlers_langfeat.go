@@ -188,6 +188,72 @@ func toDocumentSymbol(text []byte, sym langfeat.Symbol) (protocol.DocumentSymbol
 	}, true
 }
 
+// setHintsEnabled records which inlay hint kinds are enabled for s, in
+// s.hints. It is replaced wholesale (never mutated in place), so concurrent
+// reads from hintsEnabled never race with a write.
+func (s *Server) setHintsEnabled(enabled map[langfeat.HintKind]bool) {
+	s.hints.Store(&enabled)
+}
+
+// hintsEnabled returns which inlay hint kinds are enabled for s. Every kind
+// is enabled until setHintsEnabled has run (before "initialize" completes,
+// and in tests that never call it), matching golance's default of every
+// hint kind on unless a client's "hints" settings say otherwise.
+func (s *Server) hintsEnabled() map[langfeat.HintKind]bool {
+	if enabled := s.hints.Load(); enabled != nil {
+		return *enabled
+	}
+	return langfeat.ResolveHints(nil)
+}
+
+// hintsSettings is the "hints" shape golance reads from
+// initializationOptions: the same key and kind names as gopls's own
+// "hints" setting (see langfeat.AllHintKinds), so an editor config already
+// written for gopls enables the same inlay hint kinds here unmodified.
+type hintsSettings struct {
+	Hints map[string]bool `json:"hints"`
+}
+
+// parseHintsSettings resolves raw — an initializationOptions payload, or a
+// workspace/didChangeConfiguration notification's Settings, both the same
+// hintsSettings shape — into a complete enabled-kind set via
+// langfeat.ResolveHints. Missing or malformed settings resolve to every kind
+// enabled, golance's default; this is client-controlled input, so a
+// malformed payload is treated as absent rather than as a request failure.
+func parseHintsSettings(raw protocol.LSPAny) map[langfeat.HintKind]bool {
+	if len(raw) == 0 {
+		return langfeat.ResolveHints(nil)
+	}
+	var settings hintsSettings
+	if err := protocol.Unmarshal(raw, &settings); err != nil {
+		return langfeat.ResolveHints(nil)
+	}
+	return langfeat.ResolveHints(settings.Hints)
+}
+
+// handleDidChangeConfiguration answers workspace/didChangeConfiguration:
+// re-resolves the enabled inlay hint kinds from params.Settings, which
+// carries the same "hints" shape as initializationOptions (hintsSettings),
+// so an editor's live settings change takes effect on the next
+// textDocument/inlayHint request.
+//
+// It does not push workspace/inlayHint/refresh to make open files' inlay
+// hints re-request themselves immediately: that is an outbound
+// server-to-client request awaiting a response, and internal/rpc.Server
+// currently only supports fire-and-forget server-to-client notifications
+// (Notify), not request/response correlation in that direction. Adding
+// that is a larger change to internal/rpc than this handler warrants: the
+// client sees the update on its next inlay hint request regardless
+// (e.g. on scroll or edit).
+func (s *Server) handleDidChangeConfiguration(_ context.Context, params json.RawMessage) error {
+	var p protocol.DidChangeConfigurationParams
+	if err := protocol.Unmarshal(params, &p); err != nil {
+		return err
+	}
+	s.setHintsEnabled(parseHintsSettings(p.Settings))
+	return nil
+}
+
 func (s *Server) handleInlayHint(ctx context.Context, params json.RawMessage) (any, error) {
 	var p protocol.InlayHintParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
@@ -206,7 +272,15 @@ func (s *Server) handleInlayHint(ctx context.Context, params json.RawMessage) (a
 	if err != nil {
 		return nil, err
 	}
-	hints, err := langfeat.InlayHints(cp, path)
+	start, ok := byteOffsetForPosition(text, p.Range.Start)
+	if !ok {
+		return []protocol.InlayHint{}, nil
+	}
+	end, ok := byteOffsetForPosition(text, p.Range.End)
+	if !ok {
+		return []protocol.InlayHint{}, nil
+	}
+	hints, err := langfeat.InlayHints(cp, path, start, end, s.hintsEnabled())
 	if err != nil {
 		return nil, err
 	}
@@ -216,10 +290,33 @@ func (s *Server) handleInlayHint(ctx context.Context, params json.RawMessage) (a
 		if !ok {
 			continue
 		}
-		out = append(out, protocol.InlayHint{Position: pos, Label: protocol.String(h.Label)})
+		out = append(out, inlayHintToLSP(pos, h))
 	}
 	return out, nil
 }
+
+// inlayHintToLSP builds the protocol.InlayHint for h at pos: its render
+// kind maps to protocol.InlayHintKind, and padding is set only where h
+// requests it (an unset *bool omits the field, which a client treats the
+// same as an explicit false).
+func inlayHintToLSP(pos protocol.Position, h langfeat.Hint) protocol.InlayHint {
+	hint := protocol.InlayHint{Position: pos, Label: protocol.String(h.Label)}
+	switch h.Render {
+	case langfeat.RenderType:
+		hint.Kind = protocol.InlayHintKindType
+	case langfeat.RenderParameter:
+		hint.Kind = protocol.InlayHintKindParameter
+	}
+	if h.PaddingLeft {
+		hint.PaddingLeft = boolPtr(true)
+	}
+	if h.PaddingRight {
+		hint.PaddingRight = boolPtr(true)
+	}
+	return hint
+}
+
+func boolPtr(b bool) *bool { return &b }
 
 func (s *Server) handleFormatting(_ context.Context, params json.RawMessage) (any, error) {
 	var p protocol.DocumentFormattingParams

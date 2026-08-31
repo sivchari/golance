@@ -74,6 +74,10 @@ func TestE2E(t *testing.T) {
 		checkE2EReferencesCrossFile(t, c, &locs)
 	})
 
+	t.Run("references_cross_package_method", func(t *testing.T) {
+		checkE2EReferencesCrossPackageMethod(t, c, &locs)
+	})
+
 	t.Run("completion_selector", func(t *testing.T) {
 		checkE2ECompletionSelector(t, c, &locs)
 	})
@@ -162,6 +166,33 @@ func checkE2EReferencesCrossFile(t *testing.T, c *lspClient, locs *e2eLocs) {
 		files[l.URI.FsPath()] = true
 	}
 	for _, want := range []string{locs.appFile, locs.extraFile} {
+		if !files[want] {
+			t.Errorf("references missing a location in %s; got %d location(s): %+v", want, len(got), got)
+		}
+	}
+}
+
+// checkE2EReferencesCrossPackageMethod verifies that textDocument/references
+// on a method's declaration (lib/store.Store.Get) finds its cross-package
+// call sites in both usepkg and app — coverage checkE2EReferencesCrossFile
+// does not give, since that subtest targets a plain function. Store's
+// method set is declared in an order (Get, Zulu, Alpha, Mike) that differs
+// from alphabetical order, the same ordering mismatch
+// TestBuild_CrossPackageMethodRefIdentity guards against at the index layer.
+func checkE2EReferencesCrossPackageMethod(t *testing.T, c *lspClient, locs *e2eLocs) {
+	t.Helper()
+	got := c.waitForNonEmptyLocations(t, protocol.MethodTextDocumentReferences, &protocol.ReferenceParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.storeFile)},
+			Position:     locs.storeGetDecl,
+		},
+		Context: protocol.ReferenceContext{IncludeDeclaration: false},
+	}, e2eRequestBudget)
+	files := make(map[string]bool, len(got))
+	for _, l := range got {
+		files[l.URI.FsPath()] = true
+	}
+	for _, want := range []string{locs.usepkgFile, locs.appFile} {
 		if !files[want] {
 			t.Errorf("references missing a location in %s; got %d location(s): %+v", want, len(got), got)
 		}

@@ -351,6 +351,137 @@ func TestHandlerReturnedErrorPreservesCode(t *testing.T) {
 	}
 }
 
+// syncBuffer is a bytes.Buffer safe for one writer goroutine and one reader
+// goroutine coordinating through wait: Write signals wait (non-blocking, so
+// a burst of writes before the reader catches up never blocks the writer)
+// after every write, and Bytes takes its own lock so a concurrent Write
+// never races it.
+type syncBuffer struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	wait chan struct{}
+}
+
+func newSyncBuffer() *syncBuffer {
+	return &syncBuffer{wait: make(chan struct{}, 1)}
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	n, err := b.buf.Write(p)
+	b.mu.Unlock()
+	select {
+	case b.wait <- struct{}{}:
+	default:
+	}
+	return n, err
+}
+
+func (b *syncBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
+// waitForFrame blocks until out has at least one frame, or t.Fatal on
+// timeout, returning that frame's id re-encoded as a json.RawMessage
+// suitable for a synthetic message.ID.
+func waitForFrame(t *testing.T, out *syncBuffer) json.RawMessage {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-out.wait:
+		case <-deadline:
+			t.Fatal("no request frame written within 5s")
+		}
+		frames := readFrames(t, out.Bytes())
+		if len(frames) == 1 {
+			b, err := json.Marshal(frames[0]["id"])
+			if err != nil {
+				t.Fatalf("marshal request id: %v", err)
+			}
+			return b
+		}
+	}
+}
+
+func TestRequestReturnsClientResponse(t *testing.T) {
+	s := newTestServer(t)
+	out := newSyncBuffer()
+	s.conn = newConn(out)
+
+	type outcome struct {
+		result json.RawMessage
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := s.Request(context.Background(), "client/registerCapability", map[string]string{"id": "watch-go"})
+		done <- outcome{result, err}
+	}()
+
+	// Reply as the client would, echoing back the id Request assigned.
+	id := waitForFrame(t, out)
+	s.dispatchResponse(&message{ID: id, Result: json.RawMessage(`{"ok":true}`)})
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Request() error = %v", got.err)
+		}
+		if string(got.result) != `{"ok":true}` {
+			t.Fatalf("Request() result = %s, want {\"ok\":true}", got.result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Request() did not return after its response was dispatched")
+	}
+}
+
+func TestRequestReturnsClientError(t *testing.T) {
+	s := newTestServer(t)
+	out := newSyncBuffer()
+	s.conn = newConn(out)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Request(context.Background(), "client/registerCapability", map[string]string{})
+		done <- err
+	}()
+
+	id := waitForFrame(t, out)
+	s.dispatchResponse(&message{ID: id, Error: &wireError{Code: internalErrorCode, Message: "not supported"}})
+
+	select {
+	case err := <-done:
+		var rpcErr *Error
+		if !errors.As(err, &rpcErr) || rpcErr.Message != "not supported" {
+			t.Fatalf("Request() error = %v, want an *Error wrapping %q", err, "not supported")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Request() did not return after its error response was dispatched")
+	}
+}
+
+func TestRequestReturnsContextErrorOnTimeout(t *testing.T) {
+	s := newTestServer(t)
+	out := newSyncBuffer()
+	s.conn = newConn(out)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := s.Request(ctx, "client/registerCapability", map[string]string{})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Request() error = %v, want context.DeadlineExceeded", err)
+	}
+
+	// The abandoned pending entry must not still be there, or a
+	// since-deregistered client response arriving late would leak: dispatch
+	// one and confirm it is silently dropped rather than panicking.
+	id := waitForFrame(t, out)
+	s.dispatchResponse(&message{ID: id, Result: json.RawMessage(`{}`)})
+}
+
 func TestNotifyWritesNotificationFrame(t *testing.T) {
 	s := newTestServer(t)
 	var out bytes.Buffer
