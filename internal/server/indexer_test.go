@@ -217,6 +217,53 @@ func TestRevalidateIndex_UnchangedKeepsWarmOpenHandle(t *testing.T) {
 	}
 }
 
+// TestIndexStatsMessage verifies indexStatsMessage's parsing of the
+// indexer subprocess's final "STATS ..." stdout line (see cmd/golance's
+// indexer entry point), including that it rejects anything else
+// relayIndexProgress might read off the same stream.
+func TestIndexStatsMessage(t *testing.T) {
+	tests := []struct {
+		name    string
+		line    string
+		wantMsg string
+		wantOK  bool
+	}{
+		{
+			name:    "typical build",
+			line:    "STATS processed=3 skipped=40 errors=0 typechecked=1",
+			wantMsg: "1 type-checked, 2 resolved from cache, 40 unchanged, 0 error(s)",
+			wantOK:  true,
+		},
+		{
+			name:    "CAS-hit-only build",
+			line:    "STATS processed=1 skipped=2 errors=0 typechecked=0",
+			wantMsg: "0 type-checked, 1 resolved from cache, 2 unchanged, 0 error(s)",
+			wantOK:  true,
+		},
+		{
+			name:   "progress line",
+			line:   "PROGRESS 2 3",
+			wantOK: false,
+		},
+		{
+			name:   "empty line",
+			line:   "",
+			wantOK: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg, ok := indexStatsMessage(tt.line)
+			if ok != tt.wantOK {
+				t.Fatalf("indexStatsMessage(%q) ok = %v, want %v", tt.line, ok, tt.wantOK)
+			}
+			if ok && msg != tt.wantMsg {
+				t.Errorf("indexStatsMessage(%q) = %q, want %q", tt.line, msg, tt.wantMsg)
+			}
+		})
+	}
+}
+
 // TestIndexNeedsRebuild_MismatchedFingerprint verifies that a stale
 // database (here, a mismatched toolchain fingerprint, which forces every
 // package to be treated as changed) is flagged for a rebuild by

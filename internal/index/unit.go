@@ -54,7 +54,7 @@ type unitOutcome struct {
 // changed, since that call's reader may be an editor overlay whose content
 // differs from disk while disk's own stat stays untouched — trusting stat
 // there would silently skip a genuinely edited-but-unsaved package.
-func processUnit(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, snap *graph.Snapshot, db *store.DB, cas *store.CAS, keys *keyTable, opts Options, path string, reader FileReader, trustStat bool) (*unitOutcome, bool /*skipped*/, error) {
+func processUnit(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, snap *graph.Snapshot, db *store.DB, cas *store.CAS, keys *keyTable, opts Options, path string, reader FileReader, trustStat bool) (outcome *unitOutcome, skipped, typeChecked bool, err error) {
 	pkg := snap.Packages[path]
 	if len(pkg.GoFiles) == 0 {
 		// go/packages legitimately reports root packages with no GoFiles at
@@ -62,7 +62,7 @@ func processUnit(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSou
 		// external "_test" test package. There is nothing to type-check or
 		// index, and nothing else can import it, so it never needs a
 		// keyTable entry either.
-		return nil, true, nil
+		return nil, true, false, nil
 	}
 	pkgHash := store.Hash(path)
 	root := snap.Dir()
@@ -74,17 +74,17 @@ func processUnit(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSou
 	statOK := trustStat && trusted && len(old.Files) > 0 && filesStatMatch(pkg.GoFiles, old.Files, root, opts.RelativePaths)
 	ownHash, err := resolveOwnHash(pkg, opts, reader, root, statOK, old.ContentHash)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 
 	deps, err := directDepExports(snap, keys, pkg)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	combined := computeUnitKey(ownHash, deps)
 
 	if trusted && combined == old.BlobKey {
-		return unchangedOutcome(pkgHash, path, old, pkg, opts, root, statOK, trustStat, keys), true, nil
+		return unchangedOutcome(pkgHash, path, old, pkg, opts, root, statOK, trustStat, keys), true, false, nil
 	}
 
 	// The combined key differs from what was last recorded (or there is no
@@ -93,22 +93,22 @@ func processUnit(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSou
 	// already built before, e.g. switching back to a previously-visited
 	// branch (this is the common, fast-path case; see the package doc).
 	if blob, ok, err := cas.Get(combined); err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	} else if ok {
 		outcome, err := casHitOutcome(pkgHash, path, combined, ownHash, blob, opts, exp, keys)
 		if err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
-		return outcome, false, nil
+		return outcome, false, false, nil
 	}
 
 	// Miss: nobody has ever built this exact combination. Actually
 	// parse/type-check it.
-	outcome, err := checkAndStoreOutcome(fset, imp, cas, exp, keys, pkgHash, path, pkg, combined, ownHash, opts, reader, root, trustStat)
+	outcome, err = checkAndStoreOutcome(fset, imp, cas, exp, keys, pkgHash, path, pkg, combined, ownHash, opts, reader, root, trustStat)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
-	return outcome, false, nil
+	return outcome, false, true, nil
 }
 
 // resolveOwnHash returns pkg's own content hash: the already-recorded

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"go.etcd.io/bbolt"
 )
 
 func openTestDB(t *testing.T) *DB {
@@ -236,4 +238,60 @@ func TestBuildSymbolID(t *testing.T) {
 	if got, want := BuildSymbolID("example.com/pkg", "Foo"), "example.com/pkg#Foo"; got != want {
 		t.Errorf("BuildSymbolID() = %q, want %q", got, want)
 	}
+}
+
+// TestOpen_DiscardsDatabaseMissingSchemaVersion verifies that Open discards
+// and recreates a database whose meta bucket exists (so some earlier Open
+// has run against it) but does not record the current schemaVersion —
+// exactly the shape of a real pre-CAS golance database: it wrote the same
+// "unit" bucket encoding UnitPointer still uses today (so a stale record
+// decodes without error), but its BlobKey fields only ever resolved against
+// that older build's own blob storage, never today's CAS. Opening it as-is
+// would silently serve dangling BlobKey pointers for every package not yet
+// reprocessed by a fresh build.
+func TestOpen_DiscardsDatabaseMissingSchemaVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := db.PutUnit(&UnitEntry{PkgHash: 1, Pointer: UnitPointer{BlobKey: 7, ContentHash: 9}}); err != nil {
+		t.Fatalf("PutUnit() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if err := stripSchemaVersion(t, path); err != nil {
+		t.Fatalf("stripSchemaVersion() error = %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() on a version-less database error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	if _, err := reopened.GetUnit(1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetUnit(1) after reopening a version-less database = %v, want ErrNotFound (stale data must be discarded, not silently served)", err)
+	}
+}
+
+// stripSchemaVersion deletes path's schemaVersionKey in place, simulating a
+// database written before that key existed.
+func stripSchemaVersion(t *testing.T, path string) error {
+	t.Helper()
+	bdb, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = bdb.Close() }()
+	return bdb.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketMeta).Delete(schemaVersionKey)
+	})
 }

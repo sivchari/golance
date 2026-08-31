@@ -8,9 +8,9 @@ import "encoding/json"
 const jsonrpcVersion = "2.0"
 
 // message is the wire-level JSON-RPC 2.0 envelope. Method set means a
-// request (ID present) or notification (ID absent); Result/Error set means a
-// response to one of our own outgoing requests, which this server does not
-// currently send.
+// request (ID present) or notification (ID absent); Method unset with ID
+// present means a response to one of our own outgoing requests (see
+// Server.Request).
 type message struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
@@ -28,3 +28,7 @@ type wireError struct {
 
 func (m *message) isRequest() bool      { return m.Method != "" && m.ID != nil }
 func (m *message) isNotification() bool { return m.Method != "" && m.ID == nil }
+
+// isResponse reports whether m is a response to one of our own
+// server-initiated requests (see Server.Request): Method unset, ID present.
+func (m *message) isResponse() bool { return m.Method == "" && m.ID != nil }

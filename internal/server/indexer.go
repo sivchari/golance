@@ -377,6 +377,20 @@ func (s *Server) showMessage(typ protocol.MessageType, msg string) {
 	}
 }
 
+// logMessage sends msg to the client via window/logMessage: informational
+// detail for the editor's own log/output panel, never a popup. Some clients
+// render window/showMessage as a modal the user must dismiss (e.g. a
+// blocking "press ENTER" prompt in a terminal-based editor) — reserve
+// showMessage for failures that genuinely need the user's attention (see
+// warnIndexUnavailable) and use logMessage for everything else, including
+// routine "index still building" notices.
+func (s *Server) logMessage(typ protocol.MessageType, msg string) {
+	err := s.rpc.Notify(protocol.MethodWindowLogMessage, &protocol.LogMessageParams{Type: typ, Message: msg})
+	if err != nil {
+		s.logger.Printf("server: log message: %v", err)
+	}
+}
+
 // progressPercent returns done/total as a percentage in [0, 100], or 0 if
 // total is not yet known (<= 0) or either value is out of the range this
 // computation can trust — "PROGRESS done total" lines come from golance's
@@ -401,7 +415,12 @@ func progressPercent(done, total int) uint32 {
 
 // relayIndexProgress reads "PROGRESS done total" lines written by the
 // indexer subprocess's stdout (see cmd/golance's indexer entry point) and
-// relays them as $/progress notifications.
+// relays them as $/progress notifications. The subprocess's final "STATS
+// ..." summary line (see indexStatsMessage) becomes the "end" notification's
+// Message, so a client — including the E2E suite, which asserts on it
+// directly instead of on wall-clock build time — can tell how many
+// packages this build actually type-checked versus resolved via a CAS hit
+// or an unchanged-content skip.
 //
 // This does not implement the full window/workDoneProgress/create
 // handshake: internal/rpc.Server has no mechanism for a server-initiated
@@ -413,23 +432,46 @@ func progressPercent(done, total int) uint32 {
 func (s *Server) relayIndexProgress(r io.Reader) {
 	const token = "golance/index"
 	began := false
+	var summary string
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
+		line := sc.Text()
 		var done, total int
-		if _, err := fmt.Sscanf(sc.Text(), "PROGRESS %d %d", &done, &total); err != nil {
+		if _, err := fmt.Sscanf(line, "PROGRESS %d %d", &done, &total); err == nil {
+			if !began {
+				began = true
+				s.notifyProgress(token, &protocol.WorkDoneProgressBegin{Kind: "begin", Title: "golance: building index"})
+			}
+			pct := progressPercent(done, total)
+			msg := fmt.Sprintf("%d/%d packages", done, total)
+			s.notifyProgress(token, &protocol.WorkDoneProgressReport{Kind: "report", Percentage: &pct, Message: &msg})
 			continue
 		}
-		if !began {
-			began = true
-			s.notifyProgress(token, &protocol.WorkDoneProgressBegin{Kind: "begin", Title: "golance: building index"})
+		if msg, ok := indexStatsMessage(line); ok {
+			summary = msg
 		}
-		pct := progressPercent(done, total)
-		msg := fmt.Sprintf("%d/%d packages", done, total)
-		s.notifyProgress(token, &protocol.WorkDoneProgressReport{Kind: "report", Percentage: &pct, Message: &msg})
 	}
 	if began {
-		s.notifyProgress(token, &protocol.WorkDoneProgressEnd{Kind: "end"})
+		end := &protocol.WorkDoneProgressEnd{Kind: "end"}
+		if summary != "" {
+			end.Message = &summary
+		}
+		s.notifyProgress(token, end)
 	}
+}
+
+// indexStatsMessage turns one "STATS processed=P skipped=S errors=E
+// typechecked=T" line (see cmd/golance's indexer entry point) into a
+// human-readable summary for the $/progress "end" notification's Message,
+// reporting ok=false for anything else relayIndexProgress reads off the
+// subprocess's stdout.
+func indexStatsMessage(line string) (msg string, ok bool) {
+	var processed, skipped, errs, typeChecked int
+	if _, err := fmt.Sscanf(line, "STATS processed=%d skipped=%d errors=%d typechecked=%d", &processed, &skipped, &errs, &typeChecked); err != nil {
+		return "", false
+	}
+	casHits := processed - typeChecked
+	return fmt.Sprintf("%d type-checked, %d resolved from cache, %d unchanged, %d error(s)", typeChecked, casHits, skipped, errs), true
 }
 
 func (s *Server) notifyProgress(token string, value any) {

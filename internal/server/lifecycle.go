@@ -4,12 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
 	"github.com/sivchari/golance/internal/graph"
 )
+
+// registerWatchedFilesTimeout bounds how long registerWatchedFiles waits for
+// the client's client/registerCapability response, so a client that never
+// answers (or advertised dynamicRegistration without actually honoring the
+// request) cannot leak the goroutine handleInitialized starts for it.
+const registerWatchedFilesTimeout = 5 * time.Second
+
+// watchedFilesRegistrationID is the Registration.ID golance uses for its one
+// workspace/didChangeWatchedFiles registration (see registerWatchedFiles).
+// It is never unregistered, so this only needs to be unique among whatever
+// else the client itself might register — a fixed string is fine.
+const watchedFilesRegistrationID = "golance-watch-go-files"
+
+// allPackagesPattern is the go/packages load pattern golance uses to load
+// (and reload) the whole workspace's import graph.
+const allPackagesPattern = "./..."
 
 // handleInitialize resolves the workspace root from params, loads the
 // import graph (from cache if warm, else synchronously), and returns
@@ -24,12 +41,14 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, fmt.Errorf("server: initialize: unmarshal params: %w", err)
 	}
+	s.setHintsEnabled(parseHintsSettings(p.InitializationOptions))
+	s.watchDynamicReg.Store(clientSupportsWatchedFilesRegistration(&p))
 	root, err := rootFromInitializeParams(&p, params)
 	if err != nil {
 		return nil, err
 	}
 
-	patterns := []string{"./..."}
+	patterns := []string{allPackagesPattern}
 	loadOpts := graph.Options{Dir: root, Offline: s.opts.Offline}
 
 	snap, ok := graph.LoadCache(root, patterns, loadOpts.BuildFlags)
@@ -63,6 +82,71 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 // transitions the server's lifecycle state; there is nothing else to do.
 func (s *Server) handleShutdown(context.Context, json.RawMessage) (any, error) {
 	return nil, nil
+}
+
+// clientSupportsWatchedFilesRegistration reports whether p's client
+// capabilities declare workspace.didChangeWatchedFiles.dynamicRegistration:
+// the LSP spec gives servers no other way to receive
+// workspace/didChangeWatchedFiles notifications (there is no static
+// ServerCapabilities field for it — see
+// protocol.DidChangeWatchedFilesClientCapabilities's own doc), so without
+// this, handleDidChangeWatchedFiles's .go tracking (see workspace.go) never
+// fires for a client that requires registration.
+func clientSupportsWatchedFilesRegistration(p *protocol.InitializeParams) bool {
+	if p.Capabilities.Workspace == nil || p.Capabilities.Workspace.DidChangeWatchedFiles == nil {
+		return false
+	}
+	dr := p.Capabilities.Workspace.DidChangeWatchedFiles.DynamicRegistration
+	return dr != nil && *dr
+}
+
+// handleInitialized responds to the "initialized" notification — the LSP
+// spec requires servers to wait for it before sending any server-initiated
+// request, including client/registerCapability — by asking the client (in
+// the background) to register interest in .go file changes, if it declared
+// support for that at "initialize" (see clientSupportsWatchedFilesRegistration).
+func (s *Server) handleInitialized(ctx context.Context, _ json.RawMessage) error {
+	if !s.watchDynamicReg.Load() {
+		return nil
+	}
+	go s.registerWatchedFiles(ctx)
+	return nil
+}
+
+// registerWatchedFiles asks the client, via client/registerCapability, to
+// send workspace/didChangeWatchedFiles notifications for every .go file
+// (created, changed, or deleted) — the mechanism handleDidChangeWatchedFiles
+// relies on to keep the facts index current after a git pull/branch switch
+// made outside the editor (see workspace.go and watch.go). ctx is bounded by
+// registerWatchedFilesTimeout so a client that never responds cannot leak
+// this goroutine.
+func (s *Server) registerWatchedFiles(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, registerWatchedFilesTimeout)
+	defer cancel()
+
+	opts := protocol.DidChangeWatchedFilesRegistrationOptions{
+		Watchers: []protocol.FileSystemWatcher{
+			{
+				GlobPattern: protocol.Pattern("**/*.go"),
+				Kind:        protocol.WatchKindCreate | protocol.WatchKindChange | protocol.WatchKindDelete,
+			},
+		},
+	}
+	optsJSON, err := protocol.Marshal(opts)
+	if err != nil {
+		s.logger.Printf("server: marshal watched-files registration options: %v", err)
+		return
+	}
+	params := &protocol.RegistrationParams{
+		Registrations: []protocol.Registration{{
+			ID:              watchedFilesRegistrationID,
+			Method:          protocol.MethodWorkspaceDidChangeWatchedFiles,
+			RegisterOptions: protocol.LSPAny(optsJSON),
+		}},
+	}
+	if _, err := s.rpc.Request(ctx, protocol.MethodClientRegisterCapability, params); err != nil {
+		s.logger.Printf("server: register workspace/didChangeWatchedFiles: %v", err)
+	}
 }
 
 // rootFromInitializeParams resolves the workspace root directory from an

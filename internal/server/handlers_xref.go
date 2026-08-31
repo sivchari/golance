@@ -14,13 +14,19 @@ import (
 
 // resolverOrWarn returns the current facts-index Resolver, or ok=false if
 // the indexer subprocess has not completed a build yet. On the first such
-// call it warns the client once via window/showMessage; later calls stay
-// silent so a burst of queries during index build does not spam the user.
+// call it logs the reason to the client once via window/logMessage (not
+// showMessage: the index building is routine, not a failure, and some
+// clients render showMessage as a blocking modal — see logMessage's doc);
+// later calls stay silent so a burst of queries during index build does not
+// spam the log. Callers still answer with an ordinary empty result (see
+// handleDefinition et al.) rather than an error, since an empty result is
+// exactly how a client already renders "nothing found" — $/progress (see
+// relayIndexProgress) is what actually tells the user a build is under way.
 func (s *Server) resolverOrWarn() (*xref.Resolver, bool) {
 	idx := s.idx.Load()
 	if idx == nil {
 		if s.indexBuildingWarned.CompareAndSwap(false, true) {
-			s.showMessage(protocol.MessageTypeInfo, "golance: the workspace index is still building; cross-reference results are unavailable until it completes")
+			s.logMessage(protocol.MessageTypeInfo, "golance: the workspace index is still building; cross-reference results are unavailable until it completes")
 		}
 		return nil, false
 	}

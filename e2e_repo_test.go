@@ -27,6 +27,9 @@ type e2eLocs struct {
 	usepkgFile  string            // usepkg/usepkg.go, imports lib/store
 	selectorPos protocol.Position // just after "s." in "s.Get()", for selector completion
 
+	storeFile    string            // lib/store/store.go
+	storeGetDecl protocol.Position // "Get" in "func (s *Store) Get() string"
+
 	brokenFile string // broken/broken.go, a package with a type error
 }
 
@@ -78,8 +81,24 @@ type Store struct {
 func (s *Store) Get() string {
 	return s.Value
 }
+
+// Zulu, Alpha, and Mike exist only to give Store's method set a declaration
+// order that differs from alphabetical order, regression coverage for
+// cross-package method reference identity.
+func (s *Store) Zulu() string {
+	return s.Value
+}
+
+func (s *Store) Alpha() string {
+	return s.Value
+}
+
+func (s *Store) Mike() string {
+	return s.Value
+}
 `
-	writeE2EFile(t, root, "lib/store/store.go", storeSrc)
+	locs.storeFile = writeE2EFile(t, root, "lib/store/store.go", storeSrc)
+	locs.storeGetDecl = mustPos(t, storeSrc, "func (s *Store) Get", "Get")
 
 	const appSrc = `package app
 
@@ -96,6 +115,11 @@ func Compute() int {
 // New returns a fresh Store.
 func New() *store.Store {
 	return &store.Store{}
+}
+
+// Describe calls the Store method set across the package boundary.
+func Describe() string {
+	return New().Get()
 }
 `
 	locs.appFile = writeE2EFile(t, root, "app/app.go", appSrc)

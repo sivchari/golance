@@ -35,7 +35,7 @@ func newBuildResults(db *store.DB, batchSize int) *buildResults {
 // (see recordFatal); a handful of unbuildable packages among thousands of
 // good ones is not one of them, and must not turn a successful index
 // build into a reported failure.
-func (r *buildResults) record(outcome *unitOutcome, skipped bool, err error) int {
+func (r *buildResults) record(outcome *unitOutcome, skipped, typeChecked bool, err error) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -46,6 +46,9 @@ func (r *buildResults) record(outcome *unitOutcome, skipped bool, err error) int
 		r.stats.Skipped++
 	default:
 		r.stats.Processed++
+		if typeChecked {
+			r.stats.TypeChecked++
+		}
 	}
 	r.queueOutcomeLocked(outcome)
 	return r.stats.Processed + r.stats.Skipped + r.stats.Errors

@@ -35,9 +35,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("golance", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	logPath := fs.String("log", os.Getenv("GOLANCE_LOG"), "write server logs to this file (default: stderr)")
-	indexJobs := fs.Int("index-jobs", envInt("GOLANCE_INDEX_JOBS", 0), "index build parallelism (0 = automatic)")
+	indexJobs := fs.Int("index-jobs", envInt("GOLANCE_INDEX_JOBS"), "index build parallelism (0 = automatic)")
 	memLimit := fs.String("mem-limit", os.Getenv("GOLANCE_MEM_LIMIT"), "GOMEMLIMIT for the indexer subprocess (e.g. 1GiB)")
 	offline := fs.Bool("offline", envBool("GOLANCE_OFFLINE", false), "forbid module downloads (GOPROXY=off) during graph load and indexing")
+	watchDebounceMS := fs.Int("watch-debounce-ms", envInt("GOLANCE_WATCH_DEBOUNCE_MS"), "how long to wait for workspace/didChangeWatchedFiles .go events to go quiet before revalidating the workspace (0 = automatic)")
 	version := fs.Bool("version", false, "print version and exit")
 
 	if err := fs.Parse(args); err != nil {
@@ -66,10 +67,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	rpcServer := rpc.NewServer(rpc.WithLogger(logger))
 	server.New(rpcServer, server.Options{
-		Logger:    logger,
-		IndexJobs: *indexJobs,
-		MemLimit:  *memLimit,
-		Offline:   *offline,
+		Logger:        logger,
+		IndexJobs:     *indexJobs,
+		MemLimit:      *memLimit,
+		Offline:       *offline,
+		WatchDebounce: time.Duration(*watchDebounceMS) * time.Millisecond,
 	})
 
 	if err := rpcServer.Serve(context.Background(), stdin, stdout); err != nil {
@@ -86,9 +88,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 // runIndexer is cmd/golance's indexer-subprocess entry point: it loads the
 // import graph for server.EnvRoot, type-checks every workspace package,
 // and persists the result to server.EnvDB, reporting build progress as
-// "PROGRESS done total" lines on stdout (see internal/server's
-// relayIndexProgress, which reads them back from the subprocess it
-// launches).
+// "PROGRESS done total" lines followed by one final "STATS ..." summary
+// line on stdout (see internal/server's relayIndexProgress, which reads
+// them back from the subprocess it launches).
 //
 // Exit code contract: runIndexer returns non-zero only when
 // server.EnvDB's database is not trustworthy as a whole — a failed graph
@@ -202,14 +204,14 @@ func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if secs := envInt("GOLANCE_INDEX_DEADLINE_SECONDS", 0); secs > 0 {
+	if secs := envInt("GOLANCE_INDEX_DEADLINE_SECONDS"); secs > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(secs)*time.Second)
 		defer cancel()
 	}
 
 	stats, err := index.Build(ctx, snap, db, cas, index.Options{
-		Parallelism:   envInt(server.EnvIndexJobs, 0),
+		Parallelism:   envInt(server.EnvIndexJobs),
 		RelativePaths: server.RelativeIndexPaths(root),
 		Progress: func(done, total int) {
 			_, _ = fmt.Fprintf(stdout, "PROGRESS %d %d\n", done, total)
@@ -222,6 +224,16 @@ func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath string) int {
 	if stats.Errors > 0 {
 		_, _ = fmt.Fprintf(stderr, "golance: indexer: %d package(s) failed to type-check\n", stats.Errors)
 	}
+	// A final summary line, read back by internal/server's
+	// relayIndexProgress and folded into the $/progress "end" notification's
+	// message: unlike the per-package "PROGRESS done total" lines above,
+	// which only count packages resolved (by any means), this distinguishes
+	// how many of them required an actual parse/type-check from how many
+	// resolved via a CAS hit alone (e.g. switching back to a previously-seen
+	// branch) — the fact a caller wanting to confirm "this build avoided
+	// rechecking something" should assert on directly rather than on
+	// wall-clock time (see index.Stats.TypeChecked's doc).
+	_, _ = fmt.Fprintf(stdout, "STATS processed=%d skipped=%d errors=%d typechecked=%d\n", stats.Processed, stats.Skipped, stats.Errors, stats.TypeChecked)
 
 	// Low-frequency GC of unused CAS blobs (see store.CAS.MaybeTrim's doc):
 	// the indexer subprocess is already doing bulk I/O, so this is a better
@@ -277,14 +289,14 @@ func writeNamedProfile(stderr io.Writer, name, path string) {
 	}
 }
 
-func envInt(key string, def int) int {
+func envInt(key string) int {
 	v := os.Getenv(key)
 	if v == "" {
-		return def
+		return 0
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return def
+		return 0
 	}
 	return n
 }

@@ -9,12 +9,14 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.lsp.dev/protocol"
 
 	golance "github.com/sivchari/golance"
 	"github.com/sivchari/golance/internal/check"
 	"github.com/sivchari/golance/internal/graph"
+	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
 	"github.com/sivchari/golance/internal/rpc"
 	"github.com/sivchari/golance/internal/store"
@@ -40,6 +42,10 @@ type Options struct {
 	// Offline forbids the initial graph load and the indexer subprocess
 	// from downloading modules (GOPROXY=off).
 	Offline bool
+	// WatchDebounce is how long handleDidChangeWatchedFiles waits for .go
+	// file-change notifications to go quiet before revalidating the
+	// workspace (see watchDebouncer). <= 0 uses defaultWatchDebounce.
+	WatchDebounce time.Duration
 }
 
 // workspace bundles every value that depends on the current import graph
@@ -71,14 +77,18 @@ type Server struct {
 	rpc     *rpc.Server
 	overlay *overlay.Overlay
 
-	ws  atomic.Pointer[workspace]
-	idx atomic.Pointer[indexState]
+	ws    atomic.Pointer[workspace]
+	idx   atomic.Pointer[indexState]
+	hints atomic.Pointer[map[langfeat.HintKind]bool] // enabled inlay hint kinds; nil until "initialize" or workspace/didChangeConfiguration sets it, meaning every kind enabled (see hintsEnabled)
 
 	diagMu    sync.Mutex
 	diagFiles map[string]map[string]bool // package dir -> files last published with diagnostics
 
-	indexBuildingWarned atomic.Bool // one-time window/showMessage while the index is still building
+	indexBuildingWarned atomic.Bool // one-time window/logMessage while the index is still building
 	indexFailedWarned   atomic.Bool // one-time window/showMessage after an indexer failure
+
+	watch           *watchDebouncer // coalesces workspace/didChangeWatchedFiles .go events into revalidateWorkspace passes
+	watchDynamicReg atomic.Bool     // client declared workspace.didChangeWatchedFiles.dynamicRegistration support at initialize (see handleInitialized)
 }
 
 // New constructs a Server and registers its LSP handlers on rpcServer.
@@ -96,6 +106,7 @@ func New(rpcServer *rpc.Server, opts Options) *Server {
 		overlay:   overlay.New(),
 		diagFiles: make(map[string]map[string]bool),
 	}
+	s.watch = newWatchDebouncer(opts.WatchDebounce, s.revalidateWorkspace)
 	s.wire()
 	return s
 }
@@ -108,24 +119,28 @@ func (s *Server) wire() {
 	s.rpc.Handle(protocol.MethodInitialize, rpc.Interactive, s.handleInitialize)
 	s.rpc.Handle(protocol.MethodShutdown, rpc.Interactive, s.handleShutdown)
 
+	s.rpc.HandleNotification(protocol.MethodInitialized, s.handleInitialized)
 	s.rpc.HandleNotification(protocol.MethodTextDocumentDidOpen, s.handleDidOpen)
 	s.rpc.HandleNotification(protocol.MethodTextDocumentDidChange, s.handleDidChange)
 	s.rpc.HandleNotification(protocol.MethodTextDocumentDidSave, s.handleDidSave)
 	s.rpc.HandleNotification(protocol.MethodTextDocumentDidClose, s.handleDidClose)
 	s.rpc.HandleNotification(protocol.MethodWorkspaceDidChangeWatchedFiles, s.handleDidChangeWatchedFiles)
+	s.rpc.HandleNotification(protocol.MethodWorkspaceDidChangeConfiguration, s.handleDidChangeConfiguration)
 
 	s.rpc.Handle(protocol.MethodTextDocumentHover, rpc.Interactive, s.handleHover)
-	s.rpc.Handle(protocol.MethodTextDocumentCompletion, rpc.Interactive, s.handleCompletion)
 	s.rpc.Handle(protocol.MethodTextDocumentSignatureHelp, rpc.Interactive, s.handleSignatureHelp)
 	s.rpc.Handle(protocol.MethodTextDocumentDocumentSymbol, rpc.Interactive, s.handleDocumentSymbol)
 	s.rpc.Handle(protocol.MethodTextDocumentInlayHint, rpc.Interactive, s.handleInlayHint)
 	s.rpc.Handle(protocol.MethodTextDocumentFormatting, rpc.Interactive, s.handleFormatting)
+	s.registerCodeActionHandlers()
+	s.registerSemanticHandlers()
 
 	s.rpc.Handle(protocol.MethodTextDocumentDefinition, rpc.Background, s.handleDefinition)
 	s.rpc.Handle(protocol.MethodTextDocumentReferences, rpc.Background, s.handleReferences)
 	s.rpc.Handle(protocol.MethodTextDocumentImplementation, rpc.Background, s.handleImplementation)
 	s.rpc.Handle(protocol.MethodWorkspaceSymbol, rpc.Background, s.handleWorkspaceSymbol)
 	s.rpc.Handle(protocol.MethodTextDocumentRename, rpc.Background, s.handleRename)
+	s.registerNavHandlers()
 }
 
 // workspace returns the current workspace bundle, or nil before the

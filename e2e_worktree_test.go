@@ -12,14 +12,6 @@ import (
 	"go.lsp.dev/uri"
 )
 
-// e2eFastBuildBudget bounds a CAS-hit-only index build (no real
-// parse/type-check work, see internal/store's package doc): a session
-// whose content this repository's shared CAS has already seen before
-// should become ready to answer cross-reference queries almost
-// immediately, unlike a first-ever build of that content (bounded by the
-// much larger e2eIndexBudget).
-const e2eFastBuildBudget = 5 * time.Second
-
 // gitWorktreeModule writes a synthetic single-module workspace, commits it
 // to a fresh git repository, and adds a second worktree of it on its own
 // branch. It returns the main worktree's root, the second worktree's root,
@@ -91,18 +83,24 @@ func definitionAt(t *testing.T, c *lspClient, file string, pos protocol.Position
 }
 
 // startAndAwaitIndex starts a golance session for root (sharing fakeHome),
-// opens appFile, and blocks until the session's index becomes ready. It
-// returns the client and the elapsed wall-clock time from initialize to
-// index-ready, for callers that want to assert on build speed (a
-// CAS-hit-only build should be fast; see e2eFastBuildBudget).
-func startAndAwaitIndex(t *testing.T, root, fakeHome, appFile string, budget time.Duration) (c *lspClient, elapsed time.Duration) {
+// opens appFile, and blocks until the session's index becomes ready, or
+// e2eIndexBudget elapses. It returns the client, the build's parsed stats
+// (see parseIndexStats — callers that want to assert this build avoided
+// re-type-checking something should use stats.typeChecked, not elapsed),
+// and the elapsed wall-clock time from initialize to index-ready, kept
+// only for t.Logf: wall-clock time is not a reliable signal on a loaded CI
+// runner, so e2eIndexBudget is a generous upper bound (bounding "did not
+// hang forever"), never a tight one used to infer what the build actually
+// did.
+func startAndAwaitIndex(t *testing.T, root, fakeHome, appFile string) (c *lspClient, stats indexStats, elapsed time.Duration) {
 	t.Helper()
 	c = startClientIn(t, root, fakeHome)
 	c.initialize(t, root)
 	c.openFile(t, appFile)
 	start := time.Now()
-	c.waitForIndexReady(t, budget)
-	return c, time.Since(start)
+	msg := c.waitForIndexReady(t)
+	elapsed = time.Since(start)
+	return c, parseIndexStats(t, msg), elapsed
 }
 
 // TestE2E_WorktreeSharesIndex verifies that a second golance session opened
@@ -117,7 +115,8 @@ func startAndAwaitIndex(t *testing.T, root, fakeHome, appFile string, budget tim
 // runs its own index build on first open; what the CAS buys it is that
 // this build never re-type-checks anything the first worktree's build
 // already processed, only resolves CAS hits and writes its own small
-// per-root pointer/index entries (see e2eFastBuildBudget).
+// per-root pointer/index entries (see startAndAwaitIndex's stats.typeChecked
+// assertion below).
 func TestE2E_WorktreeSharesIndex(t *testing.T) {
 	skipUnlessE2E(t)
 
@@ -127,7 +126,7 @@ func TestE2E_WorktreeSharesIndex(t *testing.T) {
 
 	// Worktree A: an ordinary cold-start session that builds its own
 	// per-root index (and populates the shared CAS) from scratch.
-	a, _ := startAndAwaitIndex(t, mainRoot, fakeHome, locs.appFile, e2eIndexBudget)
+	a, _, _ := startAndAwaitIndex(t, mainRoot, fakeHome, locs.appFile)
 
 	got := definitionAt(t, a, locs.appFile, locs.sumCallInApp)
 	if len(got) != 1 {
@@ -140,11 +139,16 @@ func TestE2E_WorktreeSharesIndex(t *testing.T) {
 	// content, different worktree root), different absolute root. It still
 	// runs its own index build (its per-root index database is private —
 	// see startAndAwaitIndex's doc), but every package's content was
-	// already processed for worktree A, so this build must complete via
-	// CAS hits alone, well inside e2eFastBuildBudget.
+	// already processed for worktree A, so this build must complete via CAS
+	// hits alone — asserted directly on the build's own reported stats
+	// below, not inferred from how fast it happened to run; e2eIndexBudget
+	// here is only an upper bound against the build hanging outright.
 	otherAppFile := strings.Replace(locs.appFile, mainRoot, otherRoot, 1)
-	b, elapsed := startAndAwaitIndex(t, otherRoot, fakeHome, otherAppFile, e2eFastBuildBudget)
-	t.Logf("worktree B: CAS-hit-only build finished in %s", elapsed)
+	b, bStats, elapsed := startAndAwaitIndex(t, otherRoot, fakeHome, otherAppFile)
+	t.Logf("worktree B: build finished in %s (%+v)", elapsed, bStats)
+	if bStats.typeChecked != 0 {
+		t.Errorf("worktree B: type-checked %d package(s), want 0 (every package's content was already processed for worktree A; this build must resolve via CAS hits alone)", bStats.typeChecked)
+	}
 
 	got = definitionAt(t, b, otherAppFile, locs.sumCallInApp)
 	if len(got) != 1 {
@@ -220,11 +224,11 @@ func TestE2E_WorktreeSimultaneousStartup(t *testing.T) {
 	resA := make(chan protocol.LocationSlice, 1)
 	resB := make(chan protocol.LocationSlice, 1)
 	go func() {
-		a.waitForIndexReady(t, e2eIndexBudget)
+		a.waitForIndexReady(t)
 		resA <- definitionAt(t, a, locs.appFile, locs.sumCallInApp)
 	}()
 	go func() {
-		b.waitForIndexReady(t, e2eIndexBudget)
+		b.waitForIndexReady(t)
 		resB <- definitionAt(t, b, otherAppFile, locs.sumCallInApp)
 	}()
 
@@ -260,23 +264,22 @@ func TestE2E_WorktreeSimultaneousStartup(t *testing.T) {
 //
 // This drives three sequential sessions against the same root, rewriting
 // one file of a synthetic "heavy" package (writeHeavyPackage — many files,
-// so a real recheck of the whole package takes long enough to dominate
-// process/IPC overhead, the same shape as the real-world case that
-// motivated this design: a large generated-model package where any single
-// file's edit forces the whole package to be reprocessed) directly between
-// them, equivalent to the on-disk effect of a branch checkout without
-// needing a real git history for this specific timing property: A
-// (original content, a real build) -> B (a genuine edit, forcing a real
-// re-type-check of the heavy package) -> A again (revert, a CAS-hit-only
-// build).
+// so a real recheck of the whole package is representative of the
+// real-world case that motivated this design: a large generated-model
+// package where any single file's edit forces the whole package to be
+// reprocessed) directly between them, equivalent to the on-disk effect of
+// a branch checkout without needing a real git history for this specific
+// property: A (original content, a real build) -> B (a genuine edit,
+// forcing a real re-type-check of the heavy package) -> A again (revert, a
+// CAS-hit-only build).
 //
-// The comparison that matters is B's elapsed time (a real re-type-check)
-// against the third session's (a CAS hit): both start from an
-// already-warm graph cache (session A already primed it), so process
-// startup and `go list` overhead — the dominant cost for a workspace this
-// small — is present equally in both measurements, isolating the one
-// thing that differs: whether the heavy package is actually
-// parsed/type-checked again.
+// What matters is asserted directly on each build's own reported stats
+// (see startAndAwaitIndex/indexStats), not inferred from wall-clock time:
+// a shared CI runner's load makes elapsed-time comparisons an unreliable
+// proxy for "did this build actually type-check the heavy package again."
+// heavy is otherwise unimported by anything else in the workspace (see
+// writeE2EModule's doc), so it is the only package whose own recheck could
+// ever show up in these stats.
 func TestE2E_BranchSwitchNoRetypecheck(t *testing.T) {
 	skipUnlessE2E(t)
 
@@ -289,22 +292,25 @@ func TestE2E_BranchSwitchNoRetypecheck(t *testing.T) {
 	// Session A: original content, a genuine first-ever build. This also
 	// primes the graph cache (go.mod/go.sum unchanged for the rest of this
 	// test), so sessions B and C below pay the same fixed `go list`-free
-	// startup cost, isolating the heavy package's own recheck cost as the
-	// only variable between them.
-	a, firstElapsed := startAndAwaitIndex(t, root, fakeHome, locs.appFile, e2eIndexBudget)
-	t.Logf("session A: first build (real type-check, cold graph cache) finished in %s", firstElapsed)
+	// startup cost.
+	a, aStats, firstElapsed := startAndAwaitIndex(t, root, fakeHome, locs.appFile)
+	t.Logf("session A: first build finished in %s (%+v)", firstElapsed, aStats)
 	if got := definitionAt(t, a, locs.appFile, locs.sumCallInApp); len(got) != 1 {
 		t.Fatalf("session A: want exactly 1 definition location, got %d: %+v", len(got), got)
 	}
 	a.stop(t)
 
 	// Session B: a genuine edit to the heavy package — new content this
-	// CAS has never seen, forcing a real re-type-check of all 150 files.
+	// CAS has never seen, forcing a real re-type-check of the whole
+	// package.
 	if err := os.WriteFile(heavyFile, []byte(editedHeavySrc), 0o600); err != nil {
 		t.Fatalf("edit %s: %v", heavyFile, err)
 	}
-	b, editElapsed := startAndAwaitIndex(t, root, fakeHome, locs.appFile, e2eIndexBudget)
-	t.Logf("session B: real re-type-check of the heavy package finished in %s", editElapsed)
+	b, bStats, editElapsed := startAndAwaitIndex(t, root, fakeHome, locs.appFile)
+	t.Logf("session B: build finished in %s (%+v)", editElapsed, bStats)
+	if bStats.typeChecked != 1 {
+		t.Errorf("session B: type-checked %d package(s), want exactly 1 (heavy, the only package whose content changed)", bStats.typeChecked)
+	}
 	if got := definitionAt(t, b, locs.appFile, locs.sumCallInApp); len(got) != 1 {
 		t.Fatalf("session B: want exactly 1 definition location, got %d: %+v", len(got), got)
 	}
@@ -317,13 +323,12 @@ func TestE2E_BranchSwitchNoRetypecheck(t *testing.T) {
 	if err := os.WriteFile(heavyFile, []byte(originalHeavySrc), 0o600); err != nil {
 		t.Fatalf("revert %s: %v", heavyFile, err)
 	}
-	c, revertElapsed := startAndAwaitIndex(t, root, fakeHome, locs.appFile, e2eIndexBudget)
-	t.Logf("session A (reverted): CAS-hit-only build finished in %s (session B's real recheck was %s)", revertElapsed, editElapsed)
+	c, cStats, revertElapsed := startAndAwaitIndex(t, root, fakeHome, locs.appFile)
+	t.Logf("session A (reverted): build finished in %s (%+v)", revertElapsed, cStats)
+	if cStats.typeChecked != 0 {
+		t.Errorf("session A (reverted): type-checked %d package(s), want 0 (heavy's reverted content was already built by session A, so this must resolve via a CAS hit alone)", cStats.typeChecked)
+	}
 	if got := definitionAt(t, c, locs.appFile, locs.sumCallInApp); len(got) != 1 {
 		t.Fatalf("session A (reverted): want exactly 1 definition location, got %d: %+v", len(got), got)
-	}
-
-	if revertElapsed >= editElapsed {
-		t.Errorf("reverted build (%s) was not faster than session B's real recheck (%s); want a CAS-hit-only build to skip the heavy package's type-check entirely", revertElapsed, editElapsed)
 	}
 }
