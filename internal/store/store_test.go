@@ -5,8 +5,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"go.etcd.io/bbolt"
+	bolterrors "go.etcd.io/bbolt/errors"
 )
 
 func openTestDB(t *testing.T) *DB {
@@ -279,6 +281,37 @@ func TestOpen_DiscardsDatabaseMissingSchemaVersion(t *testing.T) {
 
 	if _, err := reopened.GetUnit(1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetUnit(1) after reopening a version-less database = %v, want ErrNotFound (stale data must be discarded, not silently served)", err)
+	}
+}
+
+// TestOpen_SecondOpenOnLockedDatabaseReturnsAnErrorInsteadOfHanging is a
+// regression test for the second-editor-window scenario: without
+// Options.Timeout, bbolt.Open retries its exclusive flock indefinitely and
+// never returns, which used to hang the second session's "initialize"
+// request forever. Open must now fail with a clear, wrapped
+// bbolt.ErrTimeout well within openTimeout instead of blocking.
+func TestOpen_SecondOpenOnLockedDatabaseReturnsAnErrorInsteadOfHanging(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+
+	held, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := held.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	start := time.Now()
+	_, err = Open(path)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, bolterrors.ErrTimeout) {
+		t.Fatalf("second Open() on a locked database error = %v, want an error wrapping bolterrors.ErrTimeout", err)
+	}
+	if elapsed >= openTimeout+2*time.Second {
+		t.Fatalf("second Open() took %s to fail, want it to fail at around openTimeout (%s) instead of hanging", elapsed, openTimeout)
 	}
 }
 

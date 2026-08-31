@@ -141,6 +141,25 @@ func TestCompletion_BrokenPackageSelector(t *testing.T) {
 	}
 }
 
+// TestCompletion_OffsetPastEndOfText is a regression test for the panic
+// trigger the investigation confirmed: a completion request's offset is
+// validated against one overlay read (see checkedFile in internal/server),
+// but Completion re-reads the overlay itself afterward. A didChange that
+// shrinks the buffer in between can leave offset past the freshly-read
+// text's length, which used to panic with "slice bounds out of range".
+func TestCompletion_OffsetPastEndOfText(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "completion", "completion.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	if _, err := langfeat.Completion(cp, reader, path, len(text)+1000); err != nil {
+		t.Fatalf("Completion() with an out-of-range offset error = %v, want no error (and no panic)", err)
+	}
+}
+
 func TestMergeUnimported(t *testing.T) {
 	items := []langfeat.CompletionItem{{Label: "A"}}
 	candidates := []langfeat.CompletionItem{{Label: "B"}}

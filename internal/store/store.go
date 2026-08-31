@@ -7,13 +7,23 @@ import (
 	"math"
 	"os"
 	"strings"
+	"time"
 
 	"go.etcd.io/bbolt"
+	bolterrors "go.etcd.io/bbolt/errors"
 )
 
 // ErrNotFound is returned by Get-style lookups that find no entry for the
 // given key.
 var ErrNotFound = errors.New("store: not found")
+
+// openTimeout bounds how long Open waits to acquire bbolt's exclusive file
+// lock before giving up. Without it, bbolt.Open retries indefinitely and
+// never returns an error, so a second golance session opening the same
+// workspace root (e.g. the same folder in a second editor window) would
+// hang its "initialize" request forever instead of failing fast — see
+// [DB]'s doc.
+const openTimeout = 5 * time.Second
 
 var (
 	bucketUnit   = []byte("unit")   // pkgPathHash -> UnitPointer (see PutUnit)
@@ -54,16 +64,20 @@ var schemaVersionKey = []byte("\x00golance:schema")
 // the shared, lock-free [CAS] this root's session opens alongside it (see
 // the package doc). A *DB is safe for concurrent use by multiple
 // goroutines, and — being per-root/per-worktree rather than shared across a
-// whole repository — never contended by another golance session the way the
-// old single shared bbolt database was.
+// whole repository — is not contended across different roots the way the
+// old single shared bbolt database was. Two golance sessions opening the
+// same root at once still contend on this file's lock; see [Open].
 type DB struct {
 	bolt *bbolt.DB
 }
 
 // Open opens (creating if necessary) the index database at path and ensures
 // all buckets exist. Unlike the pre-CAS design, this is always a per-root
-// file: nothing about it is ever shared across worktrees, so there is
-// nothing to lock or wait for.
+// file: nothing about it is ever shared across worktrees. It is still an
+// exclusively-locked OS file, though, so opening the same root's database
+// from two golance sessions at once (e.g. the same workspace open in a
+// second editor window) contends on that lock; Open waits up to openTimeout
+// for it before giving up, rather than blocking its caller forever.
 //
 // A database found at path but recorded under a different schemaVersion (or
 // none at all — see discardStale) is discarded and recreated empty rather
@@ -73,9 +87,9 @@ type DB struct {
 // internal/server.indexNeedsRebuild) already handles an empty database
 // correctly.
 func Open(path string) (*DB, error) {
-	bdb, err := bbolt.Open(path, 0o600, nil)
+	bdb, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: openTimeout})
 	if err != nil {
-		return nil, fmt.Errorf("store: open %s: %w", path, err)
+		return nil, wrapOpenErr(path, err)
 	}
 	if discardStale(bdb) {
 		if err := bdb.Close(); err != nil {
@@ -84,9 +98,9 @@ func Open(path string) (*DB, error) {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("store: remove stale %s: %w", path, err)
 		}
-		bdb, err = bbolt.Open(path, 0o600, nil)
+		bdb, err = bbolt.Open(path, 0o600, &bbolt.Options{Timeout: openTimeout})
 		if err != nil {
-			return nil, fmt.Errorf("store: reopen %s: %w", path, err)
+			return nil, wrapOpenErr(path, err)
 		}
 	}
 	err = bdb.Update(func(tx *bbolt.Tx) error {
@@ -102,6 +116,17 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("store: init buckets: %w", err)
 	}
 	return &DB{bolt: bdb}, nil
+}
+
+// wrapOpenErr wraps a bbolt.Open failure for path with context, calling out
+// the lock-timeout case specifically (errors.Is(err, bolterrors.ErrTimeout) still
+// holds through the %w) so a caller's log line explains what actually
+// happened instead of reading like an opaque file error.
+func wrapOpenErr(path string, err error) error {
+	if errors.Is(err, bolterrors.ErrTimeout) {
+		return fmt.Errorf("store: open %s: locked by another golance session for over %s: %w", path, openTimeout, err)
+	}
+	return fmt.Errorf("store: open %s: %w", path, err)
 }
 
 // discardStale reports whether bdb's meta bucket already exists (meaning
