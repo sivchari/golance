@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"go.lsp.dev/protocol"
+	"go.lsp.dev/uri"
 
 	"github.com/sivchari/golance/internal/rpc"
 )
@@ -61,5 +63,33 @@ func TestResolverOrWarn_UsesLogMessageNotShowMessage(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Errorf("resolverOrWarn() second call sent %q, want nothing (one-time notice already sent)", out.String())
+	}
+}
+
+// TestHandleRename_DegradesGracefullyOnResolverError checks that
+// handleRename, given a position in a file resolver.Rename cannot resolve
+// (here: a file outside any package the facts index knows about, the same
+// "not part of any known package" condition resolveAt reports for a
+// genuinely unresolvable rename target), degrades like its sibling handlers
+// (Definition/References/Implementation/WorkspaceSymbol) instead of
+// wrapping resolver.Rename's raw internal error text into an
+// rpc.NewError InvalidRequest response.
+func TestHandleRename_DegradesGracefullyOnResolverError(t *testing.T) {
+	s, _, root := newTestServer(t)
+	path := filepath.Join(root, "greet", "unsaved.go")
+	openDoc(t, s, path, "package greet\n\nfunc Orphan() {}\n")
+
+	result, err := s.handleRename(context.Background(), mustMarshal(t, &protocol.RenameParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(path)},
+			Position:     protocol.Position{Line: 2, Character: 5},
+		},
+		NewName: "Renamed",
+	}))
+	if err != nil {
+		t.Fatalf("handleRename(unresolvable target) error = %v, want nil (a null result, not a wire error)", err)
+	}
+	if result != nil {
+		t.Fatalf("handleRename(unresolvable target) result = %#v, want nil", result)
 	}
 }

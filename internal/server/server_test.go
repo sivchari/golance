@@ -226,6 +226,46 @@ func TestHandleDocumentSymbol(t *testing.T) {
 	}
 }
 
+// TestHandleFoldingRange_UnknownPackageReturnsEmptyResult checks the same
+// degradation as handlers_langfeat_test.go's hover/completion cases for
+// handleFoldingRange, which — unlike hover/completion — calls
+// ws.engine.Get directly rather than through the checkedFile helper.
+func TestHandleFoldingRange_UnknownPackageReturnsEmptyResult(t *testing.T) {
+	s, _, root := newTestServer(t)
+	path := filepath.Join(root, "greet", "unsaved.go")
+
+	result, err := s.handleFoldingRange(context.Background(), mustMarshal(t, &protocol.FoldingRangeParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(path)},
+	}))
+	if err != nil {
+		t.Fatalf("handleFoldingRange(unknown package) error = %v, want nil (an empty result, not a wire error)", err)
+	}
+	ranges, ok := result.([]protocol.FoldingRange)
+	if !ok || len(ranges) != 0 {
+		t.Fatalf("handleFoldingRange(unknown package) result = %#v, want an empty []protocol.FoldingRange", result)
+	}
+}
+
+// TestHandleSelectionRange_UnknownPackageReturnsEmptyResult checks the same
+// degradation as TestHandleFoldingRange_UnknownPackageReturnsEmptyResult for
+// handleSelectionRange, which also calls ws.engine.Get directly.
+func TestHandleSelectionRange_UnknownPackageReturnsEmptyResult(t *testing.T) {
+	s, _, root := newTestServer(t)
+	path := filepath.Join(root, "greet", "unsaved.go")
+
+	result, err := s.handleSelectionRange(context.Background(), mustMarshal(t, &protocol.SelectionRangeParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(path)},
+		Positions:    []protocol.Position{{Line: 0, Character: 0}},
+	}))
+	if err != nil {
+		t.Fatalf("handleSelectionRange(unknown package) error = %v, want nil (an empty result, not a wire error)", err)
+	}
+	ranges, ok := result.([]protocol.SelectionRange)
+	if !ok || len(ranges) != 0 {
+		t.Fatalf("handleSelectionRange(unknown package) result = %#v, want an empty []protocol.SelectionRange", result)
+	}
+}
+
 func TestHandleFormatting(t *testing.T) {
 	s, _, root := newTestServer(t)
 	file := filepath.Join(root, "greet", "greet.go")
