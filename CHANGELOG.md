@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.1.3](https://github.com/sivchari/golance/compare/v0.1.2...v0.1.3) - 2026-08-31
+- fix: return empty results instead of internal errors for unresolvable files by @sivchari in https://github.com/sivchari/golance/pull/8
+- fix: survive handler panics and fail fast on a locked store by @sivchari in https://github.com/sivchari/golance/pull/9
+
 ## [v0.1.2](https://github.com/sivchari/golance/compare/v0.1.1...v0.1.2) - 2026-08-31
 - fix: stop canceling request-driven type checks when edits arrive by @sivchari in https://github.com/sivchari/golance/pull/6
 
