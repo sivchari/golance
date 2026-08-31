@@ -1,11 +1,19 @@
 package server
 
 import (
+	"context"
+	"time"
+
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
 	"github.com/sivchari/golance/internal/check"
 )
+
+// refreshInlayHintsTimeout bounds how long refreshInlayHints waits for the
+// client's workspace/inlayHint/refresh response, so a client that never
+// answers cannot leak the goroutine publishDiagnostics starts for it.
+const refreshInlayHintsTimeout = 5 * time.Second
 
 // publishDiagnostics is registered as check.Options.OnResult: it converts a
 // recheck's diagnostics into textDocument/publishDiagnostics notifications,
@@ -55,6 +63,29 @@ func (s *Server) publishDiagnostics(res *check.Result) {
 	}
 	for file, diags := range byFile {
 		s.notifyDiagnostics(file, diags)
+	}
+
+	// Tell a client that declared workspace.inlayHint.refreshSupport its
+	// currently shown inlay hints may now be stale — e.g. res reflects an
+	// edit to a dependency, not the open file's own didChange, so the
+	// client's usual re-request-on-edit behavior never fires for it. Run
+	// via s.rpc.Go (detached, not awaited here): OnResult callers document
+	// that publishDiagnostics must not block for long, and Request itself
+	// blocks until the client responds.
+	if s.inlayHintRefreshSupport.Load() {
+		s.rpc.Go(s.refreshInlayHints)
+	}
+}
+
+// refreshInlayHints sends workspace/inlayHint/refresh, asking the client to
+// re-request inlay hints for every currently shown document. Per the LSP
+// spec this refresh is global (the request carries no params), so it is
+// sent regardless of which directory's recheck triggered it.
+func (s *Server) refreshInlayHints(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, refreshInlayHintsTimeout)
+	defer cancel()
+	if _, err := s.rpc.Request(ctx, protocol.MethodWorkspaceInlayHintRefresh, nil); err != nil {
+		s.logger.Printf("server: refresh inlay hints: %v", err)
 	}
 }
 

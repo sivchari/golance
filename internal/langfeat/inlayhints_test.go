@@ -157,6 +157,22 @@ func TestInlayHints_FunctionTypeParameters(t *testing.T) {
 	}
 }
 
+func TestInlayHints_PackageQualifier(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "inlay", "qualifier.go")
+
+	hints, err := langfeat.InlayHints(cp, path, 0, wholeFile, langfeat.ResolveHints(nil))
+	if err != nil {
+		t.Fatalf("InlayHints: %v", err)
+	}
+
+	got := labelsOf(hintsOfKind(hints, langfeat.AssignVariableTypes))
+	want := []string{": Local", ": typedefdep.Remote"}
+	if !slices.Equal(got, want) {
+		t.Errorf("assignVariableTypes labels = %v, want %v (a same-package type renders unqualified, and a type from another package renders by its short package name only, never the full module path)", got, want)
+	}
+}
+
 func TestInlayHints_DisabledKindIsOmitted(t *testing.T) {
 	reader := overlay.New()
 	cp, path := newCheckedPackage(t, reader, "inlay", "params.go")
