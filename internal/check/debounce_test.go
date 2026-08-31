@@ -109,3 +109,75 @@ func TestEngine_Invalidate_CancelsInFlightRecheck(t *testing.T) {
 		t.Fatalf("unexpected result: %+v", res)
 	}
 }
+
+// TestEngine_Stop_CancelsInFlightBackgroundRecheck covers the fix for
+// Finding 5: a debounce-triggered background recheck already in flight when
+// the caller (e.g. Server.setWorkspace, discarding this Engine for a fresh
+// one over a new import graph) calls Stop must not go on to publish via
+// OnResult afterward.
+func TestEngine_Stop_CancelsInFlightBackgroundRecheck(t *testing.T) {
+	gr := &gatingReader{
+		FileReader: overlay.New(),
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	var mu sync.Mutex
+	var count int
+
+	e, root := newTestEngine(t, gr, Options{
+		DebounceDelay: 20 * time.Millisecond,
+		OnResult: func(*Result) {
+			mu.Lock()
+			count++
+			mu.Unlock()
+		},
+	})
+	dir := filepath.Join(root, "debounce")
+
+	e.Invalidate(dir)
+	select {
+	case <-gr.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background recheck never started")
+	}
+
+	e.Stop()
+	close(gr.release) // unblock the now-canceled job; it should notice and bail
+	time.Sleep(150 * time.Millisecond)
+
+	mu.Lock()
+	got := count
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("OnResult called %d times after Stop, want 0 (the in-flight job must be canceled before it can publish)", got)
+	}
+}
+
+// TestEngine_Stop_CancelsPendingDebounceTimer covers the other half of
+// Finding 5's fix: a debounce timer that has not fired yet must never fire
+// after Stop.
+func TestEngine_Stop_CancelsPendingDebounceTimer(t *testing.T) {
+	var mu sync.Mutex
+	var count int
+
+	e, root := newTestEngine(t, overlay.New(), Options{
+		DebounceDelay: 20 * time.Millisecond,
+		OnResult: func(*Result) {
+			mu.Lock()
+			count++
+			mu.Unlock()
+		},
+	})
+	dir := filepath.Join(root, "debounce")
+
+	e.Invalidate(dir)
+	e.Stop()
+	time.Sleep(150 * time.Millisecond) // long enough for the debounce delay to have elapsed, if it were still armed
+
+	mu.Lock()
+	got := count
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("OnResult called %d times after Stop, want 0 (the pending debounce timer must never fire)", got)
+	}
+}

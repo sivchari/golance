@@ -61,11 +61,20 @@ type Server struct {
 	pending   map[string]chan *message // keyed by the request id Request assigned, awaiting the client's response
 	nextID    atomic.Int64
 
-	// wg tracks in-flight request and notification handler goroutines so
-	// Serve can wait for their responses/side effects to complete before
-	// returning, instead of racing the write of a still-running handler
-	// against the caller closing the connection.
+	// wg tracks in-flight request and notification handler goroutines, plus
+	// every Go-launched detached background goroutine, so Serve can wait for
+	// their responses/side effects to complete before returning, instead of
+	// racing the write of a still-running handler against the caller
+	// closing the connection.
 	wg sync.WaitGroup
+
+	// ctx is the session-lifetime context: a child of the ctx passed to
+	// Serve, canceled when Serve returns for any reason. An atomic.Pointer,
+	// not a plain field, so Context/Go are safe to call from any goroutine
+	// — not just ones a handler dispatched from Serve's own loop, which
+	// would otherwise be the only calls guaranteed a happens-before edge
+	// against Serve's write. Nil before Serve is called.
+	ctx atomic.Pointer[context.Context]
 
 	conn *conn
 }
@@ -144,7 +153,23 @@ func (e *ExitError) Error() string {
 // pipe without sending exit) and an *ExitError after "exit".
 func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	s.conn = newConn(w)
+	// s.ctx is deliberately independent of the per-request/notification ctx
+	// dispatchRequest/dispatchNotification pass to handlers below (still
+	// derived straight from the ctx parameter, unchanged): those already
+	// have their own cancellation story (a request's own context.WithCancel
+	// child, torn down when its handler returns; a notification's is never
+	// individually canceled), and must keep running to completion here
+	// exactly as before, not be preempted merely because Serve's read loop
+	// is winding down. s.ctx exists only for Context/Go: detached
+	// background work that has no other reason to stop.
+	sessionCtx, cancel := context.WithCancel(ctx)
+	s.ctx.Store(&sessionCtx)
+	// cancel must run before wg.Wait below (defers run LIFO): canceling
+	// first lets every Go-launched background goroutine observe it and
+	// return promptly, so wg.Wait — which also drains those — does not
+	// block on work that would otherwise never stop on its own.
 	defer s.wg.Wait()
+	defer cancel()
 	br := bufio.NewReaderSize(r, 1<<20)
 	for {
 		raw, err := readFrame(br)
@@ -171,6 +196,39 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 			return s.exitErr
 		}
 	}
+}
+
+// Context returns the context bound to this Serve call's own lifetime: a
+// child of the ctx passed to Serve, canceled once Serve returns (client
+// "exit", EOF, or a read error) but before Serve's own shutdown-time
+// wg.Wait completes. A request handler's own ctx parameter is instead a
+// per-request child canceled the moment that handler returns (see
+// dispatchRequest), so it is the wrong choice for detached background
+// work started from a request handler that must outlive the request
+// itself — use Go instead, which supplies this context automatically.
+// Before Serve has been called, Context returns context.Background(), so
+// code that may run in a test harness without a real Serve session (e.g.
+// exercising a handler directly) still gets a valid, if uncancelable,
+// context rather than a nil one.
+func (s *Server) Context() context.Context {
+	if p := s.ctx.Load(); p != nil {
+		return *p
+	}
+	return context.Background()
+}
+
+// Go runs fn in its own goroutine, passed Context() and tracked by wg the
+// same way an in-flight request/notification handler is — so Serve's
+// shutdown-time drain waits (briefly) for it instead of abandoning it —
+// for detached background work a handler starts that must outlive the
+// call that started it (e.g. launching the indexer subprocess, a
+// debounced reindex) but should still stop once the session itself ends.
+func (s *Server) Go(fn func(ctx context.Context)) {
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		fn(s.Context())
+	}()
 }
 
 func (s *Server) dispatchRequest(ctx context.Context, m *message) {

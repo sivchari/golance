@@ -65,11 +65,17 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 	}
 	s.setWorkspace(root, snap)
 
+	// revalidateIndex/buildIndex may launch the indexer subprocess, so both
+	// are bound to the session's own lifetime via s.rpc.Go — not this
+	// request's own ctx, which internal/rpc.Server cancels the moment this
+	// handler returns (see dispatchRequest) — and tracked by Serve's wg so
+	// shutdown waits (briefly) for whichever is in flight instead of
+	// leaving it orphaned.
 	if idx, ok := s.tryWarmOpen(root); ok {
 		s.idx.Store(idx)
-		go s.revalidateIndex(root)
+		s.rpc.Go(func(ctx context.Context) { s.revalidateIndex(ctx, root) })
 	} else {
-		go s.buildIndex(root)
+		s.rpc.Go(func(ctx context.Context) { s.buildIndex(ctx, root) })
 	}
 
 	return &protocol.InitializeResult{

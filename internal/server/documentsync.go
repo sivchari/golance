@@ -51,7 +51,7 @@ func (s *Server) handleDidChange(_ context.Context, params json.RawMessage) erro
 // handleDidSave refreshes the document's overlay with the saved text (if
 // the client included it), schedules a recheck, and — if the facts index
 // is ready — reindexes the saved package in the background.
-func (s *Server) handleDidSave(ctx context.Context, params json.RawMessage) error {
+func (s *Server) handleDidSave(_ context.Context, params json.RawMessage) error {
 	var p protocol.DidSaveTextDocumentParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return err
@@ -71,12 +71,14 @@ func (s *Server) handleDidSave(ctx context.Context, params json.RawMessage) erro
 	if !ok || idx == nil {
 		return nil
 	}
-	// ctx is the server's own session-lifetime context (notifications are
-	// not individually cancelable — see internal/rpc.Server.dispatchNotification),
-	// not the DidSave notification's, so using it here bounds this
-	// detached reindex goroutine to the LSP session's own lifetime instead
-	// of running past shutdown with an unbounded context.Background().
-	go s.reindex(ctx, ws, idx, pkgPath)
+	// This reindex is detached from the notification that triggered it (it
+	// can run well past handleDidSave's own return), so it must not use a
+	// per-notification ctx or an unbounded context.Background(): s.rpc.Go
+	// binds it to the session's own lifetime instead — canceled once Serve
+	// returns — and tracks it via Serve's own wg, so shutdown waits
+	// (briefly) for it to finish or notice cancellation, rather than
+	// abandoning it mid-write.
+	s.rpc.Go(func(ctx context.Context) { s.reindex(ctx, ws, idx, pkgPath) })
 	return nil
 }
 

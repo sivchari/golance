@@ -59,10 +59,20 @@ func (s *Server) publishDiagnostics(res *check.Result) {
 }
 
 func (s *Server) notifyDiagnostics(file string, diags []protocol.Diagnostic) {
-	err := s.rpc.Notify(protocol.MethodTextDocumentPublishDiagnostics, &protocol.PublishDiagnosticsParams{
+	params := &protocol.PublishDiagnosticsParams{
 		URI:         uri.File(file),
 		Diagnostics: diags,
-	})
+	}
+	// Set Version whenever the file is still open, so the client can
+	// discard/reconcile this publish against whatever version it currently
+	// has instead of trusting an out-of-order notification blindly. A file
+	// this reports on is always open (see publishDiagnostics's doc), so
+	// !ok here only means it was closed in the narrow window between that
+	// check and this notification.
+	if _, version, _, ok := s.overlay.Get(uri.File(file)); ok {
+		params.Version = protocol.NewOptional(version)
+	}
+	err := s.rpc.Notify(protocol.MethodTextDocumentPublishDiagnostics, params)
 	if err != nil {
 		s.logger.Printf("server: publish diagnostics for %s: %v", file, err)
 	}
