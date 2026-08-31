@@ -333,6 +333,86 @@ func TestPlainErrorIsReportedAsInternalError(t *testing.T) {
 	}
 }
 
+// TestPanickingRequestHandlerReturnsInternalErrorAndServerKeepsServing
+// covers Finding 4: an unrecovered panic in one handler used to crash the
+// whole process. A panicking handler must now produce an InternalError
+// response for just that request, and the server must keep serving later
+// requests on the same connection afterward.
+func TestPanickingRequestHandlerReturnsInternalErrorAndServerKeepsServing(t *testing.T) {
+	s := newTestServer(t)
+	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
+	s.Handle("boom", Interactive, func(context.Context, json.RawMessage) (any, error) {
+		panic("deliberate handler panic")
+	})
+	s.Handle("textDocument/hover", Interactive, func(context.Context, json.RawMessage) (any, error) {
+		return "still serving", nil
+	})
+
+	in := strings.NewReader(
+		frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`) +
+			frame(t, `{"jsonrpc":"2.0","id":2,"method":"boom","params":{}}`) +
+			frame(t, `{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{}}`),
+	)
+	var out bytes.Buffer
+	if err := s.Serve(context.Background(), in, &out); err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+
+	frames := readFrames(t, out.Bytes())
+	if len(frames) != 3 {
+		t.Fatalf("got %d frames, want 3: %v", len(frames), frames)
+	}
+
+	f := frameForID(t, frames, 2)
+	errObj, _ := f["error"].(map[string]any)
+	code, ok := errObj["code"].(float64)
+	if errObj == nil || !ok || int32(code) != internalErrorCode {
+		t.Fatalf("panicking handler's response = %v, want InternalError", f)
+	}
+	if msg, _ := errObj["message"].(string); strings.Contains(msg, "deliberate handler panic") {
+		t.Fatalf("client-facing message = %q, must not leak the panic value", msg)
+	}
+
+	f3 := frameForID(t, frames, 3)
+	if f3["result"] != "still serving" {
+		t.Fatalf("request after the panic = %v, want the server to keep answering requests", f3)
+	}
+}
+
+// TestPanickingNotificationHandlerIsSwallowedAndServerKeepsServing covers
+// Finding 4's notification half: a panicking notification handler has no
+// response to send, so it must be logged and swallowed rather than crashing
+// the process or wedging that notification's per-document queue.
+func TestPanickingNotificationHandlerIsSwallowedAndServerKeepsServing(t *testing.T) {
+	s := newTestServer(t)
+	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
+	s.HandleNotification("boom", func(context.Context, json.RawMessage) error {
+		panic("deliberate notification panic")
+	})
+	ran := make(chan struct{}, 1)
+	s.HandleNotification("after", func(context.Context, json.RawMessage) error {
+		ran <- struct{}{}
+		return nil
+	})
+
+	uri := `{"textDocument":{"uri":"file:///a.go"}}`
+	in := strings.NewReader(
+		frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`) +
+			frame(t, fmt.Sprintf(`{"jsonrpc":"2.0","method":"boom","params":%s}`, uri)) +
+			frame(t, fmt.Sprintf(`{"jsonrpc":"2.0","method":"after","params":%s}`, uri)),
+	)
+	var out bytes.Buffer
+	if err := s.Serve(context.Background(), in, &out); err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("notification queued after the panicking one never ran; the queue is wedged")
+	}
+}
+
 func TestHandlerReturnedErrorPreservesCode(t *testing.T) {
 	s := newTestServer(t)
 	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) {

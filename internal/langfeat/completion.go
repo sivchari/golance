@@ -57,6 +57,12 @@ func Completion(cp *check.CheckedPackage, reader overlay.FileReader, file string
 	if err != nil {
 		return nil, err
 	}
+	// offset was validated against an earlier overlay read by the caller
+	// (see internal/server's checkedFile), but reader.ReadFile above is a
+	// second, later read of the same file: a concurrent edit landing in
+	// between can leave offset stale relative to text. Clamp it so the
+	// text[prefixStart:offset] slice below never runs out of bounds.
+	offset = min(max(offset, 0), len(text))
 	prefixStart := scanIdentBack(text, offset)
 	prefix := string(text[prefixStart:offset])
 
@@ -261,9 +267,12 @@ func filterAndRank(items []CompletionItem, prefix string) []CompletionItem {
 
 // scanIdentBack returns the byte offset of the start of the identifier
 // ending at offset in text, or offset itself if text[offset-1] is not an
-// identifier rune.
+// identifier rune. offset is clamped to [0, len(text)] first: callers'
+// offsets are validated against one overlay read, but ResolveCompletionDoc
+// passes its own offset straight through without re-checking it against the
+// text (read separately, and possibly later) passed in here.
 func scanIdentBack(text []byte, offset int) int {
-	i := offset
+	i := min(max(offset, 0), len(text))
 	for i > 0 {
 		r, size := utf8.DecodeLastRune(text[:i])
 		if !isIdentRune(r) {

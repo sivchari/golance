@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 
@@ -196,6 +197,7 @@ func (s *Server) dispatchRequest(ctx context.Context, m *message) {
 	reqCtx, cancel := context.WithCancel(ctx)
 	idKey := string(m.ID)
 	id := append(json.RawMessage(nil), m.ID...)
+	method := m.Method
 	params := m.Params
 	s.cancels.register(idKey, cancel)
 	s.wg.Add(1)
@@ -203,7 +205,7 @@ func (s *Server) dispatchRequest(ctx context.Context, m *message) {
 		defer s.wg.Done()
 		defer s.cancels.unregister(idKey)
 		defer cancel()
-		result, err := reg.handler(reqCtx, params)
+		result, err := s.callRequestHandler(reqCtx, method, reg.handler, params)
 		switch {
 		case reqCtx.Err() != nil:
 			s.respondError(id, NewError(requestCancelledCode, "request cancelled"))
@@ -236,10 +238,39 @@ func (s *Server) dispatchNotification(ctx context.Context, m *message) {
 	s.wg.Add(1)
 	s.queueFor(notificationQueueKey(params)).push(func() {
 		defer s.wg.Done()
-		if err := handler(ctx, params); err != nil {
-			s.logger.Printf("rpc: notification %s: %v", method, err)
-		}
+		s.callNotificationHandler(ctx, method, handler, params)
 	})
+}
+
+// callRequestHandler invokes h, recovering a panic so a bug in one handler
+// fails only this request instead of crashing the whole server. The panic
+// value and a stack trace are logged server-side; the client only ever sees
+// a generic InternalError, never the panic details.
+func (s *Server) callRequestHandler(ctx context.Context, method string, h RequestHandler, params json.RawMessage) (result any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Printf("rpc: panic in request handler %s: %v\n%s", method, r, debug.Stack())
+			err = &Error{Code: internalErrorCode, Message: "internal error"}
+		}
+	}()
+	return h(ctx, params)
+}
+
+// callNotificationHandler invokes h, recovering a panic so it can't crash
+// the whole server or wedge this notification's per-document queue (an
+// unrecovered panic would exit notifQueue.drain's loop without resetting
+// q.running, stalling every later notification for the same key). Per the
+// JSON-RPC notification contract there is no response channel, so both a
+// returned error and a recovered panic are only logged.
+func (s *Server) callNotificationHandler(ctx context.Context, method string, h NotificationHandler, params json.RawMessage) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Printf("rpc: panic in notification handler %s: %v\n%s", method, r, debug.Stack())
+		}
+	}()
+	if err := h(ctx, params); err != nil {
+		s.logger.Printf("rpc: notification %s: %v", method, err)
+	}
 }
 
 // dispatchResponse routes a response to one of our own server-initiated
