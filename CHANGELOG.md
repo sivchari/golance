@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.1.5](https://github.com/sivchari/golance/compare/v0.1.4...v0.1.5) - 2026-08-31
+- fix: render short package names in type strings and push inlay hint refreshes by @sivchari in https://github.com/sivchari/golance/pull/19
+- fix: resolve go to implementation from method names by @sivchari in https://github.com/sivchari/golance/pull/21
+- feat: go to definition into the standard library and module dependencies by @sivchari in https://github.com/sivchari/golance/pull/22
+
 ## [v0.1.4](https://github.com/sivchari/golance/compare/v0.1.3...v0.1.4) - 2026-08-31
 - docs: add PR #10 to the v0.1.3 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/13
 - fix: use the type-checked content itself for position math by @sivchari in https://github.com/sivchari/golance/pull/15
