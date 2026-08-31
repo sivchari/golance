@@ -2,8 +2,10 @@ package langfeat
 
 import (
 	"go/token"
-	"runtime"
+	"os"
+	"os/exec"
 	"strings"
+	"sync"
 
 	"github.com/sivchari/golance/internal/check"
 	"golang.org/x/tools/go/ast/astutil"
@@ -69,13 +71,32 @@ func DependencyDefinition(cp *check.CheckedPackage, depFset *token.FileSet, file
 }
 
 // expandGoroot replaces a leading $GOROOT placeholder (see
-// goRootPlaceholder) with this process's actual GOROOT — the same
+// goRootPlaceholder) with the toolchain's actual GOROOT — the same
 // substitution golang.org/x/tools' own internal gcimporter tests apply to
 // positions decoded from stdlib export data. A module dependency's export
-// data already carries an absolute path and passes through unchanged.
+// data already carries an absolute path and passes through unchanged. If
+// GOROOT cannot be determined the placeholder is left as is; the caller's
+// file-exists check then rejects the location, degrading to no result.
 func expandGoroot(filename string) string {
 	if !strings.HasPrefix(filename, goRootPlaceholder) {
 		return filename
 	}
-	return strings.Replace(filename, goRootPlaceholder, runtime.GOROOT(), 1)
+	root := goroot()
+	if root == "" {
+		return filename
+	}
+	return strings.Replace(filename, goRootPlaceholder, root, 1)
 }
+
+// goroot resolves the toolchain's GOROOT once: "go env GOROOT" is the
+// supported way to locate it (runtime.GOROOT is deprecated since Go 1.24
+// and wrong for a relocated binary), with the GOROOT environment variable
+// as a fallback when the go binary is not on PATH.
+var goroot = sync.OnceValue(func() string {
+	if out, err := exec.Command("go", "env", "GOROOT").Output(); err == nil {
+		if root := strings.TrimSpace(string(out)); root != "" {
+			return root
+		}
+	}
+	return os.Getenv("GOROOT")
+})

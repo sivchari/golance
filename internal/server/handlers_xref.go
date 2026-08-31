@@ -147,6 +147,9 @@ func (s *Server) dependencyDefinition(ctx context.Context, u uri.URI, pos protoc
 	if _, err := os.Stat(info.Filename); err != nil {
 		return xref.Location{}, false
 	}
+	if info.Line <= 0 || int64(info.Line) > math.MaxUint32 {
+		return xref.Location{}, false
+	}
 	// Column 1 for both Col and EndCol: export data does not preserve
 	// column information (see internal/xref.methodFuncLocation's doc), so
 	// this degrades to a zero-width location at the start of the
