@@ -29,29 +29,28 @@ func (s *Server) registerSemanticHandlers() {
 // "initialize" request has populated the workspace, and likewise (logged,
 // not surfaced) when path is not part of a known package or
 // langfeat.SemanticTokens finds nothing to classify, matching every other
-// handler's read-only convention for those states. The error return is
-// always nil; kept for symmetry with its callers.
-func (s *Server) semanticTokensForFile(ctx context.Context, u uri.URI) ([]langfeat.Token, []byte, error) {
+// handler's read-only convention for those states.
+func (s *Server) semanticTokensForFile(ctx context.Context, u uri.URI) ([]langfeat.Token, []byte) {
 	path := u.FsPath()
 	ws := s.workspace()
 	if ws == nil {
-		return nil, nil, nil
+		return nil, nil
 	}
 	cp, err := ws.engine.Get(ctx, path)
 	if err != nil {
 		s.logger.Printf("server: checked package for %s: %v", path, err)
-		return nil, nil, nil
+		return nil, nil
 	}
 	text, ok := cp.FileText(path)
 	if !ok {
-		return nil, nil, nil
+		return nil, nil
 	}
 	toks, err := langfeat.SemanticTokens(cp, path, text)
 	if err != nil {
 		s.logger.Printf("server: semantic tokens %s: %v", path, err)
-		return nil, nil, nil
+		return nil, nil
 	}
-	return toks, text, nil
+	return toks, text
 }
 
 func (s *Server) handleSemanticTokensFull(ctx context.Context, params json.RawMessage) (any, error) {
@@ -59,10 +58,7 @@ func (s *Server) handleSemanticTokensFull(ctx context.Context, params json.RawMe
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	toks, text, err := s.semanticTokensForFile(ctx, p.TextDocument.URI)
-	if err != nil {
-		return nil, err
-	}
+	toks, text := s.semanticTokensForFile(ctx, p.TextDocument.URI)
 	return &protocol.SemanticTokens{Data: langfeat.Encode(text, toks)}, nil
 }
 
@@ -71,10 +67,7 @@ func (s *Server) handleSemanticTokensRange(ctx context.Context, params json.RawM
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	toks, text, err := s.semanticTokensForFile(ctx, p.TextDocument.URI)
-	if err != nil {
-		return nil, err
-	}
+	toks, text := s.semanticTokensForFile(ctx, p.TextDocument.URI)
 	return &protocol.SemanticTokens{Data: langfeat.Encode(text, tokensInRange(text, toks, p.Range))}, nil
 }
 

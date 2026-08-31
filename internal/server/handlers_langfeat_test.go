@@ -159,7 +159,7 @@ func TestCheckedFile_ConcurrentOverlayEditsStayConsistent(t *testing.T) {
 	s, _, root := newTestServer(t)
 	path := filepath.Join(root, "greet", "greet.go")
 
-	saved, err := os.ReadFile(path)
+	saved, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
@@ -182,10 +182,7 @@ func TestCheckedFile_ConcurrentOverlayEditsStayConsistent(t *testing.T) {
 
 	u := uri.File(path)
 	for i := 0; i < iterations; i++ {
-		cf, err := s.checkedFile(context.Background(), u, protocol.Position{Line: 0, Character: 0})
-		if err != nil {
-			t.Fatalf("checkedFile: %v", err)
-		}
+		cf := s.checkedFile(context.Background(), u, protocol.Position{Line: 0, Character: 0})
 		if !cf.ok {
 			continue
 		}

@@ -49,9 +49,9 @@ func (s *Server) handleTypeDefinition(ctx context.Context, params json.RawMessag
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	cf, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
-	if err != nil || !cf.ok {
-		return protocol.LocationSlice(nil), err
+	cf := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
+	if !cf.ok {
+		return protocol.LocationSlice(nil), nil
 	}
 	info, err := langfeat.TypeDefinition(cf.cp, cf.path, cf.offset)
 	if err != nil {
@@ -119,9 +119,9 @@ func (s *Server) handleDocumentHighlight(ctx context.Context, params json.RawMes
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	cf, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
-	if err != nil || !cf.ok {
-		return []protocol.DocumentHighlight{}, err
+	cf := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
+	if !cf.ok {
+		return []protocol.DocumentHighlight{}, nil
 	}
 	hs, err := langfeat.DocumentHighlight(cf.cp, cf.path, cf.offset)
 	if err != nil {
@@ -153,9 +153,9 @@ func (s *Server) handlePrepareRename(ctx context.Context, params json.RawMessage
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	cf, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
-	if err != nil || !cf.ok {
-		return nil, err
+	cf := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
+	if !cf.ok {
+		return nil, nil
 	}
 	r, err := langfeat.PrepareRename(cf.cp, cf.path, cf.offset)
 	if err != nil {
@@ -449,11 +449,7 @@ func (s *Server) handleCompletionWithData(ctx context.Context, params json.RawMe
 		s.logger.Printf("server: completion data params: %v", uerr)
 		return result, nil
 	}
-	cf, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
-	if err != nil {
-		s.logger.Printf("server: completion data lookup for %s: %v", p.TextDocument.URI.FsPath(), err)
-		return result, nil
-	}
+	cf := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
 	if !cf.ok {
 		return result, nil
 	}

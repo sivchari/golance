@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -112,7 +113,7 @@ func TestHandleRename_RefusesLoudlyOnDirtyBuffer(t *testing.T) {
 	s, _, root := newTestServer(t)
 	path := filepath.Join(root, "greet", "greet.go")
 
-	saved, err := os.ReadFile(path)
+	saved, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
@@ -145,8 +146,8 @@ func TestHandleRename_RefusesLoudlyOnDirtyBuffer(t *testing.T) {
 	if err == nil {
 		t.Fatal("handleRename(dirty buffer) error = nil, want a loud error refusing the rename")
 	}
-	rpcErr, ok := err.(*rpc.Error)
-	if !ok {
+	var rpcErr *rpc.Error
+	if !errors.As(err, &rpcErr) {
 		t.Fatalf("handleRename(dirty buffer) error type = %T, want *rpc.Error", err)
 	}
 	if !strings.Contains(rpcErr.Message, "unsaved edits") {
@@ -163,7 +164,7 @@ func TestHandleRename_AppliesEditsAcrossCleanBuffer(t *testing.T) {
 	s, _, root := newTestServer(t)
 	path := filepath.Join(root, "greet", "greet.go")
 
-	saved, err := os.ReadFile(path)
+	saved, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
