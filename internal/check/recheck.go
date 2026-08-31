@@ -60,7 +60,7 @@ func (e *Engine) runRecheck(ctx context.Context, dir string) (*CheckedPackage, e
 	}
 
 	fset := token.NewFileSet()
-	astFiles, parseErrs := parseFiles(fset, e.reader, files)
+	astFiles, texts, parseErrs := parseFiles(fset, e.reader, files)
 
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -82,6 +82,7 @@ func (e *Engine) runRecheck(ctx context.Context, dir string) (*CheckedPackage, e
 		info:        info,
 		parseErrs:   parseErrs,
 		typeErrs:    typeErrs,
+		texts:       texts,
 		contentHash: hash,
 		builtAt:     time.Now(),
 	}
@@ -198,16 +199,21 @@ func isCandidateGoFile(name string) bool {
 // parseFiles parses each of files (in order) with parser.AllErrors so a
 // syntax error in one file still yields a partial AST rather than aborting
 // the whole package, collecting every error into a single ErrorList sorted
-// by position.
-func parseFiles(fset *token.FileSet, reader overlay.FileReader, files []string) ([]*ast.File, scanner.ErrorList) {
+// by position. It also returns the exact source bytes each file was parsed
+// from, keyed by path, so the caller can attach them to the resulting
+// CheckedPackage (see CheckedPackage.FileText) instead of leaving callers
+// to re-read the overlay afterward.
+func parseFiles(fset *token.FileSet, reader overlay.FileReader, files []string) ([]*ast.File, map[string][]byte, scanner.ErrorList) {
 	var errs scanner.ErrorList
 	var out []*ast.File
+	texts := make(map[string][]byte, len(files))
 	for _, path := range files {
 		src, err := reader.ReadFile(path)
 		if err != nil {
 			errs.Add(token.Position{Filename: path}, err.Error())
 			continue
 		}
+		texts[path] = src
 		f, err := parser.ParseFile(fset, path, src, parser.ParseComments|parser.AllErrors)
 		if f != nil {
 			out = append(out, f)
@@ -222,7 +228,7 @@ func parseFiles(fset *token.FileSet, reader overlay.FileReader, files []string) 
 		}
 	}
 	errs.Sort()
-	return out, errs
+	return out, texts, errs
 }
 
 // contentHash hashes files' content (overlay-aware, via reader) together

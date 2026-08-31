@@ -21,13 +21,16 @@ func (s *Server) registerSemanticHandlers() {
 }
 
 // semanticTokensForFile resolves u's file to its classified semantic
-// Tokens (sorted, byte-offset ranges) and its current buffer content. It
-// returns (nil, nil, nil) — not an error — before the "initialize" request
-// has populated the workspace, and likewise (logged, not surfaced) when
-// path is not part of a known package or langfeat.SemanticTokens finds
-// nothing to classify, matching every other handler's read-only convention
-// for those states. err is non-nil only for a genuine overlay-read
-// failure.
+// Tokens (sorted, byte-offset ranges) and the exact buffer content
+// ws.engine.Get type-checked against — via cp.FileText, not a separate
+// later overlay read, so a concurrent edit landing in between can't leave
+// the two disagreeing (langfeat.SemanticTokens requires text to match cp
+// exactly). It returns (nil, nil, nil) — not an error — before the
+// "initialize" request has populated the workspace, and likewise (logged,
+// not surfaced) when path is not part of a known package or
+// langfeat.SemanticTokens finds nothing to classify, matching every other
+// handler's read-only convention for those states. The error return is
+// always nil; kept for symmetry with its callers.
 func (s *Server) semanticTokensForFile(ctx context.Context, u uri.URI) ([]langfeat.Token, []byte, error) {
 	path := u.FsPath()
 	ws := s.workspace()
@@ -39,9 +42,9 @@ func (s *Server) semanticTokensForFile(ctx context.Context, u uri.URI) ([]langfe
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return nil, nil, nil
 	}
-	text, err := s.overlay.ReadFile(path)
-	if err != nil {
-		return nil, nil, err
+	text, ok := cp.FileText(path)
+	if !ok {
+		return nil, nil, nil
 	}
 	toks, err := langfeat.SemanticTokens(cp, path, text)
 	if err != nil {

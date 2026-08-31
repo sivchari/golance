@@ -25,7 +25,7 @@ func TestCompletion_Selector(t *testing.T) {
 	}
 	offset := mustIndex(t, text, "return p.X") + len("return p.")
 
-	items, err := langfeat.Completion(cp, reader, path, offset)
+	items, err := langfeat.Completion(cp, text, path, offset)
 	if err != nil {
 		t.Fatalf("Completion: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestCompletion_SelectorPrefixFilter(t *testing.T) {
 	}
 	offset := mustIndex(t, text, "return p.Sc") + len("return p.Sc")
 
-	items, err := langfeat.Completion(cp, reader, path, offset)
+	items, err := langfeat.Completion(cp, text, path, offset)
 	if err != nil {
 		t.Fatalf("Completion: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestCompletion_PackageMember(t *testing.T) {
 	}
 	offset := mustIndex(t, text, "strings.ToUpper") + len("strings.")
 
-	items, err := langfeat.Completion(cp, reader, path, offset)
+	items, err := langfeat.Completion(cp, text, path, offset)
 	if err != nil {
 		t.Fatalf("Completion: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestCompletion_Lexical(t *testing.T) {
 	}
 	offset := mustIndex(t, text, "return tot") + len("return tot")
 
-	items, err := langfeat.Completion(cp, reader, path, offset)
+	items, err := langfeat.Completion(cp, text, path, offset)
 	if err != nil {
 		t.Fatalf("Completion: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestCompletion_BrokenSelector(t *testing.T) {
 	}
 	offset := mustIndex(t, text, "f.\n") + len("f.")
 
-	items, err := langfeat.Completion(cp, reader, path, offset)
+	items, err := langfeat.Completion(cp, text, path, offset)
 	if err != nil {
 		t.Fatalf("Completion: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestCompletion_BrokenPackageSelector(t *testing.T) {
 	}
 	offset := mustIndex(t, text, "strings.\n") + len("strings.")
 
-	items, err := langfeat.Completion(cp, reader, path, offset)
+	items, err := langfeat.Completion(cp, text, path, offset)
 	if err != nil {
 		t.Fatalf("Completion: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestCompletion_OffsetPastEndOfText(t *testing.T) {
 		t.Fatalf("ReadFile: %v", err)
 	}
 
-	if _, err := langfeat.Completion(cp, reader, path, len(text)+1000); err != nil {
+	if _, err := langfeat.Completion(cp, text, path, len(text)+1000); err != nil {
 		t.Fatalf("Completion() with an out-of-range offset error = %v, want no error (and no panic)", err)
 	}
 }

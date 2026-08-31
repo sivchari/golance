@@ -10,7 +10,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/sivchari/golance/internal/check"
-	"github.com/sivchari/golance/internal/overlay"
 	"golang.org/x/tools/go/ast/astutil"
 )
 
@@ -39,10 +38,11 @@ type CompletionItem struct {
 }
 
 // Completion returns completion candidates for the cursor at offset (a
-// byte offset from the start of file). It reads file's current content
-// through reader to find the identifier prefix being typed, then resolves
-// the surrounding context (selector, package member, or lexical scope)
-// against cp's already-checked types.
+// byte offset from the start of file) against text, which must be the same
+// content cp was checked against (see check.CheckedPackage.FileText) — it
+// finds the identifier prefix being typed there, then resolves the
+// surrounding context (selector, package member, or lexical scope) against
+// cp's already-checked types.
 //
 // A dangling selector ("x." with nothing typed after the dot yet) usually
 // still resolves: parser.AllErrors keeps the SelectorExpr in the partial
@@ -52,16 +52,11 @@ type CompletionItem struct {
 // falls back to lexical scope candidates instead — recovering that case
 // too would need a per-expression types.CheckExpr scratch check, a known
 // v0.1 limitation (see TODO below).
-func Completion(cp *check.CheckedPackage, reader overlay.FileReader, file string, offset int) ([]CompletionItem, error) {
-	text, err := reader.ReadFile(file)
-	if err != nil {
-		return nil, err
-	}
-	// offset was validated against an earlier overlay read by the caller
-	// (see internal/server's checkedFile), but reader.ReadFile above is a
-	// second, later read of the same file: a concurrent edit landing in
-	// between can leave offset stale relative to text. Clamp it so the
-	// text[prefixStart:offset] slice below never runs out of bounds.
+func Completion(cp *check.CheckedPackage, text []byte, file string, offset int) ([]CompletionItem, error) {
+	// text and offset are expected to already agree (the caller should have
+	// derived offset from this same text), but clamp defensively anyway:
+	// this is a public entry point, and text[prefixStart:offset] below must
+	// never run out of bounds even against a stale offset.
 	offset = min(max(offset, 0), len(text))
 	prefixStart := scanIdentBack(text, offset)
 	prefix := string(text[prefixStart:offset])
