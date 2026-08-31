@@ -230,9 +230,10 @@ func (s *Snapshot) ExportFile(path string) (string, bool) {
 		}
 	}
 	if v, ok := s.recovered.Load(path); ok {
-		recovered := v.(string)
-		if _, err := os.Stat(recovered); err == nil {
-			return recovered, true
+		if recovered, ok := v.(string); ok {
+			if _, err := os.Stat(recovered); err == nil {
+				return recovered, true
+			}
 		}
 		s.recovered.Delete(path)
 	}
