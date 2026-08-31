@@ -71,7 +71,7 @@ func TestResolver_RelativePaths_RoundTripsAcrossRoots(t *testing.T) {
 	userFile := goFile(t, snapB, pkgUser, "user.go")
 	line, col := identOccurrence(t, userFile, "Person") // "impl.Person" return type in Declare
 
-	locs, err := r.Definition(userFile, line, col)
+	locs, err := r.Definition(context.Background(), userFile, line, col)
 	if err != nil {
 		t.Fatalf("Definition: %v", err)
 	}

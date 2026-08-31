@@ -45,7 +45,7 @@ func TestRevalidate_ContentChangeDetectedWithoutWriting(t *testing.T) {
 	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	before, err := db.GetUnit(store.Hash(pkgLeaf))
+	before, err := db.GetUnit(context.Background(), store.Hash(pkgLeaf))
 	if err != nil {
 		t.Fatalf("GetUnit(leaf): %v", err)
 	}
@@ -64,7 +64,7 @@ func TestRevalidate_ContentChangeDetectedWithoutWriting(t *testing.T) {
 		t.Error("Revalidate() = false, want true after editing leaf.go's content")
 	}
 
-	after, err := db.GetUnit(store.Hash(pkgLeaf))
+	after, err := db.GetUnit(context.Background(), store.Hash(pkgLeaf))
 	if err != nil {
 		t.Fatalf("GetUnit(leaf) after Revalidate: %v", err)
 	}

@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"sync"
@@ -22,7 +23,7 @@ func TestCASPutGetRoundTrip(t *testing.T) {
 	cas := openTestCAS(t)
 	const key = 12345
 
-	if _, ok, err := cas.Get(key); err != nil || ok {
+	if _, ok, err := cas.Get(context.Background(), key); err != nil || ok {
 		t.Fatalf("Get() before Put = (%v, %v), want (false, nil)", ok, err)
 	}
 	if cas.Has(key) {
@@ -34,7 +35,7 @@ func TestCASPutGetRoundTrip(t *testing.T) {
 		t.Fatalf("Put() error = %v", err)
 	}
 
-	got, ok, err := cas.Get(key)
+	got, ok, err := cas.Get(context.Background(), key)
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
@@ -80,7 +81,7 @@ func TestCASConcurrentPutSameKeySameContent(t *testing.T) {
 		}
 	}
 
-	got, ok, err := cas.Get(key)
+	got, ok, err := cas.Get(context.Background(), key)
 	if err != nil || !ok {
 		t.Fatalf("Get() after concurrent Put = (%v, %v, %v), want (data, true, nil)", got, ok, err)
 	}

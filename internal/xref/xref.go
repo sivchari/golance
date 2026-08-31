@@ -1,6 +1,7 @@
 package xref
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -32,16 +33,16 @@ func toUint32Pos(line, col int) (uint32, uint32, error) {
 
 // Definition returns the declaration location of the symbol at (file, line,
 // col). If the cursor is already on the declaration, it resolves to itself.
-func (r *Resolver) Definition(file string, line, col int) ([]Location, error) {
+func (r *Resolver) Definition(ctx context.Context, file string, line, col int) ([]Location, error) {
 	l, c, err := toUint32Pos(line, col)
 	if err != nil {
 		return nil, err
 	}
-	target, err := r.resolveAt(file, l, c)
+	target, err := r.resolveAt(ctx, file, l, c)
 	if err != nil {
 		return nil, err
 	}
-	_, _, loc, ok := r.symbolByHash(target.PkgHash, target.IDHash)
+	_, _, loc, ok := r.symbolByHash(ctx, target.PkgHash, target.IDHash)
 	if !ok {
 		return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
 	}
@@ -52,21 +53,24 @@ func (r *Resolver) Definition(file string, line, col int) ([]Location, error) {
 // searching only the defining package plus its reverse-dependency closure
 // (see package doc). includeDecl controls whether the declaration itself is
 // included.
-func (r *Resolver) References(file string, line, col int, includeDecl bool) ([]Location, error) {
+func (r *Resolver) References(ctx context.Context, file string, line, col int, includeDecl bool) ([]Location, error) {
 	l, c, err := toUint32Pos(line, col)
 	if err != nil {
 		return nil, err
 	}
-	target, err := r.resolveAt(file, l, c)
+	target, err := r.resolveAt(ctx, file, l, c)
 	if err != nil {
 		return nil, err
 	}
-	return r.locationsFor(target, includeDecl)
+	return r.locationsFor(ctx, target, includeDecl)
 }
 
 // locationsFor collects every location referencing target across its
-// defining package's reverse-dependency closure.
-func (r *Resolver) locationsFor(target resolvedSymbol, includeDecl bool) ([]Location, error) {
+// defining package's reverse-dependency closure. ctx is checked once per
+// package in the closure (rather than per reference within a package): a
+// canceled query stops before starting the next package's facts read
+// instead of running to completion regardless.
+func (r *Resolver) locationsFor(ctx context.Context, target resolvedSymbol, includeDecl bool) ([]Location, error) {
 	defPkgPath, ok := r.pkgPathByHash[target.PkgHash]
 	if !ok {
 		return nil, fmt.Errorf("xref: unknown defining package for hash %d", target.PkgHash)
@@ -74,7 +78,7 @@ func (r *Resolver) locationsFor(target resolvedSymbol, includeDecl bool) ([]Loca
 
 	var out []Location
 	if includeDecl {
-		_, _, loc, ok := r.symbolByHash(target.PkgHash, target.IDHash)
+		_, _, loc, ok := r.symbolByHash(ctx, target.PkgHash, target.IDHash)
 		if !ok {
 			return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
 		}
@@ -82,8 +86,11 @@ func (r *Resolver) locationsFor(target resolvedSymbol, includeDecl bool) ([]Loca
 	}
 
 	for _, p := range r.snap.ClosureUnits(defPkgPath) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		pkgHash := store.Hash(p)
-		u, err := r.unitBlob(pkgHash)
+		u, err := r.unitBlob(ctx, pkgHash)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				continue
@@ -111,9 +118,12 @@ func (r *Resolver) locationsFor(target resolvedSymbol, includeDecl bool) ([]Loca
 }
 
 // WorkspaceSymbol returns every symbol whose name starts with query
-// (case-insensitive), up to defaultWorkspaceSymbolLimit results.
-func (r *Resolver) WorkspaceSymbol(query string) ([]SymbolInfo, error) {
-	matches, err := r.db.LookupNamePrefix(query)
+// (case-insensitive), up to defaultWorkspaceSymbolLimit results. ctx is
+// checked once per matched name (rather than per idHash under a name): a
+// canceled query stops before resolving the next name's matches instead of
+// running to completion regardless.
+func (r *Resolver) WorkspaceSymbol(ctx context.Context, query string) ([]SymbolInfo, error) {
+	matches, err := r.db.LookupNamePrefix(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -126,11 +136,14 @@ func (r *Resolver) WorkspaceSymbol(query string) ([]SymbolInfo, error) {
 
 	var out []SymbolInfo
 	for _, n := range names {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		for _, idHash := range matches[n] {
 			if len(out) >= defaultWorkspaceSymbolLimit {
 				return out, nil
 			}
-			info, ok, err := r.symbolInfoFromIDHash(idHash)
+			info, ok, err := r.symbolInfoFromIDHash(ctx, idHash)
 			if err != nil {
 				return nil, err
 			}
@@ -146,8 +159,8 @@ const defaultWorkspaceSymbolLimit = 100
 
 // symbolInfoFromIDHash resolves idHash to a SymbolInfo by recovering its
 // defining package from the strings recorded via [store.DB.PutSymbolIDString].
-func (r *Resolver) symbolInfoFromIDHash(idHash uint64) (SymbolInfo, bool, error) {
-	strs, err := r.db.SymbolIDStrings(idHash)
+func (r *Resolver) symbolInfoFromIDHash(ctx context.Context, idHash uint64) (SymbolInfo, bool, error) {
+	strs, err := r.db.SymbolIDStrings(ctx, idHash)
 	if err != nil {
 		return SymbolInfo{}, false, err
 	}
@@ -156,7 +169,7 @@ func (r *Resolver) symbolInfoFromIDHash(idHash uint64) (SymbolInfo, bool, error)
 		if !ok {
 			continue
 		}
-		name, kind, loc, ok := r.symbolByHash(store.Hash(pkgPath), idHash)
+		name, kind, loc, ok := r.symbolByHash(ctx, store.Hash(pkgPath), idHash)
 		if !ok {
 			continue
 		}
@@ -170,16 +183,16 @@ func (r *Resolver) symbolInfoFromIDHash(idHash uint64) (SymbolInfo, bool, error)
 // defining package's reverse-dependency closure plus the declaration itself.
 //
 // TODO(v0.1): no collision check against an existing newName in scope.
-func (r *Resolver) Rename(file string, line, col int, newName string) (map[string][]Edit, error) {
+func (r *Resolver) Rename(ctx context.Context, file string, line, col int, newName string) (map[string][]Edit, error) {
 	l, c, err := toUint32Pos(line, col)
 	if err != nil {
 		return nil, err
 	}
-	target, err := r.resolveAt(file, l, c)
+	target, err := r.resolveAt(ctx, file, l, c)
 	if err != nil {
 		return nil, err
 	}
-	locs, err := r.locationsFor(target, true)
+	locs, err := r.locationsFor(ctx, target, true)
 	if err != nil {
 		return nil, err
 	}

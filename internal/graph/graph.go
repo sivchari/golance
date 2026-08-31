@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"sync"
 
 	"golang.org/x/tools/go/packages"
 )
@@ -45,6 +46,17 @@ type Snapshot struct {
 	dir        string              // working directory to re-run packages.Load from, for ExportFile's recovery path
 	buildFlags []string            // forwarded to packages.Config.BuildFlags on that same recovery path
 	revDeps    map[string][]string // import path -> direct importers present in the graph
+
+	// recovered caches, per import path, an export file path ExportFile
+	// has already recovered via reloadExportFile, so a later call for the
+	// same package after the same stat failure reuses it instead of paying
+	// for another recovery subprocess. A Snapshot is published once (via
+	// Load or LoadCache) and read concurrently by many request handlers
+	// from then on (see internal/server's atomic.Pointer[workspace]), so
+	// this cache — the one place ExportFile writes anything back — must be
+	// synchronized itself rather than a plain map; the Packages field
+	// above stays exactly as published, never mutated in place.
+	recovered sync.Map // string (import path) -> string (recovered export file path)
 }
 
 // Options configures a Load call.
@@ -204,7 +216,9 @@ func (s *Snapshot) Dir() string { return s.dir }
 // system runs, unrelated to path's own source). Rather than surface that
 // as a permanent "no export data for path" to every caller for the rest of
 // this Snapshot's lifetime, ExportFile verifies the file still exists and,
-// if not, recovers with one scoped packages.Load for path alone.
+// if not, recovers with one scoped packages.Load for path alone — caching
+// the recovered path in s.recovered so every later call for path reuses it
+// instead of paying for another recovery subprocess.
 func (s *Snapshot) ExportFile(path string) (string, bool) {
 	p, ok := s.Packages[path]
 	if !ok {
@@ -215,7 +229,19 @@ func (s *Snapshot) ExportFile(path string) (string, bool) {
 			return p.ExportFile, true
 		}
 	}
-	return reloadExportFile(s.dir, s.buildFlags, path)
+	if v, ok := s.recovered.Load(path); ok {
+		if recovered, ok := v.(string); ok {
+			if _, err := os.Stat(recovered); err == nil {
+				return recovered, true
+			}
+		}
+		s.recovered.Delete(path)
+	}
+	file, ok := reloadExportFile(s.dir, s.buildFlags, path)
+	if ok {
+		s.recovered.Store(path, file)
+	}
+	return file, ok
 }
 
 // reloadExportFile re-runs packages.Load for the single package pkgPath,

@@ -76,7 +76,7 @@ func (s *Server) correctResultLocation(loc xref.Location) (protocol.Location, bo
 	return protocol.Location{URI: uri.File(loc.File), Range: rng}, true
 }
 
-func (s *Server) handleDefinition(_ context.Context, params json.RawMessage) (any, error) {
+func (s *Server) handleDefinition(ctx context.Context, params json.RawMessage) (any, error) {
 	var p protocol.DefinitionParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
@@ -90,7 +90,7 @@ func (s *Server) handleDefinition(_ context.Context, params json.RawMessage) (an
 	if !ok {
 		return protocol.LocationSlice(nil), nil
 	}
-	locs, err := resolver.Definition(path, line, col)
+	locs, err := resolver.Definition(ctx, path, line, col)
 	if err != nil {
 		// Most errors here mean "no symbol at this position" — a routine
 		// outcome the LSP client already handles as an empty result, not
@@ -103,7 +103,7 @@ func (s *Server) handleDefinition(_ context.Context, params json.RawMessage) (an
 	return s.toLSPLocations(locs), nil
 }
 
-func (s *Server) handleReferences(_ context.Context, params json.RawMessage) (any, error) {
+func (s *Server) handleReferences(ctx context.Context, params json.RawMessage) (any, error) {
 	var p protocol.ReferenceParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
@@ -117,7 +117,7 @@ func (s *Server) handleReferences(_ context.Context, params json.RawMessage) (an
 	if !ok {
 		return protocol.LocationSlice(nil), nil
 	}
-	locs, err := resolver.References(path, line, col, p.Context.IncludeDeclaration)
+	locs, err := resolver.References(ctx, path, line, col, p.Context.IncludeDeclaration)
 	if err != nil {
 		// See handleDefinition's comment: most errors here are an ordinary
 		// "no symbol at this position" miss, but log it anyway so a
@@ -128,7 +128,7 @@ func (s *Server) handleReferences(_ context.Context, params json.RawMessage) (an
 	return s.toLSPLocations(locs), nil
 }
 
-func (s *Server) handleImplementation(_ context.Context, params json.RawMessage) (any, error) {
+func (s *Server) handleImplementation(ctx context.Context, params json.RawMessage) (any, error) {
 	var p protocol.ImplementationParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
@@ -142,7 +142,7 @@ func (s *Server) handleImplementation(_ context.Context, params json.RawMessage)
 	if !ok {
 		return protocol.LocationSlice(nil), nil
 	}
-	locs, err := resolver.Implementation(path, line, col)
+	locs, err := resolver.Implementation(ctx, path, line, col)
 	if err != nil {
 		// See handleDefinition's comment: most errors here are an ordinary
 		// "no symbol at this position" miss, but log it anyway so a
@@ -153,7 +153,7 @@ func (s *Server) handleImplementation(_ context.Context, params json.RawMessage)
 	return s.toLSPLocations(locs), nil
 }
 
-func (s *Server) handleWorkspaceSymbol(_ context.Context, params json.RawMessage) (any, error) {
+func (s *Server) handleWorkspaceSymbol(ctx context.Context, params json.RawMessage) (any, error) {
 	var p protocol.WorkspaceSymbolParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
@@ -162,7 +162,7 @@ func (s *Server) handleWorkspaceSymbol(_ context.Context, params json.RawMessage
 	if !ok {
 		return protocol.SymbolInformationSlice(nil), nil
 	}
-	infos, err := resolver.WorkspaceSymbol(p.Query)
+	infos, err := resolver.WorkspaceSymbol(ctx, p.Query)
 	if err != nil {
 		// Unlike Definition/References/Implementation, a WorkspaceSymbol
 		// error is never an ordinary "nothing at this position" miss (it
@@ -189,7 +189,7 @@ func (s *Server) handleWorkspaceSymbol(_ context.Context, params json.RawMessage
 	return out, nil
 }
 
-func (s *Server) handleRename(_ context.Context, params json.RawMessage) (any, error) {
+func (s *Server) handleRename(ctx context.Context, params json.RawMessage) (any, error) {
 	var p protocol.RenameParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
@@ -203,7 +203,7 @@ func (s *Server) handleRename(_ context.Context, params json.RawMessage) (any, e
 	if !ok {
 		return nil, rpc.NewError(int32(protocol.ErrorCodesInvalidRequest), "golance: no renameable symbol at this position")
 	}
-	edits, err := resolver.Rename(path, line, col, p.NewName)
+	edits, err := resolver.Rename(ctx, path, line, col, p.NewName)
 	if err != nil {
 		// Most errors here mean "no symbol at this position" or a facts-read
 		// gap — a routine outcome its sibling handlers (handleDefinition et

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -306,8 +307,13 @@ func decodeUnitPointer(b []byte) (UnitPointer, error) {
 }
 
 // GetUnit returns the stored UnitPointer for pkgHash. It returns
-// ErrNotFound if no entry exists.
-func (db *DB) GetUnit(pkgHash uint64) (UnitPointer, error) {
+// ErrNotFound if no entry exists. ctx is checked before the read starts, so
+// a caller (e.g. internal/xref, mid a cancelable query) does not pay for a
+// bbolt transaction its own context has already given up on.
+func (db *DB) GetUnit(ctx context.Context, pkgHash uint64) (UnitPointer, error) {
+	if err := ctx.Err(); err != nil {
+		return UnitPointer{}, err
+	}
 	var p UnitPointer
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
 		v := tx.Bucket(bucketUnit).Get(hashKey(pkgHash))
@@ -424,8 +430,12 @@ func (db *DB) AddNameSymbol(name string, idHash uint64) error {
 
 // LookupNamePrefix returns, for every stored name with the given prefix
 // (matched case-insensitively), the list of symbolIDHash values recorded
-// under it via [DB.AddNameSymbol].
-func (db *DB) LookupNamePrefix(prefix string) (map[string][]uint64, error) {
+// under it via [DB.AddNameSymbol]. ctx is checked before the scan starts
+// (see [DB.GetUnit]'s doc).
+func (db *DB) LookupNamePrefix(ctx context.Context, prefix string) (map[string][]uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	lower := []byte(strings.ToLower(prefix))
 	result := make(map[string][]uint64)
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
@@ -464,8 +474,12 @@ func (db *DB) AddMethodSymbol(methodName string, e MethodEntry) error {
 	})
 }
 
-// LookupMethod returns every MethodEntry recorded for methodName.
-func (db *DB) LookupMethod(methodName string) ([]MethodEntry, error) {
+// LookupMethod returns every MethodEntry recorded for methodName. ctx is
+// checked before the read starts (see [DB.GetUnit]'s doc).
+func (db *DB) LookupMethod(ctx context.Context, methodName string) ([]MethodEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var entries []MethodEntry
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
 		v := tx.Bucket(bucketMethod).Get([]byte(methodName))
@@ -500,8 +514,12 @@ func (db *DB) PutSymbolIDString(idHash uint64, symbolID string) error {
 // idHash via [DB.PutSymbolIDString]. More than one entry means idHash is a
 // collision between genuinely different symbols; callers that need a single
 // symbol should pick the entry that resolves (e.g. its package's facts blob
-// actually contains a symbol with this idHash).
-func (db *DB) SymbolIDStrings(idHash uint64) ([]string, error) {
+// actually contains a symbol with this idHash). ctx is checked before the
+// read starts (see [DB.GetUnit]'s doc).
+func (db *DB) SymbolIDStrings(ctx context.Context, idHash uint64) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var out []string
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
 		out = decodeStringList(tx.Bucket(bucketSymStr).Get(hashKey(idHash)))

@@ -1,6 +1,7 @@
 package xref
 
 import (
+	"context"
 	"fmt"
 	"go/token"
 	"go/types"
@@ -87,13 +88,15 @@ func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool) *Res
 
 // unitBlob loads and decodes pkgHash's current [store.UnitBlob] via db's
 // UnitPointer and cas. It returns [store.ErrNotFound] if pkgHash has never
-// been indexed.
-func (r *Resolver) unitBlob(pkgHash uint64) (store.UnitBlob, error) {
-	ptr, err := r.db.GetUnit(pkgHash)
+// been indexed. A canceled ctx surfaces as ctx's own error (see
+// [store.DB.GetUnit] and [store.CAS.Get]), letting a caller distinguish a
+// real cancellation from an ordinary "not found" miss.
+func (r *Resolver) unitBlob(ctx context.Context, pkgHash uint64) (store.UnitBlob, error) {
+	ptr, err := r.db.GetUnit(ctx, pkgHash)
 	if err != nil {
 		return store.UnitBlob{}, err
 	}
-	blob, ok, err := r.cas.Get(ptr.BlobKey)
+	blob, ok, err := r.cas.Get(ctx, ptr.BlobKey)
 	if err != nil {
 		return store.UnitBlob{}, err
 	}
@@ -115,14 +118,14 @@ type resolvedSymbol struct {
 
 // resolveAt resolves the symbol at (file, line, col): a reference there
 // resolves to what it points to; a definition there resolves to itself.
-func (r *Resolver) resolveAt(file string, line, col uint32) (resolvedSymbol, error) {
+func (r *Resolver) resolveAt(ctx context.Context, file string, line, col uint32) (resolvedSymbol, error) {
 	pkgPath, ok := r.fileToPkg[file]
 	if !ok {
 		return resolvedSymbol{}, fmt.Errorf("xref: %s is not part of any known package", file)
 	}
 	pkgHash := store.Hash(pkgPath)
 
-	u, err := r.unitBlob(pkgHash)
+	u, err := r.unitBlob(ctx, pkgHash)
 	if err != nil {
 		return resolvedSymbol{}, fmt.Errorf("xref: read facts for %s: %w", pkgPath, err)
 	}
@@ -136,7 +139,7 @@ func (r *Resolver) resolveAt(file string, line, col uint32) (resolvedSymbol, err
 	}
 
 	if ref, ok := v.RefsAt(fileIdx, line, col); ok {
-		out, found := r.resolveRefTarget(ref)
+		out, found := r.resolveRefTarget(ctx, ref)
 		if !found {
 			return resolvedSymbol{}, fmt.Errorf("xref: no symbol at %s:%d:%d", file, line, col)
 		}
@@ -150,8 +153,8 @@ func (r *Resolver) resolveAt(file string, line, col uint32) (resolvedSymbol, err
 
 // resolveRefTarget looks up ref's target symbol's kind and name from its
 // defining package's facts.
-func (r *Resolver) resolveRefTarget(ref store.Ref) (resolvedSymbol, bool) {
-	name, kind, _, ok := r.symbolByHash(ref.ToPkgHash(), ref.ToSymbolIDHash())
+func (r *Resolver) resolveRefTarget(ctx context.Context, ref store.Ref) (resolvedSymbol, bool) {
+	name, kind, _, ok := r.symbolByHash(ctx, ref.ToPkgHash(), ref.ToSymbolIDHash())
 	if !ok {
 		return resolvedSymbol{}, false
 	}
@@ -160,8 +163,8 @@ func (r *Resolver) resolveRefTarget(ref store.Ref) (resolvedSymbol, bool) {
 
 // symbolByHash returns the name, kind, and declaration location recorded for
 // idHash in pkgHash's facts blob.
-func (r *Resolver) symbolByHash(pkgHash, idHash uint64) (name string, kind uint8, loc Location, ok bool) {
-	u, err := r.unitBlob(pkgHash)
+func (r *Resolver) symbolByHash(ctx context.Context, pkgHash, idHash uint64) (name string, kind uint8, loc Location, ok bool) {
+	u, err := r.unitBlob(ctx, pkgHash)
 	if err != nil {
 		return "", 0, Location{}, false
 	}
@@ -183,8 +186,8 @@ func (r *Resolver) symbolByHash(pkgHash, idHash uint64) (name string, kind uint8
 
 // resolveNamed decodes pkgPath's export data through r's shared cache and
 // looks up name in its package scope.
-func (r *Resolver) resolveNamed(pkgPath, name string) (*types.Named, error) {
-	u, err := r.unitBlob(store.Hash(pkgPath))
+func (r *Resolver) resolveNamed(ctx context.Context, pkgPath, name string) (*types.Named, error) {
+	u, err := r.unitBlob(ctx, store.Hash(pkgPath))
 	if err != nil {
 		return nil, fmt.Errorf("xref: read export data for %s: %w", pkgPath, err)
 	}

@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"sync"
 
 	"github.com/sivchari/golance/internal/store"
@@ -47,13 +48,19 @@ func (s *memExportSource) ExportData(pkgPath string) ([]byte, bool, error) {
 // data at all, since nothing is re-type-checking against it — the goal
 // being a no-op restart with no changes on disk.
 type casExportSource struct {
+	ctx  context.Context
 	mem  *memExportSource
 	cas  *store.CAS
 	keys *keyTable
 }
 
-func newCASExportSource(cas *store.CAS, keys *keyTable) *casExportSource {
-	return &casExportSource{mem: newMemExportSource(), cas: cas, keys: keys}
+// newCASExportSource returns a casExportSource for one Build or Reindex
+// run, checked against ctx (that run's own context) on every CAS read (see
+// ExportData) — stored once here rather than threaded through ExportData
+// itself, since it implements typecheck.ExportSource, an interface go/types'
+// own importer machinery calls with no context parameter of its own.
+func newCASExportSource(ctx context.Context, cas *store.CAS, keys *keyTable) *casExportSource {
+	return &casExportSource{ctx: ctx, mem: newMemExportSource(), cas: cas, keys: keys}
 }
 
 // Put records blob as pkgPath's export data, taking priority over a lazy
@@ -71,7 +78,7 @@ func (s *casExportSource) ExportData(pkgPath string) ([]byte, bool, error) {
 	if !ok {
 		return nil, false, nil
 	}
-	blob, ok, err := s.cas.Get(rec.blobKey)
+	blob, ok, err := s.cas.Get(s.ctx, rec.blobKey)
 	if err != nil {
 		return nil, false, err
 	}

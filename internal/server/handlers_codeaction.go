@@ -149,7 +149,11 @@ func (s *Server) addImportFixes(path string, text []byte, offset int, name strin
 // than pkgPath that exports a package-level symbol named exactly name,
 // resolved via resolver's name index.
 func importCandidates(resolver *xref.Resolver, ws *workspace, pkgPath, name string) ([]langfeat.ImportCandidate, error) {
-	matches, err := resolver.WorkspaceSymbol(name)
+	// handleCodeAction ignores its own ctx (see its _ context.Context
+	// parameter) since this quickfix-only lookup is a single bounded-size
+	// name index scan, not one of the cancellation-sensitive query paths
+	// finding 11 targets.
+	matches, err := resolver.WorkspaceSymbol(context.Background(), name)
 	if err != nil {
 		return nil, err
 	}

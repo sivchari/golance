@@ -102,8 +102,8 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 
 	fset := token.NewFileSet()
 	cache := typecheck.NewCache()
-	keys := newKeyTable(db)
-	exp := newCASExportSource(cas, keys)
+	keys := newKeyTable(ctx, db)
+	exp := newCASExportSource(ctx, cas, keys)
 	imp := typecheck.NewImporter(fset, exp, snap, cache)
 	sem := semaphore.NewWeighted(int64(opts.Parallelism))
 
@@ -154,7 +154,7 @@ func runBuildJob(ctx context.Context, sem *semaphore.Weighted, fset *token.FileS
 	if err := sem.Acquire(ctx, 1); err != nil {
 		return results.recordFatal(err)
 	}
-	outcome, skipped, typeChecked, err := processUnit(fset, imp, exp, snap, db, cas, keys, opts, path, readFileDisk, true)
+	outcome, skipped, typeChecked, err := processUnit(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, readFileDisk, true)
 	sem.Release(1)
 	return results.record(outcome, skipped, typeChecked, err)
 }

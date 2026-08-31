@@ -36,15 +36,15 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 	}
 
 	fset := token.NewFileSet()
-	keys := newKeyTable(db)
-	exp := newCASExportSource(cas, keys)
+	keys := newKeyTable(ctx, db)
+	exp := newCASExportSource(ctx, cas, keys)
 	imp := typecheck.NewImporter(fset, exp, snap, typecheck.NewCache())
 
 	var stats Stats
 	// trustStat=false: reader may be an editor overlay whose content
 	// differs from disk while disk's own stat stays untouched (see
 	// processUnit's doc).
-	if err := reindexOne(fset, imp, exp, db, cas, keys, snap, opts, changedPkg, reader, false, &stats); err != nil {
+	if err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, opts, changedPkg, reader, false, &stats); err != nil {
 		stats.Elapsed = time.Since(start)
 		return stats, err
 	}
@@ -56,7 +56,7 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 			break
 		}
 		// trustStat=true: every closure hop is always read from disk.
-		if err := reindexOne(fset, imp, exp, db, cas, keys, snap, opts, path, readFileDisk, true, &stats); err != nil {
+		if err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, opts, path, readFileDisk, true, &stats); err != nil {
 			firstErr = errors.Join(firstErr, err)
 		}
 	}
@@ -87,8 +87,8 @@ func orderedReverseClosure(snap *graph.Snapshot, changedPkg string) []string {
 // errors.Join); a persist failure for the pointer-only refresh path is
 // best-effort, not fatal — see [buildResults.flushPtrsLocked]'s identical
 // rationale.
-func reindexOne(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, opts Options, path string, reader FileReader, trustStat bool, stats *Stats) error {
-	outcome, skipped, typeChecked, err := processUnit(fset, imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
+func reindexOne(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, opts Options, path string, reader FileReader, trustStat bool, stats *Stats) error {
+	outcome, skipped, typeChecked, err := processUnit(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
 	if err != nil {
 		stats.Errors++
 		return fmt.Errorf("index: reindex: %s: %w", path, err)

@@ -57,7 +57,7 @@ func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolcha
 	}
 
 	root := snap.Dir()
-	keys := newKeyTable(db)
+	keys := newKeyTable(ctx, db)
 	sem := semaphore.NewWeighted(int64(max(1, runtime.NumCPU()*2)))
 	var changed atomic.Bool
 	var firstErr firstErrRecorder
@@ -75,7 +75,7 @@ func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolcha
 			}
 			defer sem.Release(1)
 
-			pkgChanged, err := packageChanged(db, keys, snap, pkg, path, toolchainFP, buildFlagsFP, root, relative)
+			pkgChanged, err := packageChanged(ctx, db, keys, snap, pkg, path, toolchainFP, buildFlagsFP, root, relative)
 			if err != nil {
 				firstErr.record(err)
 				return
@@ -97,8 +97,8 @@ func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolcha
 // mismatch, a dependency that has never been indexed at all, or — the
 // common case — a recomputed combined key ([computeUnitKey]) that no longer
 // matches the stored [store.UnitPointer].BlobKey.
-func packageChanged(db *store.DB, keys *keyTable, snap *graph.Snapshot, pkg *graph.Package, path, toolchainFP, buildFlagsFP, root string, relative bool) (bool, error) {
-	old, err := db.GetUnit(store.Hash(path))
+func packageChanged(ctx context.Context, db *store.DB, keys *keyTable, snap *graph.Snapshot, pkg *graph.Package, path, toolchainFP, buildFlagsFP, root string, relative bool) (bool, error) {
+	old, err := db.GetUnit(ctx, store.Hash(path))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return true, nil

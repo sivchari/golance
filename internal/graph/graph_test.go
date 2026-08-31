@@ -100,6 +100,35 @@ func TestSnapshot_ExportFile_RecoversStalePath(t *testing.T) {
 	}
 }
 
+// TestSnapshot_ExportFile_CachesRecoveredPath verifies that a path recovered
+// via ExportFile's reloadExportFile fallback is cached (see the Snapshot's
+// recovered field) and reused by a later call, instead of re-running the
+// recovery subprocess every time. To prove reuse (rather than merely
+// asserting the same string comes back twice, which a fresh, deterministic
+// recovery would also produce), snap.dir is corrupted after the first call:
+// a second reloadExportFile with that dir would necessarily fail, so a
+// successful, identical second result can only mean the cached path was
+// reused without falling back to recovery again.
+func TestSnapshot_ExportFile_CachesRecoveredPath(t *testing.T) {
+	snap := loadTestdata(t)
+
+	stale := *snap.Packages[modA]
+	stale.ExportFile = filepath.Join(t.TempDir(), "does-not-exist-d")
+	snap.Packages[modA] = &stale
+
+	first, ok := snap.ExportFile(modA)
+	if !ok || first == "" {
+		t.Fatalf("ExportFile(%s) with a stale path = %q, %v; want recovery to succeed", modA, first, ok)
+	}
+
+	snap.dir = filepath.Join(t.TempDir(), "does-not-exist-dir")
+
+	second, ok := snap.ExportFile(modA)
+	if !ok || second != first {
+		t.Errorf("ExportFile(%s) second call = %q, %v; want the cached path %q reused instead of re-running recovery against a broken dir", modA, second, ok, first)
+	}
+}
+
 func TestCache_RoundTrip(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("testdata", "simple"))
 	if err != nil {

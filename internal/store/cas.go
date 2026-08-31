@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -64,8 +65,13 @@ func (c *CAS) Has(key uint64) bool {
 
 // Get returns key's blob, refreshing its last-used time (mtime, at
 // [touchGranularity] resolution) so a later [CAS.Trim] treats it as still in
-// use. ok is false if no blob is stored for key.
-func (c *CAS) Get(key uint64) (blob []byte, ok bool, err error) {
+// use. ok is false if no blob is stored for key. ctx is checked before the
+// read starts, so a caller (e.g. internal/xref, mid a cancelable query)
+// does not pay for a file read its own context has already given up on.
+func (c *CAS) Get(ctx context.Context, key uint64) (blob []byte, ok bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	path := c.blobPath(key)
 	data, err := os.ReadFile(filepath.Clean(path))
 	if errors.Is(err, os.ErrNotExist) {
