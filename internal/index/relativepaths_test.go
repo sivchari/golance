@@ -44,7 +44,7 @@ func TestBuild_RelativePaths_StoresRootRelativeFileTable(t *testing.T) {
 		}
 	})
 
-	ptr, err := db.GetUnit(store.Hash(pkgLeaf))
+	ptr, err := db.GetUnit(context.Background(), store.Hash(pkgLeaf))
 	if err != nil {
 		t.Fatalf("GetUnit: %v", err)
 	}

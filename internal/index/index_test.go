@@ -83,11 +83,11 @@ func openTestCAS(t *testing.T) *store.CAS {
 // cas) and runs fn against a [store.View] over it, for test convenience.
 func viewFacts(t *testing.T, db *store.DB, cas *store.CAS, pkgPath string, fn func(v *store.View)) {
 	t.Helper()
-	ptr, err := db.GetUnit(store.Hash(pkgPath))
+	ptr, err := db.GetUnit(context.Background(), store.Hash(pkgPath))
 	if err != nil {
 		t.Fatalf("GetUnit(%s): %v", pkgPath, err)
 	}
-	blob, ok, err := cas.Get(ptr.BlobKey)
+	blob, ok, err := cas.Get(context.Background(), ptr.BlobKey)
 	if err != nil || !ok {
 		t.Fatalf("CAS.Get(%s) = (%v, %v, %v)", pkgPath, blob != nil, ok, err)
 	}

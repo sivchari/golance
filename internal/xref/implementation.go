@@ -1,6 +1,7 @@
 package xref
 
 import (
+	"context"
 	"fmt"
 	"go/types"
 
@@ -13,12 +14,12 @@ import (
 // type, every interface in the workspace it implements. Both directions use
 // a sound name-based first pass over the method index followed by a
 // types.Implements confirmation against export data (see package doc).
-func (r *Resolver) Implementation(file string, line, col int) ([]Location, error) {
+func (r *Resolver) Implementation(ctx context.Context, file string, line, col int) ([]Location, error) {
 	l, c, err := toUint32Pos(line, col)
 	if err != nil {
 		return nil, err
 	}
-	target, err := r.resolveAt(file, l, c)
+	target, err := r.resolveAt(ctx, file, l, c)
 	if err != nil {
 		return nil, err
 	}
@@ -26,16 +27,16 @@ func (r *Resolver) Implementation(file string, line, col int) ([]Location, error
 	if !ok {
 		return nil, fmt.Errorf("xref: unknown defining package for hash %d", target.PkgHash)
 	}
-	named, err := r.resolveNamed(pkgPath, target.Name)
+	named, err := r.resolveNamed(ctx, pkgPath, target.Name)
 	if err != nil {
 		return nil, err
 	}
 
 	switch target.Kind {
 	case index.KindInterface:
-		return r.implementationsOfInterface(named)
+		return r.implementationsOfInterface(ctx, named)
 	case index.KindType:
-		return r.interfacesImplementedBy(named)
+		return r.interfacesImplementedBy(ctx, named)
 	default:
 		return nil, fmt.Errorf("xref: implementation query not supported for symbol kind %d", target.Kind)
 	}
@@ -45,8 +46,11 @@ func (r *Resolver) Implementation(file string, line, col int) ([]Location, error
 // that implements the interface named. The first pass intersects
 // [store.DB.LookupMethod] candidates across every one of the interface's
 // method names (a real implementer must have all of them); the second pass
-// confirms each survivor with types.Implements.
-func (r *Resolver) implementationsOfInterface(named *types.Named) ([]Location, error) {
+// confirms each survivor with types.Implements. ctx is checked once per
+// candidate: a canceled query stops before decoding the next candidate's
+// export data (the expensive part of this loop) instead of running to
+// completion regardless.
+func (r *Resolver) implementationsOfInterface(ctx context.Context, named *types.Named) ([]Location, error) {
 	iface, ok := named.Underlying().(*types.Interface)
 	if !ok {
 		return nil, fmt.Errorf("xref: %s is not an interface", named.Obj().Name())
@@ -56,14 +60,17 @@ func (r *Resolver) implementationsOfInterface(named *types.Named) ([]Location, e
 		names[i] = iface.Method(i).Name()
 	}
 
-	candidates, err := r.candidatesByAllMethods(names, index.KindType)
+	candidates, err := r.candidatesByAllMethods(ctx, names, index.KindType)
 	if err != nil {
 		return nil, err
 	}
 
 	var out []Location
 	for entry := range candidates {
-		cname, _, _, ok := r.symbolByHash(entry.PkgHash, entry.TypeSymbolIDHash)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		cname, _, _, ok := r.symbolByHash(ctx, entry.PkgHash, entry.TypeSymbolIDHash)
 		if !ok {
 			continue
 		}
@@ -71,14 +78,14 @@ func (r *Resolver) implementationsOfInterface(named *types.Named) ([]Location, e
 		if !ok {
 			continue
 		}
-		cnamed, err := r.resolveNamed(cpath, cname)
+		cnamed, err := r.resolveNamed(ctx, cpath, cname)
 		if err != nil {
 			continue
 		}
 		if !types.Implements(types.NewPointer(cnamed), iface) {
 			continue
 		}
-		_, _, loc, ok := r.symbolByHash(entry.PkgHash, entry.TypeSymbolIDHash)
+		_, _, loc, ok := r.symbolByHash(ctx, entry.PkgHash, entry.TypeSymbolIDHash)
 		if !ok {
 			continue
 		}
@@ -93,22 +100,26 @@ func (r *Resolver) implementationsOfInterface(named *types.Named) ([]Location, e
 // across named's method names (an interface named satisfies must have at
 // least one method named also has); the second pass confirms each survivor
 // with types.Implements, which also rejects the interfaces the first pass
-// over-approximated.
-func (r *Resolver) interfacesImplementedBy(named *types.Named) ([]Location, error) {
+// over-approximated. ctx is checked once per candidate (see
+// implementationsOfInterface's doc).
+func (r *Resolver) interfacesImplementedBy(ctx context.Context, named *types.Named) ([]Location, error) {
 	ms := types.NewMethodSet(types.NewPointer(named))
 	names := make([]string, ms.Len())
 	for i := 0; i < ms.Len(); i++ {
 		names[i] = ms.At(i).Obj().Name()
 	}
 
-	candidates, err := r.candidatesByAnyMethod(names, index.KindInterface)
+	candidates, err := r.candidatesByAnyMethod(ctx, names, index.KindInterface)
 	if err != nil {
 		return nil, err
 	}
 
 	var out []Location
 	for entry := range candidates {
-		iname, _, _, ok := r.symbolByHash(entry.PkgHash, entry.TypeSymbolIDHash)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		iname, _, _, ok := r.symbolByHash(ctx, entry.PkgHash, entry.TypeSymbolIDHash)
 		if !ok {
 			continue
 		}
@@ -116,7 +127,7 @@ func (r *Resolver) interfacesImplementedBy(named *types.Named) ([]Location, erro
 		if !ok {
 			continue
 		}
-		inamed, err := r.resolveNamed(ipath, iname)
+		inamed, err := r.resolveNamed(ctx, ipath, iname)
 		if err != nil {
 			continue
 		}
@@ -127,7 +138,7 @@ func (r *Resolver) interfacesImplementedBy(named *types.Named) ([]Location, erro
 		if !types.Implements(types.NewPointer(named), iface) {
 			continue
 		}
-		_, _, loc, ok := r.symbolByHash(entry.PkgHash, entry.TypeSymbolIDHash)
+		_, _, loc, ok := r.symbolByHash(ctx, entry.PkgHash, entry.TypeSymbolIDHash)
 		if !ok {
 			continue
 		}
@@ -141,10 +152,10 @@ func (r *Resolver) interfacesImplementedBy(named *types.Named) ([]Location, erro
 // under every name in methodNames (intersection): a sound, name-based
 // shortlist for "does this candidate implement an interface with these
 // methods".
-func (r *Resolver) candidatesByAllMethods(methodNames []string, wantKind uint8) (map[store.MethodEntry]bool, error) {
+func (r *Resolver) candidatesByAllMethods(ctx context.Context, methodNames []string, wantKind uint8) (map[store.MethodEntry]bool, error) {
 	var result map[store.MethodEntry]bool
 	for i, name := range methodNames {
-		set, err := r.methodEntriesOfKind(name, wantKind)
+		set, err := r.methodEntriesOfKind(ctx, name, wantKind)
 		if err != nil {
 			return nil, err
 		}
@@ -167,10 +178,10 @@ func (r *Resolver) candidatesByAllMethods(methodNames []string, wantKind uint8) 
 // candidatesByAnyMethod returns every MethodEntry of kind wantKind recorded
 // under any name in methodNames (union): a sound, name-based shortlist for
 // "does this candidate's interface consist only of methods this type has".
-func (r *Resolver) candidatesByAnyMethod(methodNames []string, wantKind uint8) (map[store.MethodEntry]bool, error) {
+func (r *Resolver) candidatesByAnyMethod(ctx context.Context, methodNames []string, wantKind uint8) (map[store.MethodEntry]bool, error) {
 	result := make(map[store.MethodEntry]bool)
 	for _, name := range methodNames {
-		set, err := r.methodEntriesOfKind(name, wantKind)
+		set, err := r.methodEntriesOfKind(ctx, name, wantKind)
 		if err != nil {
 			return nil, err
 		}
@@ -181,14 +192,14 @@ func (r *Resolver) candidatesByAnyMethod(methodNames []string, wantKind uint8) (
 	return result, nil
 }
 
-func (r *Resolver) methodEntriesOfKind(methodName string, wantKind uint8) (map[store.MethodEntry]bool, error) {
-	entries, err := r.db.LookupMethod(methodName)
+func (r *Resolver) methodEntriesOfKind(ctx context.Context, methodName string, wantKind uint8) (map[store.MethodEntry]bool, error) {
+	entries, err := r.db.LookupMethod(ctx, methodName)
 	if err != nil {
 		return nil, err
 	}
 	set := make(map[store.MethodEntry]bool, len(entries))
 	for _, e := range entries {
-		_, kind, _, ok := r.symbolByHash(e.PkgHash, e.TypeSymbolIDHash)
+		_, kind, _, ok := r.symbolByHash(ctx, e.PkgHash, e.TypeSymbolIDHash)
 		if ok && kind == wantKind {
 			set[e] = true
 		}

@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -54,7 +55,7 @@ type unitOutcome struct {
 // changed, since that call's reader may be an editor overlay whose content
 // differs from disk while disk's own stat stays untouched — trusting stat
 // there would silently skip a genuinely edited-but-unsaved package.
-func processUnit(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, snap *graph.Snapshot, db *store.DB, cas *store.CAS, keys *keyTable, opts Options, path string, reader FileReader, trustStat bool) (outcome *unitOutcome, skipped, typeChecked bool, err error) {
+func processUnit(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, snap *graph.Snapshot, db *store.DB, cas *store.CAS, keys *keyTable, opts Options, path string, reader FileReader, trustStat bool) (outcome *unitOutcome, skipped, typeChecked bool, err error) {
 	pkg := snap.Packages[path]
 	if len(pkg.GoFiles) == 0 {
 		// go/packages legitimately reports root packages with no GoFiles at
@@ -67,7 +68,7 @@ func processUnit(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSou
 	pkgHash := store.Hash(path)
 	root := snap.Dir()
 
-	old, oldErr := db.GetUnit(pkgHash)
+	old, oldErr := db.GetUnit(ctx, pkgHash)
 	haveOld := oldErr == nil
 	trusted := haveOld && old.ToolchainFingerprint == opts.ToolchainFingerprint
 
@@ -92,7 +93,7 @@ func processUnit(fset *token.FileSet, imp *typecheck.Importer, exp *casExportSou
 	// type-check — this exact content-plus-dependency-API combination was
 	// already built before, e.g. switching back to a previously-visited
 	// branch (this is the common, fast-path case; see the package doc).
-	if blob, ok, err := cas.Get(combined); err != nil {
+	if blob, ok, err := cas.Get(ctx, combined); err != nil {
 		return nil, false, false, err
 	} else if ok {
 		outcome, err := casHitOutcome(pkgHash, path, combined, ownHash, blob, opts, exp, keys)

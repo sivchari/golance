@@ -64,7 +64,7 @@ func (s *Server) handleTypeDefinition(ctx context.Context, params json.RawMessag
 	if info.SameFile != "" {
 		return s.typeDefinitionSameFile(info)
 	}
-	return s.typeDefinitionCrossPackage(info)
+	return s.typeDefinitionCrossPackage(ctx, info)
 }
 
 // typeDefinitionSameFile converts a same-package TypeDefInfo (byte offsets
@@ -86,12 +86,12 @@ func (s *Server) typeDefinitionSameFile(info *langfeat.TypeDefInfo) (any, error)
 
 // typeDefinitionCrossPackage resolves a cross-package TypeDefInfo through
 // the on-disk facts index.
-func (s *Server) typeDefinitionCrossPackage(info *langfeat.TypeDefInfo) (any, error) {
+func (s *Server) typeDefinitionCrossPackage(ctx context.Context, info *langfeat.TypeDefInfo) (any, error) {
 	resolver, ok := s.resolverOrWarn()
 	if !ok {
 		return protocol.LocationSlice(nil), nil
 	}
-	loc, ok := resolver.TypeDeclaration(info.PkgPath, info.ObjPath)
+	loc, ok := resolver.TypeDeclaration(ctx, info.PkgPath, info.ObjPath)
 	if !ok {
 		return protocol.LocationSlice(nil), nil
 	}
@@ -496,7 +496,7 @@ func (s *Server) handleCompletionResolve(ctx context.Context, params json.RawMes
 	if info == nil {
 		return &item, nil
 	}
-	if doc := s.completionDoc(info); doc != "" {
+	if doc := s.completionDoc(ctx, info); doc != "" {
 		item.Documentation = protocol.String(doc)
 	}
 	return &item, nil
@@ -505,7 +505,7 @@ func (s *Server) handleCompletionResolve(ctx context.Context, params json.RawMes
 // completionDoc resolves info's doc comment: info.Doc directly if it is
 // already the answer (a same-package candidate), otherwise a facts-index
 // lookup for a cross-package one.
-func (s *Server) completionDoc(info *langfeat.CompletionDocInfo) string {
+func (s *Server) completionDoc(ctx context.Context, info *langfeat.CompletionDocInfo) string {
 	if info.Doc != "" {
 		return info.Doc
 	}
@@ -516,6 +516,6 @@ func (s *Server) completionDoc(info *langfeat.CompletionDocInfo) string {
 	if !ok {
 		return ""
 	}
-	doc, _ := resolver.SymbolDoc(info.PkgPath, info.ObjPath)
+	doc, _ := resolver.SymbolDoc(ctx, info.PkgPath, info.ObjPath)
 	return doc
 }

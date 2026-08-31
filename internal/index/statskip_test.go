@@ -99,7 +99,7 @@ func TestBuild_TouchedFileSameContentSkipsAndRefreshesStat(t *testing.T) {
 		t.Errorf("Skipped = %d, want 3", stats.Skipped)
 	}
 
-	ptr, err := db.GetUnit(store.Hash(pkgLeaf))
+	ptr, err := db.GetUnit(context.Background(), store.Hash(pkgLeaf))
 	if err != nil {
 		t.Fatalf("GetUnit(leaf): %v", err)
 	}
@@ -134,7 +134,7 @@ func TestBuild_ContentChangeTriggersRebuild(t *testing.T) {
 	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
 		t.Fatalf("first Build: %v", err)
 	}
-	firstPtr, err := db.GetUnit(store.Hash(pkgLeaf))
+	firstPtr, err := db.GetUnit(context.Background(), store.Hash(pkgLeaf))
 	if err != nil {
 		t.Fatalf("GetUnit(leaf): %v", err)
 	}
@@ -173,7 +173,7 @@ func Hello(name string) Greeting {
 		t.Errorf("Skipped = %d, want 2 (mid, top: unaffected by a body-only edit to a dependency)", stats.Skipped)
 	}
 
-	secondPtr, err := db.GetUnit(store.Hash(pkgLeaf))
+	secondPtr, err := db.GetUnit(context.Background(), store.Hash(pkgLeaf))
 	if err != nil {
 		t.Fatalf("GetUnit(leaf) after rebuild: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestBuild_NoStatSnapshotFallsBackToContentHash(t *testing.T) {
 	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
 		t.Fatalf("first Build: %v", err)
 	}
-	ptr, err := db.GetUnit(store.Hash(pkgLeaf))
+	ptr, err := db.GetUnit(context.Background(), store.Hash(pkgLeaf))
 	if err != nil {
 		t.Fatalf("GetUnit(leaf): %v", err)
 	}
@@ -275,7 +275,7 @@ func TestBuild_NoStatSnapshotFallsBackToContentHash(t *testing.T) {
 		t.Errorf("Skipped = %d, want 3", stats.Skipped)
 	}
 
-	refreshed, err := db.GetUnit(store.Hash(pkgLeaf))
+	refreshed, err := db.GetUnit(context.Background(), store.Hash(pkgLeaf))
 	if err != nil {
 		t.Fatalf("GetUnit(leaf) after refresh: %v", err)
 	}

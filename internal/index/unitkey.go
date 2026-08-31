@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"encoding/binary"
 	"hash/fnv"
 	"sort"
@@ -94,13 +95,16 @@ type unitKeyRecord struct {
 // updated moments ago by this same run, or, for a package this run leaves
 // entirely untouched, unaffected and so still exactly what db already says.
 type keyTable struct {
-	db *store.DB
-	mu sync.Mutex
-	m  map[string]unitKeyRecord
+	ctx context.Context
+	db  *store.DB
+	mu  sync.Mutex
+	m   map[string]unitKeyRecord
 }
 
-func newKeyTable(db *store.DB) *keyTable {
-	return &keyTable{db: db, m: make(map[string]unitKeyRecord)}
+// newKeyTable returns a keyTable for one Build, Reindex, or Revalidate run,
+// checked against ctx (that run's own context) on every db read (see get).
+func newKeyTable(ctx context.Context, db *store.DB) *keyTable {
+	return &keyTable{ctx: ctx, db: db, m: make(map[string]unitKeyRecord)}
 }
 
 func (t *keyTable) set(path string, rec unitKeyRecord) {
@@ -122,7 +126,7 @@ func (t *keyTable) get(path string) (unitKeyRecord, bool) {
 	if ok {
 		return rec, true
 	}
-	p, err := t.db.GetUnit(store.Hash(path))
+	p, err := t.db.GetUnit(t.ctx, store.Hash(path))
 	if err != nil {
 		return unitKeyRecord{}, false
 	}

@@ -1,17 +1,21 @@
 package xref
 
-import "github.com/sivchari/golance/internal/store"
+import (
+	"context"
+
+	"github.com/sivchari/golance/internal/store"
+)
 
 // TypeDeclaration returns the declaration location of the object identified
 // by (pkgPath, objPath) — an objectpath.Path string computed the same way
 // internal/index's facts extraction computes it (see store.BuildSymbolID)
 // — for resolving textDocument/typeDefinition when the type lives in a
 // different package than the query (see internal/langfeat.TypeDefinition).
-// ok is false if pkgPath's facts are not indexed, or no symbol in them
-// matches.
-func (r *Resolver) TypeDeclaration(pkgPath, objPath string) (Location, bool) {
+// ok is false if pkgPath's facts are not indexed, no symbol in them
+// matches, or ctx is canceled.
+func (r *Resolver) TypeDeclaration(ctx context.Context, pkgPath, objPath string) (Location, bool) {
 	idHash := store.Hash(store.BuildSymbolID(pkgPath, objPath))
-	_, _, loc, ok := r.symbolByHash(store.Hash(pkgPath), idHash)
+	_, _, loc, ok := r.symbolByHash(ctx, store.Hash(pkgPath), idHash)
 	return loc, ok
 }
 
@@ -20,8 +24,8 @@ func (r *Resolver) TypeDeclaration(pkgPath, objPath string) (Location, bool) {
 // candidate is declared in a different package than the query (see
 // internal/langfeat.ResolveCompletionDoc). ok is false under the same
 // conditions as TypeDeclaration.
-func (r *Resolver) SymbolDoc(pkgPath, objPath string) (string, bool) {
-	u, err := r.unitBlob(store.Hash(pkgPath))
+func (r *Resolver) SymbolDoc(ctx context.Context, pkgPath, objPath string) (string, bool) {
+	u, err := r.unitBlob(ctx, store.Hash(pkgPath))
 	if err != nil {
 		return "", false
 	}

@@ -2,6 +2,7 @@ package xref
 
 import (
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -113,7 +114,7 @@ func TestDefinition_CrossPackage(t *testing.T) {
 	userFile := goFile(t, snap, pkgUser, "user.go")
 	line, col := identOccurrence(t, userFile, "Person") // impl.Person in Declare's return type
 
-	locs, err := r.Definition(userFile, line, col)
+	locs, err := r.Definition(context.Background(), userFile, line, col)
 	if err != nil {
 		t.Fatalf("Definition: %v", err)
 	}
@@ -135,7 +136,7 @@ func TestDefinition_OnDeclarationResolvesToItself(t *testing.T) {
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
 	line, col := identOccurrence(t, implFile, "Person")
 
-	locs, err := r.Definition(implFile, line, col)
+	locs, err := r.Definition(context.Background(), implFile, line, col)
 	if err != nil {
 		t.Fatalf("Definition: %v", err)
 	}
@@ -154,7 +155,7 @@ func TestReferences_SpansDefiningAndReferencingPackages(t *testing.T) {
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
 	line, col := identOccurrence(t, implFile, "Person") // the declaration
 
-	locs, err := r.References(implFile, line, col, true)
+	locs, err := r.References(context.Background(), implFile, line, col, true)
 	if err != nil {
 		t.Fatalf("References: %v", err)
 	}
@@ -188,7 +189,7 @@ func TestReferences_ExcludesDeclarationWhenNotIncluded(t *testing.T) {
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
 	declLine, declCol := identOccurrence(t, implFile, "Person")
 
-	locs, err := r.References(implFile, declLine, declCol, false)
+	locs, err := r.References(context.Background(), implFile, declLine, declCol, false)
 	if err != nil {
 		t.Fatalf("References: %v", err)
 	}
@@ -208,7 +209,7 @@ func TestImplementation_InterfaceToImplementer(t *testing.T) {
 	ifaceFile := goFile(t, snap, pkgIface, "iface.go")
 	line, col := identOccurrence(t, ifaceFile, "Greeter")
 
-	locs, err := r.Implementation(ifaceFile, line, col)
+	locs, err := r.Implementation(context.Background(), ifaceFile, line, col)
 	if err != nil {
 		t.Fatalf("Implementation: %v", err)
 	}
@@ -230,7 +231,7 @@ func TestImplementation_ConcreteTypeToInterface(t *testing.T) {
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
 	line, col := identOccurrence(t, implFile, "Person")
 
-	locs, err := r.Implementation(implFile, line, col)
+	locs, err := r.Implementation(context.Background(), implFile, line, col)
 	if err != nil {
 		t.Fatalf("Implementation: %v", err)
 	}
@@ -249,7 +250,7 @@ func TestImplementation_ConcreteTypeToInterface(t *testing.T) {
 func TestWorkspaceSymbol_PrefixMatch(t *testing.T) {
 	r, snap := newTestResolver(t)
 
-	results, err := r.WorkspaceSymbol("Per")
+	results, err := r.WorkspaceSymbol(context.Background(), "Per")
 	if err != nil {
 		t.Fatalf("WorkspaceSymbol: %v", err)
 	}
@@ -281,7 +282,7 @@ func TestWorkspaceSymbol_PrefixMatch(t *testing.T) {
 func TestWorkspaceSymbol_NoMatch(t *testing.T) {
 	r, _ := newTestResolver(t)
 
-	results, err := r.WorkspaceSymbol("Zzz")
+	results, err := r.WorkspaceSymbol(context.Background(), "Zzz")
 	if err != nil {
 		t.Fatalf("WorkspaceSymbol: %v", err)
 	}
@@ -296,7 +297,7 @@ func TestRename_EditsEveryReferenceAcrossFiles(t *testing.T) {
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
 	line, col := identOccurrence(t, implFile, "Person")
 
-	edits, err := r.Rename(implFile, line, col, "Human")
+	edits, err := r.Rename(context.Background(), implFile, line, col, "Human")
 	if err != nil {
 		t.Fatalf("Rename: %v", err)
 	}
@@ -322,5 +323,67 @@ func TestRename_EditsEveryReferenceAcrossFiles(t *testing.T) {
 				t.Errorf("edit NewText = %q, want %q", e.NewText, "Human")
 			}
 		}
+	}
+}
+
+// TestQueries_HonorCanceledContext verifies that every xref query entry
+// point (finding 11) checks ctx before doing any real work: called with an
+// already-canceled context, each must return promptly with an error
+// satisfying errors.Is(err, context.Canceled) — a real context error, not a
+// degraded-to-empty "nothing found" result (the distinction that matters to
+// a caller like internal/rpc's dispatch layer, which maps exactly this
+// error into a RequestCancelled response).
+func TestQueries_HonorCanceledContext(t *testing.T) {
+	r, snap := newTestResolver(t)
+	implFile := goFile(t, snap, pkgImpl, "impl.go")
+	line, col := identOccurrence(t, implFile, "Person")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := r.Definition(ctx, implFile, line, col); !errors.Is(err, context.Canceled) {
+		t.Errorf("Definition with a canceled context: err = %v, want context.Canceled", err)
+	}
+	if _, err := r.References(ctx, implFile, line, col, true); !errors.Is(err, context.Canceled) {
+		t.Errorf("References with a canceled context: err = %v, want context.Canceled", err)
+	}
+	if _, err := r.Implementation(ctx, implFile, line, col); !errors.Is(err, context.Canceled) {
+		t.Errorf("Implementation with a canceled context: err = %v, want context.Canceled", err)
+	}
+	if _, err := r.WorkspaceSymbol(ctx, "Per"); !errors.Is(err, context.Canceled) {
+		t.Errorf("WorkspaceSymbol with a canceled context: err = %v, want context.Canceled", err)
+	}
+	if _, err := r.Rename(ctx, implFile, line, col, "Human"); !errors.Is(err, context.Canceled) {
+		t.Errorf("Rename with a canceled context: err = %v, want context.Canceled", err)
+	}
+}
+
+// TestLocationsFor_HonorsCanceledContext exercises the per-package loop
+// boundary check inside locationsFor directly (rather than only the
+// entry-point check in resolveAt, which TestQueries_HonorCanceledContext
+// already covers indirectly): resolveAt runs first, uncanceled, to obtain a
+// real target; ctx is then canceled before locationsFor's own closure-unit
+// loop ever runs. includeDecl is false so the very first thing locationsFor
+// does is enter that loop, whose ctx.Err() check (checked once per package,
+// see locationsFor's doc) must fire on its first iteration.
+func TestLocationsFor_HonorsCanceledContext(t *testing.T) {
+	r, snap := newTestResolver(t)
+	implFile := goFile(t, snap, pkgImpl, "impl.go")
+	line, col := identOccurrence(t, implFile, "Person")
+
+	l, c, err := toUint32Pos(line, col)
+	if err != nil {
+		t.Fatalf("toUint32Pos: %v", err)
+	}
+	target, err := r.resolveAt(context.Background(), implFile, l, c)
+	if err != nil {
+		t.Fatalf("resolveAt: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := r.locationsFor(ctx, target, false); !errors.Is(err, context.Canceled) {
+		t.Errorf("locationsFor with a canceled context: err = %v, want context.Canceled", err)
 	}
 }

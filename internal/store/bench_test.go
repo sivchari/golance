@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"testing"
@@ -169,7 +170,7 @@ func BenchmarkRandomSymbolLookup(b *testing.B) {
 		pkg := corpus[rng.intn(len(corpus))]
 		idHash := pkg.symIDHashes[rng.intn(len(pkg.symIDHashes))]
 
-		blob, ok, err := cas.Get(pkg.pkgHash)
+		blob, ok, err := cas.Get(context.Background(), pkg.pkgHash)
 		if err != nil || !ok {
 			b.Fatalf("Get(%d) = %v, %v, %v", pkg.pkgHash, blob != nil, ok, err)
 		}
@@ -205,7 +206,7 @@ func BenchmarkRefsTo(b *testing.B) {
 		pkg := corpus[rng.intn(len(corpus))]
 		idHash := pkg.symIDHashes[rng.intn(len(pkg.symIDHashes))]
 
-		blob, ok, err := cas.Get(pkg.pkgHash)
+		blob, ok, err := cas.Get(context.Background(), pkg.pkgHash)
 		if err != nil || !ok {
 			b.Fatalf("Get(%d) = %v, %v, %v", pkg.pkgHash, blob != nil, ok, err)
 		}

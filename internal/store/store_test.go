@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -29,7 +30,7 @@ func TestDBUnitPointerRoundTrip(t *testing.T) {
 	db := openTestDB(t)
 	const pkgHash = 12345
 
-	if _, err := db.GetUnit(pkgHash); !errors.Is(err, ErrNotFound) {
+	if _, err := db.GetUnit(context.Background(), pkgHash); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetUnit before Put: err = %v, want ErrNotFound", err)
 	}
 
@@ -45,7 +46,7 @@ func TestDBUnitPointerRoundTrip(t *testing.T) {
 		t.Fatalf("PutUnit() error = %v", err)
 	}
 
-	got, err := db.GetUnit(pkgHash)
+	got, err := db.GetUnit(context.Background(), pkgHash)
 	if err != nil {
 		t.Fatalf("GetUnit() error = %v", err)
 	}
@@ -69,15 +70,15 @@ func TestDBPutUnitAppliesIndexEntries(t *testing.T) {
 		t.Fatalf("PutUnit() error = %v", err)
 	}
 
-	names, err := db.LookupNamePrefix("foo")
+	names, err := db.LookupNamePrefix(context.Background(), "foo")
 	if err != nil || len(names["foo"]) != 1 || names["foo"][0] != 100 {
 		t.Errorf("LookupNamePrefix(foo) = %v, %v, want [100], nil", names, err)
 	}
-	methods, err := db.LookupMethod("String")
+	methods, err := db.LookupMethod(context.Background(), "String")
 	if err != nil || len(methods) != 1 {
 		t.Errorf("LookupMethod(String) = %v, %v, want 1 entry", methods, err)
 	}
-	strs, err := db.SymbolIDStrings(100)
+	strs, err := db.SymbolIDStrings(context.Background(), 100)
 	if err != nil || len(strs) != 1 || strs[0] != "pkg#Foo" {
 		t.Errorf("SymbolIDStrings(100) = %v, %v, want [pkg#Foo]", strs, err)
 	}
@@ -93,7 +94,7 @@ func TestDBPutUnitsBatch(t *testing.T) {
 		t.Fatalf("PutUnitsBatch() error = %v", err)
 	}
 	for _, e := range entries {
-		got, err := db.GetUnit(e.PkgHash)
+		got, err := db.GetUnit(context.Background(), e.PkgHash)
 		if err != nil || got.BlobKey != e.Pointer.BlobKey {
 			t.Errorf("pkgHash %d: GetUnit() = %+v, %v, want BlobKey %d", e.PkgHash, got, err, e.Pointer.BlobKey)
 		}
@@ -115,11 +116,11 @@ func TestDBPutUnitPointersBatchLeavesIndexUntouched(t *testing.T) {
 		t.Fatalf("PutUnitPointersBatch() error = %v", err)
 	}
 
-	got, err := db.GetUnit(1)
+	got, err := db.GetUnit(context.Background(), 1)
 	if err != nil || !reflect.DeepEqual(got, refreshed) {
 		t.Errorf("GetUnit() after PutUnitPointersBatch = %+v, %v, want %+v", got, err, refreshed)
 	}
-	names, err := db.LookupNamePrefix("foo")
+	names, err := db.LookupNamePrefix(context.Background(), "foo")
 	if err != nil || len(names["foo"]) != 1 {
 		t.Errorf("LookupNamePrefix(foo) after PutUnitPointersBatch = %v, %v, want the original index entry untouched", names, err)
 	}
@@ -140,7 +141,7 @@ func TestDBNameIndexPrefixScan(t *testing.T) {
 		t.Fatalf("AddNameSymbol(Baz) error = %v", err)
 	}
 
-	got, err := db.LookupNamePrefix("foo")
+	got, err := db.LookupNamePrefix(context.Background(), "foo")
 	if err != nil {
 		t.Fatalf("LookupNamePrefix(foo) error = %v", err)
 	}
@@ -171,7 +172,7 @@ func TestDBMethodIndex(t *testing.T) {
 		t.Fatalf("AddMethodSymbol() dup error = %v", err)
 	}
 
-	entries, err := db.LookupMethod("String")
+	entries, err := db.LookupMethod(context.Background(), "String")
 	if err != nil {
 		t.Fatalf("LookupMethod() error = %v", err)
 	}
@@ -179,7 +180,7 @@ func TestDBMethodIndex(t *testing.T) {
 		t.Fatalf("LookupMethod(String) returned %d entries, want 2: %v", len(entries), entries)
 	}
 
-	if entries, err := db.LookupMethod("Unknown"); err != nil || entries != nil {
+	if entries, err := db.LookupMethod(context.Background(), "Unknown"); err != nil || entries != nil {
 		t.Errorf("LookupMethod(Unknown) = %v, %v, want nil, nil", entries, err)
 	}
 }
@@ -279,7 +280,7 @@ func TestOpen_DiscardsDatabaseMissingSchemaVersion(t *testing.T) {
 		}
 	})
 
-	if _, err := reopened.GetUnit(1); !errors.Is(err, ErrNotFound) {
+	if _, err := reopened.GetUnit(context.Background(), 1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetUnit(1) after reopening a version-less database = %v, want ErrNotFound (stale data must be discarded, not silently served)", err)
 	}
 }
