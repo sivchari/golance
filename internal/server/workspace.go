@@ -58,6 +58,22 @@ func (d *depCacheHolder) importer() types.ImporterFrom {
 	return typecheck.NewImporter(d.fset, nil, d.files, d.cache)
 }
 
+// FileSet returns the *token.FileSet dependency export data is currently
+// decoded into (see importer). Its positions are only meaningful against a
+// *types.Package decoded by the same (fset, cache) pair still current when
+// the caller reads them: a concurrent recheck that pushes d past
+// maxDepCacheBytes swaps in a fresh pair, after which an older decode's
+// positions belong to neither the new fset this returns nor any fset the
+// caller still has a reference to. That window is narrow in practice
+// (512MiB of decoded export data) relative to how soon after a check a
+// caller reads cp's objects, and accepted for the same reason importer's
+// own eviction is.
+func (d *depCacheHolder) FileSet() *token.FileSet {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.fset
+}
+
 // invalidate drops pkgPaths from the current cache, so the next recheck
 // that imports any of them re-decodes fresh export data instead of reusing
 // a now-possibly-stale *types.Package. Callers use this after a workspace

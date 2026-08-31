@@ -195,3 +195,94 @@ func TestHandleRename_AppliesEditsAcrossCleanBuffer(t *testing.T) {
 		t.Errorf("handleRename(clean buffer) edit count = %d, want 2 (declaration + call site)", len(edits))
 	}
 }
+
+// TestHandleDefinition_Stdlib verifies dependencyDefinition's fallback: the
+// workspace facts index only ever indexes root packages (see
+// internal/index/scheduler.go's doc), so it has no answer for a standard
+// library symbol used from a workspace file — handleDefinition must resolve
+// it instead through the type-checked package's own Uses/Defs and the
+// shared dependency importer's export-data position, landing inside GOROOT.
+func TestHandleDefinition_Stdlib(t *testing.T) {
+	s, snap, _ := newTestServer(t)
+	pkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(pkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	file := pkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	pos := identPositionIn(t, file, data, "Sprintf", 1)
+
+	result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleDefinition(fmt.Sprintf): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleDefinition(fmt.Sprintf): result = %#v, want a single location", result)
+	}
+	target := locs[0].URI.FsPath()
+	if !strings.HasSuffix(target, filepath.FromSlash("fmt/print.go")) {
+		t.Errorf("definition file = %q, want it to end with fmt/print.go (inside GOROOT)", target)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("definition file %s does not exist on disk: %v", target, err)
+	}
+	if locs[0].Range.Start.Line == 0 {
+		t.Error("definition line = 0, want a real declaration line inside fmt/print.go")
+	}
+}
+
+// TestHandleDefinition_WorkspaceSymbolPreferred is a regression guard for
+// dependencyDefinition's fallback: a definition query on a cross-package
+// workspace symbol must still be answered by the workspace facts index
+// (accurate to the exact declaration column) rather than falling through to
+// the export-data fallback (which always degrades to column 1 — see
+// dependencyDefinition's doc).
+func TestHandleDefinition_WorkspaceSymbolPreferred(t *testing.T) {
+	s, snap, _ := newTestServer(t)
+	depusePkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(depusePkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	depuseFile := depusePkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(depuseFile))
+	if err != nil {
+		t.Fatalf("read %s: %v", depuseFile, err)
+	}
+	pos := identPositionIn(t, depuseFile, data, "Greeting", 1) // greet.Greeting reference
+
+	result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(depuseFile)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleDefinition(greet.Greeting): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleDefinition(greet.Greeting): result = %#v, want a single location", result)
+	}
+
+	greetFile := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+	if got := locs[0].URI.FsPath(); got != greetFile {
+		t.Fatalf("definition file = %q, want %q (greet.go, via the workspace facts index)", got, greetFile)
+	}
+	greetText, err := os.ReadFile(filepath.Clean(greetFile))
+	if err != nil {
+		t.Fatalf("read %s: %v", greetFile, err)
+	}
+	want := identPositionIn(t, greetFile, greetText, "Greeting", 1) // type Greeting struct declaration
+	if locs[0].Range.Start != want {
+		t.Errorf("definition start = %+v, want %+v (Greeting's declaration, exact column from the facts index)", locs[0].Range.Start, want)
+	}
+}

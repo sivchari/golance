@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"os"
 	"strings"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
+	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/rpc"
 	"github.com/sivchari/golance/internal/xref"
 )
@@ -98,9 +100,61 @@ func (s *Server) handleDefinition(ctx context.Context, params json.RawMessage) (
 		// facts-read failure is still visible, rather than silently
 		// indistinguishable from an ordinary miss.
 		s.logger.Printf("server: definition at %s:%d:%d: %v", path, line, col, err)
+		if loc, ok := s.dependencyDefinition(ctx, p.TextDocument.URI, p.Position); ok {
+			return s.toLSPLocations([]xref.Location{loc}), nil
+		}
 		return protocol.LocationSlice(nil), nil
 	}
 	return s.toLSPLocations(locs), nil
+}
+
+// dependencyDefinition is handleDefinition's fallback for a symbol the
+// workspace facts index has no answer for: the facts index only ever
+// covers root (workspace) packages (see internal/index/scheduler.go's
+// doc), so a definition query on an identifier from the standard library or
+// a module dependency always misses there. This resolves it instead through
+// the type-checked package's own Uses/Defs and the shared dependency
+// importer's export-data positions (see internal/langfeat.DependencyDefinition,
+// depCacheHolder.FileSet) — the same decode already paid for to type-check
+// path in the first place, not a separate source parse of the dependency.
+func (s *Server) dependencyDefinition(ctx context.Context, u uri.URI, pos protocol.Position) (xref.Location, bool) {
+	ws := s.workspace()
+	if ws == nil {
+		return xref.Location{}, false
+	}
+	cf := s.checkedFile(ctx, u, pos)
+	if !cf.ok {
+		return xref.Location{}, false
+	}
+	info, err := langfeat.DependencyDefinition(cf.cp, ws.depCache.FileSet(), cf.path, cf.offset)
+	if err != nil {
+		s.logger.Printf("server: dependency definition %s: %v", cf.path, err)
+		return xref.Location{}, false
+	}
+	if info == nil {
+		return xref.Location{}, false
+	}
+	// A root (workspace) package's export data is still a package
+	// resolveAt should have answered from the facts index; do not offer a
+	// possibly-stale export-data position as a substitute for whatever made
+	// that lookup fail.
+	if pkg, ok := ws.snap.Packages[info.PkgPath]; ok && pkg.Root {
+		return xref.Location{}, false
+	}
+	if info.Line > math.MaxUint32 {
+		return xref.Location{}, false
+	}
+	if _, err := os.Stat(info.Filename); err != nil {
+		return xref.Location{}, false
+	}
+	if info.Line <= 0 || int64(info.Line) > math.MaxUint32 {
+		return xref.Location{}, false
+	}
+	// Column 1 for both Col and EndCol: export data does not preserve
+	// column information (see internal/xref.methodFuncLocation's doc), so
+	// this degrades to a zero-width location at the start of the
+	// declaration's line rather than guessing.
+	return xref.Location{File: info.Filename, Line: uint32(info.Line), Col: 1, EndCol: 1}, true
 }
 
 func (s *Server) handleReferences(ctx context.Context, params json.RawMessage) (any, error) {
