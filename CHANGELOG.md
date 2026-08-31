@@ -1,5 +1,12 @@
 # Changelog
 
+## [v0.1.4](https://github.com/sivchari/golance/compare/v0.1.3...v0.1.4) - 2026-08-31
+- docs: add PR #10 to the v0.1.3 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/13
+- fix: use the type-checked content itself for position math by @sivchari in https://github.com/sivchari/golance/pull/15
+- fix: resolve lint findings from the overlay atomicity change by @sivchari in https://github.com/sivchari/golance/pull/16
+- fix: make cross-reference queries cancelable and cache recovered export paths by @sivchari in https://github.com/sivchari/golance/pull/17
+- fix: detect deleted module files, fatal reindex persist failures, and pin empty-interface implementations by @sivchari in https://github.com/sivchari/golance/pull/18
+
 ## [v0.1.3](https://github.com/sivchari/golance/compare/v0.1.2...v0.1.3) - 2026-08-31
 - fix: return empty results instead of internal errors for unresolvable files by @sivchari in https://github.com/sivchari/golance/pull/8
 - fix: survive handler panics and fail fast on a locked store by @sivchari in https://github.com/sivchari/golance/pull/9
