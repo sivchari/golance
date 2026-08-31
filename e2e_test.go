@@ -1,8 +1,10 @@
 package golance_test
 
 import (
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -89,6 +91,19 @@ func TestE2E(t *testing.T) {
 	// a single racy request right after the notification.
 	t.Run("hover_reflects_unsaved_edit", func(t *testing.T) {
 		checkE2EHoverReflectsUnsavedEdit(t, c, &locs)
+	})
+
+	// concurrent_edits_no_error_responses is a regression test for a bug
+	// where a request-driven type check (hover/completion) shared per-dir
+	// supersede cancellation with debounce-triggered background rechecks:
+	// while a burst of edits kept re-firing the debounce for lib/util, an
+	// in-flight hover or completion request's type check could be canceled
+	// by it, surfacing an error response for a request that was still
+	// alive. It sends a burst of textDocument/didChange while issuing
+	// hover and completion requests concurrently and asserts none of them
+	// ever come back as an error response.
+	t.Run("concurrent_edits_no_error_responses", func(t *testing.T) {
+		checkE2EConcurrentEditsNoErrorResponses(t, c, &locs)
 	})
 }
 
@@ -261,5 +276,83 @@ func checkE2EHoverReflectsUnsavedEdit(t *testing.T, c *lspClient, locs *e2eLocs)
 			t.Fatalf("hover did not reflect the unsaved edit within %s: %s", e2eRequestBudget, lastDoc)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// checkE2EConcurrentEditsNoErrorResponses sends a burst of
+// textDocument/didChange for locs.utilFile while concurrently issuing
+// hover requests against it and completion requests against
+// locs.usepkgFile (already open from the completion_selector subtest), and
+// asserts none of those requests ever comes back as an error response.
+// Before request-driven checks stopped sharing per-dir cancellation with
+// debounce-triggered background rechecks, a request's in-flight type check
+// could be canceled by the next debounce firing for the same directory.
+func checkE2EConcurrentEditsNoErrorResponses(t *testing.T, c *lspClient, locs *e2eLocs) {
+	t.Helper()
+
+	stop := make(chan struct{})
+	var editWG sync.WaitGroup
+	editWG.Add(1)
+	go func() {
+		defer editWG.Done()
+		version := int32(100)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			version++
+			newText := fmt.Sprintf("%s\n// edit %d\n", locs.utilSrc, version)
+			c.changeFile(t, locs.utilFile, version, newText)
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	var mu sync.Mutex
+	var errs []string
+	record := func(label string, resp *message) {
+		if resp != nil && len(resp.Error) > 0 {
+			mu.Lock()
+			errs = append(errs, fmt.Sprintf("%s: %s", label, resp.Error))
+			mu.Unlock()
+		}
+	}
+
+	const rounds = 30
+	var reqWG sync.WaitGroup
+	for range rounds {
+		reqWG.Add(2)
+		go func() {
+			defer reqWG.Done()
+			resp := c.call(t, protocol.MethodTextDocumentHover, &protocol.HoverParams{
+				TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+					TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.utilFile)},
+					Position:     locs.sumDecl,
+				},
+			}, e2eRequestBudget)
+			record("hover", resp)
+		}()
+		go func() {
+			defer reqWG.Done()
+			resp := c.call(t, protocol.MethodTextDocumentCompletion, &protocol.CompletionParams{
+				TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+					TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.usepkgFile)},
+					Position:     locs.selectorPos,
+				},
+			}, e2eRequestBudget)
+			record("completion", resp)
+		}()
+		time.Sleep(3 * time.Millisecond)
+	}
+	reqWG.Wait()
+
+	close(stop)
+	editWG.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errs) != 0 {
+		t.Fatalf("got %d error response(s) during concurrent edits, want 0:\n%s", len(errs), strings.Join(errs, "\n"))
 	}
 }

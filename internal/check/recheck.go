@@ -23,9 +23,11 @@ import (
 // runRecheck re-type-checks the package in dir: it lists and filters the
 // directory's Go files, parses them, resolves dependencies via
 // e.newImporter, and type-checks the result. On success the CheckedPackage
-// is cached and, if configured, published via Options.OnResult. ctx.Err()
-// is checked before and after both parsing and type-checking so a
-// canceled recheck returns promptly without touching the cache.
+// is committed (see Engine.commit) — cached and, if configured, published
+// via Options.OnResult, unless a newer-generation recheck for dir has
+// already committed. ctx.Err() is checked before and after both parsing
+// and type-checking so a canceled recheck returns promptly without
+// touching the cache.
 func (e *Engine) runRecheck(ctx context.Context, dir string) (*CheckedPackage, error) {
 	e.mu.Lock()
 	pi, ok := e.dirs[dir]
@@ -41,6 +43,8 @@ func (e *Engine) runRecheck(ctx context.Context, dir string) (*CheckedPackage, e
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+
+	gen := e.nextGen(dir)
 
 	files, err := e.resolveFiles(pi, dir)
 	if err != nil {
@@ -82,11 +86,7 @@ func (e *Engine) runRecheck(ctx context.Context, dir string) (*CheckedPackage, e
 		builtAt:     time.Now(),
 	}
 
-	e.store(dir, cp)
-
-	if e.opts.OnResult != nil {
-		e.opts.OnResult(newResult(cp, Diagnostics(cp, e.reader)))
-	}
+	e.commit(dir, gen, cp)
 
 	return cp, nil
 }
