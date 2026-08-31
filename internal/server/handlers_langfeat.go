@@ -16,9 +16,11 @@ import (
 
 // checkedFileResult is checkedFile's result: the package's CheckedPackage,
 // the document's current buffer content, and the query's byte offset into
-// it. Ok is false when the workspace is not loaded yet or pos does not
-// resolve to a valid offset in Text — both are "no result", not request
-// failures.
+// it. Ok is false when the workspace is not loaded yet, path is not part of
+// a known package (e.g. a testdata fixture, an external _test package
+// file, or a brand-new unsaved file the graph hasn't picked up yet — see
+// check.Engine.Get), or pos does not resolve to a valid offset in Text —
+// all "no result", not request failures.
 type checkedFileResult struct {
 	cp     *check.CheckedPackage
 	path   string
@@ -28,8 +30,11 @@ type checkedFileResult struct {
 }
 
 // checkedFile resolves an LSP TextDocumentPositionParams-style request to a
-// checkedFileResult. err is non-nil only for a hard failure such as a read
-// or type-check error.
+// checkedFileResult. err is non-nil only for a hard failure such as an
+// overlay read error; a "path is not part of a known package" error from
+// ws.engine.Get is logged and reported as an ordinary !ok "no result"
+// instead (the client already renders that as "nothing here," matching how
+// handleCompletionResolve treats the identical Engine.Get failure).
 func (s *Server) checkedFile(ctx context.Context, u uri.URI, pos protocol.Position) (checkedFileResult, error) {
 	path := u.FsPath()
 	ws := s.workspace()
@@ -38,7 +43,8 @@ func (s *Server) checkedFile(ctx context.Context, u uri.URI, pos protocol.Positi
 	}
 	cp, err := ws.engine.Get(ctx, path)
 	if err != nil {
-		return checkedFileResult{path: path}, err
+		s.logger.Printf("server: checked package for %s: %v", path, err)
+		return checkedFileResult{path: path}, nil
 	}
 	text, err := s.overlay.ReadFile(path)
 	if err != nil {
@@ -58,8 +64,12 @@ func (s *Server) handleHover(ctx context.Context, params json.RawMessage) (any, 
 		return nil, err
 	}
 	info, err := langfeat.Hover(cf.cp, cf.path, cf.offset)
-	if err != nil || info == nil {
-		return nil, err
+	if err != nil {
+		s.logger.Printf("server: hover %s: %v", cf.path, err)
+		return nil, nil
+	}
+	if info == nil {
+		return nil, nil
 	}
 	rng, ok := offsetRangeToLSP(cf.text, info.Range.StartOffset, info.Range.EndOffset)
 	if !ok {
@@ -90,7 +100,8 @@ func (s *Server) handleCompletion(ctx context.Context, params json.RawMessage) (
 	}
 	items, err := langfeat.Completion(cf.cp, s.overlay, cf.path, cf.offset)
 	if err != nil {
-		return nil, err
+		s.logger.Printf("server: completion %s: %v", cf.path, err)
+		return protocol.CompletionItemSlice(nil), nil
 	}
 	out := make(protocol.CompletionItemSlice, len(items))
 	for i, it := range items {
@@ -114,8 +125,12 @@ func (s *Server) handleSignatureHelp(ctx context.Context, params json.RawMessage
 		return nil, err
 	}
 	info, err := langfeat.SignatureHelp(cf.cp, cf.path, cf.offset)
-	if err != nil || info == nil {
-		return nil, err
+	if err != nil {
+		s.logger.Printf("server: signature help %s: %v", cf.path, err)
+		return nil, nil
+	}
+	if info == nil {
+		return nil, nil
 	}
 	sigParams := make([]protocol.ParameterInformation, len(info.Params))
 	for i, ps := range info.Params {
@@ -149,7 +164,8 @@ func (s *Server) handleDocumentSymbol(ctx context.Context, params json.RawMessag
 	}
 	cp, err := ws.engine.Get(ctx, path)
 	if err != nil {
-		return nil, err
+		s.logger.Printf("server: checked package for %s: %v", path, err)
+		return protocol.DocumentSymbolSlice(nil), nil
 	}
 	text, err := s.overlay.ReadFile(path)
 	if err != nil {
@@ -157,7 +173,8 @@ func (s *Server) handleDocumentSymbol(ctx context.Context, params json.RawMessag
 	}
 	syms, err := langfeat.DocumentSymbols(cp, path)
 	if err != nil {
-		return nil, err
+		s.logger.Printf("server: document symbols %s: %v", path, err)
+		return protocol.DocumentSymbolSlice(nil), nil
 	}
 	out := make(protocol.DocumentSymbolSlice, 0, len(syms))
 	for _, sym := range syms {
@@ -266,7 +283,8 @@ func (s *Server) handleInlayHint(ctx context.Context, params json.RawMessage) (a
 	}
 	cp, err := ws.engine.Get(ctx, path)
 	if err != nil {
-		return nil, err
+		s.logger.Printf("server: checked package for %s: %v", path, err)
+		return []protocol.InlayHint{}, nil
 	}
 	text, err := s.overlay.ReadFile(path)
 	if err != nil {
@@ -282,7 +300,8 @@ func (s *Server) handleInlayHint(ctx context.Context, params json.RawMessage) (a
 	}
 	hints, err := langfeat.InlayHints(cp, path, start, end, s.hintsEnabled())
 	if err != nil {
-		return nil, err
+		s.logger.Printf("server: inlay hints %s: %v", path, err)
+		return []protocol.InlayHint{}, nil
 	}
 	out := make([]protocol.InlayHint, 0, len(hints))
 	for _, h := range hints {

@@ -204,7 +204,13 @@ func (s *Server) handleRename(_ context.Context, params json.RawMessage) (any, e
 	}
 	edits, err := resolver.Rename(path, line, col, p.NewName)
 	if err != nil {
-		return nil, rpc.NewError(int32(protocol.ErrorCodesInvalidRequest), err.Error())
+		// Most errors here mean "no symbol at this position" or a facts-read
+		// gap — a routine outcome its sibling handlers (handleDefinition et
+		// al.) already treat as an empty result, not a protocol error. Log
+		// it so a genuine fault is still visible, rather than surfacing the
+		// raw internal error text to the client.
+		s.logger.Printf("server: rename at %s:%d:%d: %v", path, line, col, err)
+		return nil, nil
 	}
 
 	changes := make(map[uri.URI][]protocol.TextEdit, len(edits))

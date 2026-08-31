@@ -54,8 +54,12 @@ func (s *Server) handleTypeDefinition(ctx context.Context, params json.RawMessag
 		return protocol.LocationSlice(nil), err
 	}
 	info, err := langfeat.TypeDefinition(cf.cp, cf.path, cf.offset)
-	if err != nil || info == nil {
-		return protocol.LocationSlice(nil), err
+	if err != nil {
+		s.logger.Printf("server: type definition %s: %v", cf.path, err)
+		return protocol.LocationSlice(nil), nil
+	}
+	if info == nil {
+		return protocol.LocationSlice(nil), nil
 	}
 	if info.SameFile != "" {
 		return s.typeDefinitionSameFile(info)
@@ -121,7 +125,8 @@ func (s *Server) handleDocumentHighlight(ctx context.Context, params json.RawMes
 	}
 	hs, err := langfeat.DocumentHighlight(cf.cp, cf.path, cf.offset)
 	if err != nil {
-		return nil, err
+		s.logger.Printf("server: document highlight %s: %v", cf.path, err)
+		return []protocol.DocumentHighlight{}, nil
 	}
 	out := make([]protocol.DocumentHighlight, 0, len(hs))
 	for _, h := range hs {
@@ -153,8 +158,12 @@ func (s *Server) handlePrepareRename(ctx context.Context, params json.RawMessage
 		return nil, err
 	}
 	r, err := langfeat.PrepareRename(cf.cp, cf.path, cf.offset)
-	if err != nil || r == nil {
-		return nil, err
+	if err != nil {
+		s.logger.Printf("server: prepare rename %s: %v", cf.path, err)
+		return nil, nil
+	}
+	if r == nil {
+		return nil, nil
 	}
 	rng, ok := offsetRangeToLSP(cf.text, r.StartOffset, r.EndOffset)
 	if !ok {
@@ -176,7 +185,8 @@ func (s *Server) handleFoldingRange(ctx context.Context, params json.RawMessage)
 	}
 	cp, err := ws.engine.Get(ctx, path)
 	if err != nil {
-		return nil, err
+		s.logger.Printf("server: checked package for %s: %v", path, err)
+		return []protocol.FoldingRange{}, nil
 	}
 	text, err := s.overlay.ReadFile(path)
 	if err != nil {
@@ -184,7 +194,8 @@ func (s *Server) handleFoldingRange(ctx context.Context, params json.RawMessage)
 	}
 	frs, err := langfeat.FoldingRanges(cp, path)
 	if err != nil {
-		return nil, err
+		s.logger.Printf("server: folding ranges %s: %v", path, err)
+		return []protocol.FoldingRange{}, nil
 	}
 	out := make([]protocol.FoldingRange, 0, len(frs))
 	for _, fr := range frs {
@@ -221,7 +232,8 @@ func (s *Server) handleSelectionRange(ctx context.Context, params json.RawMessag
 	}
 	cp, err := ws.engine.Get(ctx, path)
 	if err != nil {
-		return nil, err
+		s.logger.Printf("server: checked package for %s: %v", path, err)
+		return []protocol.SelectionRange{}, nil
 	}
 	text, err := s.overlay.ReadFile(path)
 	if err != nil {
@@ -375,7 +387,8 @@ func (s *Server) handleDocumentLink(ctx context.Context, params json.RawMessage)
 	}
 	cp, err := ws.engine.Get(ctx, path)
 	if err != nil {
-		return nil, err
+		s.logger.Printf("server: checked package for %s: %v", path, err)
+		return []protocol.DocumentLink{}, nil
 	}
 	text, err := s.overlay.ReadFile(path)
 	if err != nil {
@@ -383,7 +396,8 @@ func (s *Server) handleDocumentLink(ctx context.Context, params json.RawMessage)
 	}
 	links, err := langfeat.ImportLinks(cp, path)
 	if err != nil {
-		return nil, err
+		s.logger.Printf("server: document links %s: %v", path, err)
+		return []protocol.DocumentLink{}, nil
 	}
 	out := make([]protocol.DocumentLink, 0, len(links))
 	for _, l := range links {
