@@ -39,11 +39,11 @@ func SignatureHelp(cp *check.CheckedPackage, file string, offset int) (*SigInfo,
 
 	params := make([]string, sig.Params().Len())
 	for i := range sig.Params().Len() {
-		params[i] = types.ObjectString(sig.Params().At(i), types.RelativeTo(cp.Package()))
+		params[i] = types.ObjectString(sig.Params().At(i), qualifier(cp.Package()))
 	}
 
 	return &SigInfo{
-		Label:       types.TypeString(sig, types.RelativeTo(cp.Package())),
+		Label:       types.TypeString(sig, qualifier(cp.Package())),
 		Params:      params,
 		ActiveParam: activeParamIndex(call, pos, sig),
 	}, nil

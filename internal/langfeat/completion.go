@@ -109,12 +109,14 @@ func selectorCompletions(cp *check.CheckedPackage, sel *ast.SelectorExpr, prefix
 		// on selector completion entirely.
 		return nil
 	}
-	return filterAndRank(memberItems(xType), prefix)
+	return filterAndRank(memberItems(cp.Package(), xType), prefix)
 }
 
 // memberItems collects t's method set (value and pointer receivers) and,
-// if t is (or points to) a struct, its immediate fields.
-func memberItems(t types.Type) []CompletionItem {
+// if t is (or points to) a struct, its immediate fields. pkg is the
+// package being edited, used to qualify a member's type only when it comes
+// from a different package.
+func memberItems(pkg *types.Package, t types.Type) []CompletionItem {
 	seen := make(map[string]bool)
 	var items []CompletionItem
 	addMethod := func(sel *types.Selection) {
@@ -126,7 +128,7 @@ func memberItems(t types.Type) []CompletionItem {
 		items = append(items, CompletionItem{
 			Label:  obj.Name(),
 			Kind:   KindMethod,
-			Detail: types.ObjectString(obj, nil),
+			Detail: types.ObjectString(obj, qualifier(pkg)),
 		})
 	}
 
@@ -151,7 +153,7 @@ func memberItems(t types.Type) []CompletionItem {
 			items = append(items, CompletionItem{
 				Label:  f.Name(),
 				Kind:   KindField,
-				Detail: types.ObjectString(f, nil),
+				Detail: types.ObjectString(f, qualifier(pkg)),
 			})
 		}
 	}
@@ -181,7 +183,7 @@ func packageMemberItems(pkg *types.Package) []CompletionItem {
 		items = append(items, CompletionItem{
 			Label:  name,
 			Kind:   kindForObject(obj),
-			Detail: types.ObjectString(obj, types.RelativeTo(pkg)),
+			Detail: types.ObjectString(obj, qualifier(pkg)),
 		})
 	}
 	return items
@@ -208,7 +210,7 @@ func lexicalCompletions(cp *check.CheckedPackage, pos token.Pos, prefix string) 
 			items = append(items, CompletionItem{
 				Label:  name,
 				Kind:   kindForObject(obj),
-				Detail: types.ObjectString(obj, types.RelativeTo(cp.Package())),
+				Detail: types.ObjectString(obj, qualifier(cp.Package())),
 			})
 		}
 	}

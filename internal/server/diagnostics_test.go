@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
@@ -81,5 +82,39 @@ func TestNotifyDiagnostics_OmitsVersionForClosedFile(t *testing.T) {
 	written := out.String()
 	if strings.Contains(written, `"version"`) {
 		t.Fatalf("notifyDiagnostics(never-opened file) published a version: %q", written)
+	}
+}
+
+// TestRefreshInlayHints_SendsWorkspaceInlayHintRefresh verifies that
+// refreshInlayHints sends a workspace/inlayHint/refresh request — the push
+// that lets a client relying on it (rather than polling) learn its
+// currently shown inlay hints are stale after a recheck publishes new
+// results (see publishDiagnostics). No response is read back here, so ctx's
+// short deadline (not refreshInlayHintsTimeout) is what makes the call
+// return.
+func TestRefreshInlayHints_SendsWorkspaceInlayHintRefresh(t *testing.T) {
+	var out bytes.Buffer
+	pr, pw := io.Pipe()
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+
+	done := make(chan struct{})
+	go func() {
+		_ = rpcServer.Serve(context.Background(), pr, &out)
+		close(done)
+	}()
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+	<-done
+
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	s.refreshInlayHints(ctx)
+
+	written := out.String()
+	if !strings.Contains(written, `"method":"workspace/inlayHint/refresh"`) {
+		t.Fatalf("refreshInlayHints did not send workspace/inlayHint/refresh: %q", written)
 	}
 }

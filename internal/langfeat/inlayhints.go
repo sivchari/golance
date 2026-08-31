@@ -177,7 +177,7 @@ func variableTypeHint(info *types.Info, pkg *types.Package, tf *token.File, e as
 	}
 	return Hint{
 		Offset: tf.Offset(e.End()),
-		Label:  ": " + types.TypeString(t, types.RelativeTo(pkg)),
+		Label:  ": " + types.TypeString(t, qualifier(pkg)),
 		Kind:   kind,
 		Render: RenderType,
 	}, true
@@ -260,7 +260,7 @@ func funcTypeParamHint(info *types.Info, pkg *types.Package, tf *token.File, cal
 	}
 	args := make([]string, inst.TypeArgs.Len())
 	for i := range args {
-		args[i] = types.TypeString(inst.TypeArgs.At(i), types.RelativeTo(pkg))
+		args[i] = types.TypeString(inst.TypeArgs.At(i), qualifier(pkg))
 	}
 	return Hint{
 		Offset: tf.Offset(id.End()),
@@ -343,7 +343,7 @@ func compositeLiteralTypeHint(info *types.Info, pkg *types.Package, tf *token.Fi
 	}
 	return Hint{
 		Offset: tf.Offset(lit.Lbrace),
-		Label:  prefix + types.TypeString(t, types.RelativeTo(pkg)),
+		Label:  prefix + types.TypeString(t, qualifier(pkg)),
 		Kind:   CompositeLiteralTypes,
 		Render: RenderType,
 	}, true

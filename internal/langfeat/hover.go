@@ -35,7 +35,7 @@ func Hover(cp *check.CheckedPackage, file string, offset int) (*HoverInfo, error
 		return nil, nil
 	}
 	return &HoverInfo{
-		Signature: types.ObjectString(obj, types.RelativeTo(cp.Package())),
+		Signature: types.ObjectString(obj, qualifier(cp.Package())),
 		Doc:       docForObject(cp, obj),
 		Range:     rangeOf(tf, id.Pos(), id.End()),
 	}, nil

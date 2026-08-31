@@ -43,6 +43,7 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 	}
 	s.setHintsEnabled(parseHintsSettings(p.InitializationOptions))
 	s.watchDynamicReg.Store(clientSupportsWatchedFilesRegistration(&p))
+	s.inlayHintRefreshSupport.Store(clientSupportsInlayHintRefresh(&p))
 	root, err := rootFromInitializeParams(&p, params)
 	if err != nil {
 		return nil, err
@@ -104,6 +105,18 @@ func clientSupportsWatchedFilesRegistration(p *protocol.InitializeParams) bool {
 	}
 	dr := p.Capabilities.Workspace.DidChangeWatchedFiles.DynamicRegistration
 	return dr != nil && *dr
+}
+
+// clientSupportsInlayHintRefresh reports whether p's client capabilities
+// declare workspace.inlayHint.refreshSupport: without it, a
+// workspace/inlayHint/refresh request (see refreshInlayHints) would be
+// sending the client a request it never asked for and may not handle.
+func clientSupportsInlayHintRefresh(p *protocol.InitializeParams) bool {
+	if p.Capabilities.Workspace == nil || p.Capabilities.Workspace.InlayHint == nil {
+		return false
+	}
+	rs := p.Capabilities.Workspace.InlayHint.RefreshSupport
+	return rs != nil && *rs
 }
 
 // handleInitialized responds to the "initialized" notification — the LSP
