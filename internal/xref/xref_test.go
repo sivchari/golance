@@ -30,6 +30,14 @@ func newTestResolver(t *testing.T) (*Resolver, *graph.Snapshot) {
 	if err != nil {
 		t.Fatalf("abs testdata root: %v", err)
 	}
+	return newResolverForDir(t, root)
+}
+
+// newResolverForDir is newTestResolver's shared core, parameterized by
+// module root, for tests that need their own synthetic module instead of
+// the shared testdata/module fixture.
+func newResolverForDir(t *testing.T, root string) (*Resolver, *graph.Snapshot) {
+	t.Helper()
 	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
 	if err != nil {
 		t.Fatalf("graph.Load: %v", err)

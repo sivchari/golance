@@ -44,7 +44,7 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 	// trustStat=false: reader may be an editor overlay whose content
 	// differs from disk while disk's own stat stays untouched (see
 	// processUnit's doc).
-	if err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, opts, changedPkg, reader, false, &stats); err != nil {
+	if _, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, opts, changedPkg, reader, false, &stats); err != nil {
 		stats.Elapsed = time.Since(start)
 		return stats, err
 	}
@@ -56,8 +56,18 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 			break
 		}
 		// trustStat=true: every closure hop is always read from disk.
-		if err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, opts, path, readFileDisk, true, &stats); err != nil {
+		fatal, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, opts, path, readFileDisk, true, &stats)
+		if err != nil {
 			firstErr = errors.Join(firstErr, err)
+			if fatal {
+				// A broken db would make every remaining hop's own
+				// persist attempt fail identically (see reindexOne's
+				// doc); stop instead of burning CPU re-type-checking the
+				// rest of the closure against it for nothing, the same
+				// distinction Build's own fatal path draws (see
+				// buildResults.flushPendingLocked).
+				break
+			}
 		}
 	}
 	stats.Elapsed = time.Since(start)
@@ -82,16 +92,25 @@ func orderedReverseClosure(snap *graph.Snapshot, changedPkg string) []string {
 }
 
 // reindexOne resolves path via processUnit and persists its outcome (if
-// any), updating stats. A processing error counts toward stats.Errors and
-// is returned (propagated as part of Reindex's overall error via
-// errors.Join); a persist failure for the pointer-only refresh path is
-// best-effort, not fatal — see [buildResults.flushPtrsLocked]'s identical
-// rationale.
-func reindexOne(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, opts Options, path string, reader FileReader, trustStat bool, stats *Stats) error {
+// any), updating stats. It distinguishes two error sources, mirroring
+// Build's own fatal-vs-per-package split (see [buildResults.record] and
+// [buildResults.flushPendingLocked]):
+//   - a processUnit failure (path's own parse/type-check/facts error) is
+//     one package's problem: it counts toward stats.Errors and is returned
+//     non-fatal (fatal=false), so Reindex's closure walk keeps going past
+//     it exactly as before.
+//   - a db.PutUnit failure means db can no longer be trusted to accept any
+//     further write this run; it is returned fatal (fatal=true) so the
+//     caller can stop the closure walk instead of re-type-checking every
+//     remaining package only to hit the same broken store again.
+//
+// A persist failure for the pointer-only refresh path stays best-effort,
+// not fatal — see [buildResults.flushPtrsLocked]'s identical rationale.
+func reindexOne(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, opts Options, path string, reader FileReader, trustStat bool, stats *Stats) (fatal bool, err error) {
 	outcome, skipped, typeChecked, err := processUnit(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
 	if err != nil {
 		stats.Errors++
-		return fmt.Errorf("index: reindex: %s: %w", path, err)
+		return false, fmt.Errorf("index: reindex: %s: %w", path, err)
 	}
 	if skipped {
 		stats.Skipped++
@@ -102,16 +121,16 @@ func reindexOne(ctx context.Context, fset *token.FileSet, imp *typecheck.Importe
 		}
 	}
 	if outcome == nil {
-		return nil
+		return false, nil
 	}
 	if outcome.entry != nil {
 		if err := db.PutUnit(outcome.entry); err != nil {
 			stats.Errors++
-			return fmt.Errorf("index: reindex: persist %s: %w", path, err)
+			return true, fmt.Errorf("index: reindex: persist %s: %w", path, err)
 		}
 	}
 	if outcome.ptrRefresh != nil {
 		_ = db.PutUnitPointersBatch(map[uint64]store.UnitPointer{outcome.pkgHash: *outcome.ptrRefresh})
 	}
-	return nil
+	return false, nil
 }
