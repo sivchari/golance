@@ -291,12 +291,24 @@ func TestRevalidateWorkspace_ReloadPicksUpNewPackage(t *testing.T) {
 // checked-in testdata.
 func copyTestdataModule(t *testing.T) string {
 	t.Helper()
-	src, err := filepath.Abs(filepath.Join("testdata", "module"))
+	srcPath, err := filepath.Abs(filepath.Join("testdata", "module"))
 	if err != nil {
 		t.Fatalf("abs testdata root: %v", err)
 	}
-	dst := t.TempDir()
-	entries, err := os.ReadDir(src)
+	src, err := os.OpenRoot(srcPath)
+	if err != nil {
+		t.Fatalf("open root %s: %v", srcPath, err)
+	}
+	defer func() { _ = src.Close() }()
+
+	dstPath := t.TempDir()
+	dst, err := os.OpenRoot(dstPath)
+	if err != nil {
+		t.Fatalf("open root %s: %v", dstPath, err)
+	}
+	defer func() { _ = dst.Close() }()
+
+	entries, err := os.ReadDir(srcPath)
 	if err != nil {
 		t.Fatalf("read testdata module: %v", err)
 	}
@@ -304,26 +316,26 @@ func copyTestdataModule(t *testing.T) string {
 		if e.IsDir() {
 			continue // testdata/module is flat today; nothing to recurse into
 		}
-		data, err := os.ReadFile(filepath.Join(src, e.Name()))
+		data, err := src.ReadFile(e.Name())
 		if err != nil {
 			t.Fatalf("read %s: %v", e.Name(), err)
 		}
-		if err := os.WriteFile(filepath.Join(dst, e.Name()), data, 0o600); err != nil {
+		if err := dst.WriteFile(e.Name(), data, 0o600); err != nil {
 			t.Fatalf("write %s: %v", e.Name(), err)
 		}
 	}
-	greetDir := filepath.Join(dst, "greet")
-	if err := os.MkdirAll(greetDir, 0o750); err != nil {
+	if err := dst.MkdirAll("greet", 0o750); err != nil {
 		t.Fatalf("mkdir greet: %v", err)
 	}
-	greetSrc, err := os.ReadFile(filepath.Join(src, "greet", "greet.go"))
+	greetRelPath := filepath.Join("greet", "greet.go")
+	greetSrc, err := src.ReadFile(greetRelPath)
 	if err != nil {
 		t.Fatalf("read greet/greet.go: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(greetDir, "greet.go"), greetSrc, 0o600); err != nil {
+	if err := dst.WriteFile(greetRelPath, greetSrc, 0o600); err != nil {
 		t.Fatalf("write greet/greet.go: %v", err)
 	}
-	return dst
+	return dstPath
 }
 
 // newWorkspaceOnlyServerAt is newWorkspaceOnlyServer parameterized on root

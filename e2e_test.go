@@ -64,7 +64,7 @@ func TestE2E(t *testing.T) {
 	// GoFiles (see writeE2EModule): the indexer must still exit 0 and
 	// build a usable index despite it, or everything below would fail.
 	c.openFile(t, locs.appFile)
-	c.waitForIndexReady(t, e2eIndexBudget)
+	c.waitForIndexReady(t)
 
 	t.Run("definition_cross_package", func(t *testing.T) {
 		checkE2EDefinitionCrossPackage(t, c, &locs)
@@ -118,7 +118,7 @@ func checkE2EInitializeCapabilities(t *testing.T, result *protocol.InitializeRes
 func checkE2EDiagnosticsOnOpen(t *testing.T, c *lspClient, locs *e2eLocs) {
 	t.Helper()
 	c.openFile(t, locs.brokenFile)
-	diags := c.waitForDiagnostics(t, locs.brokenFile, e2eRequestBudget)
+	diags := c.waitForDiagnostics(t, locs.brokenFile)
 	if len(diags) == 0 {
 		t.Fatal("want at least one diagnostic for broken.go, got none")
 	}
@@ -130,7 +130,7 @@ func checkE2EDiagnosticsOnOpen(t *testing.T, c *lspClient, locs *e2eLocs) {
 func checkE2EDiagnosticsOnOpenCleanFile(t *testing.T, c *lspClient, locs *e2eLocs) {
 	t.Helper()
 	c.openFile(t, locs.extraFile)
-	diags := c.waitForDiagnostics(t, locs.extraFile, e2eRequestBudget)
+	diags := c.waitForDiagnostics(t, locs.extraFile)
 	if len(diags) != 0 {
 		t.Fatalf("want zero diagnostics for a clean file, got %d: %+v", len(diags), diags)
 	}

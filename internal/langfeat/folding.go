@@ -69,13 +69,13 @@ func blockFoldingRange(tf *token.File, n ast.Node) (FoldingRangeInfo, bool) {
 	return FoldingRangeInfo{}, false
 }
 
-// spanningFoldingRange returns a FoldingRangeInfo for [open, close] if they
-// fall on different lines (nothing to fold otherwise).
-func spanningFoldingRange(tf *token.File, open, close token.Pos, kind FoldingKind) (FoldingRangeInfo, bool) {
-	if !open.IsValid() || !close.IsValid() || tf.Line(open) == tf.Line(close) {
+// spanningFoldingRange returns a FoldingRangeInfo for [open, closePos] if
+// they fall on different lines (nothing to fold otherwise).
+func spanningFoldingRange(tf *token.File, open, closePos token.Pos, kind FoldingKind) (FoldingRangeInfo, bool) {
+	if !open.IsValid() || !closePos.IsValid() || tf.Line(open) == tf.Line(closePos) {
 		return FoldingRangeInfo{}, false
 	}
-	return FoldingRangeInfo{Range: rangeOf(tf, open, close), Kind: kind}, true
+	return FoldingRangeInfo{Range: rangeOf(tf, open, closePos), Kind: kind}, true
 }
 
 // importFoldingRanges returns one FoldingRangeInfo per parenthesized import

@@ -480,11 +480,11 @@ func (c *lspClient) changeFile(t *testing.T, path string, version int32, newText
 }
 
 // waitForDiagnostics blocks until a publishDiagnostics notification for path
-// arrives, or timeout elapses.
-func (c *lspClient) waitForDiagnostics(t *testing.T, path string, timeout time.Duration) []protocol.Diagnostic {
+// arrives, or e2eRequestBudget elapses.
+func (c *lspClient) waitForDiagnostics(t *testing.T, path string) []protocol.Diagnostic {
 	t.Helper()
 	want := string(uri.File(path))
-	deadline := time.After(timeout)
+	deadline := time.After(e2eRequestBudget)
 	for {
 		select {
 		case n := <-c.diagnostics:
@@ -492,23 +492,23 @@ func (c *lspClient) waitForDiagnostics(t *testing.T, path string, timeout time.D
 				return n.diags
 			}
 		case <-deadline:
-			t.Fatalf("no publishDiagnostics for %s within %s", path, timeout)
+			t.Fatalf("no publishDiagnostics for %s within %s", path, e2eRequestBudget)
 			return nil
 		}
 	}
 }
 
 // waitForIndexReady blocks until the indexer subprocess's "golance/index"
-// $/progress end notification arrives, or timeout elapses, and returns its
-// message (see internal/server's indexStatsMessage) — the build-stats
-// summary a caller can parse via indexStats instead of inferring what
-// happened from wall-clock time. Cross-reference queries (definition,
-// references, implementation, workspace/symbol, rename) answer empty
-// results until this fires (see internal/server.resolverOrWarn).
-func (c *lspClient) waitForIndexReady(t *testing.T, timeout time.Duration) string {
+// $/progress end notification arrives, or e2eIndexBudget elapses, and
+// returns its message (see internal/server's indexStatsMessage) — the
+// build-stats summary a caller can parse via indexStats instead of
+// inferring what happened from wall-clock time. Cross-reference queries
+// (definition, references, implementation, workspace/symbol, rename)
+// answer empty results until this fires (see internal/server.resolverOrWarn).
+func (c *lspClient) waitForIndexReady(t *testing.T) string {
 	t.Helper()
 	const token = "golance/index"
-	deadline := time.After(timeout)
+	deadline := time.After(e2eIndexBudget)
 	for {
 		select {
 		case n := <-c.progress:
@@ -516,7 +516,7 @@ func (c *lspClient) waitForIndexReady(t *testing.T, timeout time.Duration) strin
 				return n.message
 			}
 		case <-deadline:
-			t.Fatalf("index did not become ready within %s", timeout)
+			t.Fatalf("index did not become ready within %s", e2eIndexBudget)
 			return ""
 		}
 	}

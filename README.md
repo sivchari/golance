@@ -13,3 +13,26 @@ frozen-analysis design, reusing Go's own `go/parser` + `go/types` for
 correctness. Successor to [gopls-lazy](https://github.com/sivchari/gopls-lazy).
 
 Status: under active development, not yet usable. See `plan-feat-v0.1.md`.
+
+## Development
+
+### Linting
+
+CI runs `golangci-lint run ./...` via [`.github/workflows/lint.yaml`](.github/workflows/lint.yaml)
+(golangci-lint `latest`, config in [`.golangci.yaml`](.golangci.yaml)). To reproduce
+that locally:
+
+```sh
+make lint-local
+```
+
+If your `go` in `PATH` is a non-release build (e.g. a `go1.27-devel` custom
+toolchain), plain `golangci-lint run ./...` can fail with
+`context loading failed: no go files to analyze`, because golangci-lint shells
+out to `go list -json` to load packages and that call breaks on devel builds.
+`make lint-local` points `GOROOT`/`PATH` at a stock SDK for the lint run while
+leaving your default `go` untouched. It prefers the toolchain the go command
+already downloaded for `go.mod`'s `go` directive (present in the module cache
+after any build, no network needed) and falls back to installing one through
+`golang.org/dl`. See the `lint-local` target in the [`Makefile`](Makefile) for
+details.

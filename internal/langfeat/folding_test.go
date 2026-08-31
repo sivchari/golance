@@ -28,10 +28,10 @@ func TestFoldingRanges_NestedBlocks(t *testing.T) {
 	ifRange := findFoldingRangeStartingAt(t, got, ifLbrace)
 	forRange := findFoldingRangeStartingAt(t, got, forLbrace)
 
-	if !(funcRange.Range.StartOffset < ifRange.Range.StartOffset && ifRange.Range.EndOffset < funcRange.Range.EndOffset) {
+	if funcRange.Range.StartOffset >= ifRange.Range.StartOffset || ifRange.Range.EndOffset >= funcRange.Range.EndOffset {
 		t.Errorf("if-range %+v is not nested inside func-range %+v", ifRange, funcRange)
 	}
-	if !(ifRange.Range.StartOffset < forRange.Range.StartOffset && forRange.Range.EndOffset < ifRange.Range.EndOffset) {
+	if ifRange.Range.StartOffset >= forRange.Range.StartOffset || forRange.Range.EndOffset >= ifRange.Range.EndOffset {
 		t.Errorf("for-range %+v is not nested inside if-range %+v", forRange, ifRange)
 	}
 }

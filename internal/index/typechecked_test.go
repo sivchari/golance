@@ -22,8 +22,14 @@ func TestBuild_RevertedContentIsCASHitNotTypeChecked(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	leafPath := filepath.Join(dir, "leaf", "leaf.go")
-	original, err := os.ReadFile(leafPath)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("open root %s: %v", dir, err)
+	}
+	defer func() { _ = root.Close() }()
+
+	leafRelPath := filepath.Join("leaf", "leaf.go")
+	original, err := root.ReadFile(leafRelPath)
 	if err != nil {
 		t.Fatalf("read leaf.go: %v", err)
 	}
@@ -54,7 +60,7 @@ func Hello(name string) Greeting {
 	return Greeting{Message: "hello " + name + "!"}
 }
 `)
-	if err := os.WriteFile(leafPath, edited, 0o600); err != nil {
+	if err := root.WriteFile(leafRelPath, edited, 0o600); err != nil {
 		t.Fatalf("edit leaf.go: %v", err)
 	}
 	second, err := Build(ctx, snap, db, cas, Options{})
@@ -65,7 +71,7 @@ func Hello(name string) Greeting {
 		t.Fatalf("second Build TypeChecked = %d, want 1 (leaf: new content the CAS has never seen)", second.TypeChecked)
 	}
 
-	if err := os.WriteFile(leafPath, original, 0o600); err != nil {
+	if err := root.WriteFile(leafRelPath, original, 0o600); err != nil {
 		t.Fatalf("revert leaf.go: %v", err)
 	}
 	third, err := Build(ctx, snap, db, cas, Options{})

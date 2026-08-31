@@ -103,7 +103,7 @@ func TestE2E_Nav(t *testing.T) {
 	})
 
 	c.openFile(t, locs.appFile)
-	c.waitForIndexReady(t, e2eIndexBudget)
+	c.waitForIndexReady(t)
 
 	t.Run("type_definition_cross_package", func(t *testing.T) {
 		checkE2ETypeDefinitionCrossPackage(t, c, &locs)

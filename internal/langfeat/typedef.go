@@ -62,10 +62,10 @@ func TypeDefinition(cp *check.CheckedPackage, file string, offset int) (*TypeDef
 	}
 
 	objPath, err := objectpath.For(tn)
-	if err != nil {
-		return nil, nil // not reachable via export data (e.g. a function-local type)
+	if err == nil {
+		return &TypeDefInfo{PkgPath: tn.Pkg().Path(), ObjPath: string(objPath)}, nil
 	}
-	return &TypeDefInfo{PkgPath: tn.Pkg().Path(), ObjPath: string(objPath)}, nil
+	return nil, nil // not reachable via export data (e.g. a function-local type)
 }
 
 // sameFileTypeDef resolves tn's own declaring identifier within cp's

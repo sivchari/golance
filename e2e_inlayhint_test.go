@@ -2,6 +2,7 @@ package golance_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -92,6 +93,7 @@ func initializeWithHints(t *testing.T, c *lspClient, root string, hints map[stri
 	gopid := os.Getpid()
 	if gopid < 0 || gopid > math.MaxInt32 {
 		t.Fatalf("pid %d does not fit in int32", gopid)
+		return
 	}
 	pid := int32(gopid)
 	params := &protocol.InitializeParams{
@@ -155,5 +157,12 @@ func hasInlayHintLabel(hints []protocol.InlayHint, label string) bool {
 func endOfDocument(src string) protocol.Position {
 	lines := strings.Split(src, "\n")
 	last := len(lines) - 1
-	return protocol.Position{Line: uint32(last), Character: uint32(len(lines[last]))}
+	if last < 0 || last > math.MaxUint32 {
+		panic(fmt.Sprintf("endOfDocument: line count %d out of uint32 range", len(lines)))
+	}
+	lineLen := len(lines[last])
+	if lineLen < 0 || lineLen > math.MaxUint32 {
+		panic(fmt.Sprintf("endOfDocument: last line length %d out of uint32 range", lineLen))
+	}
+	return protocol.Position{Line: uint32(last), Character: uint32(lineLen)}
 }

@@ -60,10 +60,10 @@ func ResolveCompletionDoc(cp *check.CheckedPackage, reader overlay.FileReader, k
 		return nil, nil // universe/builtin object: no doc source
 	}
 	objPath, err := objectpath.For(obj)
-	if err != nil {
-		return nil, nil
+	if err == nil {
+		return &CompletionDocInfo{PkgPath: obj.Pkg().Path(), ObjPath: string(objPath)}, nil
 	}
-	return &CompletionDocInfo{PkgPath: obj.Pkg().Path(), ObjPath: string(objPath)}, nil
+	return nil, nil
 }
 
 // objectForLabel re-resolves the same completion context Completion uses

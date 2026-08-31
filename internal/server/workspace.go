@@ -140,7 +140,7 @@ func (s *Server) handleDidChangeWatchedFiles(_ context.Context, params json.RawM
 	}
 	for _, ch := range p.Changes {
 		if isModuleFile(ch.URI.FsPath()) {
-			go s.revalidateGraph(graph.Options{Dir: ws.root, Offline: s.opts.Offline}, []string{"./..."})
+			go s.revalidateGraph(graph.Options{Dir: ws.root, Offline: s.opts.Offline}, []string{allPackagesPattern})
 			return nil
 		}
 	}
@@ -232,7 +232,7 @@ func packageDirs(snap *graph.Snapshot) map[string]bool {
 // on a cold start.
 func (s *Server) revalidateWorkspace(root string, reload bool) {
 	if reload {
-		s.revalidateGraph(graph.Options{Dir: root, Offline: s.opts.Offline}, []string{"./..."})
+		s.revalidateGraph(graph.Options{Dir: root, Offline: s.opts.Offline}, []string{allPackagesPattern})
 	}
 	s.revalidateIndex(root)
 }

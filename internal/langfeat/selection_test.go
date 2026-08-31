@@ -25,7 +25,7 @@ func TestSelectionRanges_InnermostFirst(t *testing.T) {
 	}
 	for i := 1; i < len(got); i++ {
 		prev, cur := got[i-1], got[i]
-		if !(cur.StartOffset <= prev.StartOffset && prev.EndOffset <= cur.EndOffset) {
+		if cur.StartOffset > prev.StartOffset || prev.EndOffset > cur.EndOffset {
 			t.Fatalf("SelectionRanges[%d] = %+v does not contain SelectionRanges[%d] = %+v", i, cur, i-1, prev)
 		}
 		if cur.StartOffset == prev.StartOffset && cur.EndOffset == prev.EndOffset {

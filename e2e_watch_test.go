@@ -34,7 +34,7 @@ func TestE2E_DidChangeWatchedFilesPicksUpExternalChanges(t *testing.T) {
 	c := startClient(t, root)
 	c.initialize(t, root)
 	c.openFile(t, locs.appFile)
-	c.waitForIndexReady(t, e2eIndexBudget)
+	c.waitForIndexReady(t)
 
 	t.Run("existing_file_edited_externally", func(t *testing.T) {
 		checkE2EExternalEditToKnownFile(t, c, &locs)

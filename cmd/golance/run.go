@@ -35,10 +35,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("golance", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	logPath := fs.String("log", os.Getenv("GOLANCE_LOG"), "write server logs to this file (default: stderr)")
-	indexJobs := fs.Int("index-jobs", envInt("GOLANCE_INDEX_JOBS", 0), "index build parallelism (0 = automatic)")
+	indexJobs := fs.Int("index-jobs", envInt("GOLANCE_INDEX_JOBS"), "index build parallelism (0 = automatic)")
 	memLimit := fs.String("mem-limit", os.Getenv("GOLANCE_MEM_LIMIT"), "GOMEMLIMIT for the indexer subprocess (e.g. 1GiB)")
 	offline := fs.Bool("offline", envBool("GOLANCE_OFFLINE", false), "forbid module downloads (GOPROXY=off) during graph load and indexing")
-	watchDebounceMS := fs.Int("watch-debounce-ms", envInt("GOLANCE_WATCH_DEBOUNCE_MS", 0), "how long to wait for workspace/didChangeWatchedFiles .go events to go quiet before revalidating the workspace (0 = automatic)")
+	watchDebounceMS := fs.Int("watch-debounce-ms", envInt("GOLANCE_WATCH_DEBOUNCE_MS"), "how long to wait for workspace/didChangeWatchedFiles .go events to go quiet before revalidating the workspace (0 = automatic)")
 	version := fs.Bool("version", false, "print version and exit")
 
 	if err := fs.Parse(args); err != nil {
@@ -204,14 +204,14 @@ func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if secs := envInt("GOLANCE_INDEX_DEADLINE_SECONDS", 0); secs > 0 {
+	if secs := envInt("GOLANCE_INDEX_DEADLINE_SECONDS"); secs > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(secs)*time.Second)
 		defer cancel()
 	}
 
 	stats, err := index.Build(ctx, snap, db, cas, index.Options{
-		Parallelism:   envInt(server.EnvIndexJobs, 0),
+		Parallelism:   envInt(server.EnvIndexJobs),
 		RelativePaths: server.RelativeIndexPaths(root),
 		Progress: func(done, total int) {
 			_, _ = fmt.Fprintf(stdout, "PROGRESS %d %d\n", done, total)
@@ -289,14 +289,14 @@ func writeNamedProfile(stderr io.Writer, name, path string) {
 	}
 }
 
-func envInt(key string, def int) int {
+func envInt(key string) int {
 	v := os.Getenv(key)
 	if v == "" {
-		return def
+		return 0
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return def
+		return 0
 	}
 	return n
 }

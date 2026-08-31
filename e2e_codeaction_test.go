@@ -92,14 +92,14 @@ func TestE2ECodeAction(t *testing.T) {
 	// starts the indexer subprocess, so wait for it before relying on the
 	// import-candidate lookup.
 	c.openFile(t, locs.libFile)
-	c.waitForIndexReady(t, e2eIndexBudget)
+	c.waitForIndexReady(t)
 
 	t.Run("undefined_symbol_adds_import", func(t *testing.T) {
 		checkE2ECodeActionUndefinedSymbol(t, c, locs.undefinedFile)
 	})
 
 	t.Run("only_filters_by_kind", func(t *testing.T) {
-		checkE2ECodeActionOnlyFilter(t, c, locs.unusedImportFile, unusedImportDiag)
+		checkE2ECodeActionOnlyFilter(t, c, locs.unusedImportFile, &unusedImportDiag)
 	})
 }
 
@@ -129,7 +129,7 @@ func callCodeAction(t *testing.T, c *lspClient, params *protocol.CodeActionParam
 }
 
 // applyFirstEdit returns text with action's edits for path applied.
-func applyFirstEdit(t *testing.T, path, text string, action protocol.CodeAction) string {
+func applyFirstEdit(t *testing.T, path, text string, action *protocol.CodeAction) string {
 	t.Helper()
 	if action.Edit == nil {
 		t.Fatal("action.Edit is nil")
@@ -201,7 +201,7 @@ func checkE2ECodeActionOrganizeImports(t *testing.T, c *lspClient, path string) 
 		t.Fatalf("no source.organizeImports action in %+v", actions)
 	}
 
-	got := applyFirstEdit(t, path, text, *found)
+	got := applyFirstEdit(t, path, text, found)
 	fmtIdx := strings.Index(got, `"fmt"`)
 	strconvIdx := strings.Index(got, `"strconv"`)
 	if fmtIdx < 0 || strconvIdx < 0 {
@@ -215,7 +215,7 @@ func checkE2ECodeActionOrganizeImports(t *testing.T, c *lspClient, path string) 
 func checkE2ECodeActionUnusedImport(t *testing.T, c *lspClient, path string) protocol.Diagnostic {
 	t.Helper()
 	c.openFile(t, path)
-	diags := c.waitForDiagnostics(t, path, e2eRequestBudget)
+	diags := c.waitForDiagnostics(t, path)
 	diag := findDiagnosticContaining(t, diags, "imported and not used")
 	text := readFixture(t, path)
 
@@ -223,7 +223,7 @@ func checkE2ECodeActionUnusedImport(t *testing.T, c *lspClient, path string) pro
 	if len(actions) == 0 {
 		t.Fatal("no quickfix actions for the unused-import diagnostic")
 	}
-	got := applyFirstEdit(t, path, text, actions[0])
+	got := applyFirstEdit(t, path, text, &actions[0])
 	if strings.Contains(got, `"fmt"`) {
 		t.Errorf("result still imports fmt: %s", got)
 	}
@@ -233,7 +233,7 @@ func checkE2ECodeActionUnusedImport(t *testing.T, c *lspClient, path string) pro
 func checkE2ECodeActionUnusedVar(t *testing.T, c *lspClient, path string) {
 	t.Helper()
 	c.openFile(t, path)
-	diags := c.waitForDiagnostics(t, path, e2eRequestBudget)
+	diags := c.waitForDiagnostics(t, path)
 	diag := findDiagnosticContaining(t, diags, "declared and not used")
 	text := readFixture(t, path)
 
@@ -241,7 +241,7 @@ func checkE2ECodeActionUnusedVar(t *testing.T, c *lspClient, path string) {
 	if len(actions) == 0 {
 		t.Fatal("no quickfix actions for the unused-var diagnostic")
 	}
-	got := applyFirstEdit(t, path, text, actions[0])
+	got := applyFirstEdit(t, path, text, &actions[0])
 	want := "package unusedvar\n\nfunc F() {\n\t_ = 1\n\t_ = 2\n}\n"
 	if got != want {
 		t.Errorf("result = %q, want %q", got, want)
@@ -251,7 +251,7 @@ func checkE2ECodeActionUnusedVar(t *testing.T, c *lspClient, path string) {
 func checkE2ECodeActionUndefinedSymbol(t *testing.T, c *lspClient, path string) {
 	t.Helper()
 	c.openFile(t, path)
-	diags := c.waitForDiagnostics(t, path, e2eRequestBudget)
+	diags := c.waitForDiagnostics(t, path)
 	diag := findDiagnosticContaining(t, diags, "undefined: Greet")
 	text := readFixture(t, path)
 
@@ -259,7 +259,7 @@ func checkE2ECodeActionUndefinedSymbol(t *testing.T, c *lspClient, path string) 
 	if len(actions) == 0 {
 		t.Fatal("no quickfix actions for the undefined-symbol diagnostic")
 	}
-	got := applyFirstEdit(t, path, text, actions[0])
+	got := applyFirstEdit(t, path, text, &actions[0])
 	if !strings.Contains(got, `"example.com/codeaction/lib"`) {
 		t.Errorf("result = %s, want it to import example.com/codeaction/lib", got)
 	}
@@ -268,20 +268,20 @@ func checkE2ECodeActionUndefinedSymbol(t *testing.T, c *lspClient, path string) 
 	}
 }
 
-func checkE2ECodeActionOnlyFilter(t *testing.T, c *lspClient, path string, diag protocol.Diagnostic) {
+func checkE2ECodeActionOnlyFilter(t *testing.T, c *lspClient, path string, diag *protocol.Diagnostic) {
 	t.Helper()
 
-	quickFixOnly := callCodeAction(t, c, codeActionRequest(path, diag.Range, []protocol.Diagnostic{diag}, []protocol.CodeActionKind{protocol.CodeActionKindQuickFix}))
-	for _, a := range quickFixOnly {
-		if a.Kind != nil && *a.Kind == protocol.CodeActionKindSourceOrganizeImports {
-			t.Errorf("Only=[quickfix] returned a source.organizeImports action: %+v", a)
+	quickFixOnly := callCodeAction(t, c, codeActionRequest(path, diag.Range, []protocol.Diagnostic{*diag}, []protocol.CodeActionKind{protocol.CodeActionKindQuickFix}))
+	for i := range quickFixOnly {
+		if quickFixOnly[i].Kind != nil && *quickFixOnly[i].Kind == protocol.CodeActionKindSourceOrganizeImports {
+			t.Errorf("Only=[quickfix] returned a source.organizeImports action: %+v", quickFixOnly[i])
 		}
 	}
 
-	organizeOnly := callCodeAction(t, c, codeActionRequest(path, diag.Range, []protocol.Diagnostic{diag}, []protocol.CodeActionKind{protocol.CodeActionKindSourceOrganizeImports}))
-	for _, a := range organizeOnly {
-		if a.Kind != nil && *a.Kind == protocol.CodeActionKindQuickFix {
-			t.Errorf("Only=[source.organizeImports] returned a quickfix action: %+v", a)
+	organizeOnly := callCodeAction(t, c, codeActionRequest(path, diag.Range, []protocol.Diagnostic{*diag}, []protocol.CodeActionKind{protocol.CodeActionKindSourceOrganizeImports}))
+	for i := range organizeOnly {
+		if organizeOnly[i].Kind != nil && *organizeOnly[i].Kind == protocol.CodeActionKindQuickFix {
+			t.Errorf("Only=[source.organizeImports] returned a quickfix action: %+v", organizeOnly[i])
 		}
 	}
 }
@@ -290,10 +290,10 @@ func checkE2ECodeActionOnlyFilter(t *testing.T, c *lspClient, path string, diag 
 // message contains substr, failing t if none matches.
 func findDiagnosticContaining(t *testing.T, diags []protocol.Diagnostic, substr string) protocol.Diagnostic {
 	t.Helper()
-	for _, d := range diags {
-		s, ok := d.Message.(protocol.String)
+	for i := range diags {
+		s, ok := diags[i].Message.(protocol.String)
 		if ok && strings.Contains(string(s), substr) {
-			return d
+			return diags[i]
 		}
 	}
 	t.Fatalf("no diagnostic containing %q in %+v", substr, diags)

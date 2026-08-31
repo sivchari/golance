@@ -24,6 +24,10 @@ const registerWatchedFilesTimeout = 5 * time.Second
 // else the client itself might register — a fixed string is fine.
 const watchedFilesRegistrationID = "golance-watch-go-files"
 
+// allPackagesPattern is the go/packages load pattern golance uses to load
+// (and reload) the whole workspace's import graph.
+const allPackagesPattern = "./..."
+
 // handleInitialize resolves the workspace root from params, loads the
 // import graph (from cache if warm, else synchronously), and returns
 // golance's server capabilities. The facts index is opened directly
@@ -44,7 +48,7 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 		return nil, err
 	}
 
-	patterns := []string{"./..."}
+	patterns := []string{allPackagesPattern}
 	loadOpts := graph.Options{Dir: root, Offline: s.opts.Offline}
 
 	snap, ok := graph.LoadCache(root, patterns, loadOpts.BuildFlags)
