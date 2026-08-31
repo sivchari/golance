@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 const (
@@ -159,5 +160,40 @@ func TestCache_RoundTrip(t *testing.T) {
 
 	if Stale(root) {
 		t.Error("Stale should be false right after SaveCache with no module file changes")
+	}
+}
+
+// TestStale_DeletedTrackedFile verifies that deleting a go.work that
+// existed when the cache was saved is itself detected as staleness, not
+// just a modification to one that still exists (see Stale's doc).
+func TestStale_DeletedTrackedFile(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	goWork := filepath.Join(root, "go.work")
+	if err := os.WriteFile(goWork, []byte("go 1.23\n"), 0o600); err != nil {
+		t.Fatalf("write go.work: %v", err)
+	}
+	// Back-date go.work so its ModTime is unambiguously older than the
+	// cache file SaveCache is about to write, regardless of filesystem
+	// mtime resolution.
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(goWork, past, past); err != nil {
+		t.Fatalf("chtimes go.work: %v", err)
+	}
+
+	snap := &Snapshot{Packages: map[string]*Package{}}
+	if err := SaveCache(root, []string{"./..."}, nil, snap); err != nil {
+		t.Fatalf("SaveCache: %v", err)
+	}
+	if Stale(root) {
+		t.Fatal("Stale should be false right after SaveCache with go.work present and unchanged")
+	}
+
+	if err := os.Remove(goWork); err != nil {
+		t.Fatalf("remove go.work: %v", err)
+	}
+	if !Stale(root) {
+		t.Error("Stale should be true after a go.work that existed at cache-save time was deleted")
 	}
 }

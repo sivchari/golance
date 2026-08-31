@@ -119,6 +119,22 @@ func Open(path string) (*DB, error) {
 	return &DB{bolt: bdb}, nil
 }
 
+// OpenReadOnly opens an already-initialized index database at path without
+// acquiring bbolt's exclusive write lock: reads (GetUnit, LookupMethod,
+// etc.) behave exactly as with [Open], but every write
+// (PutUnit/PutUnitsBatch/PutUnitPointersBatch/PutBuildFingerprint) fails
+// immediately with bbolt's ErrDatabaseReadOnly instead of persisting.
+// Unlike Open, it never creates the file or its buckets and never discards
+// a stale schema — path must already have been through a successful Open.
+// Test-only: production code always uses [Open].
+func OpenReadOnly(path string) (*DB, error) {
+	bdb, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: openTimeout, ReadOnly: true})
+	if err != nil {
+		return nil, wrapOpenErr(path, err)
+	}
+	return &DB{bolt: bdb}, nil
+}
+
 // wrapOpenErr wraps a bbolt.Open failure for path with context, calling out
 // the lock-timeout case specifically (errors.Is(err, bolterrors.ErrTimeout) still
 // holds through the %w) so a caller's log line explains what actually

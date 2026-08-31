@@ -50,10 +50,19 @@ func (r *Resolver) Implementation(ctx context.Context, file string, line, col in
 // candidate: a canceled query stops before decoding the next candidate's
 // export data (the expensive part of this loop) instead of running to
 // completion regardless.
+//
+// The empty interface (interface{}/any) is deliberately excluded: every
+// type in the workspace trivially implements it, so "every type" is not a
+// useful "Go to Implementations" result — the same call gopls makes for
+// the same reason. Return no results rather than enumerating the
+// workspace.
 func (r *Resolver) implementationsOfInterface(ctx context.Context, named *types.Named) ([]Location, error) {
 	iface, ok := named.Underlying().(*types.Interface)
 	if !ok {
 		return nil, fmt.Errorf("xref: %s is not an interface", named.Obj().Name())
+	}
+	if iface.NumMethods() == 0 {
+		return nil, nil
 	}
 	names := make([]string, iface.NumMethods())
 	for i := range names {
@@ -102,8 +111,17 @@ func (r *Resolver) implementationsOfInterface(ctx context.Context, named *types.
 // with types.Implements, which also rejects the interfaces the first pass
 // over-approximated. ctx is checked once per candidate (see
 // implementationsOfInterface's doc).
+//
+// A zero-method named type is symmetrically excluded: it technically
+// implements every zero-method interface (chiefly interface{}/any), but
+// implementationsOfInterface deliberately declines to report those
+// implementers, so staying consistent here means returning no results too
+// rather than the empty-method-name index having nothing to match against.
 func (r *Resolver) interfacesImplementedBy(ctx context.Context, named *types.Named) ([]Location, error) {
 	ms := types.NewMethodSet(types.NewPointer(named))
+	if ms.Len() == 0 {
+		return nil, nil
+	}
 	names := make([]string, ms.Len())
 	for i := 0; i < ms.Len(); i++ {
 		names[i] = ms.At(i).Obj().Name()
