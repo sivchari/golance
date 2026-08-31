@@ -43,6 +43,12 @@ type watchDebouncer struct {
 	rerun       bool
 	rerunRoot   string
 	rerunReload bool
+
+	// runWG tracks fire's in-flight run loop (one running=true..false span
+	// at a time, regardless of how many reruns it folds in), so Stop can
+	// wait for it to actually finish instead of merely preventing a new one
+	// from starting.
+	runWG sync.WaitGroup
 }
 
 // newWatchDebouncer returns a watchDebouncer that calls run for each
@@ -92,7 +98,9 @@ func (w *watchDebouncer) fire() {
 		return
 	}
 	w.running = true
+	w.runWG.Add(1)
 	w.execMu.Unlock()
+	defer w.runWG.Done()
 
 	for {
 		w.run(root, reload)
@@ -107,4 +115,19 @@ func (w *watchDebouncer) fire() {
 		w.rerun, w.rerunReload = false, false
 		w.execMu.Unlock()
 	}
+}
+
+// Stop cancels w's pending debounce timer, if any, so it never fires after
+// the caller no longer wants it to (server shutdown), then blocks until
+// any run loop already in flight finishes — which, since run (see
+// Server.revalidateWorkspace) is expected to observe the same shutdown
+// signal via context cancellation, should be prompt rather than a wait for
+// a full rebuild. Safe to call more than once.
+func (w *watchDebouncer) Stop() {
+	w.mu.Lock()
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.mu.Unlock()
+	w.runWG.Wait()
 }

@@ -358,6 +358,28 @@ func (e *Engine) commitPublish(gen uint64, st *dirState, cp *CheckedPackage) {
 	e.opts.OnResult(result)
 }
 
+// Stop cancels every directory's pending debounce timer and in-flight
+// background recheck (Invalidate/fireRecheck), so none of them can call
+// Options.OnResult after the caller discards this Engine — e.g. because a
+// fresh Engine over a new import graph snapshot is about to replace it.
+// This has no effect on a request-driven Get already in flight: Get never
+// registers with this per-dir bookkeeping (see its own doc), so it always
+// runs to completion and is still gated at commit time by its own
+// generation. Safe to call more than once.
+func (e *Engine) Stop() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, st := range e.jobs {
+		if st.timer != nil {
+			st.timer.Stop()
+			st.timer = nil
+		}
+		if st.cancel != nil {
+			st.cancel()
+		}
+	}
+}
+
 // evictLocked removes the least recently used non-focused cache entry, if
 // any. Callers must hold e.mu.
 func (e *Engine) evictLocked() {

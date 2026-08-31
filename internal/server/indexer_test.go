@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/index"
@@ -209,11 +210,68 @@ func TestRevalidateIndex_UnchangedKeepsWarmOpenHandle(t *testing.T) {
 	s.idx.Store(idx)
 	t.Cleanup(func() { _ = idx.db.Close() })
 
-	s.revalidateIndex(root)
+	s.revalidateIndex(context.Background(), root)
 
 	got := s.idx.Load()
 	if got != idx {
 		t.Errorf("s.idx after revalidateIndex = %p, want the original warm-opened %p (unchanged should not rebuild)", got, idx)
+	}
+}
+
+// TestRevalidateIndex_SerializedAgainstConcurrentCaller is a race test (run
+// with -race) for Finding 2: the post-initialize background check
+// (lifecycle.go) and a watched-files-triggered revalidateWorkspace pass
+// (workspace.go) both call revalidateIndex, with no synchronization between
+// their two goroutines other than s.idxMu. This drives that directly: while
+// one caller holds idxMu (simulating an in-flight rebuild), a concurrent
+// second call must block instead of running its own body concurrently —
+// the property that rules out both a nil-pointer panic racing s.idx.Store
+// against idx.db.Close and a second, redundant indexer subprocess. Once
+// the lock is released, the second call proceeds and completes, so
+// whichever call runs last necessarily re-evaluates and installs against
+// the then-current state — "newest build wins" by construction of running
+// strictly one at a time, rather than by racing two builds to completion.
+func TestRevalidateIndex_SerializedAgainstConcurrentCaller(t *testing.T) {
+	s := newWorkspaceOnlyServer(t)
+	root := s.workspace().root
+
+	s.idxMu.Lock()
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(started)
+		// s.idx is nil, so indexNeedsRebuild is false and this returns
+		// immediately once it acquires idxMu — exactly what proves it
+		// really was blocked on the lock rather than doing real work.
+		s.revalidateIndex(context.Background(), root)
+		close(done)
+	}()
+
+	<-started
+	select {
+	case <-done:
+		t.Fatal("revalidateIndex returned while s.idxMu was still held by a concurrent caller")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	s.idxMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("revalidateIndex never completed after s.idxMu was released")
+	}
+}
+
+// TestSpawnIndexer_BoundToContext verifies that spawnIndexer builds its
+// *exec.Cmd via exec.CommandContext (Cmd.Cancel is non-nil only when built
+// that way), not plain exec.Command — the wiring Finding 6's fix relies on
+// so canceling the server's own session-lifetime context (see
+// rpc.Server.Context) terminates an in-flight indexer subprocess instead of
+// orphaning it on shutdown.
+func TestSpawnIndexer_BoundToContext(t *testing.T) {
+	cmd := spawnIndexer(context.Background(), "golance-indexer-test-placeholder")
+	if cmd.Cancel == nil {
+		t.Fatal("spawnIndexer's *exec.Cmd has no Cancel func; want one built via exec.CommandContext so context cancellation terminates the subprocess")
 	}
 }
 

@@ -81,6 +81,19 @@ type Server struct {
 	idx   atomic.Pointer[indexState]
 	hints atomic.Pointer[map[langfeat.HintKind]bool] // enabled inlay hint kinds; nil until "initialize" or workspace/didChangeConfiguration sets it, meaning every kind enabled (see hintsEnabled)
 
+	// idxMu serializes every revalidateIndex/buildIndex invocation: without
+	// it, the once-per-session post-initialize background check
+	// (lifecycle.go) and a watched-files-triggered revalidateWorkspace pass
+	// (workspace.go) can both observe s.idx as "stale, not yet nil'd" and
+	// race on closing/rebuilding it concurrently — a nil-pointer panic in
+	// the interleaving where one goroutine's Store(nil) lands between the
+	// other's own Load and Close, redundant indexer subprocesses otherwise,
+	// and no guarantee the slower rebuild doesn't overwrite a fresher one's
+	// result. Holding it across an entire rebuild (including the indexer
+	// subprocess's exit) also means at most one indexer subprocess ever
+	// runs at a time.
+	idxMu sync.Mutex
+
 	diagMu    sync.Mutex
 	diagFiles map[string]map[string]bool // package dir -> files last published with diagnostics
 
@@ -141,6 +154,17 @@ func (s *Server) wire() {
 	s.rpc.Handle(protocol.MethodWorkspaceSymbol, rpc.Background, s.handleWorkspaceSymbol)
 	s.rpc.Handle(protocol.MethodTextDocumentRename, rpc.Background, s.handleRename)
 	s.registerNavHandlers()
+}
+
+// Stop releases session resources that outlive rpcServer.Serve itself:
+// currently, only s.watch's own pending/in-flight debounce work (see
+// watchDebouncer.Stop). Background work launched via s.rpc.Go (the
+// indexer subprocess, a didSave-triggered reindex) already stops on its
+// own once Serve cancels its context, and is drained by Serve's own
+// wg.Wait before Serve returns, so there is nothing else to do here.
+// Callers should call this after Serve returns.
+func (s *Server) Stop() {
+	s.watch.Stop()
 }
 
 // workspace returns the current workspace bundle, or nil before the

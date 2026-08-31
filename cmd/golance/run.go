@@ -66,7 +66,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	logger := log.New(logOut, "", log.LstdFlags)
 
 	rpcServer := rpc.NewServer(rpc.WithLogger(logger))
-	server.New(rpcServer, server.Options{
+	srv := server.New(rpcServer, server.Options{
 		Logger:        logger,
 		IndexJobs:     *indexJobs,
 		MemLimit:      *memLimit,
@@ -74,12 +74,24 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		WatchDebounce: time.Duration(*watchDebounceMS) * time.Millisecond,
 	})
 
-	if err := rpcServer.Serve(context.Background(), stdin, stdout); err != nil {
+	// Bound to the process's own signals, the same way runIndexer's own
+	// buildIndex does below: canceling this on SIGINT/SIGTERM (or when
+	// Serve returns, via rpc.Server.Context's own child context) is what
+	// lets background work rpcServer.Go launches — the indexer subprocess,
+	// a didSave-triggered reindex — stop instead of outliving this process
+	// as an orphan (see internal/server.Server.idxMu's doc).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serveErr := rpcServer.Serve(ctx, stdin, stdout)
+	srv.Stop()
+
+	if serveErr != nil {
 		var exitErr *rpc.ExitError
-		if errors.As(err, &exitErr) {
+		if errors.As(serveErr, &exitErr) {
 			return exitErr.Code
 		}
-		_, _ = fmt.Fprintf(logOut, "golance: serve: %v\n", err)
+		_, _ = fmt.Fprintf(logOut, "golance: serve: %v\n", serveErr)
 		return 1
 	}
 	return 0

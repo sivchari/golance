@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 	"sync"
@@ -572,5 +573,83 @@ func TestNotifyWritesNotificationFrame(t *testing.T) {
 	frames := readFrames(t, out.Bytes())
 	if len(frames) != 1 || frames[0]["method"] != "textDocument/publishDiagnostics" {
 		t.Fatalf("frames = %v", frames)
+	}
+}
+
+// TestContext_BeforeServeReturnsBackground verifies that Context is safe to
+// call before Serve has ever run — e.g. a handler exercised directly by a
+// unit test, without a real Serve session — falling back to
+// context.Background() instead of a nil context that would panic a caller
+// like exec.CommandContext.
+func TestContext_BeforeServeReturnsBackground(t *testing.T) {
+	s := newTestServer(t)
+	if got := s.Context(); got == nil || got.Err() != nil {
+		t.Fatalf("Context() before Serve = %v, want a non-nil, not-yet-canceled context.Background()", got)
+	}
+}
+
+// TestContext_CanceledWhenServeReturns verifies the invariant Go-launched
+// background work relies on to stop instead of outliving the session: once
+// Serve returns (here, on a clean EOF), Context is canceled.
+func TestContext_CanceledWhenServeReturns(t *testing.T) {
+	s := newTestServer(t)
+	pr, pw := io.Pipe()
+	var out bytes.Buffer
+
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(context.Background(), pr, &out) }()
+
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve() error = %v, want nil (clean EOF)", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve() did not return after EOF")
+	}
+
+	if err := s.Context().Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Context().Err() after Serve returned = %v, want context.Canceled", err)
+	}
+}
+
+// TestGo_TrackedByServeShutdownDrain verifies both of Go's guarantees at
+// once: the function it launches observes Context's cancellation once Serve
+// returns, and Serve's own defer s.wg.Wait() actually waits for it to
+// finish before Serve itself returns to its caller — the property a
+// shutdown-time goroutine-leak test relies on, instead of Serve returning
+// while Go-launched work is still outstanding. fn is launched from inside a
+// registered request handler (as production code always does — see
+// internal/server's lifecycle.go/documentsync.go), not directly from the
+// test, so this also exercises Go/Context under their real call pattern.
+func TestGo_TrackedByServeShutdownDrain(t *testing.T) {
+	s := newTestServer(t)
+	finished := make(chan struct{})
+	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) {
+		s.Go(func(ctx context.Context) {
+			<-ctx.Done() // blocks until Serve returns and cancels Context()
+			close(finished)
+		})
+		return nil, nil
+	})
+
+	pr, pw := io.Pipe()
+	var out bytes.Buffer
+	go func() {
+		_, _ = pw.Write([]byte(frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)))
+		_ = pw.Close()
+	}()
+
+	if err := s.Serve(context.Background(), pr, &out); err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+
+	select {
+	case <-finished:
+	default:
+		t.Fatal("Serve() returned before its own wg.Wait() drained the Go-launched goroutine")
 	}
 }

@@ -110,6 +110,76 @@ func TestWatchDebouncerRerunsExactlyOnceAfterInFlightPass(t *testing.T) {
 	}
 }
 
+// TestWatchDebouncerStop_PendingTimerNeverFires covers half of Finding 6's
+// fix: a debounce timer scheduled but not yet fired must never fire after
+// Stop — otherwise a pending workspace/didChangeWatchedFiles-triggered
+// revalidation would still run past server shutdown.
+func TestWatchDebouncerStop_PendingTimerNeverFires(t *testing.T) {
+	var mu sync.Mutex
+	var calls int
+	w := newWatchDebouncer(20*time.Millisecond, func(_ string, _ bool) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+	})
+
+	w.onEvent("root", false)
+	w.Stop()
+	time.Sleep(100 * time.Millisecond) // well past the debounce delay, if it were still armed
+
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("run called %d time(s) after Stop, want 0 (the pending timer must never fire)", got)
+	}
+}
+
+// TestWatchDebouncerStop_WaitsForInFlightRun covers the other half: Stop
+// blocks until a run already in flight when it is called actually finishes,
+// rather than returning while it is still outstanding — the property a
+// shutdown-time goroutine-leak check relies on.
+func TestWatchDebouncerStop_WaitsForInFlightRun(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var finished atomic.Bool
+
+	w := newWatchDebouncer(5*time.Millisecond, func(_ string, _ bool) {
+		close(started)
+		<-release
+		finished.Store(true)
+	})
+
+	w.onEvent("root", false)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run never started")
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		w.Stop()
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+		t.Fatal("Stop() returned before the in-flight run finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-stopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() never returned after the in-flight run finished")
+	}
+	if !finished.Load() {
+		t.Fatal("Stop() returned before run actually completed")
+	}
+}
+
 func waitForCalls(t *testing.T, mu *sync.Mutex, calls *[]bool, want int) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)

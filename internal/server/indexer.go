@@ -206,16 +206,30 @@ func (s *Server) tryWarmOpen(root string) (*indexState, bool) {
 // (or a go.mod/go.sum/go.work change, which handleDidChangeWatchedFiles
 // separately reloads the import graph for) — there is no ongoing poll for
 // external file changes during the rest of the session.
-func (s *Server) revalidateIndex(root string) {
+//
+// revalidateIndex has two independent callers — the once-per-session
+// background check right after initialize (lifecycle.go) and a watched-
+// files-triggered revalidateWorkspace pass (workspace.go) — that can fire
+// close enough together to both observe the same warm-opened index as
+// stale at once. s.idxMu (held for this call's entire body, including any
+// buildIndex it triggers) serializes them: the second caller through the
+// lock re-checks indexNeedsRebuild against whatever the first one just
+// installed, so it only rebuilds again if still actually necessary, never
+// races the first's own Store(nil)/Close, and never runs a second indexer
+// subprocess concurrently with the first's.
+func (s *Server) revalidateIndex(ctx context.Context, root string) {
+	s.idxMu.Lock()
+	defer s.idxMu.Unlock()
 	if !s.indexNeedsRebuild() {
 		return
 	}
-	idx := s.idx.Load()
-	s.idx.Store(nil)
-	if err := idx.db.Close(); err != nil {
-		s.logger.Printf("golance: close index before rebuild: %v", err)
+	if idx := s.idx.Load(); idx != nil {
+		s.idx.Store(nil)
+		if err := idx.db.Close(); err != nil {
+			s.logger.Printf("golance: close index before rebuild: %v", err)
+		}
 	}
-	s.buildIndex(root)
+	s.buildIndexLocked(ctx, root)
 }
 
 // indexNeedsRebuild reports whether the currently warm-opened index (if
@@ -256,16 +270,28 @@ func (s *Server) indexNeedsRebuild() bool {
 // opened anyway — stale or incomplete is strictly better than
 // unavailable — with a warning that it may not reflect this run.
 // spawnIndexer starts exe — always this same running golance binary's own
-// resolved path (see os.Executable, buildIndex's only caller) — as the
-// indexer subprocess. exe is a function parameter, so gosec's
-// subprocess-launched-with-variable check exempts it as the
+// resolved path (see os.Executable, buildIndexLocked's only caller) — as
+// the indexer subprocess, bound to ctx: canceling ctx (see
+// Server.idxMu's doc and rpc.Server.Context) terminates it instead of
+// leaving it to outlive the server process. exe is a function parameter,
+// so gosec's subprocess-launched-with-variable check exempts it as the
 // executable-name position (its own rule carves out parameters/receivers
 // used there).
-func spawnIndexer(exe string) *exec.Cmd {
-	return exec.Command(exe)
+func spawnIndexer(ctx context.Context, exe string) *exec.Cmd {
+	return exec.CommandContext(ctx, exe)
 }
 
-func (s *Server) buildIndex(root string) {
+// buildIndex acquires s.idxMu (see its doc) and runs buildIndexLocked.
+// This is the entry point for a cold-start build (no warm-opened index to
+// revalidate); revalidateIndex, which already holds idxMu itself, calls
+// buildIndexLocked directly instead.
+func (s *Server) buildIndex(ctx context.Context, root string) {
+	s.idxMu.Lock()
+	defer s.idxMu.Unlock()
+	s.buildIndexLocked(ctx, root)
+}
+
+func (s *Server) buildIndexLocked(ctx context.Context, root string) {
 	dbPath := s.dbPath(root)
 	cas := casDir(root)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
@@ -279,7 +305,7 @@ func (s *Server) buildIndex(root string) {
 		return
 	}
 
-	cmd := spawnIndexer(exe)
+	cmd := spawnIndexer(ctx, exe)
 	cmd.Env = append(os.Environ(),
 		EnvIndexer+"=1",
 		EnvRoot+"="+root,

@@ -89,6 +89,14 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 		}
 	}
 
+	// Stop the outgoing workspace's engine before installing the new one:
+	// otherwise a debounce timer already scheduled on it (e.g. by a
+	// handleDidChange that captured the old workspace microseconds before
+	// this swap) could still fire afterward and publish diagnostics
+	// computed against the now-discarded import graph.
+	if old := s.ws.Load(); old != nil {
+		old.engine.Stop()
+	}
 	s.ws.Store(&workspace{root: root, snap: snap, engine: engine, fileToPkg: fileToPkg, depCache: depCache})
 
 	if idx := s.idx.Load(); idx != nil {
@@ -234,5 +242,10 @@ func (s *Server) revalidateWorkspace(root string, reload bool) {
 	if reload {
 		s.revalidateGraph(graph.Options{Dir: root, Offline: s.opts.Offline}, []string{allPackagesPattern})
 	}
-	s.revalidateIndex(root)
+	// s.watch (see watch.go) calls this from its own debounce-timer
+	// goroutine, not from a request/notification handler, so there is no
+	// handler-scoped ctx to thread through here: s.rpc.Context() is the
+	// session-lifetime context that binds the indexer subprocess this may
+	// launch to the server's own shutdown (see revalidateIndex).
+	s.revalidateIndex(s.rpc.Context(), root)
 }
