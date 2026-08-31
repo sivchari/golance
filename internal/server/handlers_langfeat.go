@@ -34,30 +34,28 @@ type checkedFileResult struct {
 // exact content ws.engine.Get type-checked against, rather than a separate
 // later overlay read: a concurrent edit landing between the two could
 // otherwise leave Offset computed against different content than what cp
-// was built from. The error return is always nil; kept for symmetry with
-// the handlers that call this and to absorb a future hard-failure path
-// without a signature change. A "path is not part of a known package"
-// error from ws.engine.Get is logged and reported as an ordinary !ok "no
-// result" instead (the client already renders that as "nothing here,"
+// was built from. A "path is not part of a known package" error from
+// ws.engine.Get is logged and reported as an ordinary !ok "no result"
+// instead (the client already renders that as "nothing here,"
 // matching how handleCompletionResolve treats the identical Engine.Get
 // failure).
-func (s *Server) checkedFile(ctx context.Context, u uri.URI, pos protocol.Position) (checkedFileResult, error) {
+func (s *Server) checkedFile(ctx context.Context, u uri.URI, pos protocol.Position) checkedFileResult {
 	path := u.FsPath()
 	ws := s.workspace()
 	if ws == nil {
-		return checkedFileResult{path: path}, nil
+		return checkedFileResult{path: path}
 	}
 	cp, err := ws.engine.Get(ctx, path)
 	if err != nil {
 		s.logger.Printf("server: checked package for %s: %v", path, err)
-		return checkedFileResult{path: path}, nil
+		return checkedFileResult{path: path}
 	}
 	text, ok := cp.FileText(path)
 	if !ok {
-		return checkedFileResult{path: path}, nil
+		return checkedFileResult{path: path}
 	}
 	offset, ok := byteOffsetForPosition(text, pos)
-	return checkedFileResult{cp: cp, path: path, text: text, offset: offset, ok: ok}, nil
+	return checkedFileResult{cp: cp, path: path, text: text, offset: offset, ok: ok}
 }
 
 func (s *Server) handleHover(ctx context.Context, params json.RawMessage) (any, error) {
@@ -65,9 +63,9 @@ func (s *Server) handleHover(ctx context.Context, params json.RawMessage) (any, 
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	cf, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
-	if err != nil || !cf.ok {
-		return nil, err
+	cf := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
+	if !cf.ok {
+		return nil, nil
 	}
 	info, err := langfeat.Hover(cf.cp, cf.path, cf.offset)
 	if err != nil {
@@ -100,9 +98,9 @@ func (s *Server) handleCompletion(ctx context.Context, params json.RawMessage) (
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	cf, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
-	if err != nil || !cf.ok {
-		return protocol.CompletionItemSlice(nil), err
+	cf := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
+	if !cf.ok {
+		return protocol.CompletionItemSlice(nil), nil
 	}
 	items, err := langfeat.Completion(cf.cp, cf.text, cf.path, cf.offset)
 	if err != nil {
@@ -126,9 +124,9 @@ func (s *Server) handleSignatureHelp(ctx context.Context, params json.RawMessage
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	cf, err := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
-	if err != nil || !cf.ok {
-		return nil, err
+	cf := s.checkedFile(ctx, p.TextDocument.URI, p.Position)
+	if !cf.ok {
+		return nil, nil
 	}
 	info, err := langfeat.SignatureHelp(cf.cp, cf.path, cf.offset)
 	if err != nil {
