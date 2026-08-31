@@ -56,9 +56,17 @@ var _ FileReader = (*Overlay)(nil)
 func (o *Overlay) ReadFile(path string) ([]byte, error) {
 	o.mu.RLock()
 	doc, ok := o.docs[uri.File(path)]
+	// doc.text must be read while still holding the lock: DidChange/DidOpen
+	// mutate the same *overlayDoc's text field in place (see overlayDoc's
+	// doc), rather than swapping in a new one, so reading it after
+	// releasing the lock races a concurrent DidChange writing it.
+	var text []byte
+	if ok {
+		text = doc.text
+	}
 	o.mu.RUnlock()
 	if ok {
-		return doc.text, nil
+		return text, nil
 	}
 	return os.ReadFile(filepath.Clean(path))
 }

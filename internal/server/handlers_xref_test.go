@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -91,5 +92,105 @@ func TestHandleRename_DegradesGracefullyOnResolverError(t *testing.T) {
 	}
 	if result != nil {
 		t.Fatalf("handleRename(unresolvable target) result = %#v, want nil", result)
+	}
+}
+
+// TestHandleRename_RefusesLoudlyOnDirtyBuffer is a regression test for the
+// investigation's rename-corruption finding: correctResultRange's
+// dirty-buffer correction (see dirty.go) only shifts line numbers via a
+// naive top-down line diff and is blind to column-level edits on the same
+// line. Here the buffer edit inserts characters before the second "Hello"
+// occurrence on its own line, changing that occurrence's column without
+// changing the file's line count at all — dirtyLineMap reports that line
+// as needing no shift (ok=true, unchanged), so the stale on-disk column
+// would silently be applied to the edited line's now-different content
+// instead of being recognized as wrong. handleRename must refuse the whole
+// rename with a clear error in this situation, never return a
+// WorkspaceEdit that could land at the wrong column or silently omit the
+// occurrence.
+func TestHandleRename_RefusesLoudlyOnDirtyBuffer(t *testing.T) {
+	s, _, root := newTestServer(t)
+	path := filepath.Join(root, "greet", "greet.go")
+
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	openDoc(t, s, path, string(saved)) // matches disk: not dirty yet
+
+	const from = `g := Hello("world")`
+	const to = `x := 1; g := Hello("world")`
+	dirty := strings.Replace(string(saved), from, to, 1)
+	if dirty == string(saved) {
+		t.Fatalf("test fixture: %q not found in %s", from, path)
+	}
+	changeDoc(t, s, path, 2, dirty)
+
+	// Rename at Hello's declaration, on a line the edit above never
+	// touched, so xrefPosition/correctQueryLine still resolves the right
+	// symbol — the danger here is entirely in applying the resulting
+	// edits, not in finding the rename target.
+	pos := identPosition(t, path, 1) // 1st "Hello" occurrence: the declaration
+
+	result, err := s.handleRename(context.Background(), mustMarshal(t, &protocol.RenameParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(path)},
+			Position:     pos,
+		},
+		NewName: "Greet",
+	}))
+	if result != nil {
+		t.Fatalf("handleRename(dirty buffer) result = %#v, want nil: never a WorkspaceEdit that could be silently wrong or partial", result)
+	}
+	if err == nil {
+		t.Fatal("handleRename(dirty buffer) error = nil, want a loud error refusing the rename")
+	}
+	rpcErr, ok := err.(*rpc.Error)
+	if !ok {
+		t.Fatalf("handleRename(dirty buffer) error type = %T, want *rpc.Error", err)
+	}
+	if !strings.Contains(rpcErr.Message, "unsaved edits") {
+		t.Errorf("handleRename(dirty buffer) error message = %q, want it to mention unsaved edits", rpcErr.Message)
+	}
+}
+
+// TestHandleRename_AppliesEditsAcrossCleanBuffer checks that the dirty-file
+// refusal added for TestHandleRename_RefusesLoudlyOnDirtyBuffer does not
+// also block the ordinary case: a rename against a file with no unsaved
+// changes (matching what the facts index was built from) still succeeds
+// and edits every occurrence.
+func TestHandleRename_AppliesEditsAcrossCleanBuffer(t *testing.T) {
+	s, _, root := newTestServer(t)
+	path := filepath.Join(root, "greet", "greet.go")
+
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	openDoc(t, s, path, string(saved)) // matches disk: not dirty
+
+	pos := identPosition(t, path, 1) // Hello's declaration
+
+	result, err := s.handleRename(context.Background(), mustMarshal(t, &protocol.RenameParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(path)},
+			Position:     pos,
+		},
+		NewName: "Greet",
+	}))
+	if err != nil {
+		t.Fatalf("handleRename(clean buffer) error = %v, want nil", err)
+	}
+	edit, ok := result.(*protocol.WorkspaceEdit)
+	if !ok {
+		t.Fatalf("handleRename(clean buffer) result type = %T, want *protocol.WorkspaceEdit", result)
+	}
+	edits, ok := edit.Changes[uri.File(path)]
+	if !ok {
+		t.Fatalf("handleRename(clean buffer) has no edits for %s: %#v", path, edit.Changes)
+	}
+	// greet.go's "Hello" occurs twice: the declaration and useHello's call.
+	if len(edits) != 2 {
+		t.Errorf("handleRename(clean buffer) edit count = %d, want 2 (declaration + call site)", len(edits))
 	}
 }

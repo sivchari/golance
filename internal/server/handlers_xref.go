@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+	"strings"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
@@ -211,6 +212,21 @@ func (s *Server) handleRename(_ context.Context, params json.RawMessage) (any, e
 		// raw internal error text to the client.
 		s.logger.Printf("server: rename at %s:%d:%d: %v", path, line, col, err)
 		return nil, nil
+	}
+
+	if dirty := s.dirtyRenameFiles(edits); len(dirty) > 0 {
+		// correctResultRange's dirty-buffer correction (see dirty.go) only
+		// shifts line numbers via a naive top-down line diff and is blind to
+		// column-level edits on the same line, so it can silently drop or
+		// misplace occurrences. That is an acceptable simplification for
+		// its other, read-only callers (definition/references/workspace
+		// symbol: worst case a stale result the user re-navigates from),
+		// but not here, where it would silently corrupt a write. Rather than
+		// risk a partially-wrong WorkspaceEdit, refuse the whole rename
+		// loudly whenever any file it touches has unsaved edits.
+		msg := "golance: cannot safely rename while " + strings.Join(dirty, ", ") + " has unsaved edits; save and retry"
+		s.logger.Printf("server: rename %q: refusing, unsaved edits could shift occurrence positions in %v", p.NewName, dirty)
+		return nil, rpc.NewError(int32(protocol.ErrorCodesInternalError), msg)
 	}
 
 	changes := make(map[uri.URI][]protocol.TextEdit, len(edits))

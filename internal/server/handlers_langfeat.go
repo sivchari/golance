@@ -15,12 +15,12 @@ import (
 )
 
 // checkedFileResult is checkedFile's result: the package's CheckedPackage,
-// the document's current buffer content, and the query's byte offset into
-// it. Ok is false when the workspace is not loaded yet, path is not part of
-// a known package (e.g. a testdata fixture, an external _test package
-// file, or a brand-new unsaved file the graph hasn't picked up yet — see
-// check.Engine.Get), or pos does not resolve to a valid offset in Text —
-// all "no result", not request failures.
+// the exact buffer content it was checked against, and the query's byte
+// offset into it. Ok is false when the workspace is not loaded yet, path
+// is not part of a known package (e.g. a testdata fixture, an external
+// _test package file, or a brand-new unsaved file the graph hasn't picked
+// up yet — see check.Engine.Get), or pos does not resolve to a valid
+// offset in Text — all "no result", not request failures.
 type checkedFileResult struct {
 	cp     *check.CheckedPackage
 	path   string
@@ -30,11 +30,17 @@ type checkedFileResult struct {
 }
 
 // checkedFile resolves an LSP TextDocumentPositionParams-style request to a
-// checkedFileResult. err is non-nil only for a hard failure such as an
-// overlay read error; a "path is not part of a known package" error from
-// ws.engine.Get is logged and reported as an ordinary !ok "no result"
-// instead (the client already renders that as "nothing here," matching how
-// handleCompletionResolve treats the identical Engine.Get failure).
+// checkedFileResult. Text and Offset are derived from cp.FileText, the
+// exact content ws.engine.Get type-checked against, rather than a separate
+// later overlay read: a concurrent edit landing between the two could
+// otherwise leave Offset computed against different content than what cp
+// was built from. The error return is always nil; kept for symmetry with
+// the handlers that call this and to absorb a future hard-failure path
+// without a signature change. A "path is not part of a known package"
+// error from ws.engine.Get is logged and reported as an ordinary !ok "no
+// result" instead (the client already renders that as "nothing here,"
+// matching how handleCompletionResolve treats the identical Engine.Get
+// failure).
 func (s *Server) checkedFile(ctx context.Context, u uri.URI, pos protocol.Position) (checkedFileResult, error) {
 	path := u.FsPath()
 	ws := s.workspace()
@@ -46,9 +52,9 @@ func (s *Server) checkedFile(ctx context.Context, u uri.URI, pos protocol.Positi
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return checkedFileResult{path: path}, nil
 	}
-	text, err := s.overlay.ReadFile(path)
-	if err != nil {
-		return checkedFileResult{path: path}, err
+	text, ok := cp.FileText(path)
+	if !ok {
+		return checkedFileResult{path: path}, nil
 	}
 	offset, ok := byteOffsetForPosition(text, pos)
 	return checkedFileResult{cp: cp, path: path, text: text, offset: offset, ok: ok}, nil
@@ -98,7 +104,7 @@ func (s *Server) handleCompletion(ctx context.Context, params json.RawMessage) (
 	if err != nil || !cf.ok {
 		return protocol.CompletionItemSlice(nil), err
 	}
-	items, err := langfeat.Completion(cf.cp, s.overlay, cf.path, cf.offset)
+	items, err := langfeat.Completion(cf.cp, cf.text, cf.path, cf.offset)
 	if err != nil {
 		s.logger.Printf("server: completion %s: %v", cf.path, err)
 		return protocol.CompletionItemSlice(nil), nil
@@ -167,9 +173,9 @@ func (s *Server) handleDocumentSymbol(ctx context.Context, params json.RawMessag
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return protocol.DocumentSymbolSlice(nil), nil
 	}
-	text, err := s.overlay.ReadFile(path)
-	if err != nil {
-		return nil, err
+	text, ok := cp.FileText(path)
+	if !ok {
+		return protocol.DocumentSymbolSlice(nil), nil
 	}
 	syms, err := langfeat.DocumentSymbols(cp, path)
 	if err != nil {
@@ -286,9 +292,9 @@ func (s *Server) handleInlayHint(ctx context.Context, params json.RawMessage) (a
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return []protocol.InlayHint{}, nil
 	}
-	text, err := s.overlay.ReadFile(path)
-	if err != nil {
-		return nil, err
+	text, ok := cp.FileText(path)
+	if !ok {
+		return []protocol.InlayHint{}, nil
 	}
 	start, ok := byteOffsetForPosition(text, p.Range.Start)
 	if !ok {

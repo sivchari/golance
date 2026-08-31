@@ -24,6 +24,11 @@ type CheckedPackage struct {
 	parseErrs scanner.ErrorList
 	typeErrs  []types.Error
 
+	// texts holds the exact source bytes each of files was parsed from,
+	// keyed by path — the same content contentHash hashed and go/types
+	// checked against. See FileText.
+	texts map[string][]byte
+
 	contentHash string
 	builtAt     time.Time
 }
@@ -49,6 +54,18 @@ func (cp *CheckedPackage) Package() *types.Package { return cp.pkg }
 // Info returns the *types.Info populated by the check (Defs, Uses,
 // Selections, Types, Scopes, Instances, Implicits).
 func (cp *CheckedPackage) Info() *types.Info { return cp.info }
+
+// FileText returns the exact source bytes cp was checked against for path,
+// and whether path was one of the files checked. Unlike re-reading the
+// overlay after the fact, this is guaranteed to match what Files and
+// FileSet's positions were resolved against: a caller deriving byte
+// offsets from an LSP position (or otherwise needing file content
+// consistent with cp) should use this instead of its own separate overlay
+// read, which could race a concurrent edit and disagree with cp.
+func (cp *CheckedPackage) FileText(path string) ([]byte, bool) {
+	text, ok := cp.texts[path]
+	return text, ok
+}
 
 // Result is a publishable summary of a CheckedPackage, delivered to
 // Options.OnResult after a successful recheck.

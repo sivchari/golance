@@ -6,9 +6,12 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
+
+	"github.com/sivchari/golance/internal/xref"
 )
 
 // dirtyLineMap maps a 1-based line number in from's content to the
@@ -103,6 +106,23 @@ func (s *Server) correctQueryLine(path string, line uint32) uint32 {
 		return mapped
 	}
 	return line
+}
+
+// dirtyRenameFiles returns, sorted, every file among edits' keys that
+// currently has unsaved changes (see dirtyLines). handleRename uses this to
+// decide whether it is safe to apply correctResultRange's column-blind
+// line correction to a set of edits: doing so on a dirty file risks
+// silently dropping or misplacing an occurrence in what is, here, a write
+// rather than a read.
+func (s *Server) dirtyRenameFiles(edits map[string][]xref.Edit) []string {
+	var dirty []string
+	for file := range edits {
+		if _, _, ok := s.dirtyLines(file); ok {
+			dirty = append(dirty, file)
+		}
+	}
+	sort.Strings(dirty)
+	return dirty
 }
 
 // correctResultRange converts a facts-index (on-disk) span in file — a
