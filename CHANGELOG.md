@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.1.2](https://github.com/sivchari/golance/compare/v0.1.1...v0.1.2) - 2026-08-31
+- fix: stop canceling request-driven type checks when edits arrive by @sivchari in https://github.com/sivchari/golance/pull/6
+
 ## [v0.1.1](https://github.com/sivchari/golance/compare/v0.1.0...v0.1.1) - 2026-08-31
 - feat: add missing LSP features and fix silently stale cross-references by @sivchari in https://github.com/sivchari/golance/pull/4
 
