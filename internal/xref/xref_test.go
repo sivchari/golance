@@ -92,6 +92,17 @@ func goFile(t *testing.T, snap *graph.Snapshot, pkgPath, base string) string {
 // "Person" inside "NewPerson") can never produce a false match.
 func identOccurrence(t *testing.T, path, name string) (line, col int) {
 	t.Helper()
+	positions := identOccurrences(t, path, name)
+	p := positions[0]
+	return p.Line, p.Column
+}
+
+// identOccurrences is identOccurrence's counterpart for every occurrence of
+// name in path, in source order, for fixtures that declare the same
+// identifier more than once (e.g. a method name shared by several
+// receivers).
+func identOccurrences(t *testing.T, path, name string) []token.Position {
+	t.Helper()
 	data, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
@@ -112,8 +123,7 @@ func identOccurrence(t *testing.T, path, name string) (line, col int) {
 	if len(positions) < 1 {
 		t.Fatalf("%s: found no occurrences of %q", path, name)
 	}
-	p := positions[0]
-	return p.Line, p.Column
+	return positions
 }
 
 func TestDefinition_CrossPackage(t *testing.T) {
