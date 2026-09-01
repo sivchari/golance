@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.1.8](https://github.com/sivchari/golance/compare/v0.1.7...v0.1.8) - 2026-09-01
+- fix: refresh inlay hints and semantic tokens when the workspace becomes ready by @sivchari in https://github.com/sivchari/golance/pull/28
+
 ## [v0.1.7](https://github.com/sivchari/golance/compare/v0.1.6...v0.1.7) - 2026-09-01
 - feat: resolve unsaved and test files to their directory's package by @sivchari in https://github.com/sivchari/golance/pull/26
 
