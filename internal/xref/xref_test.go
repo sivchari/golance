@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	pkgIface = "example.com/xrefmod/iface"
-	pkgImpl  = "example.com/xrefmod/impl"
-	pkgUser  = "example.com/xrefmod/user"
-	pkgUser2 = "example.com/xrefmod/user2"
+	pkgIface     = "example.com/xrefmod/iface"
+	pkgImpl      = "example.com/xrefmod/impl"
+	pkgUser      = "example.com/xrefmod/user"
+	pkgUser2     = "example.com/xrefmod/user2"
+	pkgInpkgtest = "example.com/xrefmod/inpkgtest"
 )
 
 // newTestResolver builds a facts index for testdata/module and returns a
@@ -403,5 +404,94 @@ func TestLocationsFor_HonorsCanceledContext(t *testing.T) {
 
 	if _, err := r.locationsFor(ctx, target, false); !errors.Is(err, context.Canceled) {
 		t.Errorf("locationsFor with a canceled context: err = %v, want context.Canceled", err)
+	}
+}
+
+// TestResolveAt_MapsTestFilePositionToUnit verifies that resolveAt can
+// resolve a position inside an in-package "_test.go" file at all: r.fileToPkg
+// is built from graph.Package.GoFiles, which internal/graph's loadMode (no
+// packages.Config.Tests) never populates with a _test.go path (see
+// internal/index/testfiles.go's identical gap for the facts index itself,
+// closed by PR #36). Before Resolver grew its own directory fallback, this
+// failed with "is not part of any known package" for every _test.go
+// position, regardless of what the position pointed at.
+func TestResolveAt_MapsTestFilePositionToUnit(t *testing.T) {
+	r, snap := newTestResolver(t)
+	pkg, ok := snap.Package(pkgInpkgtest)
+	if !ok {
+		t.Fatalf("package %s not in snapshot", pkgInpkgtest)
+	}
+	testFile := filepath.Join(pkg.Dir, "inpkgtest_test.go")
+	line, col := identOccurrence(t, testFile, "useImplPerson") // the func decl, resolves to itself
+
+	l, c, err := toUint32Pos(line, col)
+	if err != nil {
+		t.Fatalf("toUint32Pos: %v", err)
+	}
+	sym, err := r.resolveAt(context.Background(), testFile, l, c)
+	if err != nil {
+		t.Fatalf("resolveAt: %v", err)
+	}
+	if sym.Name != "useImplPerson" {
+		t.Errorf("resolveAt = %+v, want a symbol named useImplPerson", sym)
+	}
+}
+
+// TestResolveAt_ExternalTestPackageFileStillDegrades pins that resolveAt's
+// directory fallback (see TestResolveAt_MapsTestFilePositionToUnit) does not
+// blindly trust every file in a known package's directory: inpkgtest's
+// external "_test"-suffixed test package file sits in the same directory as
+// inpkgtest_test.go, but its own package clause ("inpkgtest_test") fails
+// testFilesInPackage's canonical-name filter, so it never joined
+// inpkgtest's facts. fileIndexOf's lookup against the unit's own facts file
+// table — the source of truth for what was actually indexed — must still
+// reject a position here.
+func TestResolveAt_ExternalTestPackageFileStillDegrades(t *testing.T) {
+	r, snap := newTestResolver(t)
+	pkg, ok := snap.Package(pkgInpkgtest)
+	if !ok {
+		t.Fatalf("package %s not in snapshot", pkgInpkgtest)
+	}
+	extFile := filepath.Join(pkg.Dir, "inpkgtest_ext_test.go")
+	line, col := identOccurrence(t, extFile, "ExternalOnly")
+
+	l, c, err := toUint32Pos(line, col)
+	if err != nil {
+		t.Fatalf("toUint32Pos: %v", err)
+	}
+	if _, err := r.resolveAt(context.Background(), extFile, l, c); err == nil {
+		t.Fatal("resolveAt succeeded for a position in the external test package file, want an error (never indexed)")
+	}
+}
+
+// TestDefinition_FromTestFilePosition_CrossPackage verifies the user-visible
+// bug: a definition query issued from a position inside an in-package
+// "_test.go" file, targeting a symbol in a *different* workspace package,
+// must resolve through the facts index to the exact declaration — not just
+// the same-package case PR #36's e2e coverage exercised (masked by
+// definitionFallback's SamePackageDefinition at the server layer, which
+// this xref-level test bypasses entirely by calling Definition directly).
+func TestDefinition_FromTestFilePosition_CrossPackage(t *testing.T) {
+	r, snap := newTestResolver(t)
+	pkg, ok := snap.Package(pkgInpkgtest)
+	if !ok {
+		t.Fatalf("package %s not in snapshot", pkgInpkgtest)
+	}
+	testFile := filepath.Join(pkg.Dir, "inpkgtest_test.go")
+	line, col := identOccurrence(t, testFile, "Person") // impl.Person in useImplPerson's return type
+
+	locs, err := r.Definition(context.Background(), testFile, line, col)
+	if err != nil {
+		t.Fatalf("Definition: %v", err)
+	}
+	if len(locs) != 1 {
+		t.Fatalf("Definition returned %d locations, want 1: %+v", len(locs), locs)
+	}
+
+	implFile := goFile(t, snap, pkgImpl, "impl.go")
+	wantLine, wantCol := identOccurrence(t, implFile, "Person") // the struct decl
+	got := locs[0]
+	if got.File != implFile || int(got.Line) != wantLine || int(got.Col) != wantCol {
+		t.Errorf("Definition = %+v, want {%s %d %d}", got, implFile, wantLine, wantCol)
 	}
 }

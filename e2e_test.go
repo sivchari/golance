@@ -143,6 +143,22 @@ func TestE2E(t *testing.T) {
 		checkE2EDefinitionFromInsideTestFile(t, c, &locs)
 	})
 
+	// definition_from_inside_test_file_cross_package and
+	// references_from_inside_test_file_cross_package close the specific gap
+	// PR #36's same-package test file coverage above did not exercise: a
+	// query issued from a _test.go position, targeting a symbol in a
+	// *different* workspace package (see
+	// checkE2EDefinitionFromInsideTestFileCrossPackage's doc for why a
+	// same-package target could pass even before internal/xref.Resolver
+	// grew its own directory fallback).
+	t.Run("definition_from_inside_test_file_cross_package", func(t *testing.T) {
+		checkE2EDefinitionFromInsideTestFileCrossPackage(t, c, &locs)
+	})
+
+	t.Run("references_from_inside_test_file_cross_package", func(t *testing.T) {
+		checkE2EReferencesFromInsideTestFileCrossPackage(t, c, &locs)
+	})
+
 	// didsave_test_file_adds_new_test_only_symbol verifies the write path:
 	// saving an edited in-package test file reindexes it (internal/server's
 	// handleDidSave -> reindex -> index.Reindex), and a symbol newly added
@@ -272,6 +288,58 @@ func checkE2EDefinitionFromInsideTestFile(t *testing.T, c *lspClient, locs *e2eL
 	}
 	if gotPath := got[0].URI.FsPath(); gotPath != locs.utilFile || got[0].Range.Start.Line != locs.sumDecl.Line {
 		t.Fatalf("definition = %s:%d, want %s:%d", gotPath, got[0].Range.Start.Line, locs.utilFile, locs.sumDecl.Line)
+	}
+}
+
+// checkE2EDefinitionFromInsideTestFileCrossPackage verifies that a
+// definition query issued from a position inside an in-package test file,
+// targeting a symbol in a *different* workspace package (store.Store's use
+// in util_test.go), resolves to Store's exact declaration in lib/store.
+// checkE2EDefinitionFromInsideTestFile's Sum target cannot exercise this: a
+// same-package miss falls back to langfeat.SamePackageDefinition (see
+// definitionFallback), which masks whether the facts index itself ever
+// resolved the query position at all — only a target in another workspace
+// package forces the answer through internal/xref.Resolver's own directory
+// fallback (see resolveAt's doc), since dependencyDefinition's root-package
+// guard refuses to answer this case from definitionFallback either.
+func checkE2EDefinitionFromInsideTestFileCrossPackage(t *testing.T, c *lspClient, locs *e2eLocs) {
+	t.Helper()
+	got := c.waitForNonEmptyLocations(t, protocol.MethodTextDocumentDefinition, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.utilTestFile)},
+			Position:     locs.storeRefInUtilTest,
+		},
+	}, e2eRequestBudget)
+	if len(got) != 1 {
+		t.Fatalf("definition from inside the test file (cross-package target) returned %d locations, want 1: %+v", len(got), got)
+	}
+	if gotPath := got[0].URI.FsPath(); gotPath != locs.storeFile || got[0].Range.Start != locs.storeDecl {
+		t.Fatalf("definition = %s:%+v, want %s:%+v", gotPath, got[0].Range.Start, locs.storeFile, locs.storeDecl)
+	}
+}
+
+// checkE2EReferencesFromInsideTestFileCrossPackage verifies that a
+// references query issued from that same cross-package position (Store's
+// use inside util_test.go) returns Store's declaration: unlike Definition,
+// References has no same-package/dependency fallback chain at all (see
+// handleReferences), so this exercises the facts-index path directly.
+func checkE2EReferencesFromInsideTestFileCrossPackage(t *testing.T, c *lspClient, locs *e2eLocs) {
+	t.Helper()
+	got := c.waitForNonEmptyLocations(t, protocol.MethodTextDocumentReferences, &protocol.ReferenceParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.utilTestFile)},
+			Position:     locs.storeRefInUtilTest,
+		},
+		Context: protocol.ReferenceContext{IncludeDeclaration: true},
+	}, e2eRequestBudget)
+	var found bool
+	for _, l := range got {
+		if l.URI.FsPath() == locs.storeFile && l.Range.Start == locs.storeDecl {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("references from inside the test file (cross-package target) missing Store's declaration in %s; got %d location(s): %+v", locs.storeFile, len(got), got)
 	}
 }
 

@@ -18,6 +18,15 @@ type caLocs struct {
 	unusedImportFile string // unusedimport/unusedimport.go, one unused import
 	unusedVarFile    string // unusedvar/unusedvar.go, one unused short-declared var
 	undefinedFile    string // undefined/undefined.go, calls lib.Greet unqualified and unimported
+
+	// undefinedInTestFile is undefined/undefined_test.go, an on-disk
+	// in-package "_test.go" file with the same unqualified, unimported
+	// lib.Greet() call as undefinedFile: packages.Load's non-Tests GoFiles
+	// list omits it entirely (see internal/graph.loadMode), so it pins that
+	// the add-import quickfix still resolves its own containing package via
+	// the same directory fallback internal/xref.Resolver.pkgPathForFile
+	// uses.
+	undefinedInTestFile string
 }
 
 // writeCodeActionModule writes a small synthetic module dedicated to the
@@ -50,6 +59,8 @@ func writeCodeActionModule(t *testing.T) (root string, locs caLocs) {
 	locs.unusedVarFile = write("unusedvar/unusedvar.go", "package unusedvar\n\nfunc F() {\n\tx := 1\n\t_ = 2\n}\n")
 
 	locs.undefinedFile = write("undefined/undefined.go", "package undefined\n\nfunc F() string {\n\treturn Greet()\n}\n")
+
+	locs.undefinedInTestFile = write("undefined/undefined_test.go", "package undefined\n\nfunc testHelperF() string {\n\treturn Greet()\n}\n")
 
 	return root, locs
 }
@@ -96,6 +107,10 @@ func TestE2ECodeAction(t *testing.T) {
 
 	t.Run("undefined_symbol_adds_import", func(t *testing.T) {
 		checkE2ECodeActionUndefinedSymbol(t, c, locs.undefinedFile)
+	})
+
+	t.Run("undefined_symbol_adds_import_from_test_file", func(t *testing.T) {
+		checkE2ECodeActionUndefinedSymbol(t, c, locs.undefinedInTestFile)
 	})
 
 	t.Run("only_filters_by_kind", func(t *testing.T) {

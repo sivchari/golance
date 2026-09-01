@@ -129,7 +129,11 @@ func (s *Server) addImportFixes(path string, text []byte, offset int, name strin
 	if idx == nil || ws == nil {
 		return nil
 	}
-	pkgPath, ok := ws.fileToPkg[path]
+	// s.pkgPathForFile, not ws.fileToPkg directly: an in-package _test.go
+	// file (which ws.fileToPkg never lists — see internal/graph's loadMode)
+	// still needs its own "undefined: X" quick fix resolved against its
+	// containing package, via pkgPathForFile's directory fallback.
+	pkgPath, ok := s.pkgPathForFile(path)
 	if !ok {
 		return nil
 	}
