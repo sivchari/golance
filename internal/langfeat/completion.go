@@ -384,7 +384,7 @@ func filterAndRank(items []CompletionItem, prefix string) []CompletionItem {
 // UnimportedPackageItems/UnimportedMemberItems can rank their own matches
 // below every in-scope item (see the rank* constants) while reusing the
 // same matching logic.
-func filterAndRankBase(items []CompletionItem, prefix string, exactBase, fuzzyBase string) []CompletionItem {
+func filterAndRankBase(items []CompletionItem, prefix, exactBase, fuzzyBase string) []CompletionItem {
 	lowerPrefix := strings.ToLower(prefix)
 	out := make([]CompletionItem, 0, len(items))
 	for _, it := range items {

@@ -116,7 +116,7 @@ func (s *Server) unimportedMemberItems(ws *workspace, cf checkedFileResult, uctx
 
 // importedPackagePaths returns the import path of every package cp's
 // package already imports, so unimportedPackageCandidates can skip
-// suggesting one a second time as "unimported."
+// suggesting one a second time as unimported.
 func importedPackagePaths(cp *check.CheckedPackage) map[string]bool {
 	imports := cp.Package().Imports()
 	out := make(map[string]bool, len(imports))
