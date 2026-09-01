@@ -55,6 +55,63 @@ func TestOrganizeImportsAction_NoChange(t *testing.T) {
 	}
 }
 
+// TestOrganizeImportsAction_MinimalEdit checks that the edit is confined to
+// the changed span rather than replacing the whole file, and that applying
+// it reproduces the same result OrganizeImports itself would produce.
+func TestOrganizeImportsAction_MinimalEdit(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+	}{
+		{
+			name: "no imports to import block insertion",
+			src:  "package foo\n\nfunc F() {\n\tfmt.Println(\"hi\")\n}\n",
+		},
+		{
+			name: "unsorted imports",
+			src:  "package foo\n\nimport (\n\t\"strconv\"\n\t\"fmt\"\n)\n\nfunc F() string {\n\treturn fmt.Sprintf(\"%s\", strconv.Itoa(1))\n}\n",
+		},
+		{
+			name: "unused import removal",
+			src:  "package foo\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc F() {\n\tfmt.Println(\"hi\")\n}\n",
+		},
+		{
+			name: "no trailing newline (edit reaches EOF)",
+			src:  "package foo\n\nfunc F() {\n\tfmt.Println(\"hi\")\n}",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			file := t.TempDir() + "/foo.go"
+			text := []byte(tt.src)
+			want, err := langfeat.OrganizeImports(file, text)
+			if err != nil {
+				t.Fatalf("OrganizeImports: %v", err)
+			}
+
+			action, ok, err := langfeat.OrganizeImportsAction(file, text)
+			if err != nil {
+				t.Fatalf("OrganizeImportsAction: %v", err)
+			}
+			if !ok {
+				t.Fatal("ok = false, want true")
+			}
+			if len(action.Edits) != 1 {
+				t.Fatalf("len(Edits) = %d, want 1", len(action.Edits))
+			}
+			edit := action.Edits[0]
+
+			if got := applyEdits(tt.src, action.Edits); got != string(want) {
+				t.Errorf("applying the edit = %q, want %q", got, string(want))
+			}
+			if edit.Range.StartOffset == 0 && edit.Range.EndOffset == len(text) {
+				t.Errorf("edit spans the whole file ([0, %d)), want it confined to the changed lines", len(text))
+			}
+		})
+	}
+}
+
 func TestUnusedImportFix_SoleImport(t *testing.T) {
 	file := t.TempDir() + "/foo.go"
 	src := "package foo\n\nimport \"fmt\"\n\nfunc F() int {\n\treturn 1\n}\n"
