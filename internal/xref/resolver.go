@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"go/types"
 	"math"
+	"path/filepath"
 	"strings"
 
 	"github.com/sivchari/golance/internal/graph"
@@ -51,6 +52,7 @@ type Resolver struct {
 	cache *typecheck.Cache
 
 	fileToPkg     map[string]string
+	dirToPkg      map[string]string
 	pkgPathByHash map[uint64]string
 
 	root     string // snap.Dir(); the base a relative-format stored path joins onto
@@ -66,12 +68,14 @@ type Resolver struct {
 // Resolver returns must carry.
 func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool) *Resolver {
 	fileToPkg := make(map[string]string)
+	dirToPkg := make(map[string]string, len(snap.Packages))
 	pkgPathByHash := make(map[uint64]string, len(snap.Packages))
 	for path, pkg := range snap.Packages {
 		pkgPathByHash[store.Hash(path)] = path
 		for _, f := range pkg.GoFiles {
 			fileToPkg[f] = path
 		}
+		dirToPkg[pkg.Dir] = path
 	}
 	return &Resolver{
 		db:            db,
@@ -80,6 +84,7 @@ func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool) *Res
 		fset:          token.NewFileSet(),
 		cache:         typecheck.NewCache(),
 		fileToPkg:     fileToPkg,
+		dirToPkg:      dirToPkg,
 		pkgPathByHash: pkgPathByHash,
 		root:          snap.Dir(),
 		relative:      relative,
@@ -119,7 +124,7 @@ type resolvedSymbol struct {
 // resolveAt resolves the symbol at (file, line, col): a reference there
 // resolves to what it points to; a definition there resolves to itself.
 func (r *Resolver) resolveAt(ctx context.Context, file string, line, col uint32) (resolvedSymbol, error) {
-	pkgPath, ok := r.fileToPkg[file]
+	pkgPath, ok := r.pkgPathForFile(file)
 	if !ok {
 		return resolvedSymbol{}, fmt.Errorf("xref: %s is not part of any known package", file)
 	}
@@ -242,6 +247,32 @@ func (r *Resolver) Invalidate(pkgPaths []string) {
 	for _, p := range pkgPaths {
 		r.cache.Delete(p)
 	}
+}
+
+// pkgPathForFile resolves file to its containing package's import path.
+// r.fileToPkg (built from graph.Package.GoFiles) never lists an in-package
+// _test.go file at all — internal/graph's loadMode loads without
+// packages.Config.Tests, the same gap testFilesInPackage exists to close
+// for the facts index itself (see internal/index/testfiles.go) — so a
+// position inside one always misses there. This falls back to matching
+// file's directory against a known package's Dir, mirroring
+// internal/check.GraphSource.PackageForFile's identical fallback and
+// internal/server.workspace's dirToPkg.
+//
+// The directory fallback alone is not enough to trust file: it also
+// matches an external "_test"-suffixed test package file or an unrelated
+// ad-hoc file sitting in the same directory, neither of which
+// testFilesInPackage folds into the unit's facts. Rather than duplicate
+// that package-clause filtering here, this returns the directory's
+// candidate pkgPath as-is and lets resolveAt's subsequent fileIndexOf
+// lookup against the unit's own facts file table — the source of truth for
+// what was actually indexed — reject file if it never made it in.
+func (r *Resolver) pkgPathForFile(file string) (string, bool) {
+	if pkgPath, ok := r.fileToPkg[file]; ok {
+		return pkgPath, true
+	}
+	pkgPath, ok := r.dirToPkg[filepath.Dir(file)]
+	return pkgPath, ok
 }
 
 // fileIndexOf returns the index of file (an absolute path) in v's file

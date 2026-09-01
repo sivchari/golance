@@ -23,6 +23,14 @@ type e2eLocs struct {
 	utilTestSrc       string            // its source, for the full-document inlay hint request
 	sumCallInUtilTest protocol.Position // "Sum" in the Sum(4, 5) call inside util_test.go
 
+	// storeRefInUtilTest is "Store" in "&store.Store{}" inside
+	// util_test.go: a reference, from inside an in-package test file, to a
+	// symbol declared in a *different* workspace package (lib/store) —
+	// unlike sumCallInUtilTest's same-package Sum target, this exercises
+	// the facts-index path a same-package definitionFallback can mask (see
+	// checkE2EDefinitionFromInsideTestFileCrossPackage).
+	storeRefInUtilTest protocol.Position
+
 	appFile      string            // app/app.go, imports lib/util and lib/store
 	sumCallInApp protocol.Position // "Sum" in the util.Sum call inside app.go
 
@@ -33,6 +41,7 @@ type e2eLocs struct {
 
 	storeFile    string            // lib/store/store.go
 	storeGetDecl protocol.Position // "Get" in "func (s *Store) Get() string"
+	storeDecl    protocol.Position // "Store" in "type Store struct {"
 
 	brokenFile string // broken/broken.go, a package with a type error
 }
@@ -81,18 +90,32 @@ func Sum(a, b int) int {
 	// file does, but for a file that was already on disk when the workspace
 	// loaded. sumTotal's short variable declaration and parameterized call
 	// to Sum (defined in util.go, another file in the package) give both a
-	// cross-file hover target and at least one inlay hint.
+	// cross-file hover target and at least one inlay hint. newStore's
+	// &store.Store{} reference is this file's cross-package target (lib/
+	// store, written below): sumTotal alone can only exercise a
+	// same-package definition, which definitionFallback's
+	// SamePackageDefinition can answer even without the facts index ever
+	// resolving this file's own position at all.
 	const utilTestSrc = `package util
+
+import "example.com/e2e/lib/store"
 
 // sumTotal calls Sum, defined in util.go.
 func sumTotal() int {
 	total := Sum(4, 5)
 	return total
 }
+
+// newStore references store.Store, a symbol in a different workspace
+// package, from inside this in-package test file.
+func newStore() *store.Store {
+	return &store.Store{}
+}
 `
 	locs.utilTestFile = writeE2EFile(t, root, "lib/util/util_test.go", utilTestSrc)
 	locs.utilTestSrc = utilTestSrc
 	locs.sumCallInUtilTest = mustPos(t, utilTestSrc, "Sum(4, 5)", "Sum")
+	locs.storeRefInUtilTest = mustPos(t, utilTestSrc, "&store.Store{}", "Store")
 
 	const storeSrc = `package store
 
@@ -123,6 +146,7 @@ func (s *Store) Mike() string {
 `
 	locs.storeFile = writeE2EFile(t, root, "lib/store/store.go", storeSrc)
 	locs.storeGetDecl = mustPos(t, storeSrc, "func (s *Store) Get", "Get")
+	locs.storeDecl = mustPos(t, storeSrc, "type Store struct", "Store")
 
 	const appSrc = `package app
 
