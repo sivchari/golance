@@ -1,6 +1,6 @@
 # Changelog
 
-## [v0.2.3](https://github.com/sivchari/golance/compare/v0.2.2...v0.2.3) - 2026-09-01
+## [v0.3.0](https://github.com/sivchari/golance/compare/v0.2.2...v0.3.0) - 2026-09-01
 - docs: add PR #43 to the v0.2.2 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/45
 - fix: return minimal edits from organize imports by @sivchari in https://github.com/sivchari/golance/pull/47
 - feat: complete unimported packages and their members by @sivchari in https://github.com/sivchari/golance/pull/48
