@@ -51,8 +51,60 @@ func OrganizeImportsAction(file string, text []byte) (CodeAction, bool, error) {
 	return CodeAction{
 		Title: "Organize imports",
 		Kind:  ActionSourceOrganizeImports,
-		Edits: []Edit{{Range: Range{StartOffset: 0, EndOffset: len(text)}, NewText: string(out)}},
+		Edits: []Edit{organizeImportsEdit(text, out)},
 	}, true, nil
+}
+
+// organizeImportsEdit returns the single edit turning text into out,
+// confined to the smallest contiguous span of changed lines (the
+// common-prefix/common-suffix line diff between the two) instead of
+// replacing the whole file — matching gopls's source.organizeImports, which
+// diffs only the changed region (see computeFixEdits in gopls's
+// internal/golang/format.go).
+func organizeImportsEdit(text, out []byte) Edit {
+	fromLines := bytes.Split(text, []byte{'\n'})
+	toLines := bytes.Split(out, []byte{'\n'})
+	prefix, suffix := commonPrefixSuffixLines(fromLines, toLines)
+
+	fromOffs := lineStartOffsets(fromLines)
+	toOffs := lineStartOffsets(toLines)
+	start := fromOffs[prefix]
+	end := fromOffs[len(fromLines)-suffix]
+	newText := string(out[toOffs[prefix]:toOffs[len(toLines)-suffix]])
+
+	return Edit{Range: Range{StartOffset: start, EndOffset: end}, NewText: newText}
+}
+
+// commonPrefixSuffixLines returns the number of leading and
+// (non-overlapping) trailing lines a and b have in common.
+func commonPrefixSuffixLines(a, b [][]byte) (prefix, suffix int) {
+	n := min(len(a), len(b))
+	for prefix < n && bytes.Equal(a[prefix], b[prefix]) {
+		prefix++
+	}
+	maxSuffix := n - prefix
+	for suffix < maxSuffix && bytes.Equal(a[len(a)-1-suffix], b[len(b)-1-suffix]) {
+		suffix++
+	}
+	return prefix, suffix
+}
+
+// lineStartOffsets returns, for each index in [0, len(lines)], the byte
+// offset of the start of lines[idx] in bytes.Join(lines, "\n") —
+// lineStartOffsets(lines)[len(lines)] is that joined content's total
+// length.
+func lineStartOffsets(lines [][]byte) []int {
+	offs := make([]int, len(lines)+1)
+	pos := 0
+	for i, l := range lines {
+		offs[i] = pos
+		pos += len(l)
+		if i < len(lines)-1 {
+			pos++ // the '\n' separating this line from the next
+		}
+	}
+	offs[len(lines)] = pos
+	return offs
 }
 
 // parseSource parses text as a standalone Go file. Every CodeAction in
