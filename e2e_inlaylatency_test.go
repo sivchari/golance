@@ -111,11 +111,7 @@ func TestE2EInlayHintLatencyProfile(t *testing.T) {
 	fullRange := protocol.Range{End: endOfDocument(bigSrc)}
 	// viewportRange mimics what an editor actually sends: the visible
 	// portion of the file around the middle, not the whole document.
-	mid := len(lines) / 2
-	if mid <= 0 || mid > math.MaxInt32 {
-		t.Fatalf("unexpected generated file size: %d lines", len(lines))
-	}
-	midLine := uint32(mid)
+	midLine := lineU32(t, len(lines)/2)
 	viewportRange := protocol.Range{
 		Start: protocol.Position{Line: midLine, Character: 0},
 		End:   protocol.Position{Line: midLine + 40, Character: 0},
@@ -132,7 +128,7 @@ func TestE2EInlayHintLatencyProfile(t *testing.T) {
 			d := timeRequest(t, c, protocol.MethodTextDocumentHover, &protocol.HoverParams{
 				TextDocumentPositionParams: protocol.TextDocumentPositionParams{
 					TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(coldHoverFile)},
-					Position:     midPosition(coldHoverSrc),
+					Position:     midPosition(t, coldHoverSrc),
 				},
 			})
 			t.Logf("cold hover: %s", d)
@@ -149,8 +145,8 @@ func TestE2EInlayHintLatencyProfile(t *testing.T) {
 			c.openFile(t, coldInlayVPFile)
 			srcLines := strings.Split(coldInlayVPSrc, "\n")
 			rng := protocol.Range{
-				Start: protocol.Position{Line: uint32(len(srcLines) / 2), Character: 0},
-				End:   protocol.Position{Line: uint32(len(srcLines)/2 + 40), Character: 0},
+				Start: protocol.Position{Line: lineU32(t, len(srcLines)/2), Character: 0},
+				End:   protocol.Position{Line: lineU32(t, len(srcLines)/2+40), Character: 0},
 			}
 			d := timeRequest(t, c, protocol.MethodTextDocumentInlayHint, &protocol.InlayHintParams{
 				TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(coldInlayVPFile)},
@@ -316,10 +312,20 @@ func drainServerRequests(c *lspClient) {
 // midPosition returns a position roughly in the middle of src, at the start
 // of a line, good enough for a hover request to land on real code without
 // needing to know src's exact shape.
-func midPosition(src string) protocol.Position {
+func midPosition(t *testing.T, src string) protocol.Position {
+	t.Helper()
 	lines := strings.Split(src, "\n")
-	mid := len(lines) / 2
-	return protocol.Position{Line: uint32(mid), Character: 1}
+	return protocol.Position{Line: lineU32(t, len(lines)/2), Character: 1}
+}
+
+// lineU32 converts a line index to the uint32 LSP wire type, failing the
+// test on a value outside the protocol's range.
+func lineU32(t *testing.T, n int) uint32 {
+	t.Helper()
+	if n < 0 || int64(n) > math.MaxUint32 {
+		t.Fatalf("line index out of uint32 range: %d", n)
+	}
+	return uint32(n)
 }
 
 // newLatencyPackageSource writes a fresh package named pkgName under root
