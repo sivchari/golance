@@ -96,18 +96,22 @@ func (s *Server) handleDidClose(_ context.Context, params json.RawMessage) error
 // reindex re-type-checks pkgPath (and, if its export data changed, its
 // reverse-dependency closure) and persists the result to idx.db. On
 // success, it also drops pkgPath and every package that (transitively)
-// imports it from the check engine's persistent dependency cache, so a
-// later recheck of an open file in one of those packages re-decodes
+// imports it from the check engine's persistent dependency cache and from
+// idx.resolver's own export-data cache, so a later recheck of an open file
+// — or a later cross-reference query, e.g. Go to Implementation — re-decodes
 // pkgPath's freshly written export data instead of reusing the
-// *types.Package decoded from what was on disk before this save. This is
-// deliberately coarser than Reindex's own change-propagation (which stops
-// at the first hop whose export data didn't actually change): it is sound
-// either way, and avoids needing Reindex to report exactly which hops in
-// the closure changed.
+// *types.Package decoded from what was on disk before this save (see
+// xref.Resolver.Invalidate's doc for why that reuse would otherwise happen
+// silently). This is deliberately coarser than Reindex's own change-
+// propagation (which stops at the first hop whose export data didn't
+// actually change): it is sound either way, and avoids needing Reindex to
+// report exactly which hops in the closure changed.
 func (s *Server) reindex(ctx context.Context, ws *workspace, idx *indexState, pkgPath string) {
 	if _, err := index.Reindex(ctx, ws.snap, idx.db, idx.cas, pkgPath, s.overlay.ReadFile, index.Options{RelativePaths: RelativeIndexPaths(ws.root)}); err != nil {
 		s.logger.Printf("server: reindex %s: %v", pkgPath, err)
 		return
 	}
-	ws.depCache.invalidate(append([]string{pkgPath}, ws.snap.ClosureUnits(pkgPath)...))
+	changed := append([]string{pkgPath}, ws.snap.ClosureUnits(pkgPath)...)
+	ws.depCache.invalidate(changed)
+	idx.resolver.Invalidate(changed)
 }
