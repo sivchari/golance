@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"strings"
 	"sync"
 	"testing"
@@ -88,6 +89,93 @@ func TestServeDispatchesRequestAndWritesResult(t *testing.T) {
 	result, _ := frames[0]["result"].(map[string]any)
 	if result["ok"] != "true" {
 		t.Fatalf("result = %v, want ok=true", frames[0]["result"])
+	}
+}
+
+// TestServeReportsTruncatedStreamAsError is a regression test for a bug
+// where a stream that closed partway through a frame (here: after a
+// complete header block, before any body byte arrived) was
+// indistinguishable from a clean, between-frames end of stream — both
+// produced exactly io.EOF from readFrame, which Serve's read loop treats as
+// an ordinary session end and returns nil for, silently discarding the
+// truncated request with nothing logged. A genuinely interrupted write must
+// surface as a real error instead.
+func TestServeReportsTruncatedStreamAsError(t *testing.T) {
+	s := newTestServer(t)
+	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
+
+	in := strings.NewReader("Content-Length: 5\r\n\r\n")
+	err := s.Serve(context.Background(), in, &bytes.Buffer{})
+	if err == nil {
+		t.Fatalf("Serve() error = nil, want an error for a truncated stream")
+	}
+	if errors.Is(err, io.EOF) {
+		t.Fatalf("Serve() error = %v, wrongly classified as a clean EOF", err)
+	}
+}
+
+// TestServeOverFragmentedPipe drives a full Serve session — initialize, a
+// didOpen with a ~260KB body (comparable to a large real-world file), a
+// hover request, and exit — through a real io.Pipe fed by a writer goroutine
+// that splits the whole byte stream into small, arbitrarily-sized chunks
+// instead of writing each frame in one call. This is the shape a client's
+// writes take once an OS pipe or the runtime's own write buffering
+// fragments them, which golance's existing e2e harness never exercises: its
+// frameWriter (see e2e_client_test.go) buffers a whole frame and Flushes it
+// in one go, so on a local pipe the write (and the read on the other end)
+// is for all practical purposes atomic per frame — never catching a reader
+// that mishandles a frame split across many Reads the way this test does.
+func TestServeOverFragmentedPipe(t *testing.T) {
+	s := newTestServer(t)
+	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) {
+		return map[string]string{"ok": "true"}, nil
+	})
+	s.Handle("textDocument/hover", Interactive, func(context.Context, json.RawMessage) (any, error) {
+		return map[string]string{"hover": "true"}, nil
+	})
+	s.HandleNotification("textDocument/didOpen", func(context.Context, json.RawMessage) error { return nil })
+
+	bigText := strings.Repeat("package main\n", 20000)
+	raw := frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`) +
+		frame(t, fmt.Sprintf(`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"text":%q}}`, bigText)) +
+		frame(t, `{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{}}`) +
+		frame(t, `{"jsonrpc":"2.0","method":"exit"}`)
+
+	pr, pw := io.Pipe()
+	go func() {
+		defer func() { _ = pw.Close() }()
+		rnd := rand.New(rand.NewSource(7))
+		data := []byte(raw)
+		for len(data) > 0 {
+			n := 1 + rnd.Intn(31)
+			if n > len(data) {
+				n = len(data)
+			}
+			if _, err := pw.Write(data[:n]); err != nil {
+				return
+			}
+			data = data[n:]
+		}
+	}()
+
+	var out bytes.Buffer
+	err := s.Serve(context.Background(), pr, &out)
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("Serve() error = %v, want *ExitError", err)
+	}
+
+	frames := readFrames(t, out.Bytes())
+	if len(frames) != 2 {
+		t.Fatalf("got %d response frames, want 2: %v", len(frames), frames)
+	}
+	initResult, _ := frames[0]["result"].(map[string]any)
+	if initResult["ok"] != "true" {
+		t.Fatalf("initialize result = %v, want ok=true", frames[0]["result"])
+	}
+	hoverResult, _ := frames[1]["result"].(map[string]any)
+	if hoverResult["hover"] != "true" {
+		t.Fatalf("hover result = %v, want hover=true", frames[1]["result"])
 	}
 }
 
