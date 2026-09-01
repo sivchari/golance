@@ -85,7 +85,7 @@ func (s *Server) handleDefinition(ctx context.Context, params json.RawMessage) (
 	}
 	resolver, ok := s.resolverOrWarn()
 	if !ok {
-		return protocol.LocationSlice(nil), nil
+		return s.definitionFallback(ctx, p.TextDocument.URI, p.Position), nil
 	}
 	path := p.TextDocument.URI.FsPath()
 	line, col, ok := s.xrefPosition(path, p.Position)
@@ -100,30 +100,78 @@ func (s *Server) handleDefinition(ctx context.Context, params json.RawMessage) (
 		// facts-read failure is still visible, rather than silently
 		// indistinguishable from an ordinary miss.
 		s.logger.Printf("server: definition at %s:%d:%d: %v", path, line, col, err)
-		if loc, ok := s.dependencyDefinition(ctx, p.TextDocument.URI, p.Position); ok {
-			return s.toLSPLocations([]xref.Location{loc}), nil
-		}
-		return protocol.LocationSlice(nil), nil
+		return s.definitionFallback(ctx, p.TextDocument.URI, p.Position), nil
+	}
+	if len(locs) == 0 {
+		// The facts index only ever covers root (workspace) packages (see
+		// internal/index/scheduler.go's doc) and can otherwise legitimately
+		// have no entry for a resolvable position; fall through to the
+		// same type-info-based path used when the index cannot be
+		// consulted at all, rather than treating an empty index answer as
+		// final.
+		return s.definitionFallback(ctx, p.TextDocument.URI, p.Position), nil
 	}
 	return s.toLSPLocations(locs), nil
 }
 
-// dependencyDefinition is handleDefinition's fallback for a symbol the
-// workspace facts index has no answer for: the facts index only ever
-// covers root (workspace) packages (see internal/index/scheduler.go's
-// doc), so a definition query on an identifier from the standard library or
-// a module dependency always misses there. This resolves it instead through
-// the type-checked package's own Uses/Defs and the shared dependency
-// importer's export-data positions (see internal/langfeat.DependencyDefinition,
-// depCacheHolder.FileSet) — the same decode already paid for to type-check
-// path in the first place, not a separate source parse of the dependency.
-func (s *Server) dependencyDefinition(ctx context.Context, u uri.URI, pos protocol.Position) (xref.Location, bool) {
-	ws := s.workspace()
-	if ws == nil {
-		return xref.Location{}, false
-	}
+// definitionFallback answers handleDefinition entirely from the
+// type-checked package's own AST/types.Info/FileSet, for whenever the
+// workspace facts index cannot answer: it has not finished building yet
+// (resolverOrWarn's ok=false), a store query against it failed, or it
+// legitimately has no entry for this position. An identifier declared in
+// cp's own package resolves via langfeat.SamePackageDefinition, exact down
+// to the column, needing no index at all; a standard library or module
+// dependency identifier resolves through dependencyDefinition's export-data
+// path instead, degraded to column 1. A different *workspace* (root)
+// package's identifier is deliberately left unanswered here — see
+// dependencyDefinition's doc for why.
+func (s *Server) definitionFallback(ctx context.Context, u uri.URI, pos protocol.Position) protocol.LocationSlice {
 	cf := s.checkedFile(ctx, u, pos)
 	if !cf.ok {
+		return nil
+	}
+	info, err := langfeat.SamePackageDefinition(cf.cp, cf.path, cf.offset)
+	if err != nil {
+		s.logger.Printf("server: same-package definition %s: %v", cf.path, err)
+	} else if info != nil {
+		return s.samePackageDefinitionLocation(info)
+	}
+	if loc, ok := s.dependencyDefinition(cf); ok {
+		return s.toLSPLocations([]xref.Location{loc})
+	}
+	return nil
+}
+
+// samePackageDefinitionLocation converts a SamePackageDefInfo (byte offsets
+// against info.File's own current buffer) into an LSP location, the same
+// pattern typeDefinitionSameFile uses for langfeat.TypeDefInfo.
+func (s *Server) samePackageDefinitionLocation(info *langfeat.SamePackageDefInfo) protocol.LocationSlice {
+	text, err := s.overlay.ReadFile(info.File)
+	if err != nil {
+		s.logger.Printf("server: same-package definition read %s: %v", info.File, err)
+		return nil
+	}
+	rng, ok := offsetRangeToLSP(text, info.Range.StartOffset, info.Range.EndOffset)
+	if !ok {
+		return nil
+	}
+	return protocol.LocationSlice{{URI: uri.File(info.File), Range: rng}}
+}
+
+// dependencyDefinition is definitionFallback's path for a symbol the
+// workspace facts index has no answer for and that is not declared in cf's
+// own package: the facts index only ever covers root (workspace) packages
+// (see internal/index/scheduler.go's doc), so a definition query on an
+// identifier from the standard library or a module dependency always
+// misses there. This resolves it instead through the type-checked
+// package's own Uses/Defs and the shared dependency importer's export-data
+// positions (see internal/langfeat.DependencyDefinition,
+// depCacheHolder.FileSet) — the same decode already paid for to type-check
+// cf.path in the first place, not a separate source parse of the
+// dependency.
+func (s *Server) dependencyDefinition(cf checkedFileResult) (xref.Location, bool) {
+	ws := s.workspace()
+	if ws == nil {
 		return xref.Location{}, false
 	}
 	info, err := langfeat.DependencyDefinition(cf.cp, ws.depCache.FileSet(), cf.path, cf.offset)
@@ -134,10 +182,24 @@ func (s *Server) dependencyDefinition(ctx context.Context, u uri.URI, pos protoc
 	if info == nil {
 		return xref.Location{}, false
 	}
-	// A root (workspace) package's export data is still a package
-	// resolveAt should have answered from the facts index; do not offer a
-	// possibly-stale export-data position as a substitute for whatever made
-	// that lookup fail.
+	// A root (workspace) package's export data is never offered as a
+	// substitute for the facts index's own answer, even from
+	// definitionFallback (the index-unavailable path): TestE2E_WorktreeSharesIndex
+	// pinned a real hazard this used to create. A second session (or a
+	// cold-start session, before its own index build finishes) treats a
+	// non-empty textDocument/definition result as a signal that the index
+	// is now usable — e.g. the E2E suite's waitForNonEmptyLocations, and a
+	// real editor racing a request right after the index-build progress
+	// notification fires — and, per handleDidSave, an edit saved while
+	// s.idx is still nil never gets incrementally reindexed at all (no
+	// retry once the index later opens). Answering a workspace package's
+	// position via export data here would let that race succeed on stale
+	// grounds — the index build might complete moments later with the
+	// authoritative, exact-column answer — silently dropping the
+	// reindex-after-save the caller would otherwise still be waiting for.
+	// The standard library and module dependencies carry no such risk
+	// (nothing in this workspace ever reindexes them), so only this case is
+	// excluded.
 	if pkg, ok := ws.snap.Packages[info.PkgPath]; ok && pkg.Root {
 		return xref.Location{}, false
 	}

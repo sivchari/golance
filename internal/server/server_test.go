@@ -77,6 +77,32 @@ func newTestServer(t *testing.T) (*Server, *graph.Snapshot, string) {
 	return s, snap, root
 }
 
+// newTestServerNoIndex builds a Server wired over testdata/module exactly
+// like newTestServer, except s.idx is left at its zero value (nil): the
+// same state a failed tryWarmOpen (e.g. store.Open timing out because
+// another golance session holds the per-root index's lock) or a
+// still-running buildIndex on a cold start leaves it in — s.idx is only
+// ever Store'd on success (see lifecycle.go, buildIndexLocked).
+// resolverOrWarn reports ok=false against this server, the same as it
+// would against a real server whose facts index is unavailable.
+func newTestServerNoIndex(t *testing.T) (*Server, *graph.Snapshot) {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("testdata", "module"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	s.setWorkspace(root, snap)
+
+	return s, snap
+}
+
 // identPosition parses path's on-disk content and returns the LSP Position
 // of the occurrence-th (1-based) identifier named "Hello", in source order.
 func identPosition(t *testing.T, path string, occurrence int) protocol.Position {

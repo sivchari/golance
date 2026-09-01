@@ -113,6 +113,77 @@ func TestDependencyDefinition_SamePackageReturnsNil(t *testing.T) {
 	}
 }
 
+// TestSamePackageDefinition_ResolvesLocalIdentifier verifies
+// SamePackageDefinition's positive case: an identifier declared in cp's
+// own package resolves to its exact declaring identifier, using only cp's
+// own AST/types.Info/FileSet — the case DependencyDefinition declines (see
+// TestDependencyDefinition_SamePackageReturnsNil).
+func TestSamePackageDefinition_ResolvesLocalIdentifier(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "hover", "hover.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	// DefaultGreeting's initializer references Greeting, declared earlier
+	// in the same file.
+	offset := mustIndex(t, text, "= Greeting{") + len("= ")
+
+	got, err := langfeat.SamePackageDefinition(cp, path, offset)
+	if err != nil {
+		t.Fatalf("SamePackageDefinition: %v", err)
+	}
+	if got == nil {
+		t.Fatal("SamePackageDefinition returned nil, want a result")
+	}
+	if got.File != path {
+		t.Errorf("File = %q, want %q", got.File, path)
+	}
+	wantOffset := mustIndex(t, text, "type Greeting") + len("type ")
+	if got.Range.StartOffset != wantOffset {
+		t.Errorf("Range.StartOffset = %d, want %d (Greeting's declaring identifier)", got.Range.StartOffset, wantOffset)
+	}
+}
+
+// TestSamePackageDefinition_CrossPackageReturnsNil verifies
+// SamePackageDefinition declines an identifier declared outside cp's own
+// package, the mirror image of TestDependencyDefinition_SamePackageReturnsNil.
+func TestSamePackageDefinition_CrossPackageReturnsNil(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "depuse", "depuse.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "strings.Builder") + len("strings.")
+
+	got, err := langfeat.SamePackageDefinition(cp, path, offset)
+	if err != nil {
+		t.Fatalf("SamePackageDefinition: %v", err)
+	}
+	if got != nil {
+		t.Errorf("SamePackageDefinition = %+v, want nil (declared in a different package)", got)
+	}
+}
+
+func TestSamePackageDefinition_NoIdentifier(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "hover", "hover.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "\n\n// Greeting")
+
+	got, err := langfeat.SamePackageDefinition(cp, path, offset)
+	if err != nil {
+		t.Fatalf("SamePackageDefinition: %v", err)
+	}
+	if got != nil {
+		t.Errorf("SamePackageDefinition = %+v, want nil (no identifier at offset)", got)
+	}
+}
+
 func TestDependencyDefinition_NoIdentifier(t *testing.T) {
 	reader := overlay.New()
 	cp, path, depFset := newCheckedPackageWithDepFset(t, reader, "depuse", "depuse.go")

@@ -240,6 +240,123 @@ func TestHandleDefinition_Stdlib(t *testing.T) {
 	}
 }
 
+// TestHandleDefinition_NoIndex_SamePackage is a regression test for a real
+// user report: a second editor window on a large repo can hit
+// textDocument/definition while another golance session holds the
+// per-root index's lock (or the index is still building on a cold start),
+// which previously made every definition query — including same-package
+// jumps that need no index at all — return an empty result instead of
+// falling back to definitionFallback's type-info-based path. Against a
+// server with no index (see newTestServerNoIndex), a same-package jump
+// must still land at the exact declaration position, column included: this
+// case never touches export data (see langfeat.SamePackageDefinition), so
+// nothing here degrades.
+func TestHandleDefinition_NoIndex_SamePackage(t *testing.T) {
+	s, snap := newTestServerNoIndex(t)
+	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+	pos := identPosition(t, file, 2) // call site in useHello
+
+	result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleDefinition(no index, same package): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleDefinition(no index, same package): result = %#v, want a single location", result)
+	}
+	declPos := identPosition(t, file, 1) // func Hello(...) declaration
+	if locs[0].Range.Start != declPos {
+		t.Fatalf("definition start = %+v, want %+v (exact column, no index needed)", locs[0].Range.Start, declPos)
+	}
+}
+
+// TestHandleDefinition_NoIndex_Stdlib is TestHandleDefinition_Stdlib's
+// no-index counterpart: a standard library symbol must still resolve
+// through dependencyDefinition's export-data path (langfeat.DependencyDefinition)
+// when the facts index is entirely unavailable, landing inside GOROOT.
+func TestHandleDefinition_NoIndex_Stdlib(t *testing.T) {
+	s, snap := newTestServerNoIndex(t)
+	pkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(pkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	file := pkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	pos := identPositionIn(t, file, data, "Sprintf", 1)
+
+	result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleDefinition(no index, fmt.Sprintf): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleDefinition(no index, fmt.Sprintf): result = %#v, want a single location", result)
+	}
+	target := locs[0].URI.FsPath()
+	if !strings.HasSuffix(target, filepath.FromSlash("fmt/print.go")) {
+		t.Errorf("definition file = %q, want it to end with fmt/print.go (inside GOROOT)", target)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("definition file %s does not exist on disk: %v", target, err)
+	}
+	if locs[0].Range.Start.Line == 0 {
+		t.Error("definition line = 0, want a real declaration line inside fmt/print.go")
+	}
+}
+
+// TestHandleDefinition_NoIndex_OtherWorkspacePackage is a regression guard
+// for a real hazard TestE2E_WorktreeSharesIndex caught: dependencyDefinition
+// must keep declining to answer for a different *workspace* (root) package
+// even from definitionFallback (the index-unavailable path), never just
+// from the index-error path. A second session (or a cold-start session
+// before its own index build finishes) treats a non-empty
+// textDocument/definition result as a signal the index is now usable, and
+// handleDidSave silently drops the reindex for any edit saved while the
+// index is still unavailable (no retry once it later opens) — so answering
+// this case via possibly-premature export data would let that race succeed
+// on stale grounds, exactly the failure TestE2E_WorktreeSharesIndex
+// reproduced. See dependencyDefinition's doc for the full mechanism.
+func TestHandleDefinition_NoIndex_OtherWorkspacePackage(t *testing.T) {
+	s, snap := newTestServerNoIndex(t)
+	depusePkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(depusePkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	depuseFile := depusePkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(depuseFile))
+	if err != nil {
+		t.Fatalf("read %s: %v", depuseFile, err)
+	}
+	pos := identPositionIn(t, depuseFile, data, "Greeting", 1) // greet.Greeting reference
+
+	result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(depuseFile)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleDefinition(no index, greet.Greeting): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 0 {
+		t.Fatalf("handleDefinition(no index, greet.Greeting): result = %#v, want an empty result (never a stale root-package answer)", result)
+	}
+}
+
 // TestHandleDefinition_WorkspaceSymbolPreferred is a regression guard for
 // dependencyDefinition's fallback: a definition query on a cross-package
 // workspace symbol must still be answered by the workspace facts index
