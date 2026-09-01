@@ -31,6 +31,15 @@ type e2eLocs struct {
 	// checkE2EDefinitionFromInsideTestFileCrossPackage).
 	storeRefInUtilTest protocol.Position
 
+	// testingTypeRefInUtilTest is "T" in "*testing.T" inside util_test.go's
+	// checkTesting helper: the Phase 1 win of the out-of-workspace
+	// navigation redesign (internal/graph now loads go/packages test
+	// variants, so "testing" — imported by no production file anywhere in
+	// this synthetic module — is a real graph node with export data
+	// instead of simply absent). See
+	// checkE2ETestingTDependencyDefinition/Hover.
+	testingTypeRefInUtilTest protocol.Position
+
 	appFile      string            // app/app.go, imports lib/util and lib/store
 	sumCallInApp protocol.Position // "Sum" in the util.Sum call inside app.go
 
@@ -98,7 +107,11 @@ func Sum(a, b int) int {
 	// resolving this file's own position at all.
 	const utilTestSrc = `package util
 
-import "example.com/e2e/lib/store"
+import (
+	"testing"
+
+	"example.com/e2e/lib/store"
+)
 
 // sumTotal calls Sum, defined in util.go.
 func sumTotal() int {
@@ -111,11 +124,20 @@ func sumTotal() int {
 func newStore() *store.Store {
 	return &store.Store{}
 }
+
+// checkTesting exercises testing.T's own hover/definition resolution: no
+// production file in this module imports "testing" at all, only this
+// in-package test file does.
+func checkTesting(t *testing.T) {
+	var ref *testing.T = t
+	_ = ref
+}
 `
 	locs.utilTestFile = writeE2EFile(t, root, "lib/util/util_test.go", utilTestSrc)
 	locs.utilTestSrc = utilTestSrc
 	locs.sumCallInUtilTest = mustPos(t, utilTestSrc, "Sum(4, 5)", "Sum")
 	locs.storeRefInUtilTest = mustPos(t, utilTestSrc, "&store.Store{}", "Store")
+	locs.testingTypeRefInUtilTest = mustPos(t, utilTestSrc, "var ref *testing.T = t", "T")
 
 	const storeSrc = `package store
 

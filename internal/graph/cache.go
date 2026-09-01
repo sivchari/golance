@@ -18,7 +18,14 @@ import (
 // (see Stale, which only watches go.mod/go.sum/go.work — a Name-less cache
 // is not "stale" by that definition). Bump this whenever diskCache's shape
 // changes in a way an old cache cannot satisfy.
-const cacheVersion = 2
+//
+// v3: Load now requests test variants (Config.Tests, see Load's doc), so an
+// old cache's Packages map is missing every test-only dependency (e.g.
+// "testing", "testify") entirely, and every Package.TestImports is
+// zero-valued rather than genuinely empty — the same
+// indistinguishable-from-blank problem Package.Name had, now for the whole
+// graph completeness fix this version exists to deliver.
+const cacheVersion = 3
 
 // diskCache is the on-disk JSON envelope for a persisted Snapshot. Patterns
 // and BuildFlags are folded into the cache key: LoadCache refuses to serve

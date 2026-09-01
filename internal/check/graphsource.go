@@ -55,6 +55,23 @@ func NewGraphSource(snap *graph.Snapshot, reader overlay.FileReader) *GraphSourc
 	fileToPkg := make(map[string]string)
 	dirToPkg := make(map[string]string, len(snap.Packages))
 	for pkgPath, pkg := range snap.Packages {
+		// A ForTest-tagged entry (graph.Package.ForTest != "") is a
+		// synthesized test-only node — most commonly an external "_test"
+		// package sharing pkg.Dir with the base package it tests under a
+		// DIFFERENT PkgPath — not an ordinary directory occupant.
+		// externalTestPkgPathFor below is this GraphSource's own,
+		// pre-existing mechanism for recognizing that exact case (by
+		// reading the file's own package clause, not by trusting the
+		// graph), and it depends on the base package's real PkgPath
+		// winning fileToPkg/dirToPkg for that directory: indexing the
+		// ForTest entry too would let it win map-iteration-order roulette
+		// over the base package, sending a brand-new, still-unsaved
+		// production file in the same directory down the wrong path
+		// (misrouted to the unimportable test-only PkgPath and its own,
+		// unrelated GoFiles).
+		if pkg.ForTest != "" {
+			continue
+		}
 		for _, f := range pkg.GoFiles {
 			fileToPkg[f] = pkgPath
 		}

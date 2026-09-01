@@ -127,6 +127,21 @@ func TestE2E(t *testing.T) {
 		checkE2EHoverAndInlayHintInPackageTestFile(t, c, &locs)
 	})
 
+	// testing_t_dependency_definition and testing_t_hover pin the Phase 1
+	// win of the out-of-workspace navigation redesign
+	// (research-gopls-dependency-nav.md): internal/graph now loads
+	// go/packages test variants (Config.Tests), so "testing" — a package no
+	// production file in this synthetic module imports at all — is a real
+	// graph node with export data instead of simply absent from the graph.
+	// Before this fix, both requests below found nothing.
+	t.Run("testing_t_dependency_definition", func(t *testing.T) {
+		checkE2ETestingTDependencyDefinition(t, c, &locs)
+	})
+
+	t.Run("testing_t_hover", func(t *testing.T) {
+		checkE2ETestingTHover(t, c, &locs)
+	})
+
 	// references_includes_in_package_test_file_call_site and
 	// definition_from_inside_test_file cover the facts-index gap fixed
 	// alongside hover/inlay hints above: an in-package "_test.go" file
@@ -220,6 +235,14 @@ func Broken() int {
 func checkE2EHoverAndInlayHintInPackageTestFile(t *testing.T, c *lspClient, locs *e2eLocs) {
 	t.Helper()
 	c.openFile(t, locs.utilTestFile)
+
+	// util_test.go imports "testing" (see checkTesting) and lib/store, both
+	// resolvable now that internal/graph loads test variants — before that
+	// fix, the missing "testing" package's import failed to resolve,
+	// surfacing as a diagnostic on this file.
+	if diags := c.waitForDiagnostics(t, locs.utilTestFile); len(diags) != 0 {
+		t.Fatalf("want zero diagnostics for util_test.go, got %d: %+v", len(diags), diags)
+	}
 
 	resp := c.call(t, protocol.MethodTextDocumentHover, &protocol.HoverParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
@@ -372,6 +395,64 @@ func checkE2EDidSaveTestFileAddsNewSymbol(t *testing.T, c *lspClient, locs *e2eL
 			t.Fatalf("workspace/symbol never found Helper (added to %s and saved) within %s; got %+v", locs.utilTestFile, e2eIndexBudget, infos)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// checkE2ETestingTDependencyDefinition verifies that a definition query on
+// "T" in util_test.go's "*testing.T" resolves into GOROOT's own
+// testing/testing.go — the concrete, user-visible symptom of the bug this
+// phase fixes (internal/graph's loaded metadata graph previously never
+// contained "testing" at all, since no production file imports it and the
+// graph loader never requested go/packages test variants). The position is
+// only line-accurate (export-data-derived, not a real source parse — see
+// internal/langfeat.DependencyDefinition's doc); exact columns are a later
+// phase's concern.
+func checkE2ETestingTDependencyDefinition(t *testing.T, c *lspClient, locs *e2eLocs) {
+	t.Helper()
+	got := c.waitForNonEmptyLocations(t, protocol.MethodTextDocumentDefinition, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.utilTestFile)},
+			Position:     locs.testingTypeRefInUtilTest,
+		},
+	}, e2eRequestBudget)
+	if len(got) != 1 {
+		t.Fatalf("definition on testing.T returned %d locations, want 1: %+v", len(got), got)
+	}
+	gotPath := got[0].URI.FsPath()
+	if !strings.HasSuffix(filepath.ToSlash(gotPath), "testing/testing.go") {
+		t.Fatalf("definition on testing.T = %s, want it to land in GOROOT's testing/testing.go", gotPath)
+	}
+	if _, err := os.Stat(gotPath); err != nil {
+		t.Fatalf("definition on testing.T resolved to %s, which does not exist: %v", gotPath, err)
+	}
+}
+
+// checkE2ETestingTHover verifies that hovering "T" in util_test.go's
+// "*testing.T" produces content identifying it as testing's T type,
+// exercising the same dependency-resolution path as
+// checkE2ETestingTDependencyDefinition through check.Engine's importer
+// instead of internal/langfeat.DependencyDefinition directly.
+func checkE2ETestingTHover(t *testing.T, c *lspClient, locs *e2eLocs) {
+	t.Helper()
+	resp := c.call(t, protocol.MethodTextDocumentHover, &protocol.HoverParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.utilTestFile)},
+			Position:     locs.testingTypeRefInUtilTest,
+		},
+	}, e2eRequestBudget)
+	if len(resp.Error) > 0 {
+		t.Fatalf("hover on testing.T failed: %s", resp.Error)
+	}
+	var hover protocol.Hover
+	if err := protocol.Unmarshal(resp.Result, &hover); err != nil {
+		t.Fatalf("unmarshal hover result: %v", err)
+	}
+	md, ok := hover.Contents.(*protocol.MarkupContent)
+	if !ok {
+		t.Fatalf("hover contents type = %T, want *protocol.MarkupContent", hover.Contents)
+	}
+	if !strings.Contains(md.Value, "testing.T") {
+		t.Errorf("hover on testing.T = %q, want it to mention testing.T", md.Value)
 	}
 }
 
