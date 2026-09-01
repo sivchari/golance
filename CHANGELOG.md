@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.2.1](https://github.com/sivchari/golance/compare/v0.2.0...v0.2.1) - 2026-09-01
+- fix: resolve promoted methods and unify interface references by @sivchari in https://github.com/sivchari/golance/pull/39
+
 ## [v0.2.0](https://github.com/sivchari/golance/compare/v0.1.9...v0.2.0) - 2026-09-01
 - docs: add PR #32 to the v0.1.9 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/34
 - feat: index in-package test files for cross-reference queries by @sivchari in https://github.com/sivchari/golance/pull/36
