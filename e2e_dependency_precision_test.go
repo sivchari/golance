@@ -50,11 +50,13 @@ func selectorIdentPosition(t *testing.T, path, pkgAlias, sel string, occurrence 
 	return posAtOffset(t, path, fset, data, positions[occurrence-1])
 }
 
-// declPosition returns the LSP position of name's own top-level func/type
-// declaring identifier in path — the ground truth
-// TestE2E_DependencyDefinitionExactColumn checks the live server's
-// definition result against, derived by parsing the real target file
-// directly rather than hardcoding a version-fragile line/column constant.
+// declPosition returns the LSP position of name's own top-level func/type/
+// const/var declaring identifier in path — the ground truth
+// TestE2E_DependencyDefinitionExactColumn (and, for a const/var declaration,
+// TestE2E_DependencyFullBodyNavigation's onward-jump-to-a-dependency check)
+// verifies the live server's definition result against, derived by parsing
+// the real target file directly rather than hardcoding a version-fragile
+// line/column constant.
 func declPosition(t *testing.T, path, name string) protocol.Position {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Clean(path))
@@ -75,14 +77,26 @@ func declPosition(t *testing.T, path, name string) protocol.Position {
 			}
 		case *ast.GenDecl:
 			for _, spec := range d.Specs {
-				if ts, ok := spec.(*ast.TypeSpec); ok && ts.Name.Name == name {
-					found = ts.Name
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					if s.Name.Name == name {
+						found = s.Name
+					}
+				case *ast.ValueSpec:
+					// A const/var block can declare several names per
+					// spec (e.g. "DefaultMaxBatchSize, DefaultMaxBatchDelay int = ...");
+					// check each one, not just the first.
+					for _, n := range s.Names {
+						if n.Name == name {
+							found = n
+						}
+					}
 				}
 			}
 		}
 	}
 	if found == nil {
-		t.Fatalf("no top-level func/type declaration named %q in %s", name, path)
+		t.Fatalf("no top-level func/type/const/var declaration named %q in %s", name, path)
 	}
 	return posAtOffset(t, path, fset, data, found.Pos())
 }

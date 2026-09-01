@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sivchari/golance/internal/graph"
+	"golang.org/x/tools/go/types/objectpath"
 )
 
 // loadTestGraph loads depcheck's own tiny fixture module (testdata/module)
@@ -296,5 +297,51 @@ func TestProvider_ColdCheckTiming(t *testing.T) {
 			}
 			t.Logf("cold check of %s: %s (%d files, %d packages checked total incl. its own dependency closure)", pkgPath, elapsed, len(cp.Files()), p.Checked())
 		})
+	}
+}
+
+// TestProvider_DocAt verifies DocAt returns the real, ParseComments-parsed
+// doc comment for an exported declaration — the mechanism
+// internal/server.crossPackageDoc uses to answer a workspace file's hover
+// into a dependency (task item 2), unlike export data, which carries no
+// doc comment at all.
+func TestProvider_DocAt(t *testing.T) {
+	meta := loadTestGraph(t)
+	ctx := context.Background()
+	const pkgPath = "example.com/depcheckmod/dep"
+
+	p := NewProvider(meta, Options{})
+	cp, err := p.Package(ctx, pkgPath)
+	if err != nil {
+		t.Fatalf("Package(%s): %v", pkgPath, err)
+	}
+	obj := cp.Types().Scope().Lookup("Greet")
+	if obj == nil {
+		t.Fatal("dep.Greet not found in the checked package scope")
+	}
+	objPath, err := objectpath.For(obj)
+	if err != nil {
+		t.Fatalf("objectpath.For(Greet): %v", err)
+	}
+
+	doc, err := p.DocAt(ctx, pkgPath, string(objPath))
+	if err != nil {
+		t.Fatalf("DocAt(%s, %s): %v", pkgPath, objPath, err)
+	}
+	const want = "Greet returns a greeting for name, built with strings.Builder.\n"
+	if doc != want {
+		t.Errorf("DocAt(Greet) = %q, want %q", doc, want)
+	}
+}
+
+// TestProvider_DocAt_NotFound verifies DocAt reports an error, rather than
+// panicking or silently returning "", for an objPath that does not resolve
+// against pkgPath's checked package.
+func TestProvider_DocAt_NotFound(t *testing.T) {
+	meta := loadTestGraph(t)
+	p := NewProvider(meta, Options{})
+
+	if _, err := p.DocAt(context.Background(), "example.com/depcheckmod/dep", "NoSuchSymbol"); err == nil {
+		t.Error("DocAt for a nonexistent objPath returned no error, want one")
 	}
 }

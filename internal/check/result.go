@@ -55,6 +55,34 @@ func (cp *CheckedPackage) Package() *types.Package { return cp.pkg }
 // Selections, Types, Scopes, Instances, Implicits).
 func (cp *CheckedPackage) Info() *types.Info { return cp.info }
 
+// FromSource builds a CheckedPackage from an already source-type-checked,
+// non-workspace package (internal/depcheck.Provider's real-source pipeline)
+// rather than running Engine's own recheck: the unification point for a
+// file opened INSIDE a dependency whose directory the import graph already
+// knows (see internal/depcheck's package doc and Engine's own doc for why
+// Engine's ad-hoc pipeline stays reserved for directories the graph does
+// not). files/pkg/info/fset are exactly what depcheck already produced (no
+// separate parse or type-check happens here); texts is read directly by the
+// caller (module-cache/GOROOT files are immutable, but a caller may still
+// have one open with unsaved overlay edits) since depcheck's own
+// CheckedPackage carries no text cache of its own. There is no parse/type
+// error list to populate (depcheck's own check runs best-effort, discarding
+// individual type errors — see its doc) and no contentHash: this
+// CheckedPackage is never entered into Engine's own cache or its
+// content-hash-keyed staleness check, so both are left at their zero value.
+func FromSource(pkgPath, dir string, fset *token.FileSet, files []*ast.File, pkg *types.Package, info *types.Info, texts map[string][]byte) *CheckedPackage {
+	return &CheckedPackage{
+		pkgPath: pkgPath,
+		dir:     dir,
+		fset:    fset,
+		files:   files,
+		pkg:     pkg,
+		info:    info,
+		texts:   texts,
+		builtAt: time.Now(),
+	}
+}
+
 // FileText returns the exact source bytes cp was checked against for path,
 // and whether path was one of the files checked. Unlike re-reading the
 // overlay after the fact, this is guaranteed to match what Files and

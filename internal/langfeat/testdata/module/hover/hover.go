@@ -1,5 +1,13 @@
 package hover
 
+import "strings"
+
+// NewBuilder returns a fresh string-building value from the standard
+// library, for TestHover_CrossPackage's cross-package hover query.
+func NewBuilder() strings.Builder {
+	return strings.Builder{}
+}
+
 // Add returns the sum of a and b.
 func Add(a, b int) int {
 	return a + b

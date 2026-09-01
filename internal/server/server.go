@@ -250,6 +250,32 @@ func (s *Server) Stop() {
 // "initialize" request has completed.
 func (s *Server) workspace() *workspace { return s.ws.Load() }
 
+// nonWorkspacePackageForFile returns the real import path of the
+// graph-known, non-workspace package (GOROOT or a module-cache dependency —
+// see internal/depcheck's package doc) containing path, if any. A workspace
+// package — one that matched a Load pattern directly (graph.Package.Root) —
+// always returns ok=false here, even though fileToPkg/dirToPkg know it too:
+// a workspace file keeps using ws.engine's own compilation pipeline
+// (internal/typecheck's export-data importer for ITS dependencies remains
+// the right tool for compilation input, per internal/depcheck's package
+// doc); only a dependency file routes to ws.depProvider (see
+// resolveCheckedPackage). Mirrors internal/check.GraphSource.PackageForFile's
+// file-then-directory fallback, over the same fileToPkg/dirToPkg maps.
+func (ws *workspace) nonWorkspacePackageForFile(path string) (pkgPath string, ok bool) {
+	pp, hit := ws.fileToPkg[path]
+	if !hit {
+		pp, hit = ws.dirToPkg[filepath.Dir(path)]
+	}
+	if !hit {
+		return "", false
+	}
+	pkg, ok := ws.snap.Package(pp)
+	if !ok || pkg.Root {
+		return "", false
+	}
+	return pp, true
+}
+
 // pkgPathForFile returns the import path of the package containing path, if
 // path is part of the loaded workspace. If path is not itself a known Go
 // file (e.g. an in-package _test.go file, which ws.fileToPkg never
