@@ -6,15 +6,25 @@ import (
 
 	"github.com/sivchari/golance/internal/check"
 	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/go/types/objectpath"
 )
 
 // HoverInfo is the result of a Hover query: a symbol's type signature, its
 // doc comment (if available), and the source range of the identifier the
-// query resolved.
+// query resolved. Doc is already the answer for an object declared in cp's
+// own package; for one declared in a DIFFERENT package, Doc is "" and
+// PkgPath/ObjPath identify it instead — the same split
+// CompletionDocInfo/TypeDefInfo already use — for the server layer to
+// resolve through the workspace facts index (a root package) or
+// internal/depcheck (a standard library/module dependency), mirroring
+// handlers_nav.go's completionDoc.
 type HoverInfo struct {
 	Signature string
 	Doc       string
 	Range     Range
+
+	PkgPath string
+	ObjPath string
 }
 
 // Hover resolves the identifier at offset (a byte offset from the start of
@@ -34,11 +44,18 @@ func Hover(cp *check.CheckedPackage, file string, offset int) (*HoverInfo, error
 	if obj == nil {
 		return nil, nil
 	}
-	return &HoverInfo{
+	info := &HoverInfo{
 		Signature: types.ObjectString(obj, qualifier(cp.Package())),
-		Doc:       docForObject(cp, obj),
 		Range:     rangeOf(tf, id.Pos(), id.End()),
-	}, nil
+	}
+	if obj.Pkg() == cp.Package() {
+		info.Doc = docForObject(cp, obj)
+	} else if obj.Pkg() != nil {
+		if objPath, err := objectpath.For(obj); err == nil {
+			info.PkgPath, info.ObjPath = obj.Pkg().Path(), string(objPath)
+		}
+	}
+	return info, nil
 }
 
 // identAt returns the innermost *ast.Ident in path, or nil if path's

@@ -77,14 +77,18 @@ func (g GraphMetadataSource) Package(pkgPath string) (dir string, goFiles, impor
 // parsed files, checked *types.Package and *types.Info, sharing the
 // Provider that produced it's single persistent *token.FileSet (see
 // Provider's doc for why one shared, ever-growing fset is an accepted
-// tradeoff here). Bodies are never type-checked (types.Config.IgnoreFuncBodies
-// is always true — see Provider's doc): navigation only needs declarations,
-// and doc comments come from the AST (parser.ParseComments), present
-// regardless of whether bodies are checked. Immutable once returned by
-// Provider.Package, so sharing one instance across concurrent callers (via
-// the LRU and singleflight) needs no further synchronization.
+// tradeoff here). Doc comments come from the AST (parser.ParseComments),
+// present regardless of whether bodies are checked. A CheckedPackage
+// returned by Package has bodies never type-checked
+// (types.Config.IgnoreFuncBodies is always true there — declarations only,
+// the common case for resolving a jump target's signature/doc); one
+// returned by PackageWithBodies has full statement-level Defs/Uses/Selections
+// too (see its doc). Immutable once returned, so sharing one instance across
+// concurrent callers (via the LRU and singleflight) needs no further
+// synchronization.
 type CheckedPackage struct {
 	pkgPath string
+	dir     string
 	files   []*ast.File
 	pkg     *types.Package
 	info    *types.Info
@@ -92,6 +96,9 @@ type CheckedPackage struct {
 
 // PkgPath returns the package's import path.
 func (cp *CheckedPackage) PkgPath() string { return cp.pkgPath }
+
+// Dir returns the package's directory.
+func (cp *CheckedPackage) Dir() string { return cp.dir }
 
 // Files returns the package's parsed files, positions resolved against the
 // owning Provider's FileSet.
@@ -101,9 +108,10 @@ func (cp *CheckedPackage) Files() []*ast.File { return cp.files }
 func (cp *CheckedPackage) Types() *types.Package { return cp.pkg }
 
 // Info returns the *types.Info populated by the check (Defs, Uses,
-// Selections, Types, Scopes, Instances, Implicits) — statement-level detail
-// inside function bodies is absent (IgnoreFuncBodies), but every
-// declaration is fully resolved.
+// Selections, Types, Scopes, Instances, Implicits). Statement-level detail
+// inside function bodies is present only for a CheckedPackage returned by
+// PackageWithBodies; one returned by Package has every declaration fully
+// resolved but no body-level detail (IgnoreFuncBodies).
 func (cp *CheckedPackage) Info() *types.Info { return cp.info }
 
 // DefaultCap is the LRU's default entry capacity (Options.Cap's zero
@@ -117,10 +125,25 @@ func (cp *CheckedPackage) Info() *types.Info { return cp.info }
 // of one dependency's size, independent of workspace or GOPATH size.
 const DefaultCap = 64
 
+// FullBodyDefaultCap is the full-body LRU's default entry capacity
+// (Options.FullBodyCap's zero value; see PackageWithBodies). Kept much
+// smaller than DefaultCap: a full-body CheckedPackage carries
+// statement-level Defs/Uses/Selections for every function in the package,
+// materially larger per entry than a declarations-only one, and a user has
+// at most a handful of dependency files open (one dependency, browsed
+// locally) at any given time — unlike DefaultCap's budget, which also has
+// to absorb every transitive import touched while resolving those open
+// files' own declarations.
+const FullBodyDefaultCap = 8
+
 // Options configures a Provider.
 type Options struct {
-	// Cap is the LRU's entry capacity. Defaults to DefaultCap when <= 0.
+	// Cap is the declarations-only LRU's entry capacity. Defaults to
+	// DefaultCap when <= 0.
 	Cap int
+	// FullBodyCap is the full-body LRU's entry capacity (see
+	// PackageWithBodies). Defaults to FullBodyDefaultCap when <= 0.
+	FullBodyCap int
 }
 
 // Provider resolves non-workspace packages on demand, type-checking each
@@ -149,26 +172,39 @@ type Options struct {
 // slowly-growing cost the LRU's cap does not need to (and structurally
 // cannot, while positions must stay valid) reclaim.
 type Provider struct {
-	meta     MetadataSource
-	capacity int
+	meta         MetadataSource
+	capacity     int
+	fullCapacity int
 
 	fset *token.FileSet
 
-	sf singleflight.Group
+	sf     singleflight.Group
+	fullSF singleflight.Group
 
-	mu      sync.Mutex
-	lru     *lruCache
-	checked int64 // count of Package calls that actually ran CheckPackage (cache+singleflight misses); test/observability hook.
+	mu          sync.Mutex
+	lru         *lruCache
+	fullLRU     *lruCache // full-body-checked packages (see PackageWithBodies), separate from lru so a small handful of open dependency files never evicts the much larger decl-only working set
+	checked     int64     // count of Package calls that actually ran CheckPackage (cache+singleflight misses); test/observability hook.
+	fullChecked int64     // count of PackageWithBodies calls that actually ran a fresh full-body check; test/observability hook.
 }
 
 // NewProvider returns a Provider resolving package metadata via meta,
-// bounding its in-memory LRU at opts.Cap entries (DefaultCap if <= 0).
+// bounding its declarations-only in-memory LRU at opts.Cap entries
+// (DefaultCap if <= 0) and its full-body LRU at opts.FullBodyCap entries
+// (FullBodyDefaultCap if <= 0).
 func NewProvider(meta MetadataSource, opts Options) *Provider {
 	capacity := opts.Cap
 	if capacity <= 0 {
 		capacity = DefaultCap
 	}
-	return &Provider{meta: meta, capacity: capacity, fset: token.NewFileSet(), lru: newLRUCache(capacity)}
+	fullCapacity := opts.FullBodyCap
+	if fullCapacity <= 0 {
+		fullCapacity = FullBodyDefaultCap
+	}
+	return &Provider{
+		meta: meta, capacity: capacity, fullCapacity: fullCapacity,
+		fset: token.NewFileSet(), lru: newLRUCache(capacity), fullLRU: newLRUCache(fullCapacity),
+	}
 }
 
 // FileSet returns the *token.FileSet every *CheckedPackage this Provider
@@ -177,7 +213,8 @@ func NewProvider(meta MetadataSource, opts Options) *Provider {
 // entire lifetime.
 func (p *Provider) FileSet() *token.FileSet { return p.fset }
 
-// Len returns the number of packages currently held in the LRU.
+// Len returns the number of packages currently held in the declarations-only
+// LRU.
 func (p *Provider) Len() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -194,26 +231,53 @@ func (p *Provider) Checked() int64 {
 	return p.checked
 }
 
-// Package returns pkgPath's source-type-checked CheckedPackage, checking it
-// on demand if not already cached. Concurrent calls for the same pkgPath
-// collapse onto a single check (singleflight); calls for different
-// pkgPaths run independently and in parallel.
+// LenWithBodies returns the number of packages currently held in the
+// full-body LRU (see PackageWithBodies).
+func (p *Provider) LenWithBodies() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fullLRU.len()
+}
+
+// CheckedWithBodies returns the number of times PackageWithBodies has
+// actually run a fresh full-body check. Test-observability hook, mirroring
+// Checked.
+func (p *Provider) CheckedWithBodies() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fullChecked
+}
+
+// Package returns pkgPath's source-type-checked CheckedPackage (declarations
+// only — see CheckedPackage's doc), checking it on demand if not already
+// cached. Concurrent calls for the same pkgPath collapse onto a single check
+// (singleflight); calls for different pkgPaths run independently and in
+// parallel. If pkgPath is already held in the full-body LRU (see
+// PackageWithBodies), that CheckedPackage is returned instead of running a
+// second, redundant declarations-only check — sharing identity between the
+// two call sites is exactly the point (see PackageWithBodies's doc).
 func (p *Provider) Package(ctx context.Context, pkgPath string) (*CheckedPackage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if pkgPath == "unsafe" {
+	if pkgPath == unsafePkgPath {
 		return unsafePackage(), nil
+	}
+	if cp, ok := p.getFull(pkgPath); ok {
+		return cp, nil
 	}
 	if cp, ok := p.get(pkgPath); ok {
 		return cp, nil
 	}
 
 	v, err, _ := p.sf.Do(pkgPath, func() (any, error) {
+		if cp, ok := p.getFull(pkgPath); ok {
+			return cp, nil
+		}
 		if cp, ok := p.get(pkgPath); ok {
 			return cp, nil
 		}
-		cp, err := p.check(ctx, pkgPath)
+		cp, err := p.check(ctx, pkgPath, false)
 		if err != nil {
 			return nil, err
 		}
@@ -230,17 +294,71 @@ func (p *Provider) Package(ctx context.Context, pkgPath string) (*CheckedPackage
 	return cp, nil
 }
 
-// get returns pkgPath's cached CheckedPackage, if the LRU currently holds
-// one, bumping its recency.
+// PackageWithBodies returns pkgPath's source-type-checked CheckedPackage
+// WITH full function-body type information (statement-level Defs/Uses/
+// Selections, not just declarations) — for the single dependency package a
+// caller currently has a file open in, mirroring gopls's own treatment of a
+// "syntax target" versus an import-only dependency (see the package doc's
+// Q2 reference: checkPackage vs. checkPackageForImport). Held in a separate,
+// smaller LRU than Package's own (FullBodyDefaultCap, not DefaultCap — see
+// its doc), evicted independently.
+//
+// Import resolution shares identity with Package's own cache: this
+// CheckedPackage's own imports, and any OTHER package's import of pkgPath
+// (via Package or PackageWithBodies), both resolve through the same
+// Provider and so land on this exact instance while it stays in the
+// full-body LRU (importer.ImportFrom consults the full-body cache before
+// the declarations-only one) — the mechanism that unifies identity across
+// "a file opened directly inside this dependency" and "a jump target that
+// happens to reference it," per the design this method exists for. Once
+// evicted, a later Package/PackageWithBodies call for pkgPath re-checks it
+// from scratch, producing a new, independent instance — no different from
+// any other LRU eviction; see the package doc for why this bounded
+// divergence is an accepted tradeoff rather than something golance's
+// on-demand identity needs to solve for.
+func (p *Provider) PackageWithBodies(ctx context.Context, pkgPath string) (*CheckedPackage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if pkgPath == unsafePkgPath {
+		return unsafePackage(), nil
+	}
+	if cp, ok := p.getFull(pkgPath); ok {
+		return cp, nil
+	}
+
+	v, err, _ := p.fullSF.Do(pkgPath, func() (any, error) {
+		if cp, ok := p.getFull(pkgPath); ok {
+			return cp, nil
+		}
+		cp, err := p.check(ctx, pkgPath, true)
+		if err != nil {
+			return nil, err
+		}
+		p.putFull(pkgPath, cp)
+		return cp, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	cp, ok := v.(*CheckedPackage)
+	if !ok {
+		return nil, fmt.Errorf("depcheck: singleflight for %s returned %T, want *CheckedPackage", pkgPath, v)
+	}
+	return cp, nil
+}
+
+// get returns pkgPath's cached declarations-only CheckedPackage, if the LRU
+// currently holds one, bumping its recency.
 func (p *Provider) get(pkgPath string) (*CheckedPackage, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.lru.get(pkgPath)
 }
 
-// put stores cp in the LRU under pkgPath, evicting the least recently used
-// entry first if the LRU is at capacity, and records that a fresh check
-// happened (see Checked).
+// put stores cp in the declarations-only LRU under pkgPath, evicting the
+// least recently used entry first if the LRU is at capacity, and records
+// that a fresh check happened (see Checked).
 func (p *Provider) put(pkgPath string, cp *CheckedPackage) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -248,22 +366,43 @@ func (p *Provider) put(pkgPath string, cp *CheckedPackage) {
 	p.lru.put(pkgPath, cp)
 }
 
+// getFull returns pkgPath's cached full-body CheckedPackage, if the
+// full-body LRU currently holds one, bumping its recency.
+func (p *Provider) getFull(pkgPath string) (*CheckedPackage, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.fullLRU.get(pkgPath)
+}
+
+// putFull stores cp in the full-body LRU under pkgPath, evicting the least
+// recently used entry first if the LRU is at capacity, and records that a
+// fresh full-body check happened (see CheckedWithBodies).
+func (p *Provider) putFull(pkgPath string, cp *CheckedPackage) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.fullChecked++
+	p.fullLRU.put(pkgPath, cp)
+}
+
+const unsafePkgPath = "unsafe"
+
 // unsafePackage returns the synthetic CheckedPackage for the "unsafe"
 // pseudo-package: types.Unsafe is a fixed, pre-built *types.Package with no
 // source files of its own (mirrors gopls's own checkPackageForImport
 // special case, research-gopls-dependency-nav.md's Q2).
 func unsafePackage() *CheckedPackage {
-	return &CheckedPackage{pkgPath: "unsafe", pkg: types.Unsafe, info: &types.Info{}}
+	return &CheckedPackage{pkgPath: unsafePkgPath, pkg: types.Unsafe, info: &types.Info{}}
 }
 
 // check parses pkgPath's GoFiles (from metadata; disk content, since
-// module-cache and GOROOT files are immutable) into p.fset and
-// type-checks them, resolving pkgPath's own imports recursively through p
-// itself (see importer). Bodies are never checked (IgnoreFuncBodies):
-// navigation needs declarations, not statement-level detail, and doc
-// comments — needed for hover — come from parser.ParseComments regardless
-// of that setting.
-func (p *Provider) check(ctx context.Context, pkgPath string) (*CheckedPackage, error) {
+// module-cache and GOROOT files are immutable) into p.fset and type-checks
+// them, resolving pkgPath's own imports recursively through p itself (see
+// importer). withBodies selects IgnoreFuncBodies: false — used only by
+// PackageWithBodies, for the single package a caller has open — versus
+// Package's own true (declarations only, the common case for resolving a
+// jump target's signature/doc); doc comments come from parser.ParseComments
+// regardless of that setting.
+func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool) (*CheckedPackage, error) {
 	dir, goFiles, _, ok := p.meta.Package(pkgPath)
 	if !ok {
 		return nil, fmt.Errorf("depcheck: %s is not known to the import graph", pkgPath)
@@ -292,14 +431,14 @@ func (p *Provider) check(ctx context.Context, pkgPath string) (*CheckedPackage, 
 	}
 	conf := types.Config{
 		Importer:         (*importer)(p),
-		IgnoreFuncBodies: true,
+		IgnoreFuncBodies: !withBodies,
 		Error:            func(error) {}, // best-effort: a dependency's own source is immutable and assumed to compile; a type error here degrades to a possibly-incomplete pkg rather than failing the whole check.
 	}
 	pkg, _ := conf.Check(pkgPath, p.fset, files, info)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &CheckedPackage{pkgPath: pkgPath, files: files, pkg: pkg, info: info}, nil
+	return &CheckedPackage{pkgPath: pkgPath, dir: dir, files: files, pkg: pkg, info: info}, nil
 }
 
 // importer implements types.ImporterFrom by resolving each import back
@@ -313,8 +452,16 @@ func (imp *importer) Import(path string) (*types.Package, error) {
 	return imp.ImportFrom(path, "", 0)
 }
 
+// ImportFrom resolves path against the full-body LRU first, so an import of
+// a package the caller also has open (via PackageWithBodies) shares its
+// exact *types.Package identity instead of triggering a second, divergent
+// declarations-only check — see PackageWithBodies's doc.
 func (imp *importer) ImportFrom(path, _ string, _ types.ImportMode) (*types.Package, error) {
-	cp, err := (*Provider)(imp).Package(context.Background(), path)
+	prov := (*Provider)(imp)
+	if cp, ok := prov.getFull(path); ok {
+		return cp.Types(), nil
+	}
+	cp, err := prov.Package(context.Background(), path)
 	if err != nil {
 		return nil, err
 	}
@@ -357,14 +504,125 @@ func (p *Provider) Decl(ctx context.Context, pkgPath string, obj types.Object) (
 	if err != nil {
 		return nil, nil, err
 	}
+	return p.declOf(cp, target)
+}
+
+// DeclAt locates the declaring identifier of the object identified by
+// (pkgPath, objPath) — an objectpath.Path string, in the identical format
+// [golang.org/x/tools/go/types/objectpath] produces and
+// internal/store.BuildSymbolID's own SymbolID encoding embeds — inside
+// pkgPath's source-checked package (resolving and checking it on demand via
+// Package). Unlike Decl, this needs no live types.Object from the caller's
+// own, separately-resolved *types.Package instance: a caller that already
+// computed objPath itself (e.g. internal/langfeat.TypeDefinition, whose
+// cross-package result already carries objPath for the workspace facts
+// index's own [xref.Resolver.TypeDeclaration] — this is that same lookup's
+// fallback when the target is a dependency the facts index does not cover)
+// can resolve straight from the string, without needing to keep a
+// cross-instance types.Object alive just to re-derive it. ok is false, with
+// an error, if objPath is not a valid encoding or does not resolve against
+// pkgPath's package (e.g. it names something unexported that objectpath
+// itself never encodes — see resolveObject's identical fallback for that
+// case via Decl instead).
+func (p *Provider) DeclAt(ctx context.Context, pkgPath, objPath string) (*ast.Ident, *token.FileSet, error) {
+	cp, err := p.Package(ctx, pkgPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	target, err := objectpath.Object(cp.pkg, objectpath.Path(objPath))
+	if err != nil {
+		return nil, nil, fmt.Errorf("depcheck: resolve %s in %s: %w", objPath, pkgPath, err)
+	}
+	return p.declOf(cp, target)
+}
+
+// declOf returns target's declaring identifier among cp's own parsed files,
+// the shared work Decl and DeclAt both need once they have a resolved
+// types.Object in cp's own *types.Package instance.
+func (p *Provider) declOf(cp *CheckedPackage, target types.Object) (*ast.Ident, *token.FileSet, error) {
 	if !target.Pos().IsValid() {
-		return nil, nil, fmt.Errorf("depcheck: %s has no valid declaration position in %s", target.Name(), pkgPath)
+		return nil, nil, fmt.Errorf("depcheck: %s has no valid declaration position in %s", target.Name(), cp.pkgPath)
 	}
 	id := declIdent(cp.files, p.fset, target.Pos())
 	if id == nil {
-		return nil, nil, fmt.Errorf("depcheck: no declaring identifier found for %s in %s", target.Name(), pkgPath)
+		return nil, nil, fmt.Errorf("depcheck: no declaring identifier found for %s in %s", target.Name(), cp.pkgPath)
 	}
 	return id, p.fset, nil
+}
+
+// DocAt returns the doc comment recorded for the object identified by
+// (pkgPath, objPath) — the identical objectpath encoding DeclAt takes (see
+// its doc) — inside pkgPath's source-checked package. Unlike a workspace
+// package's facts index, which only ever records a doc comment for a
+// declaration it indexed as a root package's own unit (see
+// [xref.Resolver.SymbolDoc]'s identical doc-only lookup), this reads
+// straight from real, ParseComments-parsed source: hover/completion-doc
+// into a dependency (strings.Builder, testing.T, ...) shows its actual doc
+// comment instead of nothing, gopls's own hover content for the same
+// symbol (declaration + doc comment). "" if objPath resolves to an object
+// with no doc comment; an error only if pkgPath or objPath itself fails to
+// resolve at all.
+func (p *Provider) DocAt(ctx context.Context, pkgPath, objPath string) (string, error) {
+	cp, err := p.Package(ctx, pkgPath)
+	if err != nil {
+		return "", err
+	}
+	target, err := objectpath.Object(cp.pkg, objectpath.Path(objPath))
+	if err != nil {
+		return "", fmt.Errorf("depcheck: resolve %s in %s: %w", objPath, pkgPath, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if !target.Pos().IsValid() {
+		return "", nil
+	}
+	return docAt(cp.files, p.fset, target.Pos()), nil
+}
+
+// docAt returns the doc comment attached to the declaration at pos among
+// files ("" if none, or if pos falls in none of them), mirroring
+// internal/langfeat.docForObject's identical AST walk for a same-package
+// object — duplicated here rather than shared across the package boundary,
+// since CheckedPackage's own fields are deliberately unexported (see its
+// immutability doc) and langfeat cannot reach into them directly.
+func docAt(files []*ast.File, fset *token.FileSet, pos token.Pos) string {
+	tf := fset.File(pos)
+	if tf == nil {
+		return ""
+	}
+	var declFile *ast.File
+	for _, f := range files {
+		if fset.File(f.Pos()) == tf {
+			declFile = f
+			break
+		}
+	}
+	if declFile == nil {
+		return ""
+	}
+	path, _ := astutil.PathEnclosingInterval(declFile, pos, pos)
+	for _, n := range path {
+		switch d := n.(type) {
+		case *ast.FuncDecl:
+			return d.Doc.Text()
+		case *ast.TypeSpec:
+			if d.Doc != nil {
+				return d.Doc.Text()
+			}
+		case *ast.ValueSpec:
+			if d.Doc != nil {
+				return d.Doc.Text()
+			}
+		case *ast.Field:
+			if d.Doc != nil {
+				return d.Doc.Text()
+			}
+		case *ast.GenDecl:
+			return d.Doc.Text()
+		}
+	}
+	return ""
 }
 
 // resolveObject maps obj — resolved against some other *types.Package

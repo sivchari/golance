@@ -13,7 +13,14 @@ import (
 // handleDidOpen tracks the document's overlay content, focuses its
 // package in the check engine (exempting it from LRU eviction), and
 // schedules a recheck so diagnostics are published for a freshly opened
-// file even before any edit.
+// file even before any edit. A file inside a graph-known NON-workspace
+// package (GOROOT/module-cache — see workspace.nonWorkspacePackageForFile)
+// skips ws.engine entirely: navigation for it is served by ws.depProvider
+// instead (see resolveCheckedPackage), so focusing and scheduling an
+// Engine recheck for it would only run its superseded export-data pipeline
+// for no consumer — dependency source is immutable and assumed to compile
+// (depcheck's own best-effort check.Config.Error), so it has no
+// diagnostics worth publishing either.
 func (s *Server) handleDidOpen(_ context.Context, params json.RawMessage) error {
 	var p protocol.DidOpenTextDocumentParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
@@ -25,13 +32,17 @@ func (s *Server) handleDidOpen(_ context.Context, params json.RawMessage) error 
 		return nil
 	}
 	path := p.TextDocument.URI.FsPath()
+	if _, ok := ws.nonWorkspacePackageForFile(path); ok {
+		return nil
+	}
 	ws.engine.SetFocus(path)
 	ws.engine.Invalidate(filepath.Dir(path))
 	return nil
 }
 
 // handleDidChange applies the content change to the document's overlay and
-// schedules a debounced recheck of its package.
+// schedules a debounced recheck of its package. See handleDidOpen's doc for
+// why a graph-known non-workspace file skips ws.engine.
 func (s *Server) handleDidChange(_ context.Context, params json.RawMessage) error {
 	var p protocol.DidChangeTextDocumentParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
@@ -44,7 +55,11 @@ func (s *Server) handleDidChange(_ context.Context, params json.RawMessage) erro
 	if ws == nil {
 		return nil
 	}
-	ws.engine.Invalidate(filepath.Dir(p.TextDocument.URI.FsPath()))
+	path := p.TextDocument.URI.FsPath()
+	if _, ok := ws.nonWorkspacePackageForFile(path); ok {
+		return nil
+	}
+	ws.engine.Invalidate(filepath.Dir(path))
 	return nil
 }
 
@@ -68,6 +83,14 @@ func (s *Server) handleDidSave(_ context.Context, params json.RawMessage) error 
 		return nil
 	}
 	path := p.TextDocument.URI.FsPath()
+	// A save inside a graph-known non-workspace package (GOROOT/module-cache
+	// — see handleDidOpen's doc) needs neither an Engine recheck nor
+	// reindexing: dependency source outside the workspace is never a facts
+	// index root (internal/index/scheduler.go's doc), and navigation for it
+	// is served by ws.depProvider, not ws.engine.
+	if _, ok := ws.nonWorkspacePackageForFile(path); ok {
+		return nil
+	}
 	ws.engine.Invalidate(filepath.Dir(path))
 
 	pkgPath, ok := s.pkgPathForFile(path)

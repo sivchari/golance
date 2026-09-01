@@ -57,6 +57,39 @@ func TestHover_Type(t *testing.T) {
 	}
 }
 
+// TestHover_CrossPackage verifies Hover's split for an object declared in a
+// DIFFERENT package than the query (task item 2): Doc stays empty (cp's own
+// AST/types.Info has no source for a package it only imports, unlike its
+// own declarations — see docForObject's doc) and PkgPath/ObjPath identify
+// the object instead, for the server layer to resolve its doc comment
+// through internal/depcheck (crossPackageDoc) or the workspace facts index.
+func TestHover_CrossPackage(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "hover", "hover.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "strings.Builder") + len("strings.")
+
+	got, err := langfeat.Hover(cp, path, offset)
+	if err != nil {
+		t.Fatalf("Hover: %v", err)
+	}
+	if got == nil {
+		t.Fatal("Hover returned nil, want a result")
+	}
+	if got.Doc != "" {
+		t.Errorf("Doc = %q, want empty (cross-package: PkgPath/ObjPath carry the answer instead)", got.Doc)
+	}
+	if got.PkgPath != "strings" {
+		t.Errorf("PkgPath = %q, want %q", got.PkgPath, "strings")
+	}
+	if got.ObjPath == "" {
+		t.Error("ObjPath is empty, want a non-empty objectpath encoding of strings.Builder")
+	}
+}
+
 func TestHover_NoIdentifier(t *testing.T) {
 	reader := overlay.New()
 	cp, path := newCheckedPackage(t, reader, "hover", "hover.go")

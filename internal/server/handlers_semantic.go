@@ -36,7 +36,7 @@ func (s *Server) semanticTokensForFile(ctx context.Context, u uri.URI) ([]langfe
 	if ws == nil {
 		return nil, nil
 	}
-	cp, err := ws.engine.Get(ctx, path)
+	cp, err := s.resolveCheckedPackage(ctx, ws, path)
 	if err != nil {
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return nil, nil

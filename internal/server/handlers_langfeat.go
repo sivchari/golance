@@ -10,9 +10,72 @@ import (
 	"go.lsp.dev/uri"
 
 	"github.com/sivchari/golance/internal/check"
+	"github.com/sivchari/golance/internal/depcheck"
 	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
 )
+
+// resolveCheckedPackage resolves path's CheckedPackage, routing the request
+// to ws.depProvider's full-body pipeline (internal/depcheck) instead of
+// ws.engine's own pipeline (internal/check) whenever path's directory
+// belongs to a graph-known NON-workspace package — GOROOT or a module-cache
+// dependency reached by a jump and then opened directly (see
+// workspace.nonWorkspacePackageForFile). This is every ws.engine.Get call
+// site's entry point except SetFocus/Invalidate (which track edit/recheck
+// bookkeeping ws.engine alone owns, not a per-request read): before this,
+// such a file was still checked through Engine's own export-data-import
+// pipeline, giving it a *types.Package identity independent of what
+// DependencyDefinition's jump-target resolution (ws.depProvider) produced
+// for the very same package — "wrong identity, degraded imports" for any
+// feature invoked a second time from inside the file Definition just
+// jumped to. Routing both through the same ws.depProvider unifies that
+// identity and gives dependency-internal navigation the same exact
+// positions and unexported visibility DependencyDefinition already has.
+// ws.engine's own pipeline remains the answer for a directory the graph
+// knows nothing about (testdata/, a standalone script) and for every
+// workspace file, exactly as before.
+func (s *Server) resolveCheckedPackage(ctx context.Context, ws *workspace, path string) (*check.CheckedPackage, error) {
+	pkgPath, ok := ws.nonWorkspacePackageForFile(path)
+	if !ok {
+		return ws.engine.Get(ctx, path)
+	}
+	dcp, err := ws.depProvider.PackageWithBodies(ctx, pkgPath)
+	if err != nil {
+		return nil, err
+	}
+	return s.checkedPackageFromDep(ws, dcp), nil
+}
+
+// checkedPackageFromDep adapts a depcheck.CheckedPackage — already
+// source-type-checked with full function bodies (see
+// depcheck.Provider.PackageWithBodies) — into a *check.CheckedPackage (see
+// check.FromSource) so every existing langfeat consumer works unchanged
+// regardless of which pipeline produced it. Each file's exact source bytes
+// are read through the overlay (not cached by depcheck itself) so an
+// unsaved edit to an open dependency file is still reflected, matching
+// ws.engine's own FileText contract.
+func (s *Server) checkedPackageFromDep(ws *workspace, dcp *depcheck.CheckedPackage) *check.CheckedPackage {
+	fset := ws.depProvider.FileSet()
+	files := dcp.Files()
+	texts := make(map[string][]byte, len(files))
+	for _, f := range files {
+		tf := fset.File(f.Pos())
+		if tf == nil {
+			continue
+		}
+		name := tf.Name()
+		if _, seen := texts[name]; seen {
+			continue
+		}
+		text, err := s.overlay.ReadFile(name)
+		if err != nil {
+			s.logger.Printf("server: read dependency file %s: %v", name, err)
+			continue
+		}
+		texts[name] = text
+	}
+	return check.FromSource(dcp.PkgPath(), dcp.Dir(), fset, files, dcp.Types(), dcp.Info(), texts)
+}
 
 // checkedFileResult is checkedFile's result: the package's CheckedPackage,
 // the exact buffer content it was checked against, and the query's byte
@@ -45,7 +108,7 @@ func (s *Server) checkedFile(ctx context.Context, u uri.URI, pos protocol.Positi
 	if ws == nil {
 		return checkedFileResult{path: path}
 	}
-	cp, err := ws.engine.Get(ctx, path)
+	cp, err := s.resolveCheckedPackage(ctx, ws, path)
 	if err != nil {
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return checkedFileResult{path: path}
@@ -79,10 +142,44 @@ func (s *Server) handleHover(ctx context.Context, params json.RawMessage) (any, 
 	if !ok {
 		return nil, nil
 	}
+	if info.Doc == "" && info.PkgPath != "" {
+		info.Doc = s.crossPackageDoc(ctx, info.PkgPath, info.ObjPath)
+	}
 	return &protocol.Hover{
 		Contents: &protocol.MarkupContent{Kind: protocol.MarkupKindMarkdown, Value: hoverMarkdown(info)},
 		Range:    &rng,
 	}, nil
+}
+
+// crossPackageDoc resolves the doc comment for the object identified by
+// (pkgPath, objPath) declared OUTSIDE the queried package: through the
+// workspace facts index if pkgPath is a root (workspace) package (see
+// xref.Resolver.SymbolDoc — the only source with recorded facts for one),
+// otherwise through ws.depProvider (internal/depcheck), which parses a
+// standard library/module dependency's own real source with comments —
+// gopls's own hover content for a dependency symbol (see depcheck.Provider.
+// DocAt's doc). Shared by handleHover and handleCompletionResolve
+// (completionDoc), the two consumers that show a cross-package object's doc
+// comment.
+func (s *Server) crossPackageDoc(ctx context.Context, pkgPath, objPath string) string {
+	ws := s.workspace()
+	if ws == nil {
+		return ""
+	}
+	if pkg, ok := ws.snap.Packages[pkgPath]; ok && pkg.Root {
+		if resolver, ok := s.resolverOrWarn(); ok {
+			if doc, ok := resolver.SymbolDoc(ctx, pkgPath, objPath); ok {
+				return doc
+			}
+		}
+		return ""
+	}
+	doc, err := ws.depProvider.DocAt(ctx, pkgPath, objPath)
+	if err != nil {
+		s.logger.Printf("server: dependency doc %s#%s: %v", pkgPath, objPath, err)
+		return ""
+	}
+	return doc
 }
 
 func hoverMarkdown(info *langfeat.HoverInfo) string {
@@ -189,7 +286,7 @@ func (s *Server) handleDocumentSymbol(ctx context.Context, params json.RawMessag
 	if ws == nil {
 		return protocol.DocumentSymbolSlice(nil), nil
 	}
-	cp, err := ws.engine.Get(ctx, path)
+	cp, err := s.resolveCheckedPackage(ctx, ws, path)
 	if err != nil {
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return protocol.DocumentSymbolSlice(nil), nil
@@ -304,7 +401,7 @@ func (s *Server) handleInlayHint(ctx context.Context, params json.RawMessage) (a
 	if ws == nil {
 		return []protocol.InlayHint{}, nil
 	}
-	cp, err := ws.engine.Get(ctx, path)
+	cp, err := s.resolveCheckedPackage(ctx, ws, path)
 	if err != nil {
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return []protocol.InlayHint{}, nil

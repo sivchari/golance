@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io/fs"
+	"math"
+	"os"
 	"strings"
 
 	"go.lsp.dev/protocol"
@@ -15,6 +17,7 @@ import (
 	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
 	"github.com/sivchari/golance/internal/rpc"
+	"github.com/sivchari/golance/internal/xref"
 )
 
 // registerNavHandlers registers the navigation and light editing-support LSP
@@ -85,21 +88,59 @@ func (s *Server) typeDefinitionSameFile(info *langfeat.TypeDefInfo) (any, error)
 }
 
 // typeDefinitionCrossPackage resolves a cross-package TypeDefInfo through
-// the on-disk facts index.
+// the on-disk facts index, falling back to dependencyTypeDeclaration when
+// the index has no answer — the facts index only ever covers root
+// (workspace) packages (internal/index/scheduler.go's doc), so a type
+// declared in the standard library or a module dependency always misses
+// there. Before dependencyTypeDeclaration existed, that miss was a silent
+// early return (PR #30's report); this now mirrors definitionFallback's
+// identical resolver-then-depProvider chain for plain "Go to Definition".
 func (s *Server) typeDefinitionCrossPackage(ctx context.Context, info *langfeat.TypeDefInfo) (any, error) {
-	resolver, ok := s.resolverOrWarn()
-	if !ok {
-		return protocol.LocationSlice(nil), nil
+	if resolver, ok := s.resolverOrWarn(); ok {
+		if loc, ok := resolver.TypeDeclaration(ctx, info.PkgPath, info.ObjPath); ok {
+			if pl, ok := s.correctResultLocation(loc); ok {
+				return protocol.LocationSlice{pl}, nil
+			}
+		}
 	}
-	loc, ok := resolver.TypeDeclaration(ctx, info.PkgPath, info.ObjPath)
-	if !ok {
-		return protocol.LocationSlice(nil), nil
+	if pl, ok := s.dependencyTypeDeclaration(ctx, info); ok {
+		return protocol.LocationSlice{pl}, nil
 	}
-	pl, ok := s.correctResultLocation(loc)
-	if !ok {
-		return protocol.LocationSlice(nil), nil
+	return protocol.LocationSlice(nil), nil
+}
+
+// dependencyTypeDeclaration is typeDefinitionCrossPackage's fallback for a
+// type declared in a standard library or module dependency package:
+// resolved through ws.depProvider (internal/depcheck), exact to the column
+// and able to see unexported dependency types, mirroring
+// dependencyDefinition's identical mechanism for plain "Go to Definition"
+// (see its doc, including the same root-package exclusion below and why it
+// exists).
+func (s *Server) dependencyTypeDeclaration(ctx context.Context, info *langfeat.TypeDefInfo) (protocol.Location, bool) {
+	ws := s.workspace()
+	if ws == nil {
+		return protocol.Location{}, false
 	}
-	return protocol.LocationSlice{pl}, nil
+	if pkg, ok := ws.snap.Packages[info.PkgPath]; ok && pkg.Root {
+		return protocol.Location{}, false
+	}
+	id, fset, err := ws.depProvider.DeclAt(ctx, info.PkgPath, info.ObjPath)
+	if err != nil {
+		s.logger.Printf("server: dependency type declaration %s#%s: %v", info.PkgPath, info.ObjPath, err)
+		return protocol.Location{}, false
+	}
+	start := fset.Position(id.Pos())
+	end := fset.Position(id.End())
+	if _, err := os.Stat(start.Filename); err != nil {
+		return protocol.Location{}, false
+	}
+	if start.Line <= 0 || int64(start.Line) > math.MaxUint32 ||
+		start.Column <= 0 || int64(start.Column) > math.MaxUint32 ||
+		end.Column <= 0 || int64(end.Column) > math.MaxUint32 {
+		return protocol.Location{}, false
+	}
+	loc := xref.Location{File: start.Filename, Line: uint32(start.Line), Col: uint32(start.Column), EndCol: uint32(end.Column)}
+	return s.correctResultLocation(loc)
 }
 
 // handleDeclaration answers textDocument/declaration. Go has no separate
@@ -183,7 +224,7 @@ func (s *Server) handleFoldingRange(ctx context.Context, params json.RawMessage)
 	if ws == nil {
 		return []protocol.FoldingRange{}, nil
 	}
-	cp, err := ws.engine.Get(ctx, path)
+	cp, err := s.resolveCheckedPackage(ctx, ws, path)
 	if err != nil {
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return []protocol.FoldingRange{}, nil
@@ -237,7 +278,7 @@ func (s *Server) handleSelectionRange(ctx context.Context, params json.RawMessag
 	if ws == nil {
 		return []protocol.SelectionRange{}, nil
 	}
-	cp, err := ws.engine.Get(ctx, path)
+	cp, err := s.resolveCheckedPackage(ctx, ws, path)
 	if err != nil {
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return []protocol.SelectionRange{}, nil
@@ -394,7 +435,7 @@ func (s *Server) handleDocumentLink(ctx context.Context, params json.RawMessage)
 	if ws == nil {
 		return []protocol.DocumentLink{}, nil
 	}
-	cp, err := ws.engine.Get(ctx, path)
+	cp, err := s.resolveCheckedPackage(ctx, ws, path)
 	if err != nil {
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return []protocol.DocumentLink{}, nil
@@ -492,7 +533,7 @@ func (s *Server) handleCompletionResolve(ctx context.Context, params json.RawMes
 	if ws == nil {
 		return &item, nil
 	}
-	cp, err := ws.engine.Get(ctx, key.File)
+	cp, err := s.resolveCheckedPackage(ctx, ws, key.File)
 	if err != nil {
 		s.logger.Printf("server: completion resolve %s: %v", key.File, err)
 		return &item, nil
@@ -512,8 +553,11 @@ func (s *Server) handleCompletionResolve(ctx context.Context, params json.RawMes
 }
 
 // completionDoc resolves info's doc comment: info.Doc directly if it is
-// already the answer (a same-package candidate), otherwise a facts-index
-// lookup for a cross-package one.
+// already the answer (a same-package candidate), otherwise crossPackageDoc
+// for a cross-package one (a workspace facts-index lookup for a root
+// package, internal/depcheck for a standard library/module dependency —
+// see its doc; handleHover shares the identical fallback for the same
+// reason).
 func (s *Server) completionDoc(ctx context.Context, info *langfeat.CompletionDocInfo) string {
 	if info.Doc != "" {
 		return info.Doc
@@ -521,10 +565,5 @@ func (s *Server) completionDoc(ctx context.Context, info *langfeat.CompletionDoc
 	if info.PkgPath == "" {
 		return ""
 	}
-	resolver, ok := s.resolverOrWarn()
-	if !ok {
-		return ""
-	}
-	doc, _ := resolver.SymbolDoc(ctx, info.PkgPath, info.ObjPath)
-	return doc
+	return s.crossPackageDoc(ctx, info.PkgPath, info.ObjPath)
 }
