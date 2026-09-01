@@ -130,6 +130,37 @@ func TestSnapshot_ExportFile_CachesRecoveredPath(t *testing.T) {
 	}
 }
 
+// TestSnapshot_ExportFile_CachesFailedRecovery verifies that a failed
+// reloadExportFile attempt is itself cached, not just a successful one (see
+// TestSnapshot_ExportFile_CachesRecoveredPath): a query-time caller must
+// never re-run the recovery subprocess on every call for a package whose
+// export data cannot be recovered. To prove the failure is actually cached
+// (rather than every call merely failing independently for its own
+// reasons), snap.dir is restored to a working directory after the first
+// (forced-to-fail) call: a fresh recovery attempt with that dir would now
+// succeed, so a second call that still reports ok=false can only mean the
+// cached failure was reused instead of retrying.
+func TestSnapshot_ExportFile_CachesFailedRecovery(t *testing.T) {
+	snap := loadTestdata(t)
+
+	stale := *snap.Packages[modA]
+	stale.ExportFile = filepath.Join(t.TempDir(), "does-not-exist-d")
+	snap.Packages[modA] = &stale
+
+	goodDir := snap.dir
+	snap.dir = filepath.Join(t.TempDir(), "does-not-exist-dir")
+
+	if _, ok := snap.ExportFile(modA); ok {
+		t.Fatalf("ExportFile(%s) with a broken dir = ok; want recovery to fail", modA)
+	}
+
+	snap.dir = goodDir
+
+	if _, ok := snap.ExportFile(modA); ok {
+		t.Errorf("ExportFile(%s) second call succeeded after the dir was fixed; want the cached failure reused instead of retrying recovery", modA)
+	}
+}
+
 func TestCache_RoundTrip(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("testdata", "simple"))
 	if err != nil {

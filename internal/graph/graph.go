@@ -47,17 +47,34 @@ type Snapshot struct {
 	buildFlags []string            // forwarded to packages.Config.BuildFlags on that same recovery path
 	revDeps    map[string][]string // import path -> direct importers present in the graph
 
-	// recovered caches, per import path, an export file path ExportFile
-	// has already recovered via reloadExportFile, so a later call for the
-	// same package after the same stat failure reuses it instead of paying
-	// for another recovery subprocess. A Snapshot is published once (via
-	// Load or LoadCache) and read concurrently by many request handlers
-	// from then on (see internal/server's atomic.Pointer[workspace]), so
-	// this cache — the one place ExportFile writes anything back — must be
-	// synchronized itself rather than a plain map; the Packages field
-	// above stays exactly as published, never mutated in place.
-	recovered sync.Map // string (import path) -> string (recovered export file path)
+	// recovered caches, per import path, the outcome of ExportFile's
+	// reloadExportFile fallback: either a recovered export file path, or —
+	// stored as the recoveryFailed sentinel — that recovery was already
+	// attempted and failed. Either way, a later call for the same package
+	// after the same stat failure reuses the cached outcome instead of
+	// paying for another recovery subprocess; without caching the failure
+	// case too, a query touching a package whose export data can never be
+	// recovered (e.g. a genuinely broken dependency) would re-run the
+	// expensive go/packages.Load on every single call for it. A Snapshot is
+	// published once (via Load or LoadCache) and read concurrently by many
+	// request handlers from then on (see internal/server's
+	// atomic.Pointer[workspace]), so this cache — the one place ExportFile
+	// writes anything back — must be synchronized itself rather than a
+	// plain map; the Packages field above stays exactly as published, never
+	// mutated in place. The cache lives only as long as this Snapshot: a
+	// later revalidateGraph/setWorkspace publishes a fresh Snapshot with an
+	// empty recovered map, so a dependency's export data that becomes
+	// recoverable again (e.g. after `go build` repopulates GOCACHE) is
+	// retried on the next graph reload rather than staying permanently
+	// failed.
+	recovered sync.Map // string (import path) -> string (recovered export file path, or recoveryFailed)
 }
+
+// recoveryFailed is the sentinel Snapshot.recovered stores for an import
+// path whose reloadExportFile fallback has already been tried and failed —
+// never a value reloadExportFile could itself return, since a real export
+// file path is never empty and never starts with NUL.
+const recoveryFailed = "\x00recovery-failed"
 
 // Options configures a Load call.
 type Options struct {
@@ -217,8 +234,13 @@ func (s *Snapshot) Dir() string { return s.dir }
 // as a permanent "no export data for path" to every caller for the rest of
 // this Snapshot's lifetime, ExportFile verifies the file still exists and,
 // if not, recovers with one scoped packages.Load for path alone — caching
-// the recovered path in s.recovered so every later call for path reuses it
-// instead of paying for another recovery subprocess.
+// the outcome, success or failure, in s.recovered so every later call for
+// path (this Snapshot's whole lifetime — see s.recovered's doc for how a
+// later Snapshot gets a fresh chance) reuses it instead of paying for
+// another recovery subprocess. This matters for a query-time caller in
+// particular: ExportFile must never become a place a request handler
+// synchronously re-runs go/packages.Load on every call for a package that
+// can never be recovered.
 func (s *Snapshot) ExportFile(path string) (string, bool) {
 	p, ok := s.Packages[path]
 	if !ok {
@@ -230,18 +252,22 @@ func (s *Snapshot) ExportFile(path string) (string, bool) {
 		}
 	}
 	if v, ok := s.recovered.Load(path); ok {
-		if recovered, ok := v.(string); ok {
-			if _, err := os.Stat(recovered); err == nil {
-				return recovered, true
-			}
+		recovered, _ := v.(string)
+		if recovered == recoveryFailed {
+			return "", false
+		}
+		if _, err := os.Stat(recovered); err == nil {
+			return recovered, true
 		}
 		s.recovered.Delete(path)
 	}
 	file, ok := reloadExportFile(s.dir, s.buildFlags, path)
 	if ok {
 		s.recovered.Store(path, file)
+		return file, true
 	}
-	return file, ok
+	s.recovered.Store(path, recoveryFailed)
+	return "", false
 }
 
 // reloadExportFile re-runs packages.Load for the single package pkgPath,

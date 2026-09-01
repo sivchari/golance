@@ -210,6 +210,40 @@ func (r *Resolver) resolveNamed(ctx context.Context, pkgPath, name string) (*typ
 	return named, nil
 }
 
+// Invalidate drops pkgPaths' decoded *types.Package entries from r's shared
+// export-data cache, so a later resolveNamed/resolveMethodFunc call
+// re-decodes fresh export data instead of silently reusing a *types.Package
+// decoded before pkgPaths' facts were last reindexed.
+//
+// This matters because r.cache is shared across every query for r's whole
+// lifetime (see the Resolver doc), while the underlying CAS blob a given
+// pkgPath's facts live in changes independently, via a didSave-triggered
+// [internal/index.Reindex] running concurrently with query handling.
+// gcexportdata.Read (which resolveNamed/resolveMethodFunc call through
+// [typecheck.ReadExport]) returns whatever *types.Package is already in the
+// imports map it is given for a path, without even looking at the newly
+// read bytes, once that path has been decoded into the map once — so
+// without this, a package queried once early in a session (e.g. an
+// interface whose method set later gains or loses a method) would keep
+// answering from that first decode forever, regardless of how many times
+// it is actually reindexed afterward. That is the "Go to Implementation
+// alternates between working and not" instability this exists to close:
+// whether a given package's cache entry happens to already be warm from an
+// earlier query is invisible to the caller, so the same query can look
+// flaky depending only on session history.
+//
+// Callers pass pkgPath plus its reverse-dependency closure ([graph.
+// Snapshot.ClosureUnits]), mirroring depCacheHolder.invalidate: an
+// importer's own decoded *types.Package can embed direct references to
+// pkgPath's now-superseded one (e.g. an embedded interface or struct
+// field), so it must be dropped and re-decoded too, even though its own
+// source content did not change.
+func (r *Resolver) Invalidate(pkgPaths []string) {
+	for _, p := range pkgPaths {
+		r.cache.Delete(p)
+	}
+}
+
 // fileIndexOf returns the index of file (an absolute path) in v's file
 // table, converting it to the same root-relative form the table stores
 // first when r.relative is set.
