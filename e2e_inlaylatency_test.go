@@ -324,6 +324,7 @@ func lineU32(t *testing.T, n int) uint32 {
 	t.Helper()
 	if n < 0 || int64(n) > math.MaxUint32 {
 		t.Fatalf("line index out of uint32 range: %d", n)
+		return 0
 	}
 	return uint32(n)
 }
