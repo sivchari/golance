@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"strings"
 	"sync"
 	"testing"
@@ -144,10 +143,10 @@ func TestServeOverFragmentedPipe(t *testing.T) {
 	pr, pw := io.Pipe()
 	go func() {
 		defer func() { _ = pw.Close() }()
-		rnd := rand.New(rand.NewSource(7))
+		rnd := newTestRand(7)
 		data := []byte(raw)
 		for len(data) > 0 {
-			n := 1 + rnd.Intn(31)
+			n := 1 + rnd.intn(31)
 			if n > len(data) {
 				n = len(data)
 			}
