@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.3.2](https://github.com/sivchari/golance/compare/v0.3.1...v0.3.2) - 2026-09-01
+- docs: add PR #51 to the v0.3.1 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/53
+- feat: load complete package metadata including test variants by @sivchari in https://github.com/sivchari/golance/pull/55
+- feat: source-checked dependency packages with exact positions by @sivchari in https://github.com/sivchari/golance/pull/56
+- feat: serve opened dependency files from source-checked packages by @sivchari in https://github.com/sivchari/golance/pull/57
+
 ## [v0.3.1](https://github.com/sivchari/golance/compare/v0.3.0...v0.3.1) - 2026-09-01
 - fix: report truncated streams and add context to framing errors by @sivchari in https://github.com/sivchari/golance/pull/49
 - fix: confirm implementers by signature fingerprints by @sivchari in https://github.com/sivchari/golance/pull/51
