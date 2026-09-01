@@ -2,6 +2,7 @@
 
 ## [v0.2.2](https://github.com/sivchari/golance/compare/v0.2.1...v0.2.2) - 2026-09-01
 - fix: resolve test-file query positions through the facts index by @sivchari in https://github.com/sivchari/golance/pull/41
+- fix: embedded-field and import-path definitions, implementation diagnostics by @sivchari in https://github.com/sivchari/golance/pull/43
 
 ## [v0.2.1](https://github.com/sivchari/golance/compare/v0.2.0...v0.2.1) - 2026-09-01
 - fix: resolve promoted methods and unify interface references by @sivchari in https://github.com/sivchari/golance/pull/39
