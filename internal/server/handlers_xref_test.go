@@ -252,7 +252,7 @@ func TestHandleDefinition_Stdlib(t *testing.T) {
 // case never touches export data (see langfeat.SamePackageDefinition), so
 // nothing here degrades.
 func TestHandleDefinition_NoIndex_SamePackage(t *testing.T) {
-	s, snap, _ := newTestServerNoIndex(t)
+	s, snap := newTestServerNoIndex(t)
 	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
 	pos := identPosition(t, file, 2) // call site in useHello
 
@@ -280,7 +280,7 @@ func TestHandleDefinition_NoIndex_SamePackage(t *testing.T) {
 // through dependencyDefinition's export-data path (langfeat.DependencyDefinition)
 // when the facts index is entirely unavailable, landing inside GOROOT.
 func TestHandleDefinition_NoIndex_Stdlib(t *testing.T) {
-	s, snap, _ := newTestServerNoIndex(t)
+	s, snap := newTestServerNoIndex(t)
 	pkg, ok := snap.Packages["example.com/servermod/depuse"]
 	if !ok || len(pkg.GoFiles) == 0 {
 		t.Fatal("depuse package not found in test workspace")
@@ -330,7 +330,7 @@ func TestHandleDefinition_NoIndex_Stdlib(t *testing.T) {
 // on stale grounds, exactly the failure TestE2E_WorktreeSharesIndex
 // reproduced. See dependencyDefinition's doc for the full mechanism.
 func TestHandleDefinition_NoIndex_OtherWorkspacePackage(t *testing.T) {
-	s, snap, _ := newTestServerNoIndex(t)
+	s, snap := newTestServerNoIndex(t)
 	depusePkg, ok := snap.Packages["example.com/servermod/depuse"]
 	if !ok || len(depusePkg.GoFiles) == 0 {
 		t.Fatal("depuse package not found in test workspace")

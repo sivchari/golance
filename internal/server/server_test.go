@@ -85,7 +85,7 @@ func newTestServer(t *testing.T) (*Server, *graph.Snapshot, string) {
 // ever Store'd on success (see lifecycle.go, buildIndexLocked).
 // resolverOrWarn reports ok=false against this server, the same as it
 // would against a real server whose facts index is unavailable.
-func newTestServerNoIndex(t *testing.T) (*Server, *graph.Snapshot, string) {
+func newTestServerNoIndex(t *testing.T) (*Server, *graph.Snapshot) {
 	t.Helper()
 	root, err := filepath.Abs(filepath.Join("testdata", "module"))
 	if err != nil {
@@ -100,7 +100,7 @@ func newTestServerNoIndex(t *testing.T) (*Server, *graph.Snapshot, string) {
 	s := New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(root, snap)
 
-	return s, snap, root
+	return s, snap
 }
 
 // identPosition parses path's on-disk content and returns the LSP Position
