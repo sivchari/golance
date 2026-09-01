@@ -5,10 +5,11 @@ import (
 	"testing"
 )
 
-// wantRefLoc asserts locs contains a reference at name's occurrence-th
-// (0-based) position of name in file.
-func wantRefLoc(t *testing.T, locs []Location, file, name string, occurrence int) {
+// wantRefLoc asserts locs contains a reference at the occurrence-th
+// (0-based) position of the "Say" identifier in file.
+func wantRefLoc(t *testing.T, locs []Location, file string, occurrence int) {
 	t.Helper()
+	const name = "Say"
 	positions := identOccurrences(t, file, name)
 	if len(positions) <= occurrence {
 		t.Fatalf("%s: found %d occurrences of %q, want at least %d", file, len(positions), name, occurrence+1)
@@ -72,8 +73,8 @@ func CallConcrete() string {
 	if len(locs) != 2 {
 		t.Fatalf("References(Talker.Say) = %+v, want 2 (interface-typed call + concrete-typed call)", locs)
 	}
-	wantRefLoc(t, locs, useFile, "Say", 0) // t.Say()
-	wantRefLoc(t, locs, useFile, "Say", 1) // impl.Concrete{}.Say()
+	wantRefLoc(t, locs, useFile, 0) // first occurrence: the interface-typed call
+	wantRefLoc(t, locs, useFile, 1) // second occurrence: the concrete-typed call
 }
 
 // TestReferences_InterfaceMethodIncludesPromotedConcreteCallSite is
@@ -135,8 +136,8 @@ func CallConcrete() string {
 	if len(locs) != 2 {
 		t.Fatalf("References(Talker.Say) = %+v, want 2 (interface-typed call + promoted concrete-typed call)", locs)
 	}
-	wantRefLoc(t, locs, useFile, "Say", 0) // t.Say()
-	wantRefLoc(t, locs, useFile, "Say", 1) // impl.Concrete{}.Say()
+	wantRefLoc(t, locs, useFile, 0) // first occurrence: the interface-typed call
+	wantRefLoc(t, locs, useFile, 1) // second occurrence: the promoted concrete-typed call
 }
 
 // TestReferences_NonMethodSymbolUnaffected pins that the interface <->
