@@ -2,6 +2,7 @@
 
 ## [v0.3.1](https://github.com/sivchari/golance/compare/v0.3.0...v0.3.1) - 2026-09-01
 - fix: report truncated streams and add context to framing errors by @sivchari in https://github.com/sivchari/golance/pull/49
+- fix: confirm implementers by signature fingerprints by @sivchari in https://github.com/sivchari/golance/pull/51
 
 ## [v0.3.0](https://github.com/sivchari/golance/compare/v0.2.2...v0.3.0) - 2026-09-01
 - docs: add PR #43 to the v0.2.2 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/45
