@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.3.0](https://github.com/sivchari/golance/compare/v0.2.2...v0.3.0) - 2026-09-01
+- docs: add PR #43 to the v0.2.2 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/45
+- fix: return minimal edits from organize imports by @sivchari in https://github.com/sivchari/golance/pull/47
+- feat: complete unimported packages and their members by @sivchari in https://github.com/sivchari/golance/pull/48
+- feat: complete unimported packages and their members by @sivchari in https://github.com/sivchari/golance/pull/48
+
 ## [v0.2.2](https://github.com/sivchari/golance/compare/v0.2.1...v0.2.2) - 2026-09-01
 - fix: resolve test-file query positions through the facts index by @sivchari in https://github.com/sivchari/golance/pull/41
 - fix: embedded-field and import-path definitions, implementation diagnostics by @sivchari in https://github.com/sivchari/golance/pull/43
