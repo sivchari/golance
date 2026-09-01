@@ -1,15 +1,49 @@
 package langfeat
 
 import (
+	"go/ast"
 	"go/token"
+	"go/types"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/sivchari/golance/internal/check"
 	"golang.org/x/tools/go/ast/astutil"
 )
+
+// ImportPathDefinition resolves offset (a byte offset from the start of
+// file) to the import path of the import spec whose quoted path string
+// contains it, for handleDefinition's "cursor is inside an import path"
+// case. Facts extraction records no types.Object use for an
+// *ast.ImportSpec's path -- it is a plain string literal, not an
+// identifier -- so SamePackageDefinition/DependencyDefinition, both keyed
+// on identAt finding an *ast.Ident at the cursor, can never answer this on
+// their own; this instead walks cp's own parsed AST directly, mirroring
+// ImportLinks' identical "facts index has nothing for this node" resolution
+// (see its doc). It returns ("", false) if offset is not inside any import
+// spec's path string or its path fails to unquote.
+func ImportPathDefinition(cp *check.CheckedPackage, file string, offset int) (pkgPath string, ok bool) {
+	astFile, pos, _, err := locate(cp, file, offset)
+	if err != nil {
+		return "", false
+	}
+	for _, imp := range astFile.Imports {
+		// <= End (not < End) accepts a query right after the closing quote,
+		// matching gopls's own importDefinition tolerance for the same case.
+		if pos < imp.Path.Pos() || pos > imp.Path.End() {
+			continue
+		}
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			return "", false
+		}
+		return path, true
+	}
+	return "", false
+}
 
 // SamePackageDefInfo is the result of a SamePackageDefinition query: the
 // identifier's own declaring identifier, located entirely from cp's
@@ -43,7 +77,7 @@ func SamePackageDefinition(cp *check.CheckedPackage, file string, offset int) (*
 	if id == nil {
 		return nil, nil
 	}
-	obj := cp.Info().ObjectOf(id)
+	obj := embeddedFieldTarget(cp.Info(), id, cp.Info().ObjectOf(id))
 	if obj == nil || obj.Pkg() == nil || obj.Pkg() != cp.Package() {
 		return nil, nil
 	}
@@ -60,6 +94,29 @@ func SamePackageDefinition(cp *check.CheckedPackage, file string, offset int) (*
 		return nil, nil
 	}
 	return &SamePackageDefInfo{File: tf.Name(), Range: rangeOf(tf, declID.Pos(), declID.End())}, nil
+}
+
+// embeddedFieldTarget redirects obj to the type it names, when id is an
+// embedded field's declaring identifier and obj is the implicit field
+// [types.Info.ObjectOf] resolves it to. An embedded field's identifier both
+// declares the field (recorded in info.Defs) and, simultaneously, names the
+// embedded type as a type expression (recorded in info.Uses) -- the same
+// dual role gopls's own definition handler special-cases for the same
+// reason (golang/go#42254): "Go to Definition" on the field's name should
+// jump to the embedded TYPE's declaration, not back to the field's own
+// (identical) position, which -- since ObjectOf prefers Defs over Uses --
+// would otherwise resolve to itself and never leave the cursor's current
+// position. Every other identifier kind passes through unchanged: only an
+// embedded field's *types.Var can carry this ambiguity at all.
+func embeddedFieldTarget(info *types.Info, id *ast.Ident, obj types.Object) types.Object {
+	v, ok := obj.(*types.Var)
+	if !ok || !v.Embedded() {
+		return obj
+	}
+	if typeName := info.Uses[id]; typeName != nil {
+		return typeName
+	}
+	return obj
 }
 
 // DependencyDefinitionInfo is the result of a DependencyDefinition query:
@@ -102,7 +159,7 @@ func DependencyDefinition(cp *check.CheckedPackage, depFset *token.FileSet, file
 	if id == nil {
 		return nil, nil
 	}
-	obj := cp.Info().ObjectOf(id)
+	obj := embeddedFieldTarget(cp.Info(), id, cp.Info().ObjectOf(id))
 	if obj == nil || obj.Pkg() == nil || obj.Pkg() == cp.Package() {
 		return nil, nil
 	}

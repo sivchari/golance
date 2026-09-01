@@ -4,15 +4,19 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
+	"github.com/sivchari/golance/internal/overlay"
 	"github.com/sivchari/golance/internal/rpc"
 )
 
@@ -237,6 +241,135 @@ func TestHandleDefinition_Stdlib(t *testing.T) {
 	}
 	if locs[0].Range.Start.Line == 0 {
 		t.Error("definition line = 0, want a real declaration line inside fmt/print.go")
+	}
+}
+
+// importPathPosition parses path's content and returns the LSP Position of
+// a byte inside importPath's quoted string in its import spec, the
+// counterpart of identPositionIn for a query position that is never on an
+// *ast.Ident.
+func importPathPosition(t *testing.T, path string, data []byte, importPath string) protocol.Position {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, data, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	for _, imp := range f.Imports {
+		unquoted, err := strconv.Unquote(imp.Path.Value)
+		if err != nil || unquoted != importPath {
+			continue
+		}
+		tf := fset.File(imp.Path.Pos())
+		offset := tf.Offset(imp.Path.Pos()) + 1 // inside the opening quote
+		pos, ok := overlay.UTF16PositionForByteOffset(data, offset)
+		if !ok {
+			t.Fatalf("%s: offset %d out of range", path, offset)
+		}
+		return pos
+	}
+	t.Fatalf("%s: import %q not found", path, importPath)
+	return protocol.Position{}
+}
+
+// TestHandleDefinition_ImportPath_Workspace covers "Go to Definition" on an
+// import spec's path string naming a different workspace (root) package:
+// facts extraction never indexes an *ast.ImportSpec (there is no
+// types.Object use/def for one), so this always falls through to
+// definitionFallback's importDefinition step, never the primary facts-index
+// path — unlike an ordinary cross-package identifier reference, which
+// resolver.Definition already answers directly.
+func TestHandleDefinition_ImportPath_Workspace(t *testing.T) {
+	s, snap, _ := newTestServer(t)
+	pkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(pkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	file := pkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	pos := importPathPosition(t, file, data, "example.com/servermod/greet")
+
+	result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleDefinition(import \"example.com/servermod/greet\"): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleDefinition(import greet): result = %#v, want a single location", result)
+	}
+	greetFile := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+	if got := locs[0].URI.FsPath(); got != greetFile {
+		t.Errorf("definition file = %q, want %q (greet's own package file)", got, greetFile)
+	}
+	greetSrc, err := os.ReadFile(filepath.Clean(greetFile))
+	if err != nil {
+		t.Fatalf("read %s: %v", greetFile, err)
+	}
+	wantLine := -1
+	for i, line := range strings.Split(string(greetSrc), "\n") {
+		if strings.HasPrefix(line, "package greet") {
+			wantLine = i
+			break
+		}
+	}
+	if wantLine < 0 {
+		t.Fatalf("test fixture: no package clause line found in %s", greetFile)
+	}
+	if int(locs[0].Range.Start.Line) != wantLine {
+		t.Errorf("definition line = %d, want %d (greet's package clause)", locs[0].Range.Start.Line, wantLine)
+	}
+}
+
+// TestHandleDefinition_ImportPath_Stdlib covers "Go to Definition" on an
+// import spec's path string naming a standard library package: unlike a
+// stdlib identifier reference (TestHandleDefinition_Stdlib, resolved
+// through the shared dependency importer's export data), this never
+// type-checks anything — internal/graph's Snapshot already has fmt's own
+// Go files from packages.Load's NeedFiles (see internal/graph's loadMode),
+// covering the whole transitive import graph, not just root packages.
+func TestHandleDefinition_ImportPath_Stdlib(t *testing.T) {
+	s, snap, _ := newTestServer(t)
+	pkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(pkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	file := pkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	pos := importPathPosition(t, file, data, "fmt")
+
+	result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleDefinition(import \"fmt\"): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleDefinition(import fmt): result = %#v, want a single location", result)
+	}
+	fmtPkg, ok := snap.Packages["fmt"]
+	if !ok || len(fmtPkg.GoFiles) == 0 {
+		t.Fatal("fmt package not found in the loaded graph")
+	}
+	if got, want := locs[0].URI.FsPath(), fmtPkg.GoFiles[0]; got != want {
+		t.Errorf("definition file = %q, want %q (fmt's first Go file, inside GOROOT)", got, want)
+	}
+	if _, err := os.Stat(locs[0].URI.FsPath()); err != nil {
+		t.Errorf("definition file %s does not exist on disk: %v", locs[0].URI.FsPath(), err)
 	}
 }
 
