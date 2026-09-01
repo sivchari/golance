@@ -64,6 +64,22 @@ func (r *Resolver) Implementation(ctx context.Context, file string, line, col in
 // matching methods of every interface interfacesImplementedBy would find
 // for its type.
 func (r *Resolver) implementationOfMethod(ctx context.Context, pkgPath string, target resolvedSymbol) ([]Location, error) {
+	named, err := r.methodReceiver(ctx, pkgPath, target)
+	if err != nil {
+		return nil, err
+	}
+	if types.IsInterface(named) {
+		return r.methodImplementations(ctx, named, target.Name)
+	}
+	return r.methodInterfaces(ctx, named, target.Name)
+}
+
+// methodReceiver resolves target's own *types.Func (via resolveMethodFunc)
+// and returns its receiver's named type, shared by implementationOfMethod's
+// dispatch above and correspondingMethodSymbols' below -- both need to
+// classify target's receiver as an interface or a concrete type before
+// picking a direction to search in.
+func (r *Resolver) methodReceiver(ctx context.Context, pkgPath string, target resolvedSymbol) (*types.Named, error) {
 	fn, err := r.resolveMethodFunc(ctx, pkgPath, target.IDHash)
 	if err != nil {
 		return nil, err
@@ -80,11 +96,29 @@ func (r *Resolver) implementationOfMethod(ctx context.Context, pkgPath string, t
 	if !ok {
 		return nil, fmt.Errorf("xref: receiver of %s is not a named type", target.Name)
 	}
+	return named, nil
+}
 
-	if types.IsInterface(named) {
-		return r.methodImplementations(ctx, named, target.Name)
+// correspondingMethodSymbols is implementationOfMethod's resolvedSymbol
+// counterpart, for References (see xref.go): given a method target, it
+// returns the matching method of every type on the other side of the same
+// interface/implementer relationship implementationOfMethod would list
+// Locations for, as resolvedSymbols a caller can feed back into
+// locationsFor. Only the interface -> implementers direction is wired into
+// References today (see its doc for why the reverse direction is omitted).
+func (r *Resolver) correspondingMethodSymbols(ctx context.Context, target resolvedSymbol) ([]resolvedSymbol, error) {
+	pkgPath, ok := r.pkgPathByHash[target.PkgHash]
+	if !ok {
+		return nil, fmt.Errorf("xref: unknown defining package for hash %d", target.PkgHash)
 	}
-	return r.methodInterfaces(ctx, named, target.Name)
+	named, err := r.methodReceiver(ctx, pkgPath, target)
+	if err != nil {
+		return nil, err
+	}
+	if !types.IsInterface(named) {
+		return nil, nil
+	}
+	return r.methodImplementationSymbols(ctx, named, target.Name)
 }
 
 // resolveMethodFunc decodes pkgPath's export data and looks up the
@@ -173,6 +207,18 @@ func (r *Resolver) implementationsOfInterface(ctx context.Context, named *types.
 // matching method location instead of the implementer type's own
 // declaration location.
 func (r *Resolver) methodImplementations(ctx context.Context, iface *types.Named, methodName string) ([]Location, error) {
+	syms, err := r.methodImplementationSymbols(ctx, iface, methodName)
+	if err != nil {
+		return nil, err
+	}
+	return r.locationsOfSymbols(ctx, syms), nil
+}
+
+// methodImplementationSymbols is methodImplementations' resolvedSymbol
+// counterpart: every implementer's matching method as a resolvedSymbol
+// rather than its declaration Location, for feeding into
+// correspondingMethodSymbols/locationsFor (see xref.go's References).
+func (r *Resolver) methodImplementationSymbols(ctx context.Context, iface *types.Named, methodName string) ([]resolvedSymbol, error) {
 	ifaceType, ok := iface.Underlying().(*types.Interface)
 	if !ok {
 		return nil, fmt.Errorf("xref: %s is not an interface", iface.Obj().Name())
@@ -186,15 +232,14 @@ func (r *Resolver) methodImplementations(ctx context.Context, iface *types.Named
 	if err != nil {
 		return nil, err
 	}
-	var out []Location
-	for entry, cnamed := range impls {
-		loc, ok := r.concreteMethodLocation(ctx, entry.PkgHash, cnamed, methodName)
+	var out []resolvedSymbol
+	for _, cnamed := range impls {
+		sym, ok := r.concreteMethodSymbol(cnamed, methodName)
 		if !ok {
 			continue
 		}
-		out = append(out, loc)
+		out = append(out, sym)
 	}
-	sortLocations(out)
 	return out, nil
 }
 
@@ -237,19 +282,22 @@ func (r *Resolver) implementingTypes(ctx context.Context, iface *types.Interface
 	return out, nil
 }
 
-// concreteMethodLocation returns the declaration location, in pkgHash's own
-// facts, of methodName in named's pointer method set -- the same superset
-// registerMethodSet indexed named's type entry under.
-func (r *Resolver) concreteMethodLocation(ctx context.Context, pkgHash uint64, named *types.Named, methodName string) (Location, bool) {
+// concreteMethodSymbol resolves methodName in named's pointer method set --
+// the same superset registerMethodSet indexed named's type entry under --
+// to its own resolvedSymbol. This is deliberately NOT keyed by named's own
+// package: when methodName is promoted from an embedded field, the *Func
+// [types.MethodSet] returns is the original declaration, whose Pkg() is the
+// embedded field's defining package, not named's (see methodFuncSymbol).
+func (r *Resolver) concreteMethodSymbol(named *types.Named, methodName string) (resolvedSymbol, bool) {
 	ms := types.NewMethodSet(types.NewPointer(named))
 	for i := 0; i < ms.Len(); i++ {
 		fn, ok := ms.At(i).Obj().(*types.Func)
 		if !ok || fn.Name() != methodName {
 			continue
 		}
-		return r.methodFuncLocation(ctx, pkgHash, fn)
+		return r.methodFuncSymbol(fn)
 	}
-	return Location{}, false
+	return resolvedSymbol{}, false
 }
 
 // interfacesImplementedBy finds every interface in the workspace that named
@@ -292,6 +340,17 @@ func (r *Resolver) interfacesImplementedBy(ctx context.Context, named *types.Nam
 // interface's matching method location instead of the interface's own
 // declaration location.
 func (r *Resolver) methodInterfaces(ctx context.Context, named *types.Named, methodName string) ([]Location, error) {
+	syms, err := r.methodInterfaceSymbols(ctx, named, methodName)
+	if err != nil {
+		return nil, err
+	}
+	return r.locationsOfSymbols(ctx, syms), nil
+}
+
+// methodInterfaceSymbols is methodInterfaces' resolvedSymbol counterpart:
+// every satisfied interface's matching method as a resolvedSymbol rather
+// than its declaration Location.
+func (r *Resolver) methodInterfaceSymbols(ctx context.Context, named *types.Named, methodName string) ([]resolvedSymbol, error) {
 	ms := types.NewMethodSet(types.NewPointer(named))
 	names := make([]string, ms.Len())
 	for i := 0; i < ms.Len(); i++ {
@@ -302,15 +361,14 @@ func (r *Resolver) methodInterfaces(ctx context.Context, named *types.Named, met
 	if err != nil {
 		return nil, err
 	}
-	var out []Location
-	for entry, iface := range ifaces {
-		loc, ok := r.interfaceMethodLocation(ctx, entry.PkgHash, iface, methodName)
+	var out []resolvedSymbol
+	for _, iface := range ifaces {
+		sym, ok := r.interfaceMethodSymbol(iface, methodName)
 		if !ok {
 			continue
 		}
-		out = append(out, loc)
+		out = append(out, sym)
 	}
-	sortLocations(out)
 	return out, nil
 }
 
@@ -356,40 +414,75 @@ func (r *Resolver) implementedInterfaces(ctx context.Context, named *types.Named
 	return out, nil
 }
 
-// interfaceMethodLocation returns the declaration location, in pkgHash's
-// own facts, of methodName among iface's directly declared methods -- the
-// same set registerInterfaceMethodSet indexed iface's type entry under.
-func (r *Resolver) interfaceMethodLocation(ctx context.Context, pkgHash uint64, iface *types.Interface, methodName string) (Location, bool) {
+// interfaceMethodSymbol resolves methodName among iface's directly declared
+// methods -- the same set registerInterfaceMethodSet indexed iface's type
+// entry under -- to its own resolvedSymbol. Like concreteMethodSymbol, this
+// is deliberately NOT keyed by iface's own package: [types.Interface.
+// Method] flattens methods promoted from an embedded interface without
+// changing their Pkg(), which stays the embedded interface's own defining
+// package (see methodFuncSymbol).
+func (r *Resolver) interfaceMethodSymbol(iface *types.Interface, methodName string) (resolvedSymbol, bool) {
 	for i := 0; i < iface.NumMethods(); i++ {
 		fn := iface.Method(i)
 		if fn.Name() != methodName {
 			continue
 		}
-		return r.methodFuncLocation(ctx, pkgHash, fn)
+		return r.methodFuncSymbol(fn)
 	}
-	return Location{}, false
+	return resolvedSymbol{}, false
 }
 
-// methodFuncLocation recomputes fn's own SymbolID the same way facts
-// extraction did for its defining identifier (see index's symbolID) and
-// looks it up in pkgHash's facts, giving fn's exact declaration position.
-// This is necessary because fn -- decoded from export data via
-// resolveNamed/resolveMethodFunc -- carries a token.Pos whose column
-// information export data does not preserve; facts, built directly from
-// the AST at index time, do.
-func (r *Resolver) methodFuncLocation(ctx context.Context, pkgHash uint64, fn *types.Func) (Location, bool) {
-	pkgPath, ok := r.pkgPathByHash[pkgHash]
-	if !ok {
-		return Location{}, false
-	}
+// methodFuncSymbol resolves fn to the resolvedSymbol facts extraction
+// recorded for it, by recomputing its SymbolID the same way index's
+// symbolID did for its defining identifier: fn.Pkg().Path() plus its
+// objectpath, exactly as symbolID built it from obj.Pkg().Path() (see
+// index/facts.go). Deriving the package from fn itself -- rather than from
+// whatever candidate/interface type's method set fn was reached through --
+// is what makes this correct for a promoted method: [types.MethodSet] and
+// [types.Interface.Method] both return promoted methods as the same *Func
+// object their embedding type/interface originally declared, so fn.Pkg()
+// is that ORIGINAL declaring package, not the embedder's. Using the
+// embedder's package instead (as this used to) builds a SymbolID nothing
+// was ever indexed under, silently dropping every implementation/reference
+// that only exists via struct or interface embedding.
+func (r *Resolver) methodFuncSymbol(fn *types.Func) (resolvedSymbol, bool) {
+	pkgPath := fn.Pkg().Path()
 	enc := new(objectpath.Encoder)
 	objPath, err := enc.For(fn)
 	if err != nil {
-		return Location{}, false
+		return resolvedSymbol{}, false
 	}
-	idHash := store.Hash(store.BuildSymbolID(pkgPath, string(objPath)))
-	_, _, loc, ok := r.symbolByHash(ctx, pkgHash, idHash)
-	return loc, ok
+	return resolvedSymbol{
+		PkgHash: store.Hash(pkgPath),
+		IDHash:  store.Hash(store.BuildSymbolID(pkgPath, string(objPath))),
+		Kind:    index.KindMethod,
+		Name:    fn.Name(),
+	}, true
+}
+
+// locationsOfSymbols resolves each of syms to its declaration Location via
+// symbolByHash, silently dropping any that no longer resolve (e.g. a
+// candidate whose package fell out of the indexed workspace between the
+// symbol lookup and this call), and returns them deduplicated and sorted.
+// Deduplication matters here specifically: two distinct implementers can
+// resolve the SAME method name to the identical underlying declaration --
+// e.g. a helper type that both (a) gets embedded into some implementer,
+// contributing this method to it by promotion, and (b) happens to satisfy
+// the interface entirely on its own too -- so the candidate list this
+// builds from can legitimately contain two different concrete types whose
+// resolvedSymbol for methodName is nonetheless the same Func.
+func (r *Resolver) locationsOfSymbols(ctx context.Context, syms []resolvedSymbol) []Location {
+	var out []Location
+	for _, s := range syms {
+		_, _, loc, ok := r.symbolByHash(ctx, s.PkgHash, s.IDHash)
+		if !ok {
+			continue
+		}
+		out = append(out, loc)
+	}
+	out = dedupeLocations(out)
+	sortLocations(out)
+	return out
 }
 
 // candidatesByAllMethods returns every MethodEntry of kind wantKind recorded
