@@ -85,18 +85,17 @@ func TestE2EInlayHintLatencyProfile(t *testing.T) {
 	// rangeVariableTypes, compositeLiteralFields/Types, constantValues,
 	// functionTypeParameters), patterned like generated/DTO-heavy files
 	// gopls users report slow inlay hints on.
-	const numBlocks = 400
-	bigSrc := genLatencySource(numBlocks)
+	bigSrc := genLatencySource(latencyNumBlocks)
 	bigFile := writeE2EFile(t, root, "big/big.go", bigSrc)
 	lines := strings.Split(bigSrc, "\n")
-	t.Logf("generated file: %d lines, %d bytes, %d blocks", len(lines), len(bigSrc), numBlocks)
+	t.Logf("generated file: %d lines, %d bytes, %d blocks", len(lines), len(bigSrc), latencyNumBlocks)
 
 	// Every package the "cold" subtests below query, written up front (see
 	// the test's own doc for why).
-	coldHoverFile, coldHoverSrc := newLatencyPackageSource(root, "coldhover", numBlocks)
-	coldInlayFullFile, coldInlayFullSrc := newLatencyPackageSource(root, "coldinlayfull", numBlocks)
-	coldInlayVPFile, coldInlayVPSrc := newLatencyPackageSource(root, "coldinlayvp", numBlocks)
-	coldSemFile, _ := newLatencyPackageSource(root, "coldsem", numBlocks)
+	coldHoverFile, coldHoverSrc := newLatencyPackageSource(root, "coldhover")
+	coldInlayFullFile, coldInlayFullSrc := newLatencyPackageSource(root, "coldinlayfull")
+	coldInlayVPFile, coldInlayVPSrc := newLatencyPackageSource(root, "coldinlayvp")
+	coldSemFile, _ := newLatencyPackageSource(root, "coldsem")
 
 	c := startClient(t, root)
 	initializeWithInlayRefresh(t, c, root)
@@ -112,11 +111,16 @@ func TestE2EInlayHintLatencyProfile(t *testing.T) {
 	fullRange := protocol.Range{End: endOfDocument(bigSrc)}
 	// viewportRange mimics what an editor actually sends: the visible
 	// portion of the file around the middle, not the whole document.
-	viewportRange := protocol.Range{
-		Start: protocol.Position{Line: uint32(len(lines) / 2), Character: 0},
-		End:   protocol.Position{Line: uint32(len(lines)/2 + 40), Character: 0},
+	mid := len(lines) / 2
+	if mid <= 0 || mid > math.MaxInt32 {
+		t.Fatalf("unexpected generated file size: %d lines", len(lines))
 	}
-	midPos := protocol.Position{Line: uint32(len(lines) / 2), Character: 1}
+	midLine := uint32(mid)
+	viewportRange := protocol.Range{
+		Start: protocol.Position{Line: midLine, Character: 0},
+		End:   protocol.Position{Line: midLine + 40, Character: 0},
+	}
+	midPos := protocol.Position{Line: midLine, Character: 1}
 
 	t.Run("cold", func(t *testing.T) {
 		// Each subcase opens its own never-yet-queried package (same shape
@@ -325,8 +329,8 @@ func midPosition(src string) protocol.Position {
 // bigFile's already-warmed check.Engine cache entry. Callers must write
 // every such package before starting the client (see
 // TestE2EInlayHintLatencyProfile's own doc for why).
-func newLatencyPackageSource(root, pkgName string, numBlocks int) (path, src string) {
-	src = genLatencySource(numBlocks)
+func newLatencyPackageSource(root, pkgName string) (path, src string) {
+	src = genLatencySource(latencyNumBlocks)
 	src = strings.Replace(src, "package biglatency", "package "+pkgName, 1)
 	path = filepath.Join(root, filepath.FromSlash(pkgName), pkgName+".go")
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
@@ -346,6 +350,10 @@ func newLatencyPackageSource(root, pkgName string, numBlocks int) (path, src str
 // types), constantValues (an iota block), and functionTypeParameters (a
 // generic call with inferred type arguments) — patterned after the
 // generated/DTO-heavy files gopls users report slow inlay hints on.
+// latencyNumBlocks is the shared size of every generated latency-test
+// package, so cold packages match bigSrc's shape exactly.
+const latencyNumBlocks = 400
+
 func genLatencySource(numBlocks int) string {
 	var b strings.Builder
 	b.WriteString(`package biglatency
