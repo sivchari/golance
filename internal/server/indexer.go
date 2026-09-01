@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"go.lsp.dev/protocol"
 
@@ -122,9 +124,67 @@ func casDir(root string) string {
 // package doc). Unlike the pre-redesign single shared database, this is
 // always private to root — never shared with another worktree, even of the
 // same repository — so two golance sessions for different worktrees never
-// contend for it and no lock or fallback path is ever needed.
+// contend for it. Two golance sessions for the *same* root (e.g. the same
+// folder open in two editor windows) still contend on this one file's
+// exclusive lock, exactly as the pre-redesign database did; see
+// privateIndexDBFile and switchToPrivateIndex for how a second such session
+// now falls back instead of losing cross-reference functionality entirely.
 func indexDBFile(root string) string {
 	return cacheDBFile("index", root)
+}
+
+// privateIndexInfix marks a per-session-private index database file (see
+// privateIndexDBFile), embedded in its filename between indexDBFile's own
+// name and the .db extension so cleanupOrphanedPrivateIndexes' glob can
+// recognize one without ever matching the shared file itself, whose name
+// never contains this substring.
+const privateIndexInfix = ".private-"
+
+// privateIndexDBFile returns the session-private index database path this
+// session uses for root once it has switched away from the shared one (see
+// switchToPrivateIndex): the same base name indexDBFile(root) would use,
+// with sessionID spliced in via privateIndexInfix so two sessions (or, in a
+// test binary, two Server instances sharing one process) never collide on
+// the same private path. Never shared with any other session — maintained
+// solely by this session's own indexer subprocess and didSave-triggered
+// reindexes for as long as the session lives (see Server.Stop), giving it
+// full cross-reference functionality independent of whichever session
+// currently holds the shared database's lock.
+//
+// Future work (out of scope for this fallback): golance does not attempt
+// to reconcile a session-private index back into the shared one, run any
+// daemon to arbitrate a single shared writer, or adopt the shared file
+// read-only mid-session once its lock frees up. A session that fell back
+// to a private index keeps using it for its own remaining lifetime.
+func privateIndexDBFile(root, sessionID string) string {
+	shared := indexDBFile(root)
+	return strings.TrimSuffix(shared, ".db") + privateIndexInfix + sessionID + ".db"
+}
+
+// privateIndexGlobPattern returns the filepath.Glob pattern matching every
+// session-private index database file for root, live or orphaned — used by
+// cleanupOrphanedPrivateIndexes at startup. It never matches the shared
+// index file itself (see privateIndexInfix).
+func privateIndexGlobPattern(root string) string {
+	shared := indexDBFile(root)
+	return strings.TrimSuffix(shared, ".db") + privateIndexInfix + "*.db"
+}
+
+// newSessionID returns an identifier unique to one Server instance, not
+// just one OS process: two Server values constructed within the same test
+// binary (sharing one PID) must still resolve to different private index
+// paths (see privateIndexDBFile), so a PID alone is not enough. Random
+// bytes make collision effectively impossible regardless of how many
+// Server instances a given process ever creates.
+func newSessionID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Exceedingly unlikely (crypto/rand failing means the OS's own
+		// entropy source is broken), but a session must still get some
+		// usable, if weaker, identifier rather than fail to start.
+		return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%d-%x", os.Getpid(), b)
 }
 
 func cacheDBFile(prefix, key string) string {
@@ -140,10 +200,39 @@ func cacheBaseDir() string {
 }
 
 // dbPath returns the per-root index database path this session uses for
-// root (see indexDBFile) — a pure function of root, computed fresh on every
-// call: unlike the pre-redesign design, there is no shared-file contention
-// to probe for, so there is nothing to decide once and remember.
-func (s *Server) dbPath(root string) string { return indexDBFile(root) }
+// root: the shared one (indexDBFile) in the ordinary case, or this
+// session's own private one (privateIndexDBFile) once switchToPrivateIndex
+// has recorded that the shared database is locked by another live session.
+// Unlike the pre-fallback design, this is no longer a pure function of root
+// alone — s.usePrivateIndex makes the switch sticky for the rest of the
+// session, so every caller (tryWarmOpen, buildIndexLocked, revalidateIndex
+// via buildIndexLocked, and Stop's own cleanup) keeps agreeing on the same
+// path once it has been made.
+func (s *Server) dbPath(root string) string {
+	if s.usePrivateIndex.Load() {
+		return privateIndexDBFile(root, s.sessionID)
+	}
+	return indexDBFile(root)
+}
+
+// switchToPrivateIndex records that this session has fallen back to its own
+// private facts index (see privateIndexDBFile) after finding the shared one
+// locked by another live session, and logs one clear informational message
+// about it — deliberately via logMessage (the client's log/output panel),
+// not showMessage's modal popup, since this is an expected, self-resolving
+// situation for a normal multi-editor workflow, not a failure the user
+// needs to act on (contrast warnIndexUnavailable). Idempotent and safe to
+// call from multiple call sites that can each independently detect the same
+// lock (tryWarmOpen, and buildIndexLocked's own retry) — only the first
+// call within a session logs anything.
+func (s *Server) switchToPrivateIndex() {
+	if !s.usePrivateIndex.CompareAndSwap(false, true) {
+		return
+	}
+	const msg = "shared index locked by another session; building a session-private index"
+	s.logger.Printf("golance: %s", msg)
+	s.logMessage(protocol.MessageTypeInfo, "golance: "+msg)
+}
 
 // tryWarmOpen opens root's existing per-root index database and CAS
 // directly, if the database exists, without waiting for any revalidation.
@@ -152,6 +241,13 @@ func (s *Server) dbPath(root string) string { return indexDBFile(root) }
 // aside — still has to enumerate every workspace package before confirming
 // nothing changed. It reports ok=false if no database exists yet, in which
 // case the caller should fall back to buildIndex.
+//
+// If the shared database exists but is currently locked by another live
+// session (store.IsLocked), this switches the session over to its own
+// private index (switchToPrivateIndex) and reports ok=false exactly as the
+// "no database yet" case does: buildIndex's subsequent dbPath call then
+// resolves to the private path, so it builds and opens that instead of
+// repeating the same failed shared-path attempt.
 //
 // The database opened here may be stale — built under a different
 // toolchain, or missing changes made outside this session since it was
@@ -167,7 +263,11 @@ func (s *Server) tryWarmOpen(root string) (*indexState, bool) {
 	}
 	db, err := store.Open(dbPath)
 	if err != nil {
-		s.logger.Printf("golance: warm-open index: %v", err)
+		if store.IsLocked(err) {
+			s.switchToPrivateIndex()
+		} else {
+			s.logger.Printf("golance: warm-open index: %v", err)
+		}
 		return nil, false
 	}
 	cas, err := store.OpenCAS(casDir(root))
@@ -291,18 +391,42 @@ func (s *Server) buildIndex(ctx context.Context, root string) {
 	s.buildIndexLocked(ctx, root)
 }
 
+// buildIndexLocked runs one indexer subprocess build against s.dbPath(root)
+// (the shared path in the ordinary case) and installs its result. If that
+// attempt finds the target database locked by another live session
+// (runIndexBuild's locked return), it switches this session to its own
+// private index (switchToPrivateIndex) and retries exactly once, now
+// against the private path — covering not only the common case (tryWarmOpen
+// already detected the lock before ever getting here, so s.dbPath(root)
+// already resolves to the private path on this very first call) but also
+// two sessions racing a cold start against the same not-yet-existing shared
+// database at once, which tryWarmOpen alone cannot catch (see its doc).
 func (s *Server) buildIndexLocked(ctx context.Context, root string) {
 	dbPath := s.dbPath(root)
+	if !s.runIndexBuild(ctx, root, dbPath) {
+		return
+	}
+	s.switchToPrivateIndex()
+	s.runIndexBuild(ctx, root, s.dbPath(root))
+}
+
+// runIndexBuild launches the indexer subprocess targeting dbPath, relays
+// its progress, waits for it, and installs the result via
+// openIndexAfterBuild. It reports locked=true when dbPath turned out to be
+// held by another live session — the only outcome buildIndexLocked's retry
+// reacts to; every other failure (reported via warnIndexUnavailable inside)
+// is left as-is; there is nothing a different path would fix.
+func (s *Server) runIndexBuild(ctx context.Context, root, dbPath string) (locked bool) {
 	cas := casDir(root)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
 		s.warnIndexUnavailable(fmt.Sprintf("create index directory: %v", err))
-		return
+		return false
 	}
 
 	exe, err := os.Executable()
 	if err != nil {
 		s.warnIndexUnavailable(fmt.Sprintf("resolve golance executable: %v", err))
-		return
+		return false
 	}
 
 	cmd := spawnIndexer(ctx, exe)
@@ -326,14 +450,14 @@ func (s *Server) buildIndexLocked(ctx context.Context, root string) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		s.warnIndexUnavailable(fmt.Sprintf("start indexer: %v", err))
-		return
+		return false
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Start(); err != nil {
 		s.warnIndexUnavailable(fmt.Sprintf("start indexer: %v", err))
-		return
+		return false
 	}
 
 	done := make(chan struct{})
@@ -344,48 +468,128 @@ func (s *Server) buildIndexLocked(ctx context.Context, root string) {
 
 	waitErr := cmd.Wait()
 	<-done
-	s.openIndexAfterBuild(dbPath, waitErr, stderr.String())
+	return s.openIndexAfterBuild(ctx, dbPath, waitErr, stderr.String())
 }
 
 // openIndexAfterBuild opens dbPath and this session's CAS directory and
 // installs them as the server's facts index, once the indexer subprocess
-// that was building them has exited.
+// that was building them has exited. On success, it also reindexes any
+// package handleDidSave recorded dirty while no index was available (see
+// drainDirty), so a save that landed during that window is not lost.
 //
 // waitErr is the subprocess's exit error (nil on success). If waitErr is
 // non-nil and dbPath does not exist at all, this reports the original
 // failure via window/showMessage and gives up: nothing was ever
 // successfully indexed for this root, so there is no database to fall
-// back to. Otherwise — success, or a failure with a database already on
-// disk from an earlier run — it opens dbPath anyway, warning (on failure)
-// that the result may be stale or incomplete. stderrText is the
+// back to. Otherwise it attempts to open dbPath anyway — success, or a
+// failure with a database already on disk from an earlier run, stale or
+// incomplete being strictly better than unavailable. stderrText is the
 // subprocess's captured stderr, included in the failure report.
-func (s *Server) openIndexAfterBuild(dbPath string, waitErr error, stderrText string) {
+//
+// It reports locked=true when the only reason dbPath could not be opened
+// is that another live session currently holds its exclusive lock (see
+// store.IsLocked) — checked before the "stale index" warning below fires,
+// so that warning is never shown for a build this session is about to
+// discard and retry against a private path instead (see
+// buildIndexLocked). runIndexBuild's caller uses this to retry once
+// against a session-private path (see switchToPrivateIndex) instead of
+// leaving the facts index unavailable the way an ordinary open failure
+// does.
+func (s *Server) openIndexAfterBuild(ctx context.Context, dbPath string, waitErr error, stderrText string) (locked bool) {
 	if waitErr != nil {
 		if _, statErr := os.Stat(dbPath); statErr != nil {
 			s.warnIndexUnavailable(fmt.Sprintf("build index: %v (%s)", waitErr, strings.TrimSpace(stderrText)))
-			return
+			return false
 		}
-		s.logger.Printf("golance: indexer exited with an error (%v: %s); opening the existing index, which may be stale or incomplete", waitErr, strings.TrimSpace(stderrText))
-		s.showMessage(protocol.MessageTypeWarning, "golance: index build failed; opening the previous index, which may be stale or incomplete")
 	}
 
 	db, err := store.Open(dbPath)
 	if err != nil {
+		if store.IsLocked(err) {
+			return true
+		}
 		s.warnIndexUnavailable(fmt.Sprintf("open index: %v", err))
-		return
+		return false
 	}
+
+	if waitErr != nil {
+		s.logger.Printf("golance: indexer exited with an error (%v: %s); opening the existing index, which may be stale or incomplete", waitErr, strings.TrimSpace(stderrText))
+		s.showMessage(protocol.MessageTypeWarning, "golance: index build failed; opening the previous index, which may be stale or incomplete")
+	}
+
 	ws := s.workspace()
 	if ws == nil {
 		_ = db.Close()
-		return
+		return false
 	}
 	cas, err := store.OpenCAS(casDir(ws.root))
 	if err != nil {
 		s.warnIndexUnavailable(fmt.Sprintf("open CAS: %v", err))
 		_ = db.Close()
-		return
+		return false
 	}
 	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, ws.snap, RelativeIndexPaths(ws.root))})
+	s.drainDirty(ctx, ws)
+	return false
+}
+
+// closePrivateIndex closes and removes this session's own private facts
+// index database (see switchToPrivateIndex/privateIndexDBFile), if this
+// session ever built one — a no-op otherwise, and it never touches the
+// shared index, which other live sessions may still be using. Called from
+// Stop, after Serve has returned and drained every in-flight query (see
+// Stop's own doc), so closing s.idx's db handle here cannot race a
+// concurrent reader.
+func (s *Server) closePrivateIndex() {
+	if !s.usePrivateIndex.Load() {
+		return
+	}
+	if idx := s.idx.Load(); idx != nil {
+		if err := idx.db.Close(); err != nil {
+			s.logger.Printf("golance: close private index: %v", err)
+		}
+	}
+	ws := s.workspace()
+	if ws == nil {
+		return
+	}
+	path := privateIndexDBFile(ws.root, s.sessionID)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		s.logger.Printf("golance: remove private index %s: %v", path, err)
+	}
+}
+
+// cleanupOrphanedPrivateIndexes removes stale session-private index
+// database files (see privateIndexDBFile) left behind by a session that
+// crashed, or was killed, before its own Stop could remove them: a private
+// file is bound to exactly one session's lifetime, so nothing else should
+// ever hold its lock once its owning process is gone. It walks root's
+// cache directory for files matching the private-suffix pattern
+// (privateIndexGlobPattern — the shared index file itself is never
+// matched) and removes any whose bbolt lock can be acquired immediately
+// (store.TryClaimAbandoned): a file still genuinely in use by another live
+// session fails that probe and is left untouched, exactly like the shared
+// file always is.
+//
+// This is opportunistic best-effort housekeeping, not required for
+// correctness (an orphan left behind is otherwise harmless — it is simply
+// never opened by anything again), so callers run it via s.rpc.Go in the
+// background rather than blocking "initialize" on it.
+func (s *Server) cleanupOrphanedPrivateIndexes(root string) {
+	ownPath := privateIndexDBFile(root, s.sessionID)
+	matches, err := filepath.Glob(privateIndexGlobPattern(root))
+	if err != nil {
+		s.logger.Printf("golance: glob orphaned private indexes: %v", err)
+		return
+	}
+	for _, path := range matches {
+		if path == ownPath {
+			continue // this session's own private index, still in use
+		}
+		if store.TryClaimAbandoned(path) {
+			s.logger.Printf("golance: removed orphaned private index %s", path)
+		}
+	}
 }
 
 func (s *Server) warnIndexUnavailable(detail string) {

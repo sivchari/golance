@@ -80,6 +80,11 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 		s.rpc.Go(func(ctx context.Context) { s.buildIndex(ctx, root) })
 	}
 
+	// Opportunistic, never blocking this request: remove any session-private
+	// index files (see privateIndexDBFile) a crashed prior session left
+	// behind for this root.
+	s.rpc.Go(func(context.Context) { s.cleanupOrphanedPrivateIndexes(root) })
+
 	return &protocol.InitializeResult{
 		Capabilities: s.capabilities(),
 		ServerInfo:   protocol.ServerInfo{Name: "golance", Version: protocol.NewOptional(Version)},

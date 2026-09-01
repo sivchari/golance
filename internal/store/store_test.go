@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -313,6 +314,83 @@ func TestOpen_SecondOpenOnLockedDatabaseReturnsAnErrorInsteadOfHanging(t *testin
 	}
 	if elapsed >= openTimeout+2*time.Second {
 		t.Fatalf("second Open() took %s to fail, want it to fail at around openTimeout (%s) instead of hanging", elapsed, openTimeout)
+	}
+	if !IsLocked(err) {
+		t.Errorf("IsLocked(%v) = false, want true", err)
+	}
+}
+
+// TestIsLocked_OrdinaryErrorIsNotLocked verifies IsLocked does not treat an
+// unrelated open failure (here, a missing parent directory) as a lock
+// timeout — internal/server's fallback logic must only trigger on genuine
+// contention, not any open error.
+func TestIsLocked_OrdinaryErrorIsNotLocked(t *testing.T) {
+	_, err := Open(filepath.Join(t.TempDir(), "missing-dir", "index.db"))
+	if err == nil {
+		t.Fatal("Open() into a missing parent directory succeeded, want an error")
+	}
+	if IsLocked(err) {
+		t.Errorf("IsLocked(%v) = true, want false for a non-lock open failure", err)
+	}
+}
+
+// TestTryClaimAbandoned_UnlockedFileIsRemoved verifies that a database file
+// nothing currently holds open (the orphan left behind by a session that
+// exited without cleaning up after itself — see internal/server's
+// cleanupOrphanedPrivateIndexes) is claimed and removed.
+func TestTryClaimAbandoned_UnlockedFileIsRemoved(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "orphan.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if !TryClaimAbandoned(path) {
+		t.Fatal("TryClaimAbandoned() on an unlocked file = false, want true")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("os.Stat(%s) after TryClaimAbandoned = %v, want IsNotExist", path, err)
+	}
+}
+
+// TestTryClaimAbandoned_LockedFileIsLeftAlone verifies that a database file
+// still genuinely held open by a live process is left untouched — the
+// counterpart property to TestTryClaimAbandoned_UnlockedFileIsRemoved,
+// guarding against a cleanup pass ever deleting a private index another
+// session is still actively using.
+func TestTryClaimAbandoned_LockedFileIsLeftAlone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "in-use.db")
+	held, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := held.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	if TryClaimAbandoned(path) {
+		t.Fatal("TryClaimAbandoned() on a locked file = true, want false")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("os.Stat(%s) after TryClaimAbandoned on a locked file = %v, want it to still exist", path, err)
+	}
+}
+
+// TestTryClaimAbandoned_MissingFile verifies TryClaimAbandoned reports
+// false without creating path, for a file that no longer exists (e.g.
+// already removed by a racing cleanup pass in another session).
+func TestTryClaimAbandoned_MissingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "never-existed.db")
+	if TryClaimAbandoned(path) {
+		t.Fatal("TryClaimAbandoned() on a nonexistent file = true, want false")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("TryClaimAbandoned() created %s, want it to remain absent", path)
 	}
 }
 

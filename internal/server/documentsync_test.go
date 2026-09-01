@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sivchari/golance/internal/store"
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 )
@@ -67,4 +68,88 @@ func TestHandleDidSave_ReindexNeverOrphanedByShutdown(t *testing.T) {
 	// Reaching here means Serve's own wg.Wait() drained the s.rpc.Go-tracked
 	// reindex goroutine before Serve returned — it neither outlived the
 	// session nor panicked.
+}
+
+// TestHandleDidSave_ReindexedOnceIndexBecomesAvailable is a regression test
+// for the didSave hole PR #30 left open: handleDidSave silently skipped its
+// reindex whenever s.idx was nil (index still building, or briefly swapped
+// out mid revalidateIndex) and never retried, permanently losing that save.
+//
+// It saves greet.go while s.idx is nil (via newTestServerNoIndex), which
+// must record the package as dirty (markDirty) instead of reindexing
+// immediately; the new content — a brand-new exported symbol — is tracked
+// only via the overlay (DidOpen), never written to the on-disk testdata
+// fixture. Once an index becomes available — built here from the
+// unmodified on-disk content, the same snapshot a build already in flight
+// when the save happened would have used — installing it (via
+// openIndexAfterBuild, exactly as a real build completion does) must drain
+// the dirty set and reindex greet, so the new symbol becomes visible via
+// workspace/symbol without any further save.
+func TestHandleDidSave_ReindexedOnceIndexBecomesAvailable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s, snap := newTestServerNoIndex(t)
+	root := s.workspace().root
+
+	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+	original, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	const newSymbol = "GoodbyeDirtySave"
+	edited := string(original) + "\n// " + newSymbol + " is added only via the overlay in this test.\nfunc " + newSymbol + "(name string) Greeting {\n\treturn Greeting{Text: \"goodbye, \" + name}\n}\n"
+
+	openDoc(t, s, file, edited)
+
+	saveParams := mustMarshal(t, &protocol.DidSaveTextDocumentParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+	})
+	if err := s.handleDidSave(context.Background(), saveParams); err != nil {
+		t.Fatalf("handleDidSave (index unavailable): %v", err)
+	}
+	if idx := s.idx.Load(); idx != nil {
+		t.Fatal("s.idx installed during a test that never built one before the save; want nil")
+	}
+	s.dirtyMu.Lock()
+	dirty := s.dirtyPkgs["example.com/servermod/greet"]
+	s.dirtyMu.Unlock()
+	if !dirty {
+		t.Fatal("greet not recorded dirty after a save while the index was unavailable")
+	}
+
+	// Build and install an index from the unmodified on-disk content — the
+	// snapshot a build already running when the save above happened would
+	// have used. newSymbol must be absent from it.
+	dbPath := indexDBFile(root)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+	cas, err := store.OpenCAS(casDir(root))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	buildTestIndexDB(t, snap, dbPath, cas)
+
+	if s.openIndexAfterBuild(context.Background(), dbPath, nil, "") {
+		t.Fatal("openIndexAfterBuild locked = true, want false")
+	}
+	idx := s.idx.Load()
+	if idx == nil {
+		t.Fatal("s.idx is nil after openIndexAfterBuild")
+	}
+	t.Cleanup(func() { _ = idx.db.Close() })
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err := s.handleWorkspaceSymbol(context.Background(), mustMarshal(t, &protocol.WorkspaceSymbolParams{Query: newSymbol}))
+		if err != nil {
+			t.Fatalf("handleWorkspaceSymbol: %v", err)
+		}
+		if syms, ok := resp.(protocol.SymbolInformationSlice); ok && len(syms) > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not become visible via workspace/symbol after the index became available; the save made while the index was unavailable appears to have been lost", newSymbol)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

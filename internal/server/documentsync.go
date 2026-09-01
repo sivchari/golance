@@ -49,8 +49,12 @@ func (s *Server) handleDidChange(_ context.Context, params json.RawMessage) erro
 }
 
 // handleDidSave refreshes the document's overlay with the saved text (if
-// the client included it), schedules a recheck, and — if the facts index
-// is ready — reindexes the saved package in the background.
+// the client included it), schedules a recheck, and reindexes the saved
+// package in the background — immediately if the facts index is ready, or
+// once it becomes ready otherwise (see markDirty/drainDirty), rather than
+// simply dropping the save: the facts index is nil not just before the
+// very first successful build, but also briefly whenever revalidateIndex
+// swaps out a stale one for a rebuilt one.
 func (s *Server) handleDidSave(_ context.Context, params json.RawMessage) error {
 	var p protocol.DidSaveTextDocumentParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
@@ -67,8 +71,24 @@ func (s *Server) handleDidSave(_ context.Context, params json.RawMessage) error 
 	ws.engine.Invalidate(filepath.Dir(path))
 
 	pkgPath, ok := s.pkgPathForFile(path)
+	if !ok {
+		return nil
+	}
 	idx := s.idx.Load()
-	if !ok || idx == nil {
+	if idx == nil {
+		s.markDirty(pkgPath)
+		// Re-read s.idx: openIndexAfterBuild may have installed it and
+		// already drained the dirty set in the window between our own Load
+		// above and markDirty just now, in which case this save's pkgPath
+		// would otherwise sit unindexed until some unrelated later change
+		// happens to drain it again. If that race did happen, idx is
+		// non-nil here, and draining ourselves closes the gap; if it
+		// didn't, this is simply nil again and openIndexAfterBuild's own
+		// eventual drainDirty call picks pkgPath up as usual. Either way
+		// this is at most a harmless duplicate reindex, never a lost one.
+		if idx = s.idx.Load(); idx != nil {
+			s.rpc.Go(func(ctx context.Context) { s.drainDirty(ctx, ws) })
+		}
 		return nil
 	}
 	// This reindex is detached from the notification that triggered it (it
@@ -80,6 +100,53 @@ func (s *Server) handleDidSave(_ context.Context, params json.RawMessage) error 
 	// abandoning it mid-write.
 	s.rpc.Go(func(ctx context.Context) { s.reindex(ctx, ws, idx, pkgPath) })
 	return nil
+}
+
+// markDirty records pkgPath as saved while no facts index was available
+// (see handleDidSave), pending reindex once one becomes available (see
+// drainDirty).
+func (s *Server) markDirty(pkgPath string) {
+	s.dirtyMu.Lock()
+	defer s.dirtyMu.Unlock()
+	if s.dirtyPkgs == nil {
+		s.dirtyPkgs = make(map[string]bool)
+	}
+	s.dirtyPkgs[pkgPath] = true
+}
+
+// takeDirty returns every package path recorded via markDirty since the
+// last takeDirty call, clearing the set.
+func (s *Server) takeDirty() []string {
+	s.dirtyMu.Lock()
+	defer s.dirtyMu.Unlock()
+	if len(s.dirtyPkgs) == 0 {
+		return nil
+	}
+	pkgs := make([]string, 0, len(s.dirtyPkgs))
+	for p := range s.dirtyPkgs {
+		pkgs = append(pkgs, p)
+	}
+	s.dirtyPkgs = nil
+	return pkgs
+}
+
+// drainDirty reindexes every package markDirty recorded while the facts
+// index was unavailable, if it is available now — a no-op if s.idx is
+// still nil, or if nothing is dirty. Called from two places that can each
+// observe s.idx transition from nil to installed: openIndexAfterBuild,
+// right after installing a freshly built index, and handleDidSave itself,
+// when a save's own idx.Load() raced that installation (see its doc). Both
+// ultimately drain the same underlying set, so a call from both in that
+// race window just reindexes the same package(s) twice — extra work, never
+// a lost save.
+func (s *Server) drainDirty(ctx context.Context, ws *workspace) {
+	idx := s.idx.Load()
+	if idx == nil {
+		return
+	}
+	for _, pkgPath := range s.takeDirty() {
+		s.reindex(ctx, ws, idx, pkgPath)
+	}
 }
 
 // handleDidClose stops tracking the document's overlay content; its

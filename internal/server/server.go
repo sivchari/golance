@@ -116,6 +116,30 @@ type Server struct {
 	// registerWatchedFiles, which is safe by construction simply because
 	// handleInitialized is its only caller.
 	clientInitialized atomic.Bool
+
+	// sessionID uniquely identifies this Server instance (not just this
+	// process — see newSessionID's doc), embedded in this session's own
+	// private index database filename (see privateIndexDBFile) once
+	// usePrivateIndex is set.
+	sessionID string
+
+	// usePrivateIndex reports whether this session has switched from the
+	// shared per-root facts index (indexDBFile) to a session-private one
+	// (privateIndexDBFile) after finding the shared database locked by
+	// another live session (see switchToPrivateIndex). Sticky for the rest
+	// of the session once set: dbPath, and the file Stop removes, must
+	// keep agreeing on the same path.
+	usePrivateIndex atomic.Bool
+
+	// dirtyMu guards dirtyPkgs.
+	dirtyMu sync.Mutex
+	// dirtyPkgs records package import paths handleDidSave saved while
+	// s.idx was nil (index still building, or briefly swapped out mid
+	// revalidateIndex), pending reindex once an index becomes available —
+	// see markDirty/takeDirty/drainDirty. Without this, such a save was
+	// simply lost until some unrelated later change happened to touch the
+	// same package again.
+	dirtyPkgs map[string]bool
 }
 
 // New constructs a Server and registers its LSP handlers on rpcServer.
@@ -132,6 +156,7 @@ func New(rpcServer *rpc.Server, opts Options) *Server {
 		rpc:       rpcServer,
 		overlay:   overlay.New(),
 		diagFiles: make(map[string]map[string]bool),
+		sessionID: newSessionID(),
 	}
 	s.watch = newWatchDebouncer(opts.WatchDebounce, s.revalidateWorkspace)
 	s.wire()
@@ -171,14 +196,18 @@ func (s *Server) wire() {
 }
 
 // Stop releases session resources that outlive rpcServer.Serve itself:
-// currently, only s.watch's own pending/in-flight debounce work (see
-// watchDebouncer.Stop). Background work launched via s.rpc.Go (the
-// indexer subprocess, a didSave-triggered reindex) already stops on its
-// own once Serve cancels its context, and is drained by Serve's own
-// wg.Wait before Serve returns, so there is nothing else to do here.
-// Callers should call this after Serve returns.
+// s.watch's own pending/in-flight debounce work (see watchDebouncer.Stop),
+// and — if this session ever fell back to one (see switchToPrivateIndex) —
+// this session's own private facts index database, closed and removed so
+// it does not outlive the session (see closePrivateIndex). Background work
+// launched via s.rpc.Go (the indexer subprocess, a didSave-triggered
+// reindex) already stops on its own once Serve cancels its context, and is
+// drained by Serve's own wg.Wait before Serve returns, so by the time Stop
+// runs nothing is still reading s.idx concurrently. Callers should call
+// this after Serve returns.
 func (s *Server) Stop() {
 	s.watch.Stop()
+	s.closePrivateIndex()
 }
 
 // workspace returns the current workspace bundle, or nil before the
