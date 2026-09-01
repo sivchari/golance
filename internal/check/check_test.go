@@ -5,6 +5,7 @@ import (
 	"go/token"
 	"go/types"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sivchari/golance/internal/graph"
@@ -91,6 +92,49 @@ func TestEngine_Get_SyntaxErrorPartialAST(t *testing.T) {
 	}
 }
 
+// TestEngine_Get_AdhocPackage covers Phase 3 of design-adhoc-packages.md:
+// testdata/module/testdata/fixture is a directory graph.Load never reports
+// (the go tool always excludes "testdata" directories from "./..."
+// patterns), so GraphSource.PackageForFile falls all the way through to
+// its ad-hoc synthesis. Get on one of its files must still succeed,
+// joining same-package-clause siblings (a_fixture.go and b_fixture.go)
+// while excluding a different-clause sibling (z_other.go), tag the result
+// with an "adhoc:"-prefixed pkgPath, and surface an unresolvable import
+// (c_badimport.go) as an ordinary diagnostic rather than an error from Get
+// itself.
+func TestEngine_Get_AdhocPackage(t *testing.T) {
+	e, root := newTestEngine(t, overlay.New(), Options{})
+	path := filepath.Join(root, "testdata", "fixture", "a_fixture.go")
+
+	cp, err := e.Get(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if !strings.HasPrefix(cp.PkgPath(), "adhoc:") {
+		t.Errorf(`PkgPath() = %q, want an "adhoc:"-prefixed pkgPath`, cp.PkgPath())
+	}
+	if cp.Dir() != filepath.Dir(path) {
+		t.Errorf("Dir() = %q, want %q", cp.Dir(), filepath.Dir(path))
+	}
+
+	scope := cp.Package().Scope()
+	if scope.Lookup("Foo") == nil {
+		t.Error("Foo (a_fixture.go) not found in the ad-hoc package's scope")
+	}
+	if scope.Lookup("Bar") == nil {
+		t.Error("Bar (b_fixture.go, a same-package-clause sibling) not found in the ad-hoc package's scope")
+	}
+	if scope.Lookup("Baz") != nil {
+		t.Error("Baz (z_other.go, a different package clause) must be excluded from the ad-hoc unit, but was found in scope")
+	}
+
+	diags := Diagnostics(cp, e.reader)
+	if len(diags) == 0 {
+		t.Fatal("want at least one diagnostic for c_badimport.go's unresolvable import, got none")
+	}
+}
+
 // TestEngine_LRUEvictionAndFocus covers (f): non-focused packages are
 // evicted LRU-first once the cache is at capacity, while the focused
 // package is exempt.
@@ -153,12 +197,12 @@ func TestEngine_DependencyDecodeCachedAcrossRechecks(t *testing.T) {
 
 	depFset := token.NewFileSet()
 	depCache := typecheck.NewCache()
-	src := NewGraphSource(snap)
+	ov := overlay.New()
+	src := NewGraphSource(snap, ov)
 	imp := func() types.ImporterFrom {
 		return typecheck.NewImporter(depFset, nil, snap, depCache)
 	}
 
-	ov := overlay.New()
 	e := New(src, ov, imp, Options{})
 	path := filepath.Join(root, "depuser", "depuser.go")
 

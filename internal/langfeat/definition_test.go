@@ -31,7 +31,7 @@ func newCheckedPackageWithDepFset(t *testing.T, reader overlay.FileReader, pkgDi
 	if err != nil {
 		t.Fatalf("graph.Load: %v", err)
 	}
-	src := check.NewGraphSource(snap)
+	src := check.NewGraphSource(snap, reader)
 	depFset = token.NewFileSet()
 	depCache := typecheck.NewCache()
 	imp := func() types.ImporterFrom {

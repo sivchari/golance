@@ -24,7 +24,7 @@ func newTestEngine(t *testing.T, reader overlay.FileReader, opts Options) (*Engi
 	if err != nil {
 		t.Fatalf("graph.Load: %v", err)
 	}
-	src := NewGraphSource(snap)
+	src := NewGraphSource(snap, reader)
 	depFset := token.NewFileSet()
 	depCache := typecheck.NewCache()
 	imp := func() types.ImporterFrom {

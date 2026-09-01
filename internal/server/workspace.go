@@ -93,7 +93,7 @@ func (d *depCacheHolder) invalidate(pkgPaths []string) {
 // (the *store.DB itself is untouched — only the in-memory import-graph
 // view a Resolver holds needs refreshing).
 func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
-	src := check.NewGraphSource(snap)
+	src := check.NewGraphSource(snap, s.overlay)
 	depCache := newDepCacheHolder(snap)
 	imp := depCache.importer
 	engine := check.New(src, s.overlay, imp, check.Options{OnResult: s.publishDiagnostics})
