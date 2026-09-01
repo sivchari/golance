@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"testing"
 )
@@ -295,5 +296,9 @@ func (r *testRand) intn(n int) int {
 	r.state ^= r.state << 13
 	r.state ^= r.state >> 7
 	r.state ^= r.state << 17
-	return int(r.state % uint64(n))
+	v := r.state % uint64(n)
+	if v > uint64(math.MaxInt) {
+		return 0
+	}
+	return int(v)
 }
