@@ -104,6 +104,50 @@ func runeSizeAt(b []byte, offset int) int {
 	return size
 }
 
+// TestUTF16PositionConverter_MatchesUTF16PositionForByteOffset pins
+// UTF16PositionConverter's incremental result to the non-incremental
+// UTF16PositionForByteOffset it is a faster substitute for, both for a
+// realistic ascending sequence of offsets (its intended use: converting
+// hints already sorted by offset) and for an out-of-order offset (which
+// must fall back to rescanning from the start rather than returning a
+// wrong position computed from the wrong cursor).
+func TestUTF16PositionConverter_MatchesUTF16PositionForByteOffset(t *testing.T) {
+	text := []byte("package main\n\nfunc main() {\n\tprintln(\"héllo, 世界 \U0001F600\")\n}\n")
+
+	t.Run("ascending offsets", func(t *testing.T) {
+		conv := NewUTF16PositionConverter(text)
+		for offset := 0; offset <= len(text); offset += runeSizeAt(text, offset) {
+			want, wantOK := UTF16PositionForByteOffset(text, offset)
+			got, gotOK := conv.Position(offset)
+			if gotOK != wantOK || got != want {
+				t.Fatalf("Position(%d) = %+v, %v; want %+v, %v", offset, got, gotOK, want, wantOK)
+			}
+		}
+	})
+
+	t.Run("out of order offset falls back correctly", func(t *testing.T) {
+		conv := NewUTF16PositionConverter(text)
+		if _, ok := conv.Position(40); !ok {
+			t.Fatalf("Position(40): not ok")
+		}
+		got, gotOK := conv.Position(5) // earlier than the cursor's current position
+		want, wantOK := UTF16PositionForByteOffset(text, 5)
+		if gotOK != wantOK || got != want {
+			t.Fatalf("Position(5) after Position(40) = %+v, %v; want %+v, %v", got, gotOK, want, wantOK)
+		}
+	})
+
+	t.Run("offset outside text is rejected", func(t *testing.T) {
+		conv := NewUTF16PositionConverter(text)
+		if _, ok := conv.Position(len(text) + 1); ok {
+			t.Fatalf("Position(len+1): ok, want not ok")
+		}
+		if _, ok := conv.Position(-1); ok {
+			t.Fatalf("Position(-1): ok, want not ok")
+		}
+	})
+}
+
 func TestApplyContentChanges(t *testing.T) {
 	tests := []struct {
 		name    string
