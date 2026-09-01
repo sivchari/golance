@@ -2,6 +2,8 @@ package langfeat_test
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"os"
@@ -10,18 +12,21 @@ import (
 	"testing"
 
 	"github.com/sivchari/golance/internal/check"
+	"github.com/sivchari/golance/internal/depcheck"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
 	"github.com/sivchari/golance/internal/typecheck"
 )
 
-// newCheckedPackageWithDepFset is newCheckedPackage plus the dependency
-// importer's own *token.FileSet, which DependencyDefinition needs to
-// resolve an imported object's export-data position (see
-// internal/server's depCacheHolder.FileSet, the production equivalent of
-// depFset here).
-func newCheckedPackageWithDepFset(t *testing.T, reader overlay.FileReader, pkgDir, file string) (cp *check.CheckedPackage, path string, depFset *token.FileSet) {
+// newCheckedPackageWithProvider is newCheckedPackage plus a depcheck.Provider
+// over the same import graph — the production equivalent of dp is
+// internal/server's workspace.depProvider. cp itself is still compiled with
+// its dependencies resolved from export data (internal/typecheck), exactly
+// as internal/check.Engine does in production: only DependencyDefinition's
+// OWN resolution of the target dependency's declaration uses dp, not cp's
+// compilation.
+func newCheckedPackageWithProvider(t *testing.T, reader overlay.FileReader, pkgDir, file string) (cp *check.CheckedPackage, path string, dp *depcheck.Provider) {
 	t.Helper()
 	root, err := filepath.Abs(filepath.Join("testdata", "module"))
 	if err != nil {
@@ -32,24 +37,60 @@ func newCheckedPackageWithDepFset(t *testing.T, reader overlay.FileReader, pkgDi
 		t.Fatalf("graph.Load: %v", err)
 	}
 	src := check.NewGraphSource(snap, reader)
-	depFset = token.NewFileSet()
+	depFset := token.NewFileSet()
 	depCache := typecheck.NewCache()
 	imp := func() types.ImporterFrom {
 		return typecheck.NewImporter(depFset, nil, snap, depCache)
 	}
 	engine := check.New(src, reader, imp, check.Options{})
+	dp = depcheck.NewProvider(depcheck.NewGraphMetadataSource(snap), depcheck.Options{})
 
 	path = filepath.Join(root, pkgDir, file)
 	cp, err = engine.Get(context.Background(), path)
 	if err != nil {
 		t.Fatalf("Get(%s): %v", path, err)
 	}
-	return cp, path, depFset
+	return cp, path, dp
+}
+
+// wantDeclPosition returns the (line, column) of name's top-level
+// func/type declaring identifier in filename, parsed independently of any
+// checker — the ground truth TestDependencyDefinition_Stdlib's exact-column
+// assertions check the provider-backed result against, so the expected
+// value tracks whatever the installed Go toolchain's real source says
+// rather than a hardcoded, version-fragile constant.
+func wantDeclPosition(t *testing.T, filename, name string) (line, col int) {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filename, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", filename, err)
+	}
+	var found *ast.Ident
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Recv == nil && d.Name.Name == name {
+				found = d.Name
+			}
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				if ts, ok := spec.(*ast.TypeSpec); ok && ts.Name.Name == name {
+					found = ts.Name
+				}
+			}
+		}
+	}
+	if found == nil {
+		t.Fatalf("no top-level func/type declaration named %q in %s", name, filename)
+	}
+	p := fset.Position(found.Pos())
+	return p.Line, p.Column
 }
 
 func TestDependencyDefinition_Stdlib(t *testing.T) {
 	reader := overlay.New()
-	cp, path, depFset := newCheckedPackageWithDepFset(t, reader, "depuse", "depuse.go")
+	cp, path, dp := newCheckedPackageWithProvider(t, reader, "depuse", "depuse.go")
 	text, err := reader.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
@@ -58,17 +99,18 @@ func TestDependencyDefinition_Stdlib(t *testing.T) {
 	tests := []struct {
 		name        string
 		substr      string
+		declName    string // top-level identifier wantDeclPosition looks up
 		wantPkgPath string
 		wantSuffix  string
 	}{
-		{name: "strings.Builder", substr: "strings.Builder", wantPkgPath: "strings", wantSuffix: filepath.FromSlash("strings/builder.go")},
-		{name: "fmt.Sprintf", substr: "fmt.Sprintf", wantPkgPath: "fmt", wantSuffix: filepath.FromSlash("fmt/print.go")},
+		{name: "strings.Builder", substr: "strings.Builder", declName: "Builder", wantPkgPath: "strings", wantSuffix: filepath.FromSlash("strings/builder.go")},
+		{name: "fmt.Sprintf", substr: "fmt.Sprintf", declName: "Sprintf", wantPkgPath: "fmt", wantSuffix: filepath.FromSlash("fmt/print.go")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			offset := mustIndex(t, text, tt.substr) + len(strings.SplitN(tt.substr, ".", 2)[0]) + 1
 
-			got, err := langfeat.DependencyDefinition(cp, depFset, path, offset)
+			got, err := langfeat.DependencyDefinition(context.Background(), cp, dp, path, offset)
 			if err != nil {
 				t.Fatalf("DependencyDefinition: %v", err)
 			}
@@ -81,11 +123,15 @@ func TestDependencyDefinition_Stdlib(t *testing.T) {
 			if !strings.HasSuffix(got.Filename, tt.wantSuffix) {
 				t.Errorf("Filename = %q, want it to end with %q", got.Filename, tt.wantSuffix)
 			}
-			if got.Line <= 0 {
-				t.Errorf("Line = %d, want > 0", got.Line)
-			}
 			if _, err := os.Stat(got.Filename); err != nil {
 				t.Errorf("resolved file %s does not exist on disk: %v", got.Filename, err)
+			}
+			wantLine, wantCol := wantDeclPosition(t, got.Filename, tt.declName)
+			if got.Line != wantLine || got.Col != wantCol {
+				t.Errorf("position = %d:%d, want %d:%d (from parsing %s directly)", got.Line, got.Col, wantLine, wantCol, got.Filename)
+			}
+			if got.EndCol != got.Col+len(tt.declName) {
+				t.Errorf("EndCol = %d, want %d (Col + len(%q))", got.EndCol, got.Col+len(tt.declName), tt.declName)
 			}
 		})
 	}
@@ -102,14 +148,14 @@ func TestDependencyDefinition_Stdlib(t *testing.T) {
 // TestSamePackageDefinition_EmbeddedField's doc.
 func TestDependencyDefinition_EmbeddedStdlibField(t *testing.T) {
 	reader := overlay.New()
-	cp, path, depFset := newCheckedPackageWithDepFset(t, reader, "embed", "embedstruct_stdlib.go")
+	cp, path, dp := newCheckedPackageWithProvider(t, reader, "embed", "embedstruct_stdlib.go")
 	text, err := reader.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
 	offset := mustIndex(t, text, "bytes.Buffer\n") + len("bytes.")
 
-	got, err := langfeat.DependencyDefinition(cp, depFset, path, offset)
+	got, err := langfeat.DependencyDefinition(context.Background(), cp, dp, path, offset)
 	if err != nil {
 		t.Fatalf("DependencyDefinition: %v", err)
 	}
@@ -122,6 +168,10 @@ func TestDependencyDefinition_EmbeddedStdlibField(t *testing.T) {
 	if !strings.HasSuffix(got.Filename, filepath.FromSlash("bytes/buffer.go")) {
 		t.Errorf("Filename = %q, want it to end with bytes/buffer.go", got.Filename)
 	}
+	wantLine, wantCol := wantDeclPosition(t, got.Filename, "Buffer")
+	if got.Line != wantLine || got.Col != wantCol {
+		t.Errorf("position = %d:%d, want %d:%d (from parsing %s directly)", got.Line, got.Col, wantLine, wantCol, got.Filename)
+	}
 }
 
 // TestDependencyDefinition_EmbeddedStdlibInterface covers "Go to
@@ -132,14 +182,14 @@ func TestDependencyDefinition_EmbeddedStdlibField(t *testing.T) {
 // case needed no fix and still passes through unaffected.
 func TestDependencyDefinition_EmbeddedStdlibInterface(t *testing.T) {
 	reader := overlay.New()
-	cp, path, depFset := newCheckedPackageWithDepFset(t, reader, "embed", "embediface.go")
+	cp, path, dp := newCheckedPackageWithProvider(t, reader, "embed", "embediface.go")
 	text, err := reader.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
 	offset := mustIndex(t, text, "io.Reader\n") + len("io.")
 
-	got, err := langfeat.DependencyDefinition(cp, depFset, path, offset)
+	got, err := langfeat.DependencyDefinition(context.Background(), cp, dp, path, offset)
 	if err != nil {
 		t.Fatalf("DependencyDefinition: %v", err)
 	}
@@ -153,7 +203,7 @@ func TestDependencyDefinition_EmbeddedStdlibInterface(t *testing.T) {
 
 func TestDependencyDefinition_SamePackageReturnsNil(t *testing.T) {
 	reader := overlay.New()
-	cp, path, depFset := newCheckedPackageWithDepFset(t, reader, "depuse", "depuse.go")
+	cp, path, dp := newCheckedPackageWithProvider(t, reader, "depuse", "depuse.go")
 	text, err := reader.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
@@ -161,10 +211,10 @@ func TestDependencyDefinition_SamePackageReturnsNil(t *testing.T) {
 	// UseStdlib's own declaring identifier is in cp's own package: the
 	// workspace facts index already has a better answer for this case, so
 	// DependencyDefinition should decline rather than offer a
-	// column-degraded substitute.
+	// substitute.
 	offset := mustIndex(t, text, "func UseStdlib") + len("func ")
 
-	got, err := langfeat.DependencyDefinition(cp, depFset, path, offset)
+	got, err := langfeat.DependencyDefinition(context.Background(), cp, dp, path, offset)
 	if err != nil {
 		t.Fatalf("DependencyDefinition: %v", err)
 	}
@@ -275,14 +325,14 @@ func TestSamePackageDefinition_NoIdentifier(t *testing.T) {
 
 func TestDependencyDefinition_NoIdentifier(t *testing.T) {
 	reader := overlay.New()
-	cp, path, depFset := newCheckedPackageWithDepFset(t, reader, "depuse", "depuse.go")
+	cp, path, dp := newCheckedPackageWithProvider(t, reader, "depuse", "depuse.go")
 	text, err := reader.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
 	offset := mustIndex(t, text, "\n\n// UseStdlib")
 
-	got, err := langfeat.DependencyDefinition(cp, depFset, path, offset)
+	got, err := langfeat.DependencyDefinition(context.Background(), cp, dp, path, offset)
 	if err != nil {
 		t.Fatalf("DependencyDefinition: %v", err)
 	}

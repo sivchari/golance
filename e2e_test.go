@@ -142,6 +142,10 @@ func TestE2E(t *testing.T) {
 		checkE2ETestingTHover(t, c, &locs)
 	})
 
+	t.Run("strings_builder_dependency_definition", func(t *testing.T) {
+		checkE2EStringsBuilderDependencyDefinition(t, c, &locs)
+	})
+
 	// references_includes_in_package_test_file_call_site and
 	// definition_from_inside_test_file cover the facts-index gap fixed
 	// alongside hover/inlay hints above: an in-package "_test.go" file
@@ -400,13 +404,14 @@ func checkE2EDidSaveTestFileAddsNewSymbol(t *testing.T, c *lspClient, locs *e2eL
 
 // checkE2ETestingTDependencyDefinition verifies that a definition query on
 // "T" in util_test.go's "*testing.T" resolves into GOROOT's own
-// testing/testing.go — the concrete, user-visible symptom of the bug this
-// phase fixes (internal/graph's loaded metadata graph previously never
-// contained "testing" at all, since no production file imports it and the
-// graph loader never requested go/packages test variants). The position is
-// only line-accurate (export-data-derived, not a real source parse — see
-// internal/langfeat.DependencyDefinition's doc); exact columns are a later
-// phase's concern.
+// testing/testing.go, at the EXACT line and column of testing.T's own
+// declaring identifier (internal/depcheck's source-checked dependency
+// provider — see its package doc) — not merely the correct file/line, as
+// this used to be limited to when the resolution went through export data.
+// The concrete, user-visible symptom the FILE-level part of this fixes is
+// older still (Phase 1): internal/graph's loaded metadata graph previously
+// never contained "testing" at all, since no production file imports it
+// and the graph loader never requested go/packages test variants.
 func checkE2ETestingTDependencyDefinition(t *testing.T, c *lspClient, locs *e2eLocs) {
 	t.Helper()
 	got := c.waitForNonEmptyLocations(t, protocol.MethodTextDocumentDefinition, &protocol.DefinitionParams{
@@ -424,6 +429,32 @@ func checkE2ETestingTDependencyDefinition(t *testing.T, c *lspClient, locs *e2eL
 	}
 	if _, err := os.Stat(gotPath); err != nil {
 		t.Fatalf("definition on testing.T resolved to %s, which does not exist: %v", gotPath, err)
+	}
+	want := declPosition(t, gotPath, "T")
+	if got[0].Range.Start != want {
+		t.Errorf("definition on testing.T landed at %+v, want %+v (T's own declaring identifier in %s)", got[0].Range.Start, want, gotPath)
+	}
+}
+
+// checkE2EStringsBuilderDependencyDefinition mirrors
+// checkE2ETestingTDependencyDefinition for a stdlib package this synthetic
+// module's production code (unlike "testing") could plausibly reach on its
+// own too: "Go to Definition" on strings.Builder must land at the exact
+// line and column of Builder's own declaring identifier in GOROOT's
+// strings/builder.go.
+func checkE2EStringsBuilderDependencyDefinition(t *testing.T, c *lspClient, locs *e2eLocs) {
+	t.Helper()
+	got := definitionAt(t, c, locs.utilTestFile, locs.builderRefInUtilTest)
+	if len(got) != 1 {
+		t.Fatalf("definition on strings.Builder returned %d locations, want 1: %+v", len(got), got)
+	}
+	gotPath := got[0].URI.FsPath()
+	if !strings.HasSuffix(filepath.ToSlash(gotPath), "strings/builder.go") {
+		t.Fatalf("definition on strings.Builder = %s, want it to land in GOROOT's strings/builder.go", gotPath)
+	}
+	want := declPosition(t, gotPath, "Builder")
+	if got[0].Range.Start != want {
+		t.Errorf("definition on strings.Builder landed at %+v, want %+v (Builder's own declaring identifier in %s)", got[0].Range.Start, want, gotPath)
 	}
 }
 

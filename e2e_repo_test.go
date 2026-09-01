@@ -40,6 +40,13 @@ type e2eLocs struct {
 	// checkE2ETestingTDependencyDefinition/Hover.
 	testingTypeRefInUtilTest protocol.Position
 
+	// builderRefInUtilTest is "Builder" in "strings.Builder" inside
+	// util_test.go's checkTesting helper — the Phase 2 win (source-checked
+	// dependency navigation, internal/depcheck): "Go to Definition" here
+	// must now land at the EXACT declaring identifier of strings.Builder,
+	// not just its line. See checkE2EStringsBuilderDependencyDefinition.
+	builderRefInUtilTest protocol.Position
+
 	appFile      string            // app/app.go, imports lib/util and lib/store
 	sumCallInApp protocol.Position // "Sum" in the util.Sum call inside app.go
 
@@ -108,6 +115,7 @@ func Sum(a, b int) int {
 	const utilTestSrc = `package util
 
 import (
+	"strings"
 	"testing"
 
 	"example.com/e2e/lib/store"
@@ -127,10 +135,15 @@ func newStore() *store.Store {
 
 // checkTesting exercises testing.T's own hover/definition resolution: no
 // production file in this module imports "testing" at all, only this
-// in-package test file does.
+// in-package test file does. The strings package value declared below
+// additionally exercises a stdlib dependency's definition resolution for a
+// package this module's production code could otherwise reach too (unlike
+// testing).
 func checkTesting(t *testing.T) {
 	var ref *testing.T = t
 	_ = ref
+	var b strings.Builder
+	_ = b
 }
 `
 	locs.utilTestFile = writeE2EFile(t, root, "lib/util/util_test.go", utilTestSrc)
@@ -138,6 +151,7 @@ func checkTesting(t *testing.T) {
 	locs.sumCallInUtilTest = mustPos(t, utilTestSrc, "Sum(4, 5)", "Sum")
 	locs.storeRefInUtilTest = mustPos(t, utilTestSrc, "&store.Store{}", "Store")
 	locs.testingTypeRefInUtilTest = mustPos(t, utilTestSrc, "var ref *testing.T = t", "T")
+	locs.builderRefInUtilTest = mustPos(t, utilTestSrc, "var b strings.Builder", "Builder")
 
 	const storeSrc = `package store
 

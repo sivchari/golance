@@ -16,6 +16,7 @@ import (
 
 	golance "github.com/sivchari/golance"
 	"github.com/sivchari/golance/internal/check"
+	"github.com/sivchari/golance/internal/depcheck"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
@@ -53,11 +54,24 @@ type Options struct {
 // snapshot, so a workspace/didChangeWatchedFiles-triggered reload can swap
 // them in atomically without a lock on the read path.
 type workspace struct {
-	root      string
-	snap      *graph.Snapshot
-	engine    *check.Engine
-	depCache  *depCacheHolder
-	fileToPkg map[string]string
+	root     string
+	snap     *graph.Snapshot
+	engine   *check.Engine
+	depCache *depCacheHolder
+	// depProvider resolves non-workspace (standard library, module
+	// dependency, test-only) packages by type-checking their own real
+	// source on demand (internal/depcheck), for navigation consumers that
+	// need an exact declaration position or unexported visibility into a
+	// dependency — currently only langfeat.DependencyDefinition (see
+	// dependencyDefinition in handlers_xref.go). Unlike depCache, which
+	// internal/check.Engine's own compilation of WORKSPACE packages still
+	// depends on (export data stays the right tool there — see
+	// internal/depcheck's package doc), nothing else in this workspace
+	// depends on depProvider's cache surviving a reload, so — like depCache
+	// — a fresh one is simply built per setWorkspace call rather than
+	// carried forward.
+	depProvider *depcheck.Provider
+	fileToPkg   map[string]string
 	// dirToPkg maps a package's directory to its import path, the fallback
 	// pkgPathForFile uses for a file fileToPkg does not itself know about —
 	// in particular an in-package _test.go file, which graph.Package.GoFiles

@@ -123,8 +123,9 @@ func (s *Server) handleDefinition(ctx context.Context, params json.RawMessage) (
 // legitimately has no entry for this position. An identifier declared in
 // cp's own package resolves via langfeat.SamePackageDefinition, exact down
 // to the column, needing no index at all; a standard library or module
-// dependency identifier resolves through dependencyDefinition's export-data
-// path instead, degraded to column 1. A different *workspace* (root)
+// dependency identifier resolves through dependencyDefinition's
+// depcheck.Provider path instead, exact to the column as well (see
+// internal/depcheck's package doc). A different *workspace* (root)
 // package's identifier is deliberately left unanswered here — see
 // dependencyDefinition's doc for why.
 func (s *Server) definitionFallback(ctx context.Context, u uri.URI, pos protocol.Position) protocol.LocationSlice {
@@ -141,7 +142,7 @@ func (s *Server) definitionFallback(ctx context.Context, u uri.URI, pos protocol
 	} else if info != nil {
 		return s.samePackageDefinitionLocation(info)
 	}
-	if loc, ok := s.dependencyDefinition(cf); ok {
+	if loc, ok := s.dependencyDefinition(ctx, cf); ok {
 		return s.toLSPLocations([]xref.Location{loc})
 	}
 	return nil
@@ -169,17 +170,18 @@ func (s *Server) samePackageDefinitionLocation(info *langfeat.SamePackageDefInfo
 // (see internal/index/scheduler.go's doc), so a definition query on an
 // identifier from the standard library or a module dependency always
 // misses there. This resolves it instead through the type-checked
-// package's own Uses/Defs and the shared dependency importer's export-data
-// positions (see internal/langfeat.DependencyDefinition,
-// depCacheHolder.FileSet) — the same decode already paid for to type-check
-// cf.path in the first place, not a separate source parse of the
-// dependency.
-func (s *Server) dependencyDefinition(cf checkedFileResult) (xref.Location, bool) {
+// package's own Uses/Defs, mapped into a source-type-checked copy of the
+// target dependency package via ws.depProvider (internal/depcheck) —
+// exact to the column, and able to see unexported dependency types (see
+// internal/langfeat.DependencyDefinition, internal/depcheck's package doc)
+// — rather than the line-only, exported-only positions
+// gcexportdata/depCache offer.
+func (s *Server) dependencyDefinition(ctx context.Context, cf checkedFileResult) (xref.Location, bool) {
 	ws := s.workspace()
 	if ws == nil {
 		return xref.Location{}, false
 	}
-	info, err := langfeat.DependencyDefinition(cf.cp, ws.depCache.FileSet(), cf.path, cf.offset)
+	info, err := langfeat.DependencyDefinition(ctx, cf.cp, ws.depProvider, cf.path, cf.offset)
 	if err != nil {
 		s.logger.Printf("server: dependency definition %s: %v", cf.path, err)
 		return xref.Location{}, false
@@ -208,20 +210,15 @@ func (s *Server) dependencyDefinition(cf checkedFileResult) (xref.Location, bool
 	if pkg, ok := ws.snap.Packages[info.PkgPath]; ok && pkg.Root {
 		return xref.Location{}, false
 	}
-	if info.Line > math.MaxUint32 {
-		return xref.Location{}, false
-	}
 	if _, err := os.Stat(info.Filename); err != nil {
 		return xref.Location{}, false
 	}
-	if info.Line <= 0 || int64(info.Line) > math.MaxUint32 {
+	if info.Line <= 0 || int64(info.Line) > math.MaxUint32 ||
+		info.Col <= 0 || int64(info.Col) > math.MaxUint32 ||
+		info.EndCol <= 0 || int64(info.EndCol) > math.MaxUint32 {
 		return xref.Location{}, false
 	}
-	// Column 1 for both Col and EndCol: export data does not preserve
-	// column information (see internal/xref.methodFuncLocation's doc), so
-	// this degrades to a zero-width location at the start of the
-	// declaration's line rather than guessing.
-	return xref.Location{File: info.Filename, Line: uint32(info.Line), Col: 1, EndCol: 1}, true
+	return xref.Location{File: info.Filename, Line: uint32(info.Line), Col: uint32(info.Col), EndCol: uint32(info.EndCol)}, true
 }
 
 // importDefinition is definitionFallback's path for the cursor being inside
