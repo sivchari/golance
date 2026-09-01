@@ -188,9 +188,16 @@ func (s *Server) handleFoldingRange(ctx context.Context, params json.RawMessage)
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return []protocol.FoldingRange{}, nil
 	}
-	text, err := s.overlay.ReadFile(path)
-	if err != nil {
-		return nil, err
+	// FileText, not a separate s.overlay.ReadFile(path): since GraphSource's
+	// directory fallback (see internal/check.GraphSource.PackageForFile), a
+	// successful Get no longer guarantees path itself is one of cp's files
+	// — e.g. a stale path in a known package's directory that was never
+	// actually opened or saved. FileText degrades that case to !ok, the
+	// same "no result" treatment as an unknown package, instead of a wire
+	// error from a raw disk read.
+	text, ok := cp.FileText(path)
+	if !ok {
+		return []protocol.FoldingRange{}, nil
 	}
 	frs, err := langfeat.FoldingRanges(cp, path)
 	if err != nil {
@@ -235,9 +242,11 @@ func (s *Server) handleSelectionRange(ctx context.Context, params json.RawMessag
 		s.logger.Printf("server: checked package for %s: %v", path, err)
 		return []protocol.SelectionRange{}, nil
 	}
-	text, err := s.overlay.ReadFile(path)
-	if err != nil {
-		return nil, err
+	// FileText, not a separate s.overlay.ReadFile(path): see the identical
+	// comment in handleFoldingRange.
+	text, ok := cp.FileText(path)
+	if !ok {
+		return []protocol.SelectionRange{}, nil
 	}
 	out := make([]protocol.SelectionRange, len(p.Positions))
 	for i, pos := range p.Positions {

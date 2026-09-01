@@ -496,6 +496,21 @@ func (c *lspClient) openFile(t *testing.T, path string) {
 	})
 }
 
+// openNewFile sends textDocument/didOpen with text, without ever reading or
+// writing path on disk — simulating a brand-new file an editor just
+// created and has not saved yet.
+func (c *lspClient) openNewFile(t *testing.T, path, text string) {
+	t.Helper()
+	c.notify(t, protocol.MethodTextDocumentDidOpen, &protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{
+			URI:        uri.File(path),
+			LanguageID: protocol.LanguageKindGo,
+			Version:    1,
+			Text:       text,
+		},
+	})
+}
+
 // changeFile sends textDocument/didChange replacing path's whole content
 // with newText, without saving it to disk.
 func (c *lspClient) changeFile(t *testing.T, path string, version int32, newText string) {

@@ -96,7 +96,7 @@ func (e *Engine) runRecheck(ctx context.Context, dir string) (*CheckedPackage, e
 // each candidate Go file in dir until one resolves. Used when dir is
 // invalidated before any file in it has been resolved via Get or SetFocus.
 func (e *Engine) resolvePackage(dir string) (pkgInfo, error) {
-	candidates, err := listCandidateFiles(dir)
+	candidates, err := e.listCandidateFiles(dir)
 	if err != nil {
 		return pkgInfo{}, err
 	}
@@ -119,7 +119,7 @@ func (e *Engine) resolvePackage(dir string) (pkgInfo, error) {
 // knows about, plus any _test.go file in the same package (the external
 // "_test"-suffixed test package is not supported).
 func (e *Engine) resolveFiles(pi pkgInfo, dir string) ([]string, error) {
-	candidates, err := listCandidateFiles(dir)
+	candidates, err := e.listCandidateFiles(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -171,19 +171,41 @@ func (e *Engine) packageClauseName(path string) (string, bool) {
 	return f.Name.Name, true
 }
 
+// dirLister is an optional capability of an Engine's reader: if it can
+// report which of its open documents live in a given directory (as
+// *overlay.Overlay does), listCandidateFiles includes those alongside
+// whatever os.ReadDir finds on disk — so an unsaved new file, which exists
+// only in the overlay, is still a candidate for its directory's package.
+type dirLister interface {
+	OpenFilesInDir(dir string) []string
+}
+
 // listCandidateFiles lists dir's regular *.go files, skipping names the Go
-// tool itself ignores (leading "." or "_").
-func listCandidateFiles(dir string) ([]string, error) {
+// tool itself ignores (leading "." or "_"), unioning disk content with any
+// open overlay documents in dir the reader can report (see dirLister).
+func (e *Engine) listCandidateFiles(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("check: read dir %s: %w", dir, err)
 	}
+	seen := make(map[string]bool, len(entries))
 	var files []string
 	for _, ent := range entries {
 		if ent.IsDir() || !isCandidateGoFile(ent.Name()) {
 			continue
 		}
-		files = append(files, filepath.Join(dir, ent.Name()))
+		path := filepath.Join(dir, ent.Name())
+		seen[path] = true
+		files = append(files, path)
+	}
+	if lister, ok := e.reader.(dirLister); ok {
+		for _, path := range lister.OpenFilesInDir(dir) {
+			if seen[path] || !isCandidateGoFile(filepath.Base(path)) {
+				continue
+			}
+			seen[path] = true
+			files = append(files, path)
+		}
 	}
 	sort.Strings(files)
 	return files, nil

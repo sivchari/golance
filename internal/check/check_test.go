@@ -189,3 +189,130 @@ func TestEngine_DependencyDecodeCachedAcrossRechecks(t *testing.T) {
 		t.Errorf("Decodes after 2nd recheck = %d, want unchanged from %d (fmt should be served from the persistent cache, not re-decoded)", secondDecodes, firstDecodes)
 	}
 }
+
+// openOverlayOnly opens path in ov with text, without ever writing it to
+// disk — simulating a brand-new, never-saved file an editor just created.
+func openOverlayOnly(ov *overlay.Overlay, path, text string) {
+	ov.DidOpen(&protocol.DidOpenTextDocumentParams{TextDocument: protocol.TextDocumentItem{
+		URI:        uri.File(path),
+		LanguageID: "go",
+		Version:    1,
+		Text:       text,
+	}})
+}
+
+// TestEngine_Get_UnsavedNewFileJoinsKnownPackage covers Phase 1's core
+// case: a new .go file created in an editor, in a directory that is
+// already a known package, joins that package and is type-checked as part
+// of it even though it was never saved to disk.
+func TestEngine_Get_UnsavedNewFileJoinsKnownPackage(t *testing.T) {
+	ov := overlay.New()
+	e, root := newTestEngine(t, ov, Options{})
+	newPath := filepath.Join(root, "overlaypkg", "newfile.go")
+	openOverlayOnly(ov, newPath, "package overlaypkg\n\nfunc Bar() int { return 2 }\n")
+
+	cp, err := e.Get(context.Background(), newPath)
+	if err != nil {
+		t.Fatalf("Get(new unsaved file): %v", err)
+	}
+	if cp.Package().Scope().Lookup("Bar") == nil {
+		t.Error("Bar, declared only in the unsaved new file, not found in package scope")
+	}
+	if cp.Package().Scope().Lookup("Foo") == nil {
+		t.Error("Foo, declared in the pre-existing on-disk file, not found in package scope")
+	}
+	if text, ok := cp.FileText(newPath); !ok || len(text) == 0 {
+		t.Errorf("FileText(%s) = (%q, %v), want the overlay content and ok=true", newPath, text, ok)
+	}
+}
+
+// TestEngine_Get_UnsavedNewFileWrongPackageClauseExcluded covers the
+// complementary edge case: an unsaved new file in a known package's
+// directory whose package clause names a different package is excluded
+// from that package's file set, exactly as an on-disk file with a
+// mismatched package clause already is.
+func TestEngine_Get_UnsavedNewFileWrongPackageClauseExcluded(t *testing.T) {
+	ov := overlay.New()
+	e, root := newTestEngine(t, ov, Options{})
+	wrongPath := filepath.Join(root, "overlaypkg", "wrongclause.go")
+	openOverlayOnly(ov, wrongPath, "package wrong\n\nfunc Baz() int { return 3 }\n")
+
+	basicPath := filepath.Join(root, "overlaypkg", "overlaypkg.go")
+	cp, err := e.Get(context.Background(), basicPath)
+	if err != nil {
+		t.Fatalf("Get(overlaypkg.go): %v", err)
+	}
+	if cp.Package().Scope().Lookup("Foo") == nil {
+		t.Error("Foo should still be checkable despite the mismatched-package sibling file")
+	}
+	if cp.Package().Scope().Lookup("Baz") != nil {
+		t.Error("Baz, declared in a file with a mismatched package clause, should not join the package")
+	}
+	if _, ok := cp.FileText(wrongPath); ok {
+		t.Errorf("FileText(%s) ok = true, want false: the mismatched-clause file should not be part of the checked package", wrongPath)
+	}
+}
+
+// TestEngine_Get_UnknownDirectoryStillFails covers the scope guard: a file
+// in a directory SnapshotSource has never heard of (no ad-hoc synthesis, in
+// or out of the overlay) still degrades to "not found," exactly as before
+// Phase 1.
+func TestEngine_Get_UnknownDirectoryStillFails(t *testing.T) {
+	ov := overlay.New()
+	e, root := newTestEngine(t, ov, Options{})
+	unknownPath := filepath.Join(root, "totally-unknown-dir", "standalone.go")
+	openOverlayOnly(ov, unknownPath, "package standalone\n\nfunc Qux() int { return 4 }\n")
+
+	if _, err := e.Get(context.Background(), unknownPath); err == nil {
+		t.Fatal("Get(file in an unknown directory) succeeded, want an error")
+	}
+}
+
+// TestEngine_Get_InPackageTestFileJoinsPackage covers the second symptom
+// the directory fallback fixes: an on-disk in-package "_test.go" file is
+// never in the import graph's GoFiles (packages.Load without Tests:true
+// omits test files from a package's GoFiles entirely, see
+// internal/graph.loadMode), so GraphSource's exact-path lookup alone never
+// resolves it. The directory fallback makes it resolve to the enclosing
+// package, letting check.Engine.resolveFiles's existing same-package-name
+// filtering fold it into the checked unit like any other sibling file.
+func TestEngine_Get_InPackageTestFileJoinsPackage(t *testing.T) {
+	e, root := newTestEngine(t, overlay.New(), Options{})
+	testFile := filepath.Join(root, "withtests", "withtests_test.go")
+
+	cp, err := e.Get(context.Background(), testFile)
+	if err != nil {
+		t.Fatalf("Get(in-package _test.go file): %v", err)
+	}
+	if cp.Package().Scope().Lookup("TestOnlyHelper") == nil {
+		t.Error("TestOnlyHelper, declared only in the in-package _test.go file, not found in package scope")
+	}
+	if cp.Package().Scope().Lookup("Value") == nil {
+		t.Error("Value, declared in the base file, not found in package scope")
+	}
+	if _, ok := cp.FileText(testFile); !ok {
+		t.Errorf("FileText(%s) ok = false, want true: the in-package test file should be part of the checked package", testFile)
+	}
+}
+
+// TestEngine_Get_ExternalTestPackageFileExcluded pins the complementary
+// scope guard: a "package foo_test" external test file in the same
+// directory still degrades to no-result for that file — external test
+// packages are Phase 2, not this change — even though the directory
+// fallback now resolves its path to the base package too.
+func TestEngine_Get_ExternalTestPackageFileExcluded(t *testing.T) {
+	e, root := newTestEngine(t, overlay.New(), Options{})
+	baseFile := filepath.Join(root, "withtests", "withtests.go")
+	extFile := filepath.Join(root, "withtests", "withtests_ext_test.go")
+
+	cp, err := e.Get(context.Background(), baseFile)
+	if err != nil {
+		t.Fatalf("Get(withtests.go): %v", err)
+	}
+	if cp.Package().Scope().Lookup("ExternalOnly") != nil {
+		t.Error("ExternalOnly, declared in the external \"_test\" package file, should not join the base package")
+	}
+	if _, ok := cp.FileText(extFile); ok {
+		t.Errorf("FileText(%s) ok = true, want false: the external test package file should not be part of the checked package", extFile)
+	}
+}
