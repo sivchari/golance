@@ -14,13 +14,13 @@ import (
 	"github.com/sivchari/golance/internal/overlay"
 )
 
-// selectorIdentPosition returns the LSP position of the occurrence-th
+// selectorIdentPosition returns the LSP position of the first
 // (1-based) "pkgAlias.sel" selector's Sel identifier in path, read and
 // parsed fresh from disk — a precise query position for "Go to Definition"
 // on a specific cross-package reference, unambiguous even when sel is also
 // a locally-declared identifier elsewhere in the same file (as with
 // internal/store.Open alongside bbolt.Open, immediately below it).
-func selectorIdentPosition(t *testing.T, path, pkgAlias, sel string, occurrence int) protocol.Position {
+func selectorIdentPosition(t *testing.T, path, pkgAlias, sel string) protocol.Position {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
@@ -44,10 +44,10 @@ func selectorIdentPosition(t *testing.T, path, pkgAlias, sel string, occurrence 
 		positions = append(positions, se.Sel.Pos())
 		return true
 	})
-	if occurrence < 1 || occurrence > len(positions) {
-		t.Fatalf("%s: found %d occurrences of %s.%s, want at least %d", path, len(positions), pkgAlias, sel, occurrence)
+	if len(positions) == 0 {
+		t.Fatalf("%s: no occurrence of %s.%s", path, pkgAlias, sel)
 	}
-	return posAtOffset(t, path, fset, data, positions[occurrence-1])
+	return posAtOffset(t, path, fset, data, positions[0])
 }
 
 // declPosition returns the LSP position of name's own top-level func/type/
@@ -68,33 +68,7 @@ func declPosition(t *testing.T, path, name string) protocol.Position {
 	if err != nil {
 		t.Fatalf("parse %s: %v", path, err)
 	}
-	var found *ast.Ident
-	for _, decl := range f.Decls {
-		switch d := decl.(type) {
-		case *ast.FuncDecl:
-			if d.Recv == nil && d.Name.Name == name {
-				found = d.Name
-			}
-		case *ast.GenDecl:
-			for _, spec := range d.Specs {
-				switch s := spec.(type) {
-				case *ast.TypeSpec:
-					if s.Name.Name == name {
-						found = s.Name
-					}
-				case *ast.ValueSpec:
-					// A const/var block can declare several names per
-					// spec (e.g. "DefaultMaxBatchSize, DefaultMaxBatchDelay int = ...");
-					// check each one, not just the first.
-					for _, n := range s.Names {
-						if n.Name == name {
-							found = n
-						}
-					}
-				}
-			}
-		}
-	}
+	found := topLevelDeclIdent(f, name)
 	if found == nil {
 		t.Fatalf("no top-level func/type/const/var declaration named %q in %s", name, path)
 	}
@@ -138,7 +112,7 @@ func TestE2E_DependencyDefinitionExactColumn(t *testing.T) {
 	c.openFile(t, storeFile)
 	c.waitForIndexReady(t)
 
-	pos := selectorIdentPosition(t, storeFile, "bbolt", "Open", 1)
+	pos := selectorIdentPosition(t, storeFile, "bbolt", "Open")
 	got := definitionAt(t, c, storeFile, pos)
 	if len(got) != 1 {
 		t.Fatalf("definition(bbolt.Open) = %+v, want exactly 1 location", got)
@@ -151,4 +125,43 @@ func TestE2E_DependencyDefinitionExactColumn(t *testing.T) {
 	if got[0].Range.Start != want {
 		t.Errorf("definition(bbolt.Open) landed at %+v, want %+v (Open's own declaring identifier in %s)", got[0].Range.Start, want, gotPath)
 	}
+}
+
+// topLevelDeclIdent returns the declaring identifier of the top-level
+// func, type, const, or var named name in f, or nil if absent.
+func topLevelDeclIdent(f *ast.File, name string) *ast.Ident {
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Recv == nil && d.Name.Name == name {
+				return d.Name
+			}
+		case *ast.GenDecl:
+			if id := genDeclIdent(d, name); id != nil {
+				return id
+			}
+		}
+	}
+	return nil
+}
+
+// genDeclIdent returns the declaring identifier named name inside a
+// type/const/var declaration block, or nil. A const/var spec can declare
+// several names at once; every one is checked.
+func genDeclIdent(d *ast.GenDecl, name string) *ast.Ident {
+	for _, spec := range d.Specs {
+		switch s := spec.(type) {
+		case *ast.TypeSpec:
+			if s.Name.Name == name {
+				return s.Name
+			}
+		case *ast.ValueSpec:
+			for _, n := range s.Names {
+				if n.Name == name {
+					return n
+				}
+			}
+		}
+	}
+	return nil
 }

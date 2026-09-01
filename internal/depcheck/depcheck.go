@@ -260,7 +260,7 @@ func (p *Provider) Package(ctx context.Context, pkgPath string) (*CheckedPackage
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if pkgPath == "unsafe" {
+	if pkgPath == unsafePkgPath {
 		return unsafePackage(), nil
 	}
 	if cp, ok := p.getFull(pkgPath); ok {
@@ -320,7 +320,7 @@ func (p *Provider) PackageWithBodies(ctx context.Context, pkgPath string) (*Chec
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if pkgPath == "unsafe" {
+	if pkgPath == unsafePkgPath {
 		return unsafePackage(), nil
 	}
 	if cp, ok := p.getFull(pkgPath); ok {
@@ -384,12 +384,14 @@ func (p *Provider) putFull(pkgPath string, cp *CheckedPackage) {
 	p.fullLRU.put(pkgPath, cp)
 }
 
+const unsafePkgPath = "unsafe"
+
 // unsafePackage returns the synthetic CheckedPackage for the "unsafe"
 // pseudo-package: types.Unsafe is a fixed, pre-built *types.Package with no
 // source files of its own (mirrors gopls's own checkPackageForImport
 // special case, research-gopls-dependency-nav.md's Q2).
 func unsafePackage() *CheckedPackage {
-	return &CheckedPackage{pkgPath: "unsafe", pkg: types.Unsafe, info: &types.Info{}}
+	return &CheckedPackage{pkgPath: unsafePkgPath, pkg: types.Unsafe, info: &types.Info{}}
 }
 
 // check parses pkgPath's GoFiles (from metadata; disk content, since

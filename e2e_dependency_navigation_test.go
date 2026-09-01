@@ -167,7 +167,7 @@ func TestE2E_DependencyFullBodyNavigation(t *testing.T) {
 	// First hop: workspace -> go.etcd.io/bbolt, landing inside its own
 	// db.go (the same file store.go's own bbolt.DB field type declaration
 	// and bbolt.Open both resolve into).
-	openPos := selectorIdentPosition(t, storeFile, "bbolt", "Open", 1)
+	openPos := selectorIdentPosition(t, storeFile, "bbolt", "Open")
 	first := definitionAt(t, c, storeFile, openPos)
 	if len(first) != 1 {
 		t.Fatalf("definition(bbolt.Open) = %+v, want exactly 1 location", first)
@@ -178,75 +178,84 @@ func TestE2E_DependencyFullBodyNavigation(t *testing.T) {
 	}
 	c.openFile(t, dbGoFile)
 
-	t.Run("hover_local_symbol_full_body", func(t *testing.T) {
-		// lg is declared "lg := db.Logger()" -- a body-local variable whose
-		// static type (bbolt's own Logger interface) is resolved only when
-		// statement-level type-checking actually ran; a declarations-only
-		// check (IgnoreFuncBodies, the superseded pipeline for this case)
-		// never populates types.Info.Defs/Uses for it at all, so hover would
-		// return nil, not a Logger-typed signature.
-		pos := identOccurrencePosition(t, dbGoFile, "lg", 1)
-		md := hoverMarkdown(t, c, dbGoFile, pos)
-		if !strings.Contains(md, "lg") || !strings.Contains(md, "Logger") {
-			t.Errorf("hover(lg) = %q, want its signature to name both lg and its Logger type", md)
-		}
-	})
+	t.Run("hover_local_symbol_full_body", func(t *testing.T) { checkDepHoverLocalSymbol(t, c, dbGoFile) })
+	t.Run("definition_to_another_file_of_the_dependency", func(t *testing.T) { checkDepCrossFileDefinition(t, c, dbGoFile) })
+	t.Run("definition_onward_to_a_dependency_of_the_dependency", func(t *testing.T) { checkDepOnwardDefinition(t, c, dbGoFile) })
+	t.Run("typedefinition_cross_package_from_workspace_into_a_dependency", func(t *testing.T) { checkDepTypeDefinition(t, c, storeFile) })
+}
 
-	t.Run("definition_to_another_file_of_the_dependency", func(t *testing.T) {
-		pos := identOccurrencePosition(t, dbGoFile, "getDiscardLogger", 1)
-		got := definitionAt(t, c, dbGoFile, pos)
-		if len(got) != 1 {
-			t.Fatalf("definition(getDiscardLogger) = %+v, want exactly 1 location", got)
-		}
-		gotPath := got[0].URI.FsPath()
-		if !strings.HasSuffix(filepath.ToSlash(gotPath), "logger.go") {
-			t.Fatalf("definition(getDiscardLogger) = %s, want a path ending in logger.go (another file of the SAME bbolt package)", gotPath)
-		}
-		want := declPosition(t, gotPath, "getDiscardLogger")
-		if got[0].Range.Start != want {
-			t.Errorf("definition(getDiscardLogger) landed at %+v, want %+v (its own declaring identifier in %s)", got[0].Range.Start, want, gotPath)
-		}
-	})
+func checkDepHoverLocalSymbol(t *testing.T, c *lspClient, dbGoFile string) {
+	t.Helper()
+	// lg is declared "lg := db.Logger()" -- a body-local variable whose
+	// static type (bbolt's own Logger interface) is resolved only when
+	// statement-level type-checking actually ran; a declarations-only
+	// check (IgnoreFuncBodies, the superseded pipeline for this case)
+	// never populates types.Info.Defs/Uses for it at all, so hover would
+	// return nil, not a Logger-typed signature.
+	pos := identOccurrencePosition(t, dbGoFile, "lg", 1)
+	md := hoverMarkdown(t, c, dbGoFile, pos)
+	if !strings.Contains(md, "lg") || !strings.Contains(md, "Logger") {
+		t.Errorf("hover(lg) = %q, want its signature to name both lg and its Logger type", md)
+	}
+}
 
-	t.Run("definition_onward_to_a_dependency_of_the_dependency", func(t *testing.T) {
-		pos := selectorIdentPosition(t, dbGoFile, "common", "DefaultMaxBatchSize", 1)
-		got := definitionAt(t, c, dbGoFile, pos)
-		if len(got) != 1 {
-			t.Fatalf("definition(common.DefaultMaxBatchSize) = %+v, want exactly 1 location", got)
-		}
-		gotPath := got[0].URI.FsPath()
-		// The module cache directory is "go.etcd.io/bbolt@<version>/internal/common",
-		// not "bbolt/internal/common" — the "@<version>" suffix rules out a
-		// plain substring check on the unversioned import path.
-		slash := filepath.ToSlash(gotPath)
-		if !strings.Contains(slash, "go.etcd.io/bbolt@") || !strings.HasSuffix(slash, "/internal/common/types.go") {
-			t.Fatalf("definition(common.DefaultMaxBatchSize) = %s, want a path inside the go.etcd.io/bbolt module cache's internal/common package", gotPath)
-		}
-		want := declPosition(t, gotPath, "DefaultMaxBatchSize")
-		if got[0].Range.Start != want {
-			t.Errorf("definition(common.DefaultMaxBatchSize) landed at %+v, want %+v (its own declaring identifier in %s)", got[0].Range.Start, want, gotPath)
-		}
-	})
+func checkDepCrossFileDefinition(t *testing.T, c *lspClient, dbGoFile string) {
+	t.Helper()
+	pos := identOccurrencePosition(t, dbGoFile, "getDiscardLogger", 1)
+	got := definitionAt(t, c, dbGoFile, pos)
+	if len(got) != 1 {
+		t.Fatalf("definition(getDiscardLogger) = %+v, want exactly 1 location", got)
+	}
+	gotPath := got[0].URI.FsPath()
+	if !strings.HasSuffix(filepath.ToSlash(gotPath), "logger.go") {
+		t.Fatalf("definition(getDiscardLogger) = %s, want a path ending in logger.go (another file of the SAME bbolt package)", gotPath)
+	}
+	want := declPosition(t, gotPath, "getDiscardLogger")
+	if got[0].Range.Start != want {
+		t.Errorf("definition(getDiscardLogger) landed at %+v, want %+v (its own declaring identifier in %s)", got[0].Range.Start, want, gotPath)
+	}
+}
 
-	t.Run("typedefinition_cross_package_from_workspace_into_a_dependency", func(t *testing.T) {
-		// store.go's own "bolt *bbolt.DB" field — the same reference
-		// openPos's own definition(bbolt.Open) hop is unrelated to; this is
-		// a typeDefinition query, not a definition one, and targets the
-		// TYPE bbolt.DB rather than the func bbolt.Open.
-		pos := selectorIdentPosition(t, storeFile, "bbolt", "DB", 1)
-		got := typeDefinitionAt(t, c, storeFile, pos)
-		if len(got) != 1 {
-			t.Fatalf("typeDefinition(bbolt.DB) = %+v, want exactly 1 location", got)
-		}
-		gotPath := got[0].URI.FsPath()
-		if !strings.HasSuffix(filepath.ToSlash(gotPath), "db.go") {
-			t.Fatalf("typeDefinition(bbolt.DB) = %s, want a path ending in db.go (inside the go.etcd.io/bbolt module cache)", gotPath)
-		}
-		want := declPosition(t, gotPath, "DB")
-		if got[0].Range.Start != want {
-			t.Errorf("typeDefinition(bbolt.DB) landed at %+v, want %+v (DB's own declaring identifier in %s) — before item 3's fix this returned no results at all, since the facts index never covers a non-root package", got[0].Range.Start, want, gotPath)
-		}
-	})
+func checkDepOnwardDefinition(t *testing.T, c *lspClient, dbGoFile string) {
+	t.Helper()
+	pos := selectorIdentPosition(t, dbGoFile, "common", "DefaultMaxBatchSize")
+	got := definitionAt(t, c, dbGoFile, pos)
+	if len(got) != 1 {
+		t.Fatalf("definition(common.DefaultMaxBatchSize) = %+v, want exactly 1 location", got)
+	}
+	gotPath := got[0].URI.FsPath()
+	// The module cache directory is "go.etcd.io/bbolt@<version>/internal/common",
+	// not "bbolt/internal/common" — the "@<version>" suffix rules out a
+	// plain substring check on the unversioned import path.
+	slash := filepath.ToSlash(gotPath)
+	if !strings.Contains(slash, "go.etcd.io/bbolt@") || !strings.HasSuffix(slash, "/internal/common/types.go") {
+		t.Fatalf("definition(common.DefaultMaxBatchSize) = %s, want a path inside the go.etcd.io/bbolt module cache's internal/common package", gotPath)
+	}
+	want := declPosition(t, gotPath, "DefaultMaxBatchSize")
+	if got[0].Range.Start != want {
+		t.Errorf("definition(common.DefaultMaxBatchSize) landed at %+v, want %+v (its own declaring identifier in %s)", got[0].Range.Start, want, gotPath)
+	}
+}
+
+func checkDepTypeDefinition(t *testing.T, c *lspClient, storeFile string) {
+	t.Helper()
+	// store.go's own "bolt *bbolt.DB" field — the same reference
+	// openPos's own definition(bbolt.Open) hop is unrelated to; this is
+	// a typeDefinition query, not a definition one, and targets the
+	// TYPE bbolt.DB rather than the func bbolt.Open.
+	pos := selectorIdentPosition(t, storeFile, "bbolt", "DB")
+	got := typeDefinitionAt(t, c, storeFile, pos)
+	if len(got) != 1 {
+		t.Fatalf("typeDefinition(bbolt.DB) = %+v, want exactly 1 location", got)
+	}
+	gotPath := got[0].URI.FsPath()
+	if !strings.HasSuffix(filepath.ToSlash(gotPath), "db.go") {
+		t.Fatalf("typeDefinition(bbolt.DB) = %s, want a path ending in db.go (inside the go.etcd.io/bbolt module cache)", gotPath)
+	}
+	want := declPosition(t, gotPath, "DB")
+	if got[0].Range.Start != want {
+		t.Errorf("typeDefinition(bbolt.DB) landed at %+v, want %+v (DB's own declaring identifier in %s) — before item 3's fix this returned no results at all, since the facts index never covers a non-root package", got[0].Range.Start, want, gotPath)
+	}
 }
 
 // TestE2E_HoverDependencyDocComment drives a real golance binary over a
