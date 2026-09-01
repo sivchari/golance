@@ -53,6 +53,18 @@ type progressNotification struct {
 	message string
 }
 
+// serverRequest is one server-initiated JSON-RPC request (e.g.
+// workspace/inlayHint/refresh), timestamped at the moment readLoop decoded
+// it, for latency measurements that need to know when the server asked the
+// client for something rather than only when the client asked the server.
+// readLoop answers every such request with a null result immediately after
+// queuing it, so the server's own s.rpc.Request never blocks waiting on a
+// reply this minimal client has no other reason to send.
+type serverRequest struct {
+	method     string
+	receivedAt time.Time
+}
+
 // lspClient is a minimal stdio LSP client good enough to drive golance: it
 // correlates responses by id and queues the two notification kinds the E2E
 // suite waits on (diagnostics, index-build progress) on their own channels
@@ -69,6 +81,7 @@ type lspClient struct {
 
 	diagnostics chan diagnosticsNotification
 	progress    chan progressNotification
+	requests    chan serverRequest
 }
 
 var (
@@ -206,6 +219,7 @@ func startClientIn(t *testing.T, root, fakeHome string) *lspClient {
 		pending:     map[string]chan *message{},
 		diagnostics: make(chan diagnosticsNotification, 128),
 		progress:    make(chan progressNotification, 128),
+		requests:    make(chan serverRequest, 128),
 	}
 	go c.readLoop()
 	return c
@@ -315,6 +329,8 @@ func (c *lspClient) readLoop() {
 			c.dispatchDiagnostics(&m)
 		case m.Method == protocol.MethodProgress:
 			c.dispatchProgress(&m)
+		case m.Method != "" && m.ID != nil:
+			c.dispatchServerRequest(&m)
 		}
 	}
 }
@@ -366,6 +382,22 @@ func (c *lspClient) dispatchProgress(m *message) {
 		msg = *kv.Message
 	}
 	c.progress <- progressNotification{token: string(token), kind: kv.Kind, message: msg}
+}
+
+// dispatchServerRequest records m's arrival time and answers it with a null
+// result, so a server-initiated request this minimal client has no
+// domain-specific handling for (e.g. workspace/inlayHint/refresh) never
+// blocks the server's own s.rpc.Request waiting on a reply.
+func (c *lspClient) dispatchServerRequest(m *message) {
+	select {
+	case c.requests <- serverRequest{method: m.Method, receivedAt: time.Now()}:
+	default:
+	}
+	raw, err := json.Marshal(message{JSONRPC: jsonrpcVersion, ID: m.ID, Result: json.RawMessage("null")})
+	if err != nil {
+		return
+	}
+	_ = c.in.write(raw)
 }
 
 // call sends a request and waits for its response, failing t on timeout.

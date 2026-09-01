@@ -100,6 +100,52 @@ func UTF16PositionForByteOffset(text []byte, offset int) (protocol.Position, boo
 	return protocol.Position{Line: line, Character: col}, true
 }
 
+// UTF16PositionConverter converts a series of byte offsets into text to LSP
+// UTF-16 Positions like UTF16PositionForByteOffset, but in amortized O(1)
+// per call (O(n) total across the whole series) when the offsets are
+// non-decreasing, by resuming the scan from wherever the previous call left
+// off instead of rescanning text from byte 0 every time. A caller
+// converting many offsets already sorted ascending — e.g. one per inlay
+// hint, as langfeat.InlayHints returns them — should use this instead of
+// calling UTF16PositionForByteOffset in a loop, which costs O(n*m) for n
+// offsets across an m-byte file. An offset lower than the previous one is
+// still handled correctly, by falling back to a rescan from the start.
+type UTF16PositionConverter struct {
+	text []byte
+	pos  int
+	line uint32
+	col  uint32
+}
+
+// NewUTF16PositionConverter returns a converter for text, positioned at the
+// start of the file.
+func NewUTF16PositionConverter(text []byte) *UTF16PositionConverter {
+	return &UTF16PositionConverter{text: text}
+}
+
+// Position converts offset to its UTF-16 line/character Position, advancing
+// the converter's cursor to offset. It returns false for an offset outside
+// [0, len(text)].
+func (c *UTF16PositionConverter) Position(offset int) (protocol.Position, bool) {
+	if offset < 0 || offset > len(c.text) {
+		return protocol.Position{}, false
+	}
+	if offset < c.pos {
+		c.pos, c.line, c.col = 0, 0, 0
+	}
+	for c.pos < offset {
+		r, size := utf8.DecodeRune(c.text[c.pos:])
+		c.pos += size
+		if r == '\n' {
+			c.line++
+			c.col = 0
+		} else {
+			c.col += utf16Units(r)
+		}
+	}
+	return protocol.Position{Line: c.line, Character: c.col}, true
+}
+
 func utf16Units(r rune) uint32 {
 	if r > 0xffff {
 		return 2

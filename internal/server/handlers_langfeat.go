@@ -304,8 +304,15 @@ func (s *Server) handleInlayHint(ctx context.Context, params json.RawMessage) (a
 		return []protocol.InlayHint{}, nil
 	}
 	out := make([]protocol.InlayHint, 0, len(hints))
+	// hints is sorted ascending by Offset (see langfeat.InlayHints), so a
+	// single UTF16PositionConverter can convert every hint's offset in one
+	// forward pass over text instead of the O(len(hints)*len(text)) a fresh
+	// overlay.UTF16PositionForByteOffset call per hint would cost — the
+	// difference between single-digit milliseconds and several hundred on a
+	// large file with many hints.
+	conv := overlay.NewUTF16PositionConverter(text)
 	for _, h := range hints {
-		pos, ok := overlay.UTF16PositionForByteOffset(text, h.Offset)
+		pos, ok := conv.Position(h.Offset)
 		if !ok {
 			continue
 		}
