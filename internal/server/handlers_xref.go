@@ -280,7 +280,9 @@ func packageClauseLocation(file string) (xref.Location, bool) {
 	}
 	start := fset.Position(astFile.Name.Pos())
 	end := fset.Position(astFile.Name.End())
-	if start.Line <= 0 || start.Line > math.MaxUint32 || start.Column <= 0 || end.Column <= 0 {
+	if start.Line <= 0 || int64(start.Line) > math.MaxUint32 ||
+		start.Column <= 0 || int64(start.Column) > math.MaxUint32 ||
+		end.Column <= 0 || int64(end.Column) > math.MaxUint32 {
 		return xref.Location{}, false
 	}
 	return xref.Location{
