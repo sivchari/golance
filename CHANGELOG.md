@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.1.7](https://github.com/sivchari/golance/compare/v0.1.6...v0.1.7) - 2026-09-01
+- feat: resolve unsaved and test files to their directory's package by @sivchari in https://github.com/sivchari/golance/pull/26
+
 ## [v0.1.6](https://github.com/sivchari/golance/compare/v0.1.5...v0.1.6) - 2026-09-01
 - fix: invalidate the xref resolver cache on reindex and stop retrying failed export recovery by @sivchari in https://github.com/sivchari/golance/pull/23
 - fix: convert inlay hint positions incrementally by @sivchari in https://github.com/sivchari/golance/pull/25
