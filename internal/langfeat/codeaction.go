@@ -7,6 +7,7 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
+	"strings"
 
 	"golang.org/x/tools/go/ast/astutil"
 )
@@ -376,4 +377,57 @@ func addImportAction(file string, text []byte, offset int, name string, c Import
 		Kind:  ActionQuickFix,
 		Edits: []Edit{{Range: Range{StartOffset: 0, EndOffset: len(text)}, NewText: string(out)}},
 	}, nil
+}
+
+// importInsertEdit returns the minimal-diff Edit that adds an import for
+// importPath (aliased as pkgName only when its assumed name — derived from
+// importPath alone, see assumedPackageName — would not already resolve to
+// pkgName) into file's current content text, sorted into its import block
+// the same way gofmt would leave it (via ast.SortImports). Used by
+// langfeat.UnimportedPackageItems/UnimportedMemberItems: unlike
+// addImportAction, which qualifies an already-typed unqualified identifier
+// before adding its import, this adds only the import declaration — text
+// still has no reference to importPath at the time this runs, since the
+// completion's own primary edit (inserting the identifier or member name
+// itself) is a separate, client-applied edit. That is also why this
+// formats through go/format rather than OrganizeImports/goimports: goimports
+// treats an import nothing in the source yet references as unused and
+// deletes it right back out, which is correct for source.organizeImports
+// but wrong here.
+func importInsertEdit(file string, text []byte, pkgName, importPath string) (Edit, error) {
+	astFile, fset, err := parseSource(file, text)
+	if err != nil {
+		return Edit{}, fmt.Errorf("langfeat: parse %s for import insertion: %w", file, err)
+	}
+	name := ""
+	if assumedPackageName(importPath) != pkgName {
+		name = pkgName
+	}
+	astutil.AddNamedImport(fset, astFile, name, importPath)
+	ast.SortImports(fset, astFile)
+
+	var buf bytes.Buffer
+	if err := format.Node(&buf, fset, astFile); err != nil {
+		return Edit{}, fmt.Errorf("langfeat: print %s: %w", file, err)
+	}
+	return organizeImportsEdit(text, buf.Bytes()), nil
+}
+
+// assumedPackageName approximates goimports' importPathToAssumedName
+// heuristic (golang.org/x/tools/internal/imports, unavailable to golance
+// since only code inside the golang.org/x/tools module tree can import one
+// of its internal packages): importPath's last slash-separated segment.
+// That is enough to decide whether an explicit import alias would help
+// readability in the common case, but — unlike the real heuristic — does
+// not strip a trailing major-version segment (e.g. "gopkg.in/yaml.v2"
+// assumes "yaml.v2", not "yaml"), a known v1 simplification: the worst
+// case is only ever a stylistically redundant explicit alias
+// (`yaml "gopkg.in/yaml.v2"`) on the generated import, never a wrong or
+// non-compiling one, since the alias always names candidate's own actual
+// declared package name.
+func assumedPackageName(importPath string) string {
+	if i := strings.LastIndexByte(importPath, '/'); i >= 0 {
+		return importPath[i+1:]
+	}
+	return importPath
 }

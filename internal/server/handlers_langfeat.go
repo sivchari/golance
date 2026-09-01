@@ -107,16 +107,39 @@ func (s *Server) handleCompletion(ctx context.Context, params json.RawMessage) (
 		s.logger.Printf("server: completion %s: %v", cf.path, err)
 		return protocol.CompletionItemSlice(nil), nil
 	}
+	items = s.appendUnimportedCompletions(cf, items)
 	out := make(protocol.CompletionItemSlice, len(items))
 	for i, it := range items {
 		out[i] = protocol.CompletionItem{
-			Label:    it.Label,
-			Kind:     completionItemKind(it.Kind),
-			Detail:   protocol.NewOptional(it.Detail),
-			SortText: protocol.NewOptional(it.SortText),
+			Label:               it.Label,
+			Kind:                completionItemKind(it.Kind),
+			Detail:              protocol.NewOptional(it.Detail),
+			SortText:            protocol.NewOptional(it.SortText),
+			AdditionalTextEdits: additionalTextEdits(cf.text, it.AdditionalTextEdits),
 		}
 	}
 	return out, nil
+}
+
+// additionalTextEdits converts edits (in langfeat's byte-offset coordinate
+// system, computed against text) into protocol.TextEdit values. An edit
+// whose range cannot be converted (offset out of range for text) is
+// dropped rather than failing the whole completion response — the same
+// degrade-instead-of-fail policy toProtocolCodeAction uses for the
+// identical conversion.
+func additionalTextEdits(text []byte, edits []langfeat.Edit) []protocol.TextEdit {
+	if len(edits) == 0 {
+		return nil
+	}
+	out := make([]protocol.TextEdit, 0, len(edits))
+	for _, e := range edits {
+		rng, ok := offsetRangeToLSP(text, e.Range.StartOffset, e.Range.EndOffset)
+		if !ok {
+			continue
+		}
+		out = append(out, protocol.TextEdit{Range: rng, NewText: e.NewText})
+	}
+	return out
 }
 
 func (s *Server) handleSignatureHelp(ctx context.Context, params json.RawMessage) (any, error) {

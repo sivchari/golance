@@ -1,6 +1,7 @@
 package langfeat
 
 import (
+	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
@@ -35,6 +36,12 @@ type CompletionItem struct {
 	Kind     CompletionKind
 	Detail   string
 	SortText string
+	// AdditionalTextEdits are edits applied alongside accepting this item,
+	// disjoint from wherever the client inserts Label itself — currently
+	// only ever the import-block insertion an unimported-package candidate
+	// needs (see UnimportedPackageItems/UnimportedMemberItems). nil for
+	// every other candidate.
+	AdditionalTextEdits []Edit
 }
 
 // Completion returns completion candidates for the cursor at offset (a
@@ -79,6 +86,118 @@ func Completion(cp *check.CheckedPackage, text []byte, file string, offset int) 
 // server layer owns how unimported candidates are sourced and ordered.
 func MergeUnimported(items, candidates []CompletionItem) []CompletionItem {
 	return append(items, candidates...)
+}
+
+// UnimportedContext describes what unimported-package lookup, if any,
+// applies to the same cursor position a Completion call was made against —
+// a second, cheap pass over the same AST (Completion's own path is not
+// exposed to callers), for the server layer to resolve candidates against
+// its own workspace/graph state (Completion itself never reads the graph)
+// and turn into CompletionItems via UnimportedPackageItems/
+// UnimportedMemberItems.
+type UnimportedContext struct {
+	// Prefix is the identifier prefix already typed at the cursor — the
+	// package name being typed for a Selector == "" (shape 1) context, or
+	// the member name prefix for a Selector != "" (shape 2) one.
+	Prefix string
+	// Selector is the base identifier's name in a "Selector.Prefix"
+	// qualified-selector position whose base does not already resolve (to
+	// an imported package or a value) — a shape-2 candidate. Empty for a
+	// bare lexical-position prefix instead (shape 1).
+	Selector string
+}
+
+// Unimported reports the UnimportedContext for the cursor at offset in
+// text (see Completion for the shared coordinate system), or ok=false if
+// no unimported-package lookup applies there: a shape-2 selector whose
+// base already resolves (nothing to add), or a shape-1 lexical position
+// with an empty prefix — mirroring gopls's own "don't suggest unimported
+// packages if we have absolutely nothing to go on" cutoff, since scoring
+// every package in the workspace against an empty prefix is all cost and
+// no signal.
+func Unimported(cp *check.CheckedPackage, text []byte, file string, offset int) (UnimportedContext, bool) {
+	offset = min(max(offset, 0), len(text))
+	prefixStart := scanIdentBack(text, offset)
+	prefix := string(text[prefixStart:offset])
+
+	astFile, ctxPos, _, err := locate(cp, file, prefixStart)
+	if err != nil {
+		return UnimportedContext{}, false
+	}
+	path, _ := astutil.PathEnclosingInterval(astFile, ctxPos, ctxPos)
+
+	if sel := enclosingSelector(path); sel != nil {
+		id, ok := sel.X.(*ast.Ident)
+		if !ok {
+			return UnimportedContext{}, false
+		}
+		if _, ok := cp.Info().ObjectOf(id).(*types.PkgName); ok {
+			return UnimportedContext{}, false // already imported; ordinary selectorCompletions handles it
+		}
+		if cp.Info().TypeOf(sel.X) != nil {
+			return UnimportedContext{}, false // resolves to a value; ordinary member completion handles it
+		}
+		return UnimportedContext{Selector: id.Name, Prefix: prefix}, true
+	}
+
+	if prefix == "" {
+		return UnimportedContext{}, false
+	}
+	return UnimportedContext{Prefix: prefix}, true
+}
+
+// UnimportedPackageCandidate names a graph-known package that could satisfy
+// an unimported-package completion: its declared name (e.g. "strings",
+// read from its package clause — can differ from its import path's last
+// segment) and import path.
+type UnimportedPackageCandidate struct {
+	Name       string
+	ImportPath string
+}
+
+// UnimportedPackageItems returns one KindPackage CompletionItem per
+// candidate (shape 1: the user is typing a package name itself, not yet
+// imported), ranked below every in-scope candidate via SortText (see the
+// rank* constants) — each carrying the AdditionalTextEdits that import
+// candidate's path into file's current content text. A candidate whose
+// import edit cannot be computed (e.g. text fails to parse) is silently
+// skipped rather than failing the whole completion request.
+func UnimportedPackageItems(file string, text []byte, prefix string, candidates []UnimportedPackageCandidate) []CompletionItem {
+	items := make([]CompletionItem, 0, len(candidates))
+	for _, c := range candidates {
+		edit, err := importInsertEdit(file, text, c.Name, c.ImportPath)
+		if err != nil {
+			continue
+		}
+		items = append(items, CompletionItem{
+			Label:               c.Name,
+			Kind:                KindPackage,
+			Detail:              fmt.Sprintf("package (from %q)", c.ImportPath),
+			AdditionalTextEdits: []Edit{edit},
+		})
+	}
+	return filterAndRankBase(items, prefix, rankUnimported, rankUnimportedFuzzy)
+}
+
+// UnimportedMemberItems returns candidate's exported member
+// CompletionItems (shape 2: "pkg.Prefix" where pkg names candidate but is
+// not yet imported), matching prefix — reusing the same
+// packageMemberItems/kindForObject machinery selectorCompletions uses for
+// an already-imported package, so Kind/Detail formatting is identical.
+// Every returned item carries the same AdditionalTextEdits importing
+// candidate's path; pkg is candidate's already-decoded *types.Package (the
+// caller resolves this from export data — see internal/typecheck — since
+// Unimported itself never reads the graph).
+func UnimportedMemberItems(file string, text []byte, prefix string, candidate UnimportedPackageCandidate, pkg *types.Package) []CompletionItem {
+	edit, err := importInsertEdit(file, text, candidate.Name, candidate.ImportPath)
+	if err != nil {
+		return nil
+	}
+	items := packageMemberItems(pkg)
+	for i := range items {
+		items[i].AdditionalTextEdits = []Edit{edit}
+	}
+	return filterAndRankBase(items, prefix, rankUnimported, rankUnimportedFuzzy)
 }
 
 // enclosingSelector returns the nearest *ast.SelectorExpr in path, or nil
@@ -241,18 +360,39 @@ func kindForObject(obj types.Object) CompletionKind {
 	}
 }
 
+// Rank prefixes filterAndRankBase's SortText values sort by: in-scope
+// candidates (rankExact/rankFuzzy) always precede unimported ones
+// (rankUnimported), matching gopls's unimportedScore, which always scores
+// below any in-scope candidate — see UnimportedPackageItems/
+// UnimportedMemberItems.
+const (
+	rankExact           = "0"
+	rankFuzzy           = "1"
+	rankUnimported      = "2"
+	rankUnimportedFuzzy = "3"
+)
+
 // filterAndRank keeps only items whose Label matches prefix (case-sensitive
 // prefix match ranked above case-insensitive), sets each survivor's
 // SortText accordingly, and returns them sorted by rank then label.
 func filterAndRank(items []CompletionItem, prefix string) []CompletionItem {
+	return filterAndRankBase(items, prefix, rankExact, rankFuzzy)
+}
+
+// filterAndRankBase is filterAndRank generalized over the rank prefixes
+// used for an exact-prefix versus a case-insensitive match, so
+// UnimportedPackageItems/UnimportedMemberItems can rank their own matches
+// below every in-scope item (see the rank* constants) while reusing the
+// same matching logic.
+func filterAndRankBase(items []CompletionItem, prefix string, exactBase, fuzzyBase string) []CompletionItem {
 	lowerPrefix := strings.ToLower(prefix)
 	out := make([]CompletionItem, 0, len(items))
 	for _, it := range items {
 		switch {
 		case prefix == "" || strings.HasPrefix(it.Label, prefix):
-			it.SortText = "0" + it.Label
+			it.SortText = exactBase + it.Label
 		case strings.HasPrefix(strings.ToLower(it.Label), lowerPrefix):
-			it.SortText = "1" + it.Label
+			it.SortText = fuzzyBase + it.Label
 		default:
 			continue
 		}

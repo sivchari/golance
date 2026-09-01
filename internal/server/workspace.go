@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"go/types"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -105,6 +106,7 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 		}
 		dirToPkg[pkg.Dir] = pkgPath
 	}
+	pkgNameIndex := buildPkgNameIndex(snap)
 
 	// Stop the outgoing workspace's engine before installing the new one:
 	// otherwise a debounce timer already scheduled on it (e.g. by a
@@ -114,13 +116,37 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	if old := s.ws.Load(); old != nil {
 		old.engine.Stop()
 	}
-	s.ws.Store(&workspace{root: root, snap: snap, engine: engine, fileToPkg: fileToPkg, dirToPkg: dirToPkg, depCache: depCache})
+	s.ws.Store(&workspace{
+		root: root, snap: snap, engine: engine, fileToPkg: fileToPkg, dirToPkg: dirToPkg,
+		depCache: depCache, pkgNameIndex: pkgNameIndex,
+	})
 
 	if idx := s.idx.Load(); idx != nil {
 		s.idx.Store(&indexState{db: idx.db, cas: idx.cas, resolver: s.newResolver(idx.db, idx.cas, snap, RelativeIndexPaths(root))})
 	}
 
 	s.refreshOnWorkspaceReady()
+}
+
+// buildPkgNameIndex indexes every package in snap by its declared name, for
+// unimported-package completion (see workspace.pkgNameIndex's doc). A
+// package with no Name (a pre-Name-field on-disk cache — see
+// graph.cacheVersion — or a package go/packages could not resolve a name
+// for) or named "main" (never importable) is skipped; the latter mirrors
+// gopls's own unimportedPackages, which excludes "main" packages from its
+// candidate set the same way.
+func buildPkgNameIndex(snap *graph.Snapshot) map[string][]string {
+	idx := make(map[string][]string)
+	for path, pkg := range snap.Packages {
+		if pkg.Name == "" || pkg.Name == "main" {
+			continue
+		}
+		idx[pkg.Name] = append(idx[pkg.Name], path)
+	}
+	for name := range idx {
+		sort.Strings(idx[name])
+	}
+	return idx
 }
 
 // refreshOnWorkspaceReady tells a capability-declaring client that

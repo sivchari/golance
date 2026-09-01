@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -45,6 +46,25 @@ func TestLoad_TopoOrder(t *testing.T) {
 	}
 	if idx[modB] >= idx[modC] {
 		t.Errorf("topo order: want b before c, got order %v", snap.Order)
+	}
+}
+
+// TestLoad_PackageName checks that Package.Name is populated straight from
+// go/packages' NeedName result (see loadMode) — the candidate source
+// internal/server's unimported-completion index relies on to avoid ever
+// having to open and parse a package's files itself just to learn its
+// declared name.
+func TestLoad_PackageName(t *testing.T) {
+	snap := loadTestdata(t)
+
+	for path, want := range map[string]string{modA: "a", modB: "b", modC: "c"} {
+		pkg, ok := snap.Package(path)
+		if !ok {
+			t.Fatalf("Package(%s) missing", path)
+		}
+		if pkg.Name != want {
+			t.Errorf("Package(%s).Name = %q, want %q", path, pkg.Name, want)
+		}
 	}
 }
 
@@ -191,6 +211,38 @@ func TestCache_RoundTrip(t *testing.T) {
 
 	if Stale(root) {
 		t.Error("Stale should be false right after SaveCache with no module file changes")
+	}
+}
+
+// TestLoadCache_RejectsOldVersion checks that a diskCache written before
+// cacheVersion existed (or by an older mismatched version) is treated as a
+// miss rather than being served with its packages' Name fields silently
+// empty — see cacheVersion's doc for why this matters specifically for
+// unimported completion: Stale alone (go.mod/go.sum/go.work mtimes) would
+// never catch this, since none of those changed.
+func TestLoadCache_RejectsOldVersion(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("testdata", "simple"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	patterns := []string{"./..."}
+
+	old := diskCache{Version: cacheVersion - 1, Root: root, Patterns: patterns, Packages: map[string]*Package{}}
+	b, err := json.Marshal(old)
+	if err != nil {
+		t.Fatalf("marshal old diskCache: %v", err)
+	}
+	file := CacheFile(root)
+	if err := os.MkdirAll(filepath.Dir(file), 0o750); err != nil {
+		t.Fatalf("mkdir cache dir: %v", err)
+	}
+	if err := os.WriteFile(file, b, 0o600); err != nil {
+		t.Fatalf("write old cache file: %v", err)
+	}
+
+	if _, ok := LoadCache(root, patterns, nil); ok {
+		t.Error("LoadCache should miss for a cache written with an old cacheVersion")
 	}
 }
 
