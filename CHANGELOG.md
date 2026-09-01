@@ -2,6 +2,7 @@
 
 ## [v0.1.9](https://github.com/sivchari/golance/compare/v0.1.8...v0.1.9) - 2026-09-01
 - fix: fall back to type-info definitions when the facts index cannot answer by @sivchari in https://github.com/sivchari/golance/pull/30
+- feat: fall back to a session-private index when the shared one is locked by @sivchari in https://github.com/sivchari/golance/pull/32
 
 ## [v0.1.8](https://github.com/sivchari/golance/compare/v0.1.7...v0.1.8) - 2026-09-01
 - fix: refresh inlay hints and semantic tokens when the workspace becomes ready by @sivchari in https://github.com/sivchari/golance/pull/28
