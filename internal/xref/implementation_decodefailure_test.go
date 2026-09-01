@@ -56,11 +56,18 @@ type Repo interface {
 	Save() error
 }
 `)
+	// Broken's receiver is generic so its methods are never fingerprinted
+	// (see registerMethodSet's doc): this keeps the test exercising the
+	// decode-based confirmation fallback implementingTypes still uses for a
+	// candidate fingerprint confirmation cannot trust, which is exactly what
+	// corruptExportData needs to matter here. A non-generic Broken would now
+	// be confirmed by Fingerprint alone, needing no decode at all — the
+	// whole point of the unexported-implementer fix this test predates.
 	writeTestFile(t, dir, "broken/broken.go", `package broken
 
-type Broken struct{}
+type Broken[T any] struct{}
 
-func (b Broken) Save() error { return nil }
+func (b Broken[T]) Save() error { return nil }
 `)
 	writeTestFile(t, dir, "healthy/healthy.go", `package healthy
 
@@ -105,11 +112,18 @@ type Repo interface {
 	Save() error
 }
 `)
+	// Broken's receiver is generic so its methods are never fingerprinted
+	// (see registerMethodSet's doc): this keeps the test exercising the
+	// decode-based confirmation fallback implementingTypes still uses for a
+	// candidate fingerprint confirmation cannot trust, which is exactly what
+	// corruptExportData needs to matter here. A non-generic Broken would now
+	// be confirmed by Fingerprint alone, needing no decode at all — the
+	// whole point of the unexported-implementer fix this test predates.
 	writeTestFile(t, dir, "broken/broken.go", `package broken
 
-type Broken struct{}
+type Broken[T any] struct{}
 
-func (b Broken) Save() error { return nil }
+func (b Broken[T]) Save() error { return nil }
 `)
 
 	r, snap, db, cas := newResolverAndStoreForDir(t, dir)
@@ -155,11 +169,18 @@ type Repo interface {
 	Save() error
 }
 `)
+	// Broken's receiver is generic so its methods are never fingerprinted
+	// (see registerMethodSet's doc): this keeps the test exercising the
+	// decode-based confirmation fallback implementingTypes still uses for a
+	// candidate fingerprint confirmation cannot trust, which is exactly what
+	// corruptExportData needs to matter here. A non-generic Broken would now
+	// be confirmed by Fingerprint alone, needing no decode at all — the
+	// whole point of the unexported-implementer fix this test predates.
 	writeTestFile(t, dir, "broken/broken.go", `package broken
 
-type Broken struct{}
+type Broken[T any] struct{}
 
-func (b Broken) Save() error { return nil }
+func (b Broken[T]) Save() error { return nil }
 `)
 	writeTestFile(t, dir, "healthy/healthy.go", `package healthy
 

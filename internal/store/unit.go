@@ -20,8 +20,14 @@ type UnitBlob struct {
 }
 
 const (
-	unitMagic   = "GLUB"
-	unitVersion = 1
+	unitMagic = "GLUB"
+	// unitVersion is bumped to 2 alongside [MethodEntry]'s three new fields
+	// (see its doc and schemaVersion's matching bump): a version-1 blob's
+	// methods section is encoded one 16-byte record per method, this
+	// package's own decodeMethodEntries now expects (and internal/index's
+	// factsSchemaVersion forces every CAS key to change so a fresh build
+	// never asks casHitOutcome to decode a stale version-1 blob at all).
+	unitVersion = 2
 )
 
 // EncodeUnitBlob serializes u as:
@@ -31,7 +37,7 @@ const (
 //	[factsLen]facts [exportLen]export
 //	fileCount * { [4]pathLen [pathLen]path [8]size [8]modTimeNanos }
 //	namesCount * { [4]nameLen [nameLen]name [8]idHash }
-//	methodsCount * { [4]nameLen [nameLen]name [8]pkgHash [8]typeSymbolIDHash }
+//	methodsCount * { [4]nameLen [nameLen]name [8]pkgHash [8]typeSymbolIDHash [8]methodPkgHash [8]methodIDHash [8]fingerprint }
 //	symstrCount * { [8]idHash [4]symbolIDLen [symbolIDLen]symbolID }
 func EncodeUnitBlob(u *UnitBlob) []byte {
 	size := 24 + 8 + len(u.Facts) + len(u.Export) // +8: methodsCount, symstrCount (see putIndexEntries)
@@ -42,7 +48,7 @@ func EncodeUnitBlob(u *UnitBlob) []byte {
 		size += 4 + len(n.Name) + 8
 	}
 	for _, m := range u.Index.Methods {
-		size += 4 + len(m.Name) + 16
+		size += 4 + len(m.Name) + 40
 	}
 	for _, s := range u.Index.SymStrs {
 		size += 8 + 4 + len(s.SymbolID)
@@ -103,6 +109,12 @@ func putIndexEntries(b []byte, off int, idx PackageIndexEntries) int {
 		binary.LittleEndian.PutUint64(b[off:], m.Entry.PkgHash)
 		off += 8
 		binary.LittleEndian.PutUint64(b[off:], m.Entry.TypeSymbolIDHash)
+		off += 8
+		binary.LittleEndian.PutUint64(b[off:], m.Entry.MethodPkgHash)
+		off += 8
+		binary.LittleEndian.PutUint64(b[off:], m.Entry.MethodIDHash)
+		off += 8
+		binary.LittleEndian.PutUint64(b[off:], m.Entry.Fingerprint)
 		off += 8
 	}
 	binary.LittleEndian.PutUint32(b[off:], u32len(len(idx.SymStrs)))
@@ -233,7 +245,7 @@ func decodeMethodEntries(b []byte, off int) ([]MethodSymbolEntry, int, error) {
 		if err != nil {
 			return nil, 0, fmt.Errorf("store: unit blob method %d: %w", i, err)
 		}
-		var pkgHash, typeIDHash uint64
+		var pkgHash, typeIDHash, methodPkgHash, methodIDHash, fingerprint uint64
 		pkgHash, off, err = takeUint64(b, off)
 		if err != nil {
 			return nil, 0, fmt.Errorf("store: unit blob method %d pkgHash: %w", i, err)
@@ -242,7 +254,25 @@ func decodeMethodEntries(b []byte, off int) ([]MethodSymbolEntry, int, error) {
 		if err != nil {
 			return nil, 0, fmt.Errorf("store: unit blob method %d typeIDHash: %w", i, err)
 		}
-		methods[i] = MethodSymbolEntry{Name: name, Entry: MethodEntry{PkgHash: pkgHash, TypeSymbolIDHash: typeIDHash}}
+		methodPkgHash, off, err = takeUint64(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob method %d methodPkgHash: %w", i, err)
+		}
+		methodIDHash, off, err = takeUint64(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob method %d methodIDHash: %w", i, err)
+		}
+		fingerprint, off, err = takeUint64(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob method %d fingerprint: %w", i, err)
+		}
+		methods[i] = MethodSymbolEntry{Name: name, Entry: MethodEntry{
+			PkgHash:          pkgHash,
+			TypeSymbolIDHash: typeIDHash,
+			MethodPkgHash:    methodPkgHash,
+			MethodIDHash:     methodIDHash,
+			Fingerprint:      fingerprint,
+		}}
 	}
 	return methods, off, nil
 }

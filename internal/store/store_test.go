@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -406,4 +407,65 @@ func stripSchemaVersion(t *testing.T, path string) error {
 	return bdb.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(bucketMeta).Delete(schemaVersionKey)
 	})
+}
+
+// writeSchemaVersion overwrites path's recorded schemaVersion in place,
+// simulating a database a previous, older build of golance already wrote —
+// as opposed to stripSchemaVersion's "written before the key existed at
+// all" case.
+func writeSchemaVersion(t *testing.T, path string, version uint16) error {
+	t.Helper()
+	bdb, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = bdb.Close() }()
+	b := make([]byte, 2)
+	binary.LittleEndian.PutUint16(b, version)
+	return bdb.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketMeta).Put(schemaVersionKey, b)
+	})
+}
+
+// TestOpen_DiscardsDatabaseWithOldSchemaVersion is
+// TestOpen_DiscardsDatabaseMissingSchemaVersion's counterpart for the
+// MethodEntry schema bump (unitVersion/schemaVersion 1 -> 2, see
+// store.go's schemaVersion doc): a database explicitly recorded under the
+// PRIOR numeric version -- not just one missing the key entirely -- must
+// also be discarded and recreated, since its "method" bucket posting lists
+// were written under the old, 16-byte-per-entry stride and would otherwise
+// misdecode against decodeMethodEntryList's new 40-byte one instead of
+// erroring outright (see the doc for why a decode-error check alone cannot
+// catch this).
+func TestOpen_DiscardsDatabaseWithOldSchemaVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := db.PutUnit(&UnitEntry{PkgHash: 1, Pointer: UnitPointer{BlobKey: 7, ContentHash: 9}}); err != nil {
+		t.Fatalf("PutUnit() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if err := writeSchemaVersion(t, path, schemaVersion-1); err != nil {
+		t.Fatalf("writeSchemaVersion() error = %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() on an old-schema-version database error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	if _, err := reopened.GetUnit(context.Background(), 1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetUnit(1) after reopening an old-schema-version database = %v, want ErrNotFound (stale data must be discarded, not silently served)", err)
+	}
 }

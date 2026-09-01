@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -19,7 +20,7 @@ func TestUnitBlobRoundTrip(t *testing.T) {
 				{Name: "Bar", IDHash: 2},
 			},
 			Methods: []MethodSymbolEntry{
-				{Name: "String", Entry: MethodEntry{PkgHash: 10, TypeSymbolIDHash: 20}},
+				{Name: "String", Entry: MethodEntry{PkgHash: 10, TypeSymbolIDHash: 20, MethodPkgHash: 30, MethodIDHash: 40, Fingerprint: 50}},
 			},
 			SymStrs: []SymStrEntry{
 				{IDHash: 1, SymbolID: "pkg#Foo"},
@@ -82,5 +83,18 @@ func TestUnitBlobTruncatedErrors(t *testing.T) {
 	}
 	if _, err := DecodeUnitBlob([]byte("short")); err == nil {
 		t.Error("DecodeUnitBlob(too short for header) = nil error, want an error")
+	}
+}
+
+// TestUnitBlobRejectsOldVersion pins unitVersion's own bump (1 -> 2, for
+// MethodEntry's three new fields — see store.go's schemaVersion doc): a
+// blob stamped with the PRIOR version must be rejected outright rather than
+// decoded against the new, wider per-method record layout, which would
+// otherwise misinterpret a version-1 blob's bytes instead of erroring.
+func TestUnitBlobRejectsOldVersion(t *testing.T) {
+	encoded := EncodeUnitBlob(&UnitBlob{Facts: []byte("hello")})
+	binary.LittleEndian.PutUint16(encoded[4:6], unitVersion-1)
+	if _, err := DecodeUnitBlob(encoded); err == nil {
+		t.Error("DecodeUnitBlob(old version) = nil error, want an error")
 	}
 }

@@ -75,6 +75,25 @@ func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool) *Res
 	pkgPathByHash := make(map[uint64]string, len(snap.Packages))
 	for path, pkg := range snap.Packages {
 		pkgPathByHash[store.Hash(path)] = path
+		// fileToPkg/dirToPkg deliberately index root (workspace) packages
+		// only, even though snap.Packages also carries the whole transitive
+		// closure (module dependencies and the standard library — see
+		// internal/graph's loadMode doc): the facts index this Resolver
+		// reads from only ever covers root packages
+		// (internal/index/scheduler.go's doc), so a dependency file's own
+		// pkgPath would resolve here only to send resolveAt straight into a
+		// GetUnit call that can never succeed. Excluding it here instead
+		// makes pkgPathForFile report "not part of any known package" for a
+		// dependency file exactly like it already does for a genuinely
+		// unresolvable one (e.g. a testdata fixture) — the same ordinary,
+		// low-noise miss internal/server.definitionFallback's ad-hoc
+		// CheckedPackage/SamePackageDefinition/DependencyDefinition chain
+		// already answers on its own, rather than a wrapped "read facts for
+		// X: store: not found" that reads like a genuine index failure for
+		// what is, for every dependency file, an entirely expected outcome.
+		if !pkg.Root {
+			continue
+		}
 		for _, f := range pkg.GoFiles {
 			fileToPkg[f] = path
 		}
@@ -268,15 +287,16 @@ func (r *Resolver) Invalidate(pkgPaths []string) {
 	}
 }
 
-// pkgPathForFile resolves file to its containing package's import path.
-// r.fileToPkg (built from graph.Package.GoFiles) never lists an in-package
-// _test.go file at all — internal/graph's loadMode loads without
-// packages.Config.Tests, the same gap testFilesInPackage exists to close
-// for the facts index itself (see internal/index/testfiles.go) — so a
-// position inside one always misses there. This falls back to matching
-// file's directory against a known package's Dir, mirroring
-// internal/check.GraphSource.PackageForFile's identical fallback and
-// internal/server.workspace's dirToPkg.
+// pkgPathForFile resolves file to its containing package's import path,
+// among root (workspace) packages only — see New's doc for why a
+// dependency file is deliberately never found here. r.fileToPkg (built from
+// graph.Package.GoFiles) never lists an in-package _test.go file at all —
+// internal/graph's loadMode loads without packages.Config.Tests, the same
+// gap testFilesInPackage exists to close for the facts index itself (see
+// internal/index/testfiles.go) — so a position inside one always misses
+// there. This falls back to matching file's directory against a known
+// package's Dir, mirroring internal/check.GraphSource.PackageForFile's
+// identical fallback and internal/server.workspace's dirToPkg.
 //
 // The directory fallback alone is not enough to trust file: it also
 // matches an external "_test"-suffixed test package file or an unrelated

@@ -133,10 +133,10 @@ func addDef(fset *token.FileSet, pkgHash uint64, tpkg *types.Package, fileIdx ma
 		return
 	}
 	if types.IsInterface(named) {
-		registerInterfaceMethodSet(idx, pkgHash, idHash, named)
+		registerInterfaceMethodSet(idx, pkgHash, idHash, named, enc, fset)
 		return
 	}
-	registerMethodSet(idx, pkgHash, idHash, named)
+	registerMethodSet(idx, pkgHash, idHash, named, enc, fset)
 }
 
 // u32pos converts a go/token.Position field (Line, Column) — always
@@ -188,8 +188,28 @@ func addRef(fset *token.FileSet, fileIdx map[string]uint32, enc *objectpath.Enco
 // registerMethodSet records every method in named's pointer method set (a
 // superset of its value method set) under idx's method index, keyed by
 // method name, so implementation queries can find named as a candidate
-// receiver type via a name-based first pass.
-func registerMethodSet(idx *store.PackageIndexEntries, pkgHash, typeIDHash uint64, named *types.Named) {
+// receiver type via a name-based first pass. Alongside the receiver type's
+// own identity (typeIDHash), each entry also records the method's own
+// SymbolID (via methodEntrySelf) and a canonical signature fingerprint (via
+// MethodFingerprint) — see [store.MethodEntry]'s doc — letting
+// internal/xref confirm interface satisfaction and resolve the method's own
+// declaration for a candidate whose export data is unreachable there (the
+// dominant case for an unexported type: export data only ever carries
+// exported package-scope objects, so a candidate like this used to be
+// silently dropped by the old decode-then-types.Implements confirmation no
+// matter how genuinely it implemented the interface).
+//
+// named's own type parameters (if any) leave every entry's Fingerprint at
+// its zero value instead: a still-generic (uninstantiated) receiver's
+// method signature can reference its own type parameter as a bare,
+// package-unqualified identifier (e.g. "T"), which is not canonically
+// comparable against another type's fingerprint the way a fully-qualified
+// signature is — internal/xref treats Fingerprint == 0 as "not
+// fingerprinted, must fall back to decoding this candidate instead",
+// exactly the pre-fix confirmation path, unaffected for this (rare, already
+// working) case.
+func registerMethodSet(idx *store.PackageIndexEntries, pkgHash, typeIDHash uint64, named *types.Named, enc *objectpath.Encoder, fset *token.FileSet) {
+	generic := named.TypeParams().Len() > 0
 	ms := types.NewMethodSet(types.NewPointer(named))
 	for i := 0; i < ms.Len(); i++ {
 		fn, ok := ms.At(i).Obj().(*types.Func)
@@ -198,7 +218,7 @@ func registerMethodSet(idx *store.PackageIndexEntries, pkgHash, typeIDHash uint6
 		}
 		idx.Methods = append(idx.Methods, store.MethodSymbolEntry{
 			Name:  fn.Name(),
-			Entry: store.MethodEntry{PkgHash: pkgHash, TypeSymbolIDHash: typeIDHash},
+			Entry: methodEntrySelf(pkgHash, typeIDHash, fn, generic, enc, fset),
 		})
 	}
 }
@@ -209,18 +229,67 @@ func registerMethodSet(idx *store.PackageIndexEntries, pkgHash, typeIDHash uint6
 // concrete-type entries. An implementation query distinguishes the two by
 // looking up each candidate's [store.Symbol.Kind]: this lets both directions
 // of an implementation query (interface -> implementers, concrete type ->
-// interfaces it satisfies) share the same name-based first pass.
-func registerInterfaceMethodSet(idx *store.PackageIndexEntries, pkgHash, typeIDHash uint64, named *types.Named) {
+// interfaces it satisfies) share the same name-based first pass. See
+// registerMethodSet's doc for methodEntrySelf/Fingerprint/the generic
+// exclusion, applied identically here for an interface's own methods.
+func registerInterfaceMethodSet(idx *store.PackageIndexEntries, pkgHash, typeIDHash uint64, named *types.Named, enc *objectpath.Encoder, fset *token.FileSet) {
 	iface, ok := named.Underlying().(*types.Interface)
 	if !ok {
 		return
 	}
+	generic := named.TypeParams().Len() > 0
 	for i := 0; i < iface.NumMethods(); i++ {
+		fn := iface.Method(i)
 		idx.Methods = append(idx.Methods, store.MethodSymbolEntry{
-			Name:  iface.Method(i).Name(),
-			Entry: store.MethodEntry{PkgHash: pkgHash, TypeSymbolIDHash: typeIDHash},
+			Name:  fn.Name(),
+			Entry: methodEntrySelf(pkgHash, typeIDHash, fn, generic, enc, fset),
 		})
 	}
+}
+
+// methodEntrySelf builds one store.MethodEntry for fn, a method belonging
+// to the type identified by (pkgHash, typeIDHash): fn's own SymbolID (the
+// same deterministic computation addDef uses for fn's own definition,
+// applied here too since a method is itself a definition info.Defs walks
+// separately — see symbolID's doc for why this always lands on the same
+// IDHash addDef already recorded for fn) plus, unless generic, its
+// canonical signature fingerprint.
+func methodEntrySelf(pkgHash, typeIDHash uint64, fn *types.Func, generic bool, enc *objectpath.Encoder, fset *token.FileSet) store.MethodEntry {
+	e := store.MethodEntry{
+		PkgHash:          pkgHash,
+		TypeSymbolIDHash: typeIDHash,
+		MethodPkgHash:    store.Hash(fn.Pkg().Path()),
+		MethodIDHash:     store.Hash(symbolID(fn, enc, fset)),
+	}
+	if !generic {
+		if sig, ok := fn.Type().(*types.Signature); ok {
+			e.Fingerprint = MethodFingerprint(sig)
+		}
+	}
+	return e
+}
+
+// fingerprintQualifier renders every package — including a signature's own
+// home package — by its full import path, unlike qualifier's local-package
+// blanking. MethodFingerprint needs this: two independently type-checked
+// renderings of the very same method signature (once from the type that
+// declares it, once from an interface elsewhere referencing the same named
+// types) must produce identical text, which only holds if the qualifier
+// never special-cases "whichever package happens to be current".
+func fingerprintQualifier(p *types.Package) string {
+	return p.Path()
+}
+
+// MethodFingerprint returns a deterministic hash of sig's canonical,
+// fully-qualified rendering, for [store.MethodEntry.Fingerprint]. It
+// excludes the receiver — types.TypeString on a *types.Signature never
+// prints one — matching how Go itself compares method identity for
+// interface satisfaction: name plus parameter/result types, irrespective of
+// receiver. Exported for internal/xref, which computes the same fingerprint
+// for a queried interface's own (already decoded, live) methods to compare
+// against a candidate's index-recorded one.
+func MethodFingerprint(sig *types.Signature) uint64 {
+	return store.Hash(types.TypeString(sig, fingerprintQualifier))
 }
 
 // isSkippedObject reports whether obj denotes something facts extraction
