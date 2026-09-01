@@ -22,12 +22,18 @@ const refreshSemanticTokensTimeout = 5 * time.Second
 
 // publishDiagnostics is registered as check.Options.OnResult: it converts a
 // recheck's diagnostics into textDocument/publishDiagnostics notifications,
-// one per file. Every open file in res.Dir gets a notification: files with
-// diagnostics get them, and every other open file gets an empty list —
-// whether it previously had diagnostics that are now gone, or it has never
-// had any diagnostics at all — so the client can tell a file is clean
-// instead of hearing nothing. A file that is not open is never notified,
-// to avoid spamming clients about files they are not displaying.
+// one per file. Every open file res is authoritative for — res.Files, the
+// files that unit was actually checked against, not just res.Dir's open
+// files (a directory can hold two independent units, its base package and
+// its external "_test" package, each publishing its own Result for the
+// same Dir over a disjoint file set — see internal/check's unitKey) — gets
+// a notification: files with diagnostics get them, and every other such
+// file gets an empty list — whether it previously had diagnostics that are
+// now gone, or it has never had any diagnostics at all — so the client can
+// tell a file is clean instead of hearing nothing. A file that is not open,
+// or that this unit is not authoritative for, is never notified: the
+// latter matters now that two units can share res.Dir, so one publishing
+// must not clear or otherwise speak for a file only the other one checked.
 func (s *Server) publishDiagnostics(res *check.Result) {
 	byFile := make(map[string][]protocol.Diagnostic)
 	for _, d := range res.Diags {
@@ -42,8 +48,13 @@ func (s *Server) publishDiagnostics(res *check.Result) {
 		})
 	}
 
+	owned := make(map[string]bool, len(res.Files))
+	for _, f := range res.Files {
+		owned[f] = true
+	}
+
 	s.diagMu.Lock()
-	prev := s.diagFiles[res.Dir]
+	prev := s.diagFiles[res.PkgPath]
 	next := make(map[string]bool, len(byFile))
 	for file := range byFile {
 		next[file] = true
@@ -55,12 +66,12 @@ func (s *Server) publishDiagnostics(res *check.Result) {
 		}
 	}
 	for _, file := range s.overlay.OpenFilesInDir(res.Dir) {
-		if next[file] || prev[file] {
+		if !owned[file] || next[file] || prev[file] {
 			continue
 		}
 		empty = append(empty, file)
 	}
-	s.diagFiles[res.Dir] = next
+	s.diagFiles[res.PkgPath] = next
 	s.diagMu.Unlock()
 
 	for _, file := range empty {

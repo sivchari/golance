@@ -102,20 +102,21 @@ func TestEngine_Commit_OlderGenerationDoesNotClobberNewer(t *testing.T) {
 		},
 	})
 	dir := filepath.Join(root, "basic")
+	key := unitKey{dir: dir, variant: variantBase}
 
-	genOld := e.nextGen(dir)
-	genNew := e.nextGen(dir)
+	genOld := e.nextGen(key)
+	genNew := e.nextGen(key)
 
 	oldCP := &CheckedPackage{pkgPath: "old", dir: dir, builtAt: time.Now()}
 	newCP := &CheckedPackage{pkgPath: "new", dir: dir, builtAt: time.Now()}
 
 	// The newer generation commits first (it started reading content
 	// later but finished sooner); the older generation commits after.
-	e.commit(dir, genNew, newCP)
-	e.commit(dir, genOld, oldCP)
+	e.commit(key, genNew, newCP)
+	e.commit(key, genOld, oldCP)
 
 	e.mu.Lock()
-	cached := e.cache[dir]
+	cached := e.cache[key]
 	e.mu.Unlock()
 	if cached == nil || cached.pkg != newCP {
 		t.Fatalf("cache holds %+v, want the newer commit (%q)", cached, newCP.pkgPath)
@@ -153,22 +154,23 @@ func TestEngine_CommitPublish_OrderedByGeneration(t *testing.T) {
 		},
 	})
 	dir := filepath.Join(root, "basic")
+	key := unitKey{dir: dir, variant: variantBase}
 
-	genOld := e.nextGen(dir)
-	genNew := e.nextGen(dir)
+	genOld := e.nextGen(key)
+	genNew := e.nextGen(key)
 
 	oldCP := &CheckedPackage{pkgPath: "old", dir: dir, builtAt: time.Now()}
 	newCP := &CheckedPackage{pkgPath: "new", dir: dir, builtAt: time.Now()}
 
 	// genOld passes the cache gate first (it is the older generation).
-	stOld, ok := e.commitCache(dir, genOld, oldCP)
+	stOld, ok := e.commitCache(key, genOld, oldCP)
 	if !ok {
 		t.Fatal("commitCache(genOld) rejected, want accepted (first commit for dir)")
 	}
 
 	// genOld is now "descheduled" between commitCache and commitPublish.
 	// genNew runs to completion, including its publish, before it resumes.
-	stNew, ok := e.commitCache(dir, genNew, newCP)
+	stNew, ok := e.commitCache(key, genNew, newCP)
 	if !ok {
 		t.Fatal("commitCache(genNew) rejected, want accepted (newer than doneGen)")
 	}

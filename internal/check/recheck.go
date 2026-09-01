@@ -20,21 +20,26 @@ import (
 	"github.com/sivchari/golance/internal/typecheck"
 )
 
-// runRecheck re-type-checks the package in dir: it lists and filters the
-// directory's Go files, parses them, resolves dependencies via
-// e.newImporter, and type-checks the result. On success the CheckedPackage
-// is committed (see Engine.commit) — cached and, if configured, published
-// via Options.OnResult, unless a newer-generation recheck for dir has
-// already committed. ctx.Err() is checked before and after both parsing
-// and type-checking so a canceled recheck returns promptly without
-// touching the cache.
-func (e *Engine) runRecheck(ctx context.Context, dir string) (*CheckedPackage, error) {
+// runRecheck re-type-checks key's unit: it lists and filters the
+// directory's Go files down to the ones declaring key's variant (base or
+// external test — see resolveFiles), parses them, resolves dependencies via
+// e.newImporter, and type-checks the result. A file declaring the external
+// test package imports its base package (if at all) by its ordinary,
+// real import path — resolved through the exact same e.newImporter() chain
+// as any other cross-package import (export data, not source), same as
+// every dependency; nothing here treats it specially. On success the
+// CheckedPackage is committed (see Engine.commit) — cached and, if
+// configured, published via Options.OnResult, unless a newer-generation
+// recheck for key has already committed. ctx.Err() is checked before and
+// after both parsing and type-checking so a canceled recheck returns
+// promptly without touching the cache.
+func (e *Engine) runRecheck(ctx context.Context, key unitKey) (*CheckedPackage, error) {
 	e.mu.Lock()
-	pi, ok := e.dirs[dir]
+	pi, ok := e.dirs[key]
 	e.mu.Unlock()
 	if !ok {
 		var err error
-		pi, err = e.resolvePackage(dir)
+		pi, err = e.resolvePackage(key)
 		if err != nil {
 			return nil, err
 		}
@@ -44,9 +49,9 @@ func (e *Engine) runRecheck(ctx context.Context, dir string) (*CheckedPackage, e
 		return nil, err
 	}
 
-	gen := e.nextGen(dir)
+	gen := e.nextGen(key)
 
-	files, err := e.resolveFiles(pi, dir)
+	files, err := e.resolveFiles(pi, key.dir)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +80,7 @@ func (e *Engine) runRecheck(ctx context.Context, dir string) (*CheckedPackage, e
 
 	cp := &CheckedPackage{
 		pkgPath:     pi.pkgPath,
-		dir:         dir,
+		dir:         key.dir,
 		fset:        fset,
 		files:       astFiles,
 		pkg:         pkg,
@@ -87,37 +92,44 @@ func (e *Engine) runRecheck(ctx context.Context, dir string) (*CheckedPackage, e
 		builtAt:     time.Now(),
 	}
 
-	e.commit(dir, gen, cp)
+	e.commit(key, gen, cp)
 
 	return cp, nil
 }
 
-// resolvePackage determines dir's package by probing SnapshotSource with
-// each candidate Go file in dir until one resolves. Used when dir is
-// invalidated before any file in it has been resolved via Get or SetFocus.
-func (e *Engine) resolvePackage(dir string) (pkgInfo, error) {
-	candidates, err := e.listCandidateFiles(dir)
+// resolvePackage determines key's package by probing SnapshotSource with
+// each candidate Go file in key.dir until one resolves to key itself (its
+// directory and variant both match — a directory can have a candidate file
+// for each of its (at most two) units, so a probe matching only the
+// directory is not enough once key.variant is checked, see unitKeyFor).
+// Used when a unit is invalidated before any file in it has been resolved
+// via Get or SetFocus.
+func (e *Engine) resolvePackage(key unitKey) (pkgInfo, error) {
+	candidates, err := e.listCandidateFiles(key.dir)
 	if err != nil {
 		return pkgInfo{}, err
 	}
 	for _, path := range candidates {
 		pkgPath, d, goFiles, ok := e.snap.PackageForFile(path)
-		if !ok || d != dir {
+		if !ok || d != key.dir || unitKeyFor(pkgPath, d) != key {
 			continue
 		}
 		pi := pkgInfo{pkgPath: pkgPath, goFiles: goFiles}
 		e.mu.Lock()
-		e.dirs[dir] = pi
+		e.dirs[key] = pi
 		e.mu.Unlock()
 		return pi, nil
 	}
-	return pkgInfo{}, fmt.Errorf("check: no known package for directory %s", dir)
+	return pkgInfo{}, fmt.Errorf("check: no known package for directory %s", key.dir)
 }
 
 // resolveFiles lists dir's candidate Go files and filters them down to
-// those declaring pi's package: the non-test files SnapshotSource already
-// knows about, plus any _test.go file in the same package (the external
-// "_test"-suffixed test package is not supported).
+// those declaring pi's package: for the base variant, the non-test files
+// SnapshotSource already knows about, plus any _test.go file in the same
+// package (the external "_test"-suffixed test package is excluded — see
+// canonicalPackageName); for the external test variant (recognized from
+// pi.pkgPath, see externalTestVariant), the reverse — only the "_test"
+// -suffixed package's own files.
 func (e *Engine) resolveFiles(pi pkgInfo, dir string) ([]string, error) {
 	candidates, err := e.listCandidateFiles(dir)
 	if err != nil {
@@ -138,11 +150,22 @@ func (e *Engine) resolveFiles(pi pkgInfo, dir string) ([]string, error) {
 	return files, nil
 }
 
-// canonicalPackageName determines the Go package name declared in dir,
-// preferring pi's known non-test files (which cannot be the external
-// "_test" package) and falling back to the first non-"_test" package
-// clause found among candidates.
+// canonicalPackageName determines the Go package name resolveFiles should
+// keep among dir's candidates. For the external test variant it is the
+// first "_test"-suffixed package clause found (pi.goFiles is always empty
+// for this variant — see GraphSource.PackageForFile — so there is nothing
+// to prefer there). For the base variant (the pre-existing behavior,
+// unchanged) it is pi's known non-test files' name, preferred over falling
+// back to the first non-"_test" package clause found among candidates.
 func (e *Engine) canonicalPackageName(pi pkgInfo, candidates []string) (string, error) {
+	if _, ok := externalTestVariant(pi.pkgPath); ok {
+		for _, f := range candidates {
+			if name, ok := e.packageClauseName(f); ok && strings.HasSuffix(name, "_test") {
+				return name, nil
+			}
+		}
+		return "", fmt.Errorf("check: no external test package clause found among %v", candidates)
+	}
 	for _, f := range pi.goFiles {
 		if name, ok := e.packageClauseName(f); ok && !strings.HasSuffix(name, "_test") {
 			return name, nil
