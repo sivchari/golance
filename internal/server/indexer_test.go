@@ -71,7 +71,7 @@ func TestOpenIndexAfterBuild_FallsBackToExistingDBOnFailure(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "index.db")
 	buildTestIndexDB(t, snap, dbPath, openTestCAS(t))
 
-	s.openIndexAfterBuild(dbPath, errors.New("boom"), "indexer stderr")
+	s.openIndexAfterBuild(context.Background(), dbPath, errors.New("boom"), "indexer stderr")
 
 	idx := s.idx.Load()
 	if idx == nil {
@@ -91,7 +91,7 @@ func TestOpenIndexAfterBuild_NoDatabaseStaysUnavailable(t *testing.T) {
 	s := newWorkspaceOnlyServer(t)
 	dbPath := filepath.Join(t.TempDir(), "never-built.db")
 
-	s.openIndexAfterBuild(dbPath, errors.New("boom"), "indexer stderr")
+	s.openIndexAfterBuild(context.Background(), dbPath, errors.New("boom"), "indexer stderr")
 
 	if idx := s.idx.Load(); idx != nil {
 		t.Fatal("idx is non-nil; want nil when the indexer failed and no database was ever built")
@@ -106,7 +106,7 @@ func TestOpenIndexAfterBuild_Success(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "index.db")
 	buildTestIndexDB(t, snap, dbPath, openTestCAS(t))
 
-	s.openIndexAfterBuild(dbPath, nil, "")
+	s.openIndexAfterBuild(context.Background(), dbPath, nil, "")
 
 	idx := s.idx.Load()
 	if idx == nil {
@@ -364,5 +364,161 @@ func TestIndexNeedsRebuild_MismatchedFingerprint(t *testing.T) {
 
 	if !s.indexNeedsRebuild() {
 		t.Error("indexNeedsRebuild() = false, want true for a mismatched toolchain fingerprint")
+	}
+}
+
+// TestOpenIndexAfterBuild_LockedSharedIndexFallsBackToPrivateIndex is a
+// regression test for the multi-editor scenario: a second live session
+// finding the shared per-root index locked must not simply go without
+// cross-reference features for the rest of the session. It simulates a
+// first session already holding the shared database's lock, verifies
+// openIndexAfterBuild reports locked=true for it (never installing s.idx),
+// then drives the same recovery buildIndexLocked performs — switchToPrivateIndex
+// followed by a build against the now-private dbPath — entirely in-process
+// (via index.Build, not a real indexer subprocess: see buildTestIndexDB),
+// and asserts the resulting index is fully usable.
+func TestOpenIndexAfterBuild_LockedSharedIndexFallsBackToPrivateIndex(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newWorkspaceOnlyServer(t)
+	root := s.workspace().root
+	snap := s.workspace().snap
+
+	sharedDBPath := indexDBFile(root)
+	if err := os.MkdirAll(filepath.Dir(sharedDBPath), 0o750); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+	// Simulate a first live session already holding the shared database's
+	// exclusive lock (see store.Open's doc).
+	held, err := store.Open(sharedDBPath)
+	if err != nil {
+		t.Fatalf("store.Open (simulated first session): %v", err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+
+	locked := s.openIndexAfterBuild(context.Background(), sharedDBPath, nil, "")
+	if !locked {
+		t.Fatal("openIndexAfterBuild(shared, locked by another session) locked = false, want true")
+	}
+	if idx := s.idx.Load(); idx != nil {
+		t.Fatal("s.idx installed from a locked open attempt; want nil")
+	}
+
+	s.switchToPrivateIndex()
+	if !s.usePrivateIndex.Load() {
+		t.Fatal("usePrivateIndex not set after switchToPrivateIndex")
+	}
+
+	privateDBPath := s.dbPath(root)
+	if privateDBPath == sharedDBPath {
+		t.Fatalf("dbPath() after switchToPrivateIndex = %s, want a different, private path", privateDBPath)
+	}
+	cas, err := store.OpenCAS(casDir(root))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	buildTestIndexDB(t, snap, privateDBPath, cas)
+
+	locked = s.openIndexAfterBuild(context.Background(), privateDBPath, nil, "")
+	if locked {
+		t.Fatal("openIndexAfterBuild(private) locked = true, want false")
+	}
+	idx := s.idx.Load()
+	if idx == nil {
+		t.Fatal("s.idx is nil after installing the session-private index")
+	}
+	t.Cleanup(func() { _ = idx.db.Close() })
+
+	infos, err := idx.resolver.WorkspaceSymbol(context.Background(), "Hello")
+	if err != nil {
+		t.Fatalf("WorkspaceSymbol: %v", err)
+	}
+	if len(infos) == 0 {
+		t.Fatal(`WorkspaceSymbol("Hello") returned nothing from the session-private index, want it to resolve exactly as the shared index would`)
+	}
+}
+
+// TestStop_RemovesPrivateIndexFiles verifies that Stop removes a session's
+// own private index database (see privateIndexDBFile) once it has fallen
+// back to one, so a crashed-free session never leaks these files.
+func TestStop_RemovesPrivateIndexFiles(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newWorkspaceOnlyServer(t)
+	root := s.workspace().root
+	snap := s.workspace().snap
+
+	s.switchToPrivateIndex()
+	privateDBPath := s.dbPath(root)
+	cas, err := store.OpenCAS(casDir(root))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	buildTestIndexDB(t, snap, privateDBPath, cas)
+
+	if s.openIndexAfterBuild(context.Background(), privateDBPath, nil, "") {
+		t.Fatal("openIndexAfterBuild(private) locked = true, want false")
+	}
+	if s.idx.Load() == nil {
+		t.Fatal("s.idx is nil after installing the session-private index")
+	}
+	if _, err := os.Stat(privateDBPath); err != nil {
+		t.Fatalf("private index file missing before Stop: %v", err)
+	}
+
+	s.Stop()
+
+	if _, err := os.Stat(privateDBPath); !os.IsNotExist(err) {
+		t.Fatalf("private index file still exists after Stop: err=%v, want IsNotExist", err)
+	}
+}
+
+// TestCleanupOrphanedPrivateIndexes verifies that an ownerless private
+// index file (its lock immediately acquirable — the signature of a
+// crashed session's leftover, see store.TryClaimAbandoned) is removed,
+// while the shared index file and a private index file still genuinely
+// locked by another live session are both left untouched.
+func TestCleanupOrphanedPrivateIndexes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newWorkspaceOnlyServer(t)
+	root := s.workspace().root
+
+	sharedDBPath := indexDBFile(root)
+	if err := os.MkdirAll(filepath.Dir(sharedDBPath), 0o750); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+	// The shared file: its name never contains privateIndexInfix, so the
+	// cleanup glob must never even consider it, let alone remove it.
+	if err := os.WriteFile(sharedDBPath, []byte("shared"), 0o600); err != nil {
+		t.Fatalf("write shared decoy file: %v", err)
+	}
+
+	// An orphaned private index: created, then its lock released (no
+	// process holds it anymore), simulating a crashed prior session.
+	orphanPath := privateIndexDBFile(root, "orphan-session")
+	orphanDB, err := store.Open(orphanPath)
+	if err != nil {
+		t.Fatalf("store.Open (orphan): %v", err)
+	}
+	if err := orphanDB.Close(); err != nil {
+		t.Fatalf("close orphan db: %v", err)
+	}
+
+	// A private index still genuinely in use by another live session.
+	livePath := privateIndexDBFile(root, "live-session")
+	liveDB, err := store.Open(livePath)
+	if err != nil {
+		t.Fatalf("store.Open (live): %v", err)
+	}
+	t.Cleanup(func() { _ = liveDB.Close() })
+
+	s.cleanupOrphanedPrivateIndexes(root)
+
+	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
+		t.Errorf("orphaned private index not removed: err=%v, want IsNotExist", err)
+	}
+	if _, err := os.Stat(sharedDBPath); err != nil {
+		t.Errorf("shared index file was touched by cleanup (must never be): %v", err)
+	}
+	if _, err := os.Stat(livePath); err != nil {
+		t.Errorf("locked private index (still in use by a live session) was removed: %v", err)
 	}
 }

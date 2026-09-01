@@ -146,6 +146,48 @@ func wrapOpenErr(path string, err error) error {
 	return fmt.Errorf("store: open %s: %w", path, err)
 }
 
+// IsLocked reports whether err — an error returned by [Open] or
+// [OpenReadOnly] — means path is currently held open by another live
+// process (bbolt's ErrTimeout, wrapped by wrapOpenErr), as opposed to some
+// other failure (e.g. a missing parent directory or a corrupt file).
+// internal/server uses this to distinguish "another golance session
+// already has this database open" — worth falling back to a different
+// path for — from an ordinary open failure, which is not.
+func IsLocked(err error) bool {
+	return errors.Is(err, bolterrors.ErrTimeout)
+}
+
+// probeTimeout bounds how long TryClaimAbandoned waits for path's lock
+// before concluding it is genuinely held by another process. Much shorter
+// than openTimeout: TryClaimAbandoned is a background "is anyone still
+// using this" probe across many candidate files, not a real open a caller
+// is blocked on, so it should fail fast on a file that is actually still
+// in use.
+const probeTimeout = 20 * time.Millisecond
+
+// TryClaimAbandoned attempts to open path with a short lock-wait timeout
+// and, if that succeeds — meaning no other process currently holds path's
+// exclusive lock — closes it immediately and removes the file, reporting
+// true. It reports false, leaving path untouched, if the lock is currently
+// held by another process (the file is still genuinely in use) or any
+// other error occurs (e.g. path no longer exists, already removed by a
+// racing cleanup pass in another session started at the same time — see
+// internal/server's startup orphan cleanup). Never creates path if it does
+// not already exist.
+func TryClaimAbandoned(path string) bool {
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	bdb, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: probeTimeout})
+	if err != nil {
+		return false
+	}
+	if err := bdb.Close(); err != nil {
+		return false
+	}
+	return os.Remove(path) == nil
+}
+
 // discardStale reports whether bdb's meta bucket already exists (meaning
 // some earlier Open — old or new code — has run against this file at least
 // once) but does not record the current schemaVersion. A brand new file has
