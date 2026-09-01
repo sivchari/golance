@@ -1,6 +1,6 @@
 # Changelog
 
-## [v0.3.2](https://github.com/sivchari/golance/compare/v0.3.1...v0.3.2) - 2026-09-01
+## [v0.4.0](https://github.com/sivchari/golance/compare/v0.3.1...v0.4.0) - 2026-09-01
 - docs: add PR #51 to the v0.3.1 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/53
 - feat: load complete package metadata including test variants by @sivchari in https://github.com/sivchari/golance/pull/55
 - feat: source-checked dependency packages with exact positions by @sivchari in https://github.com/sivchari/golance/pull/56
