@@ -102,8 +102,14 @@ type Server struct {
 	// runs at a time.
 	idxMu sync.Mutex
 
-	diagMu    sync.Mutex
-	diagFiles map[string]map[string]bool // package dir -> files last published with diagnostics
+	diagMu sync.Mutex
+	// diagFiles is keyed by check.Result.PkgPath, not directory: a directory
+	// can hold two independent units (its base package and, separately, its
+	// external "_test" package — see internal/check's unitKey), each
+	// publishing its own Result, so tracking per-directory would let one
+	// unit's publish clear the other's not-yet-republished diagnostics (see
+	// publishDiagnostics's doc).
+	diagFiles map[string]map[string]bool // check.Result.PkgPath -> files last published with diagnostics
 
 	indexBuildingWarned atomic.Bool // one-time window/logMessage while the index is still building
 	indexFailedWarned   atomic.Bool // one-time window/showMessage after an indexer failure

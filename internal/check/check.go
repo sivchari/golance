@@ -68,13 +68,48 @@ type Options struct {
 	OnResult func(*Result)
 }
 
-// pkgInfo is what Engine remembers about a directory once it has resolved
-// the package it holds: its import path and the non-test Go files
+// pkgInfo is what Engine remembers about a unit once it has resolved the
+// package it holds: its import path and the non-test Go files
 // SnapshotSource reported for it (used to determine the package's name when
-// re-listing the directory).
+// re-listing the directory). For the external test variant, pkgPath carries
+// externalTestPkgPathMarker and goFiles is empty (see
+// GraphSource.PackageForFile and Engine.canonicalPackageName).
 type pkgInfo struct {
 	pkgPath string
 	goFiles []string
+}
+
+// variant distinguishes which of a directory's (at most two) type-checked
+// units a unitKey names. Before external test package support, a directory
+// held at most one unit and dir alone was Engine's cache/dirs/jobs key; the
+// directory's external "_test" package (see GraphSource.PackageForFile) is
+// a second, independent unit over the same directory — different files,
+// different pkgPath, its own recheck/cache/generation bookkeeping — so the
+// key must carry which one a given entry is.
+type variant int
+
+// Variants a unitKey can name.
+const (
+	variantBase variant = iota
+	variantExternalTest
+)
+
+// unitKey identifies one of Engine's type-checked units: a directory plus
+// which variant of its package. See variant's doc.
+type unitKey struct {
+	dir     string
+	variant variant
+}
+
+// unitKeyFor returns the unitKey a PackageForFile result identifies: the
+// external test variant if pkgPath carries externalTestPkgPathMarker (see
+// GraphSource.PackageForFile and externalTestVariant), the base variant
+// otherwise.
+func unitKeyFor(pkgPath, dir string) unitKey {
+	if _, ok := externalTestVariant(pkgPath); ok {
+		return unitKey{dir: dir, variant: variantExternalTest}
+	}
+	return unitKey{dir: dir, variant: variantBase}
 }
 
 // cacheEntry is one cached CheckedPackage plus its recency, for LRU
@@ -84,7 +119,8 @@ type cacheEntry struct {
 	lastUsed time.Time
 }
 
-// dirState tracks one directory's recheck bookkeeping.
+// dirState tracks one unit's (a directory plus variant, see unitKey) recheck
+// bookkeeping.
 //
 // timer and cancel govern only the debounce-triggered background job
 // (Invalidate/fireRecheck): timer is the pending debounce, cancel cancels
@@ -96,7 +132,7 @@ type cacheEntry struct {
 //
 // gen, doneGen, pubMu, and pubGen implement the two completion-ordering
 // guards described on Engine.commitCache and Engine.commitPublish: gen is
-// the last generation handed out by nextGen for this directory. Both
+// the last generation handed out by nextGen for this unit. Both
 // request-driven and background rechecks share this counter, since they
 // can now complete in either order. doneGen (guarded by Engine.mu) is the
 // highest generation whose cache write has been committed. pubGen (guarded
@@ -127,10 +163,10 @@ type Engine struct {
 	opts        Options
 
 	mu    sync.Mutex
-	focus string // directory of the focused package, "" if none
-	dirs  map[string]pkgInfo
-	cache map[string]*cacheEntry
-	jobs  map[string]*dirState
+	focus string // directory of the focused package, "" if none — protects every variant of that directory from eviction, see evictLocked
+	dirs  map[unitKey]pkgInfo
+	cache map[unitKey]*cacheEntry
+	jobs  map[unitKey]*dirState
 }
 
 // New returns an Engine that resolves files to packages via snap, reads
@@ -148,9 +184,9 @@ func New(snap SnapshotSource, reader overlay.FileReader, imp Importer, opts Opti
 		reader:      reader,
 		newImporter: imp,
 		opts:        opts,
-		dirs:        make(map[string]pkgInfo),
-		cache:       make(map[string]*cacheEntry),
-		jobs:        make(map[string]*dirState),
+		dirs:        make(map[unitKey]pkgInfo),
+		cache:       make(map[unitKey]*cacheEntry),
+		jobs:        make(map[unitKey]*dirState),
 	}
 }
 
@@ -164,7 +200,7 @@ func (e *Engine) SetFocus(filePath string) {
 	}
 	e.mu.Lock()
 	e.focus = dir
-	e.dirs[dir] = pkgInfo{pkgPath: pkgPath, goFiles: goFiles}
+	e.dirs[unitKeyFor(pkgPath, dir)] = pkgInfo{pkgPath: pkgPath, goFiles: goFiles}
 	e.mu.Unlock()
 }
 
@@ -187,10 +223,11 @@ func (e *Engine) Get(ctx context.Context, filePath string) (*CheckedPackage, err
 	if !ok {
 		return nil, fmt.Errorf("check: %s is not part of a known package", filePath)
 	}
+	key := unitKeyFor(pkgPath, dir)
 	pi := pkgInfo{pkgPath: pkgPath, goFiles: goFiles}
 
 	e.mu.Lock()
-	e.dirs[dir] = pi
+	e.dirs[key] = pi
 	e.mu.Unlock()
 
 	files, err := e.resolveFiles(pi, dir)
@@ -203,7 +240,7 @@ func (e *Engine) Get(ctx context.Context, filePath string) (*CheckedPackage, err
 	}
 
 	e.mu.Lock()
-	if entry, ok := e.cache[dir]; ok && entry.pkg.contentHash == hash {
+	if entry, ok := e.cache[key]; ok && entry.pkg.contentHash == hash {
 		entry.lastUsed = time.Now()
 		cp := entry.pkg
 		e.mu.Unlock()
@@ -211,52 +248,84 @@ func (e *Engine) Get(ctx context.Context, filePath string) (*CheckedPackage, err
 	}
 	e.mu.Unlock()
 
-	return e.runRecheck(ctx, dir)
+	return e.runRecheck(ctx, key)
 }
 
-// Invalidate schedules a recheck of dir after Options.DebounceDelay of
-// quiet. Repeated calls before the delay elapses reset the timer, so a
-// burst of edits collapses into a single recheck. If a background recheck
-// for dir is still running when the delay elapses, it is canceled before
-// the new one starts. This never cancels a concurrent request-driven Get
-// for the same directory; see Get's doc.
+// Invalidate schedules a recheck of dir's unit(s) after
+// Options.DebounceDelay of quiet. Repeated calls before the delay elapses
+// reset the timer, so a burst of edits collapses into a single recheck per
+// unit. If a background recheck for a unit is still running when the delay
+// elapses, it is canceled before the new one starts. This never cancels a
+// concurrent request-driven Get for the same unit; see Get's doc.
+//
+// dir's base unit is always armed. Its external test unit (see
+// GraphSource.PackageForFile) is armed too, but only if Engine has resolved
+// one for dir before (via Get or SetFocus) — a directory's external test
+// unit is the exception, not the rule, so arming a second debounce, probe,
+// and doomed recheck attempt for every directory in the workspace on every
+// edit, on the off chance it might have one, would cost every directory
+// that never will to save one that might. A brand-new external test file's
+// own first edit still resolves promptly: it goes through didOpen/Get
+// (a request-driven check), which populates e.dirs for it before any
+// Invalidate call needs to know to arm it.
 func (e *Engine) Invalidate(dir string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	st := e.jobStateLocked(dir)
+	keys := []unitKey{{dir: dir, variant: variantBase}}
+	if extKey := (unitKey{dir: dir, variant: variantExternalTest}); e.unitKnownLocked(extKey) {
+		keys = append(keys, extKey)
+	}
+	for _, key := range keys {
+		e.armDebounceLocked(key)
+	}
+}
+
+// unitKnownLocked reports whether Engine has ever resolved or cached key.
+// Callers must hold e.mu.
+func (e *Engine) unitKnownLocked(key unitKey) bool {
+	if _, ok := e.dirs[key]; ok {
+		return true
+	}
+	_, ok := e.cache[key]
+	return ok
+}
+
+// armDebounceLocked (re)starts key's debounce timer. Callers must hold e.mu.
+func (e *Engine) armDebounceLocked(key unitKey) {
+	st := e.jobStateLocked(key)
 	if st.timer != nil {
 		st.timer.Stop()
 	}
-	st.timer = time.AfterFunc(e.opts.DebounceDelay, func() { e.fireRecheck(dir) })
+	st.timer = time.AfterFunc(e.opts.DebounceDelay, func() { e.fireRecheck(key) })
 }
 
-// fireRecheck runs the debounce-triggered background recheck job for dir.
-func (e *Engine) fireRecheck(dir string) {
-	ctx, finish := e.startJob(context.Background(), dir)
+// fireRecheck runs the debounce-triggered background recheck job for key.
+func (e *Engine) fireRecheck(key unitKey) {
+	ctx, finish := e.startJob(context.Background(), key)
 	defer finish()
-	_, _ = e.runRecheck(ctx, dir)
+	_, _ = e.runRecheck(ctx, key)
 }
 
-// jobStateLocked returns dir's dirState, creating it if necessary. Callers
+// jobStateLocked returns key's dirState, creating it if necessary. Callers
 // must hold e.mu.
-func (e *Engine) jobStateLocked(dir string) *dirState {
-	st, ok := e.jobs[dir]
+func (e *Engine) jobStateLocked(key unitKey) *dirState {
+	st, ok := e.jobs[key]
 	if !ok {
 		st = &dirState{}
-		e.jobs[dir] = st
+		e.jobs[key] = st
 	}
 	return st
 }
 
-// startJob cancels any background job already running for dir, registers a
+// startJob cancels any background job already running for key, registers a
 // new cancelable context derived from parent, and returns it along with a
 // finish func the caller must invoke when the job completes. finish is a
 // no-op if a newer background job has since superseded this one. This is
 // used only for debounce-triggered background rechecks (fireRecheck); Get
 // does not call it.
-func (e *Engine) startJob(parent context.Context, dir string) (context.Context, func()) {
+func (e *Engine) startJob(parent context.Context, key unitKey) (context.Context, func()) {
 	e.mu.Lock()
-	st := e.jobStateLocked(dir)
+	st := e.jobStateLocked(key)
 	if st.timer != nil {
 		st.timer.Stop()
 		st.timer = nil
@@ -272,7 +341,7 @@ func (e *Engine) startJob(parent context.Context, dir string) (context.Context, 
 
 	finish := func() {
 		e.mu.Lock()
-		if s, ok := e.jobs[dir]; ok && s.epoch == myEpoch {
+		if s, ok := e.jobs[key]; ok && s.epoch == myEpoch {
 			s.cancel = nil
 		}
 		e.mu.Unlock()
@@ -280,57 +349,57 @@ func (e *Engine) startJob(parent context.Context, dir string) (context.Context, 
 	return ctx, finish
 }
 
-// nextGen assigns and returns dir's next monotonic generation number,
+// nextGen assigns and returns key's next monotonic generation number,
 // creating its dirState if necessary. runRecheck calls this once per
 // recheck attempt (both request-driven, via Get, and debounce-triggered,
 // via fireRecheck), right before it starts reading file content: since
 // neither kind of recheck can cancel the other anymore, they can finish in
 // either order, so commit's completion-ordering guard uses gen — not
 // completion order — to tell which of two concurrently running rechecks
-// for the same directory reflects newer content.
-func (e *Engine) nextGen(dir string) uint64 {
+// for the same unit reflects newer content.
+func (e *Engine) nextGen(key unitKey) uint64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	st := e.jobStateLocked(dir)
+	st := e.jobStateLocked(key)
 	st.gen++
 	return st.gen
 }
 
-// commit caches cp for dir and, if configured, publishes it via
-// Options.OnResult, honoring dir's completion-ordering guards on both
+// commit caches cp for key and, if configured, publishes it via
+// Options.OnResult, honoring key's completion-ordering guards on both
 // steps. gen, assigned by nextGen when the recheck started reading
 // content, stands in for completion order: a request-driven Get and a
-// background recheck for the same directory no longer cancel each other
+// background recheck for the same unit no longer cancel each other
 // and so can complete in either order, and a slower-but-older recheck's
 // result must not clobber a faster-but-newer one's — neither in the cache
 // (commitCache) nor, independently, in what gets published (commitPublish;
 // gating only the cache write is not enough, since computing and
 // publishing a Result run outside Engine.mu and can take unbounded time).
-func (e *Engine) commit(dir string, gen uint64, cp *CheckedPackage) {
-	st, ok := e.commitCache(dir, gen, cp)
+func (e *Engine) commit(key unitKey, gen uint64, cp *CheckedPackage) {
+	st, ok := e.commitCache(key, gen, cp)
 	if !ok || e.opts.OnResult == nil {
 		return
 	}
 	e.commitPublish(gen, st, cp)
 }
 
-// commitCache stores cp in dir's cache slot under e.mu, evicting the least
+// commitCache stores cp in key's cache slot under e.mu, evicting the least
 // recently used non-focused entry if the cache is at capacity, unless a
-// recheck with a higher generation for dir has already committed. ok is
-// false, and nothing is written, if gen is stale. st is dir's dirState, for
+// recheck with a higher generation for key has already committed. ok is
+// false, and nothing is written, if gen is stale. st is key's dirState, for
 // a subsequent commitPublish call.
-func (e *Engine) commitCache(dir string, gen uint64, cp *CheckedPackage) (st *dirState, ok bool) {
+func (e *Engine) commitCache(key unitKey, gen uint64, cp *CheckedPackage) (st *dirState, ok bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	st = e.jobStateLocked(dir)
+	st = e.jobStateLocked(key)
 	if gen < st.doneGen {
 		return st, false
 	}
 	st.doneGen = gen
-	if _, exists := e.cache[dir]; !exists && len(e.cache) >= e.opts.MaxLRU {
+	if _, exists := e.cache[key]; !exists && len(e.cache) >= e.opts.MaxLRU {
 		e.evictLocked()
 	}
-	e.cache[dir] = &cacheEntry{pkg: cp, lastUsed: time.Now()}
+	e.cache[key] = &cacheEntry{pkg: cp, lastUsed: time.Now()}
 	return st, true
 }
 
@@ -339,7 +408,7 @@ func (e *Engine) commitCache(dir string, gen uint64, cp *CheckedPackage) (st *di
 // dedicated to this purpose and never held together with e.mu, since
 // Diagnostics reads files and OnResult publishes to the LSP client, neither
 // of which may run while holding e.mu. A call whose gen is lower than the
-// highest generation already published for dir is dropped without calling
+// highest generation already published for key is dropped without calling
 // OnResult: because commitCache's gate alone only orders the cache write,
 // an older-but-slower recheck that already passed it can still be
 // mid-flight here (e.g. still computing Diagnostics) when a newer-but-
@@ -380,22 +449,24 @@ func (e *Engine) Stop() {
 	}
 }
 
-// evictLocked removes the least recently used non-focused cache entry, if
-// any. Callers must hold e.mu.
+// evictLocked removes the least recently used cache entry outside the
+// focused directory (in either variant — see unitKey — SetFocus only
+// records a directory, so a focused directory's external test unit is
+// protected right alongside its base unit), if any. Callers must hold e.mu.
 func (e *Engine) evictLocked() {
-	var oldestDir string
+	var oldestKey unitKey
 	var oldestTime time.Time
 	found := false
-	for dir, entry := range e.cache {
-		if dir == e.focus {
+	for key, entry := range e.cache {
+		if key.dir == e.focus {
 			continue
 		}
 		if !found || entry.lastUsed.Before(oldestTime) {
-			oldestDir, oldestTime = dir, entry.lastUsed
+			oldestKey, oldestTime = key, entry.lastUsed
 			found = true
 		}
 	}
 	if found {
-		delete(e.cache, oldestDir)
+		delete(e.cache, oldestKey)
 	}
 }

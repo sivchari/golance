@@ -6,7 +6,9 @@ import (
 	"go/types"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/overlay"
@@ -158,9 +160,9 @@ func TestEngine_LRUEvictionAndFocus(t *testing.T) {
 	}
 
 	e.mu.Lock()
-	_, hasPkg1 := e.cache[filepath.Dir(pkgFile("pkg1"))]
-	_, hasPkg2 := e.cache[filepath.Dir(pkgFile("pkg2"))]
-	_, hasPkg3 := e.cache[filepath.Dir(pkgFile("pkg3"))]
+	_, hasPkg1 := e.cache[unitKey{dir: filepath.Dir(pkgFile("pkg1")), variant: variantBase}]
+	_, hasPkg2 := e.cache[unitKey{dir: filepath.Dir(pkgFile("pkg2")), variant: variantBase}]
+	_, hasPkg3 := e.cache[unitKey{dir: filepath.Dir(pkgFile("pkg3")), variant: variantBase}]
 	size := len(e.cache)
 	e.mu.Unlock()
 
@@ -341,9 +343,10 @@ func TestEngine_Get_InPackageTestFileJoinsPackage(t *testing.T) {
 
 // TestEngine_Get_ExternalTestPackageFileExcluded pins the complementary
 // scope guard: a "package foo_test" external test file in the same
-// directory still degrades to no-result for that file — external test
-// packages are Phase 2, not this change — even though the directory
-// fallback now resolves its path to the base package too.
+// directory still does not join the base package's checked unit — it is a
+// separate unit of its own (see unitKey and
+// TestEngine_Get_ExternalTestPackageResolvesBaseExported) — even though the
+// directory fallback resolves its path to a known package's directory.
 func TestEngine_Get_ExternalTestPackageFileExcluded(t *testing.T) {
 	e, root := newTestEngine(t, overlay.New(), Options{})
 	baseFile := filepath.Join(root, "withtests", "withtests.go")
@@ -359,4 +362,171 @@ func TestEngine_Get_ExternalTestPackageFileExcluded(t *testing.T) {
 	if _, ok := cp.FileText(extFile); ok {
 		t.Errorf("FileText(%s) ok = true, want false: the external test package file should not be part of the checked package", extFile)
 	}
+}
+
+// TestEngine_Get_ExternalTestPackageResolvesBaseExported covers the core of
+// external "_test" package support: Get on the "package withtests_test"
+// file resolves to a distinct unit (a pkgPath GraphSource never reports for
+// any real package, so it is excluded from graph/index lookups by
+// construction — the same scope guard ad-hoc packages already rely on, see
+// TestEngine_Get_AdhocPackage) whose files see the base package's exported
+// declarations through the ordinary dependency importer.
+func TestEngine_Get_ExternalTestPackageResolvesBaseExported(t *testing.T) {
+	e, root := newTestEngine(t, overlay.New(), Options{})
+	extFile := filepath.Join(root, "withtests", "withtests_ext_test.go")
+
+	cp, err := e.Get(context.Background(), extFile)
+	if err != nil {
+		t.Fatalf("Get(withtests_ext_test.go): %v", err)
+	}
+
+	if cp.PkgPath() == "example.com/checkmod/withtests" {
+		t.Errorf("PkgPath() = %q, want a distinct identity from the base package", cp.PkgPath())
+	}
+	if snap, ok := testEngineSnapshot(t, e); ok {
+		if _, ok := snap.Package(cp.PkgPath()); ok {
+			t.Errorf("snap.Package(%q) resolved, want the external test unit's pkgPath to be unknown to the import graph (scope guard: excluded from index/xref lookups by construction)", cp.PkgPath())
+		}
+	}
+
+	scope := cp.Package().Scope()
+	if scope.Lookup("UsesBaseExported") == nil {
+		t.Error("UsesBaseExported, declared in the external test file, not found in its scope")
+	}
+	if scope.Lookup("ExternalOnly") == nil {
+		t.Error("ExternalOnly, declared in the external test file, not found in its scope")
+	}
+	if scope.Lookup("Value") != nil {
+		t.Error("Value should not be a direct member of the external test unit's own scope (it is imported, not declared here)")
+	}
+	if scope.Lookup("TestOnlyHelper") != nil {
+		t.Error("TestOnlyHelper, declared in the in-package _test.go file, must not leak into the external test unit")
+	}
+
+	if diags := Diagnostics(cp, e.reader); len(diags) != 0 {
+		t.Errorf("Diagnostics = %v, want none: UsesBaseExported's call to withtests.Value should resolve cleanly", diags)
+	}
+}
+
+// TestEngine_Get_ExternalTestPackageUnexportedSymbolIsTypeError covers the
+// flip side: an external test file referencing its base package's
+// unexported declaration gets a type error, exactly as go/types itself
+// would reject it from any other importer — proving the external unit
+// really does resolve the base package by ordinary package-boundary rules
+// (only exported declarations visible), not by some looser same-directory
+// shortcut.
+func TestEngine_Get_ExternalTestPackageUnexportedSymbolIsTypeError(t *testing.T) {
+	e, root := newTestEngine(t, overlay.New(), Options{})
+	extFile := filepath.Join(root, "exttest", "exttest_ext_test.go")
+
+	cp, err := e.Get(context.Background(), extFile)
+	if err != nil {
+		t.Fatalf("Get(exttest_ext_test.go): %v", err)
+	}
+
+	if cp.Package().Scope().Lookup("UsesExported") == nil {
+		t.Error("UsesExported not found in the external test unit's scope")
+	}
+
+	diags := Diagnostics(cp, e.reader)
+	if len(diags) == 0 {
+		t.Fatal("want a type error for exttest.unexported, an unexported symbol referenced across the package boundary, got none")
+	}
+}
+
+// TestEngine_Get_ExternalTestPackageCachedIndependently covers the cache
+// key extension unitKey exists for: a directory's base and external test
+// units are cached as two independent entries, not one clobbering the
+// other.
+func TestEngine_Get_ExternalTestPackageCachedIndependently(t *testing.T) {
+	e, root := newTestEngine(t, overlay.New(), Options{})
+	dir := filepath.Join(root, "withtests")
+	baseFile := filepath.Join(dir, "withtests.go")
+	extFile := filepath.Join(dir, "withtests_ext_test.go")
+
+	baseCP, err := e.Get(context.Background(), baseFile)
+	if err != nil {
+		t.Fatalf("Get(withtests.go): %v", err)
+	}
+	extCP, err := e.Get(context.Background(), extFile)
+	if err != nil {
+		t.Fatalf("Get(withtests_ext_test.go): %v", err)
+	}
+
+	e.mu.Lock()
+	_, hasBase := e.cache[unitKey{dir: dir, variant: variantBase}]
+	_, hasExt := e.cache[unitKey{dir: dir, variant: variantExternalTest}]
+	e.mu.Unlock()
+
+	if !hasBase {
+		t.Error("base unit missing from the cache")
+	}
+	if !hasExt {
+		t.Error("external test unit missing from the cache")
+	}
+	if baseCP.PkgPath() == extCP.PkgPath() {
+		t.Errorf("base and external test units share pkgPath %q, want distinct identities", baseCP.PkgPath())
+	}
+	if baseCP.Package().Scope().Lookup("ExternalOnly") != nil {
+		t.Error("the base unit's own scope must not have picked up the external unit's ExternalOnly")
+	}
+}
+
+// TestEngine_Invalidate_InvalidatesBothVariants covers the debounce side of
+// unitKey: once a directory's external test unit has been resolved at
+// least once (via Get, as it would be right after an editor opens it),
+// Invalidate(dir) — called for an edit to either file — reschedules both
+// variants, not just the base one.
+func TestEngine_Invalidate_InvalidatesBothVariants(t *testing.T) {
+	var mu sync.Mutex
+	seen := make(map[string]bool)
+
+	e, root := newTestEngine(t, overlay.New(), Options{
+		DebounceDelay: 20 * time.Millisecond,
+		OnResult: func(r *Result) {
+			mu.Lock()
+			seen[r.PkgPath] = true
+			mu.Unlock()
+		},
+	})
+	dir := filepath.Join(root, "withtests")
+	baseFile := filepath.Join(dir, "withtests.go")
+	extFile := filepath.Join(dir, "withtests_ext_test.go")
+
+	ctx := context.Background()
+	baseCP, err := e.Get(ctx, baseFile)
+	if err != nil {
+		t.Fatalf("Get(withtests.go): %v", err)
+	}
+	extCP, err := e.Get(ctx, extFile)
+	if err != nil {
+		t.Fatalf("Get(withtests_ext_test.go): %v", err)
+	}
+
+	e.Invalidate(dir)
+	time.Sleep(300 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !seen[baseCP.PkgPath()] {
+		t.Errorf("Invalidate(dir) never republished the base unit (%q)", baseCP.PkgPath())
+	}
+	if !seen[extCP.PkgPath()] {
+		t.Errorf("Invalidate(dir) never republished the external test unit (%q)", extCP.PkgPath())
+	}
+}
+
+// testEngineSnapshot returns the *graph.Snapshot newTestEngine loaded e's
+// GraphSource from, for a test that wants to assert against it directly
+// (e.g. that a pkgPath is unknown to it). ok is false if e's SnapshotSource
+// is not a *GraphSource — it always is, for an Engine built by
+// newTestEngine, but this keeps the assertion honest rather than a type
+// assertion the caller has to repeat.
+func testEngineSnapshot(t *testing.T, e *Engine) (*graph.Snapshot, bool) {
+	t.Helper()
+	gs, ok := e.snap.(*GraphSource)
+	if !ok {
+		return nil, false
+	}
+	return gs.snap, true
 }

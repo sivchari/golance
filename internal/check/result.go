@@ -72,15 +72,32 @@ func (cp *CheckedPackage) FileText(path string) ([]byte, bool) {
 type Result struct {
 	PkgPath string
 	Dir     string
+	// Files lists every file cp was actually checked against — not just the
+	// ones in Diags. A directory can now hold two independent units (its
+	// base package and, separately, its external "_test" package — see
+	// internal/check's unitKey), each publishing its own Result for the
+	// same Dir with disjoint file sets, so a caller that clears a
+	// no-longer-diagnosed file's diagnostics on this Result's behalf needs
+	// to know which files it is actually authoritative for, rather than
+	// assuming (as a single-unit-per-directory caller safely could before)
+	// that it speaks for every open file in Dir.
+	Files   []string
 	Diags   []Diag
 	BuiltAt time.Time
 }
 
 // newResult builds a Result from cp and its diagnostics.
 func newResult(cp *CheckedPackage, diags []Diag) *Result {
+	files := make([]string, 0, len(cp.files))
+	for _, f := range cp.files {
+		if tf := cp.fset.File(f.Pos()); tf != nil {
+			files = append(files, tf.Name())
+		}
+	}
 	return &Result{
 		PkgPath: cp.pkgPath,
 		Dir:     cp.dir,
+		Files:   files,
 		Diags:   diags,
 		BuiltAt: cp.builtAt,
 	}
