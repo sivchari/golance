@@ -11,6 +11,57 @@ import (
 	"golang.org/x/tools/go/ast/astutil"
 )
 
+// SamePackageDefInfo is the result of a SamePackageDefinition query: the
+// identifier's own declaring identifier, located entirely from cp's
+// already-parsed files and FileSet — unlike DependencyDefinitionInfo's
+// export-data position, this is exact to the column, not just the line.
+type SamePackageDefInfo struct {
+	File  string
+	Range Range
+}
+
+// SamePackageDefinition resolves the identifier at offset (a byte offset
+// from the start of file) to its own declaring identifier, for the case
+// DependencyDefinition declines: an object declared in cp's own package.
+// It returns (nil, nil) if offset is not on an identifier, the identifier
+// resolves to no object, the object is predeclared (e.g. error, any — no
+// Pkg()), or the object is declared in a different package (see
+// DependencyDefinition for that case instead).
+//
+// This exists for handleDefinition's fallback when the workspace facts
+// index cannot answer at all: resolving straight from cp's own
+// AST/types.Info/FileSet needs no index and, unlike a declaration recorded
+// there or DependencyDefinition's export-data position, is exact down to
+// the column.
+func SamePackageDefinition(cp *check.CheckedPackage, file string, offset int) (*SamePackageDefInfo, error) {
+	astFile, pos, _, err := locate(cp, file, offset)
+	if err != nil {
+		return nil, err
+	}
+	path, _ := astutil.PathEnclosingInterval(astFile, pos, pos)
+	id := identAt(path)
+	if id == nil {
+		return nil, nil
+	}
+	obj := cp.Info().ObjectOf(id)
+	if obj == nil || obj.Pkg() == nil || obj.Pkg() != cp.Package() {
+		return nil, nil
+	}
+	if !obj.Pos().IsValid() {
+		return nil, nil
+	}
+	declFile, tf, ok := fileContaining(cp, obj.Pos())
+	if !ok {
+		return nil, nil
+	}
+	declPath, _ := astutil.PathEnclosingInterval(declFile, obj.Pos(), obj.Pos())
+	declID := identAt(declPath)
+	if declID == nil {
+		return nil, nil
+	}
+	return &SamePackageDefInfo{File: tf.Name(), Range: rangeOf(tf, declID.Pos(), declID.End())}, nil
+}
+
 // DependencyDefinitionInfo is the result of a DependencyDefinition query:
 // where the identifier at the cursor is declared, for an object outside the
 // checked package.
