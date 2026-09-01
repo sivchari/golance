@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"go/token"
 	"go/types"
+	"log"
 	"math"
 	"path/filepath"
 	"strings"
@@ -57,6 +58,8 @@ type Resolver struct {
 
 	root     string // snap.Dir(); the base a relative-format stored path joins onto
 	relative bool   // whether db's UnitPointers and cas's blobs store paths relative to root
+
+	logger *log.Logger // server-side diagnostics only; see SetLogger
 }
 
 // New returns a Resolver over db's per-root index, cas's content-addressed
@@ -213,6 +216,22 @@ func (r *Resolver) resolveNamed(ctx context.Context, pkgPath, name string) (*typ
 		return nil, fmt.Errorf("xref: %s in package %s is not a named type", name, pkgPath)
 	}
 	return named, nil
+}
+
+// SetLogger installs l as r's diagnostic logger for implementation-query
+// failures (see implementation.go's implDiag/logImplDiag): an empty
+// "Go to Implementation" result is otherwise indistinguishable, from the
+// client's point of view, between "genuinely no implementers" and a
+// resolution step silently failing along the way (e.g. a candidate or the
+// queried interface itself whose export data could not be decoded -- the
+// exact symptom a real monorepo report traced to an interface method
+// signature referencing a module dependency's type). r logs nowhere until
+// this is called (the zero value), so every existing New call site --
+// production and this package's own test helpers alike -- keeps its
+// current four-argument shape and its current silent behavior unless a
+// caller opts in.
+func (r *Resolver) SetLogger(l *log.Logger) {
+	r.logger = l
 }
 
 // Invalidate drops pkgPaths' decoded *types.Package entries from r's shared

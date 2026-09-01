@@ -24,4 +24,22 @@
 // consistent object identity for any package an interface and a candidate
 // both depend on. Neither is evicted, so long-lived Resolvers should be
 // recycled periodically.
+//
+// An implementation query's own diagnostics (implDiag/logImplDiag, in
+// implementation.go) never see the LSP session's live, already
+// type-checked CheckedPackage for the queried file -- this package only
+// ever reads back its own facts index and previously-written export data,
+// never the check.Engine that produced them. So when the QUERIED
+// interface's (or type's) own export data itself fails to decode --
+// Resolver.Implementation's own resolveNamed/resolveMethodFunc call, not a
+// candidate's, in implementingTypes/implementedInterfaces's loop -- there is
+// no live types.Info to fall back to here; the query simply returns that
+// decode error (already logged with the failing package's path by
+// internal/server's handleImplementation) rather than degrading to a
+// partial answer. Threading a CheckedPackage through this package's
+// otherwise index/export-data-only API is a bigger architectural change
+// than this diagnostics pass justifies on its own; left as a follow-up if
+// the interface side of implDiag's own decode-failure case turns out to be
+// the actual root cause of a future report, rather than a candidate's (the
+// case this pass could reproduce and fix -- see implementation_decodefailure_test.go).
 package xref

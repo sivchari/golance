@@ -91,6 +91,66 @@ func TestDependencyDefinition_Stdlib(t *testing.T) {
 	}
 }
 
+// TestDependencyDefinition_EmbeddedStdlibField covers "Go to Definition" on
+// an embedded struct field naming a standard-library type: the mirror image
+// of TestSamePackageDefinition_EmbeddedField for the cross-package/export-
+// data path. Before embeddedFieldTarget, ObjectOf(id) returned the implicit
+// field var, whose Pkg() is the EMBEDDING package (not bytes) -- so
+// DependencyDefinition declined outright (obj.Pkg() == cp.Package()), and
+// definitionFallback's SamePackageDefinition call (tried first) resolved
+// the same wrong object to itself instead, per
+// TestSamePackageDefinition_EmbeddedField's doc.
+func TestDependencyDefinition_EmbeddedStdlibField(t *testing.T) {
+	reader := overlay.New()
+	cp, path, depFset := newCheckedPackageWithDepFset(t, reader, "embed", "embedstruct_stdlib.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "bytes.Buffer\n") + len("bytes.")
+
+	got, err := langfeat.DependencyDefinition(cp, depFset, path, offset)
+	if err != nil {
+		t.Fatalf("DependencyDefinition: %v", err)
+	}
+	if got == nil {
+		t.Fatal("DependencyDefinition returned nil, want bytes.Buffer's declaration")
+	}
+	if got.PkgPath != "bytes" {
+		t.Errorf("PkgPath = %q, want %q", got.PkgPath, "bytes")
+	}
+	if !strings.HasSuffix(got.Filename, filepath.FromSlash("bytes/buffer.go")) {
+		t.Errorf("Filename = %q, want it to end with bytes/buffer.go", got.Filename)
+	}
+}
+
+// TestDependencyDefinition_EmbeddedStdlibInterface covers "Go to
+// Definition" on an embedded interface naming a standard-library interface
+// (io.Reader): unlike a struct field, an embedded interface element never
+// declares an implicit types.Var, so ObjectOf(id) already resolved straight
+// to Uses[id] before embeddedFieldTarget existed -- this pins that this
+// case needed no fix and still passes through unaffected.
+func TestDependencyDefinition_EmbeddedStdlibInterface(t *testing.T) {
+	reader := overlay.New()
+	cp, path, depFset := newCheckedPackageWithDepFset(t, reader, "embed", "embediface.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "io.Reader\n") + len("io.")
+
+	got, err := langfeat.DependencyDefinition(cp, depFset, path, offset)
+	if err != nil {
+		t.Fatalf("DependencyDefinition: %v", err)
+	}
+	if got == nil {
+		t.Fatal("DependencyDefinition returned nil, want io.Reader's declaration")
+	}
+	if got.PkgPath != "io" {
+		t.Errorf("PkgPath = %q, want %q", got.PkgPath, "io")
+	}
+}
+
 func TestDependencyDefinition_SamePackageReturnsNil(t *testing.T) {
 	reader := overlay.New()
 	cp, path, depFset := newCheckedPackageWithDepFset(t, reader, "depuse", "depuse.go")
@@ -163,6 +223,35 @@ func TestSamePackageDefinition_CrossPackageReturnsNil(t *testing.T) {
 	}
 	if got != nil {
 		t.Errorf("SamePackageDefinition = %+v, want nil (declared in a different package)", got)
+	}
+}
+
+// TestSamePackageDefinition_EmbeddedField covers "Go to Definition" invoked
+// on an embedded struct field's name, declared in cp's own package: per
+// gopls (golang/go#42254), it must jump to the embedded TYPE's own
+// declaration. Before embeddedFieldTarget existed, ObjectOf(id) returned
+// the implicit field types.Var types.Info.Defs records at the SAME
+// position as the identifier itself, so this resolved to itself instead of
+// leaving the cursor's current position -- see embeddedFieldTarget's doc.
+func TestSamePackageDefinition_EmbeddedField(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "embed", "embed.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "\tBase\n") + 1
+
+	got, err := langfeat.SamePackageDefinition(cp, path, offset)
+	if err != nil {
+		t.Fatalf("SamePackageDefinition: %v", err)
+	}
+	if got == nil {
+		t.Fatal("SamePackageDefinition returned nil, want Base's declaration")
+	}
+	wantOffset := mustIndex(t, text, "type Base") + len("type ")
+	if got.Range.StartOffset != wantOffset {
+		t.Errorf("Range.StartOffset = %d, want %d (Base's declaring identifier, not the embedded field itself)", got.Range.StartOffset, wantOffset)
 	}
 }
 

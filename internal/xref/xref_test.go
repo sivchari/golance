@@ -69,6 +69,44 @@ func newResolverForDir(t *testing.T, root string) (*Resolver, *graph.Snapshot) {
 	return New(db, cas, snap, false), snap
 }
 
+// newResolverAndStoreForDir is newResolverForDir plus direct access to the
+// underlying db/cas: most tests only need a Resolver, but a test that wants
+// to corrupt or remove a specific package's stored blob after indexing
+// (simulating export data becoming unavailable at query time -- see
+// implementation_decodefailure_test.go) needs the store handles
+// newResolverForDir keeps private to itself.
+func newResolverAndStoreForDir(t *testing.T, root string) (*Resolver, *graph.Snapshot, *store.DB, *store.CAS) {
+	t.Helper()
+	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+
+	db, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("db.Close: %v", err)
+		}
+	})
+	cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+
+	stats, err := index.Build(context.Background(), snap, db, cas, index.Options{})
+	if err != nil {
+		t.Fatalf("index.Build: %v", err)
+	}
+	if stats.Errors != 0 {
+		t.Fatalf("index.Build: %d errors", stats.Errors)
+	}
+
+	return New(db, cas, snap, false), snap, db, cas
+}
+
 // goFile returns the absolute path of the file named base in pkgPath's
 // GoFiles, as reported by go/packages (matching what Resolver's fileToPkg
 // index was built from).

@@ -18,6 +18,7 @@ import (
 
 	"go.lsp.dev/protocol"
 
+	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/index"
 	"github.com/sivchari/golance/internal/store"
 	"github.com/sivchari/golance/internal/xref"
@@ -256,6 +257,21 @@ func (s *Server) switchToPrivateIndex() {
 // warm-open with revalidateIndex, which checks in the background and
 // triggers a rebuild if it finds anything stale; until that finishes,
 // queries simply answer from whatever this opened.
+// newResolver builds an xref.Resolver over db/cas/snap, wired with s's own
+// logger (xref.Resolver.SetLogger) so an implementation query that comes
+// back empty leaves a server-side diagnostic trail explaining why (see
+// implementation.go's implDiag) instead of silence indistinguishable from
+// "genuinely no implementers" -- the same silent gap a real monorepo
+// report traced to an interface method signature referencing a module
+// dependency's type. Every indexState construction site (tryWarmOpen,
+// buildIndexLocked, workspace.go's revalidateGraph) goes through this
+// instead of calling xref.New directly, so none of them can forget it.
+func (s *Server) newResolver(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool) *xref.Resolver {
+	r := xref.New(db, cas, snap, relative)
+	r.SetLogger(s.logger)
+	return r
+}
+
 func (s *Server) tryWarmOpen(root string) (*indexState, bool) {
 	dbPath := s.dbPath(root)
 	if _, err := os.Stat(dbPath); err != nil {
@@ -281,7 +297,7 @@ func (s *Server) tryWarmOpen(root string) (*indexState, bool) {
 		_ = db.Close()
 		return nil, false
 	}
-	return &indexState{db: db, cas: cas, resolver: xref.New(db, cas, ws.snap, RelativeIndexPaths(root))}, true
+	return &indexState{db: db, cas: cas, resolver: s.newResolver(db, cas, ws.snap, RelativeIndexPaths(root))}, true
 }
 
 // revalidateIndex checks, cheaply and in-process, whether root's
@@ -528,7 +544,7 @@ func (s *Server) openIndexAfterBuild(ctx context.Context, dbPath string, waitErr
 		_ = db.Close()
 		return false
 	}
-	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, ws.snap, RelativeIndexPaths(ws.root))})
+	s.idx.Store(&indexState{db: db, cas: cas, resolver: s.newResolver(db, cas, ws.snap, RelativeIndexPaths(ws.root))})
 	s.drainDirty(ctx, ws)
 	return false
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"go/types"
+	"strings"
 
 	"golang.org/x/tools/go/types/objectpath"
 
@@ -185,7 +186,8 @@ func (r *Resolver) implementationsOfInterface(ctx context.Context, named *types.
 		names[i] = iface.Method(i).Name()
 	}
 
-	impls, err := r.implementingTypes(ctx, iface, names)
+	diag := newImplDiag(names)
+	impls, err := r.implementingTypes(ctx, iface, names, diag)
 	if err != nil {
 		return nil, err
 	}
@@ -198,6 +200,9 @@ func (r *Resolver) implementationsOfInterface(ctx context.Context, named *types.
 		out = append(out, loc)
 	}
 	sortLocations(out)
+	if len(out) == 0 {
+		r.logImplDiag("implementations of interface "+named.Obj().Name(), diag)
+	}
 	return out, nil
 }
 
@@ -228,7 +233,8 @@ func (r *Resolver) methodImplementationSymbols(ctx context.Context, iface *types
 		names[i] = ifaceType.Method(i).Name()
 	}
 
-	impls, err := r.implementingTypes(ctx, ifaceType, names)
+	diag := newImplDiag(names)
+	impls, err := r.implementingTypes(ctx, ifaceType, names, diag)
 	if err != nil {
 		return nil, err
 	}
@@ -239,6 +245,9 @@ func (r *Resolver) methodImplementationSymbols(ctx context.Context, iface *types
 			continue
 		}
 		out = append(out, sym)
+	}
+	if len(out) == 0 {
+		r.logImplDiag(fmt.Sprintf("implementations of %s.%s", iface.Obj().Name(), methodName), diag)
 	}
 	return out, nil
 }
@@ -251,8 +260,8 @@ func (r *Resolver) methodImplementationSymbols(ctx context.Context, iface *types
 // canceled query stops before decoding the next candidate's export data
 // (the expensive part of this loop) instead of running to completion
 // regardless.
-func (r *Resolver) implementingTypes(ctx context.Context, iface *types.Interface, methodNames []string) (map[store.MethodEntry]*types.Named, error) {
-	candidates, err := r.candidatesByAllMethods(ctx, methodNames, index.KindType)
+func (r *Resolver) implementingTypes(ctx context.Context, iface *types.Interface, methodNames []string, diag *implDiag) (map[store.MethodEntry]*types.Named, error) {
+	candidates, err := r.candidatesByAllMethods(ctx, methodNames, index.KindType, diag)
 	if err != nil {
 		return nil, err
 	}
@@ -272,6 +281,7 @@ func (r *Resolver) implementingTypes(ctx context.Context, iface *types.Interface
 		}
 		cnamed, err := r.resolveNamed(ctx, cpath, cname)
 		if err != nil {
+			diag.skip(cpath, cname, err)
 			continue
 		}
 		if !types.Implements(types.NewPointer(cnamed), iface) {
@@ -279,6 +289,7 @@ func (r *Resolver) implementingTypes(ctx context.Context, iface *types.Interface
 		}
 		out[entry] = cnamed
 	}
+	diag.survivors += len(out)
 	return out, nil
 }
 
@@ -318,7 +329,8 @@ func (r *Resolver) interfacesImplementedBy(ctx context.Context, named *types.Nam
 		names[i] = ms.At(i).Obj().Name()
 	}
 
-	ifaces, err := r.implementedInterfaces(ctx, named, names)
+	diag := newImplDiag(names)
+	ifaces, err := r.implementedInterfaces(ctx, named, names, diag)
 	if err != nil {
 		return nil, err
 	}
@@ -331,6 +343,9 @@ func (r *Resolver) interfacesImplementedBy(ctx context.Context, named *types.Nam
 		out = append(out, loc)
 	}
 	sortLocations(out)
+	if len(out) == 0 {
+		r.logImplDiag("interfaces implemented by "+named.Obj().Name(), diag)
+	}
 	return out, nil
 }
 
@@ -357,7 +372,8 @@ func (r *Resolver) methodInterfaceSymbols(ctx context.Context, named *types.Name
 		names[i] = ms.At(i).Obj().Name()
 	}
 
-	ifaces, err := r.implementedInterfaces(ctx, named, names)
+	diag := newImplDiag(names)
+	ifaces, err := r.implementedInterfaces(ctx, named, names, diag)
 	if err != nil {
 		return nil, err
 	}
@@ -369,6 +385,9 @@ func (r *Resolver) methodInterfaceSymbols(ctx context.Context, named *types.Name
 		}
 		out = append(out, sym)
 	}
+	if len(out) == 0 {
+		r.logImplDiag(fmt.Sprintf("interfaces satisfied by %s.%s", named.Obj().Name(), methodName), diag)
+	}
 	return out, nil
 }
 
@@ -379,8 +398,8 @@ func (r *Resolver) methodInterfaceSymbols(ctx context.Context, named *types.Name
 // over-approximated -- returning the ones that pass alongside their
 // resolved *types.Interface. ctx is checked once per candidate (see
 // implementingTypes's doc).
-func (r *Resolver) implementedInterfaces(ctx context.Context, named *types.Named, methodNames []string) (map[store.MethodEntry]*types.Interface, error) {
-	candidates, err := r.candidatesByAnyMethod(ctx, methodNames, index.KindInterface)
+func (r *Resolver) implementedInterfaces(ctx context.Context, named *types.Named, methodNames []string, diag *implDiag) (map[store.MethodEntry]*types.Interface, error) {
+	candidates, err := r.candidatesByAnyMethod(ctx, methodNames, index.KindInterface, diag)
 	if err != nil {
 		return nil, err
 	}
@@ -400,6 +419,7 @@ func (r *Resolver) implementedInterfaces(ctx context.Context, named *types.Named
 		}
 		inamed, err := r.resolveNamed(ctx, ipath, iname)
 		if err != nil {
+			diag.skip(ipath, iname, err)
 			continue
 		}
 		iface, ok := inamed.Underlying().(*types.Interface)
@@ -411,6 +431,7 @@ func (r *Resolver) implementedInterfaces(ctx context.Context, named *types.Named
 		}
 		out[entry] = iface
 	}
+	diag.survivors += len(out)
 	return out, nil
 }
 
@@ -489,10 +510,10 @@ func (r *Resolver) locationsOfSymbols(ctx context.Context, syms []resolvedSymbol
 // under every name in methodNames (intersection): a sound, name-based
 // shortlist for "does this candidate implement an interface with these
 // methods".
-func (r *Resolver) candidatesByAllMethods(ctx context.Context, methodNames []string, wantKind uint8) (map[store.MethodEntry]bool, error) {
+func (r *Resolver) candidatesByAllMethods(ctx context.Context, methodNames []string, wantKind uint8, diag *implDiag) (map[store.MethodEntry]bool, error) {
 	var result map[store.MethodEntry]bool
 	for i, name := range methodNames {
-		set, err := r.methodEntriesOfKind(ctx, name, wantKind)
+		set, err := r.methodEntriesOfKind(ctx, name, wantKind, diag)
 		if err != nil {
 			return nil, err
 		}
@@ -515,10 +536,10 @@ func (r *Resolver) candidatesByAllMethods(ctx context.Context, methodNames []str
 // candidatesByAnyMethod returns every MethodEntry of kind wantKind recorded
 // under any name in methodNames (union): a sound, name-based shortlist for
 // "does this candidate's interface consist only of methods this type has".
-func (r *Resolver) candidatesByAnyMethod(ctx context.Context, methodNames []string, wantKind uint8) (map[store.MethodEntry]bool, error) {
+func (r *Resolver) candidatesByAnyMethod(ctx context.Context, methodNames []string, wantKind uint8, diag *implDiag) (map[store.MethodEntry]bool, error) {
 	result := make(map[store.MethodEntry]bool)
 	for _, name := range methodNames {
-		set, err := r.methodEntriesOfKind(ctx, name, wantKind)
+		set, err := r.methodEntriesOfKind(ctx, name, wantKind, diag)
 		if err != nil {
 			return nil, err
 		}
@@ -529,11 +550,12 @@ func (r *Resolver) candidatesByAnyMethod(ctx context.Context, methodNames []stri
 	return result, nil
 }
 
-func (r *Resolver) methodEntriesOfKind(ctx context.Context, methodName string, wantKind uint8) (map[store.MethodEntry]bool, error) {
+func (r *Resolver) methodEntriesOfKind(ctx context.Context, methodName string, wantKind uint8, diag *implDiag) (map[store.MethodEntry]bool, error) {
 	entries, err := r.db.LookupMethod(ctx, methodName)
 	if err != nil {
 		return nil, err
 	}
+	diag.recordLookup(methodName, len(entries))
 	set := make(map[store.MethodEntry]bool, len(entries))
 	for _, e := range entries {
 		_, kind, _, ok := r.symbolByHash(ctx, e.PkgHash, e.TypeSymbolIDHash)
@@ -542,4 +564,58 @@ func (r *Resolver) methodEntriesOfKind(ctx context.Context, methodName string, w
 		}
 	}
 	return set, nil
+}
+
+// implDiag accumulates per-query diagnostics for an implementation query,
+// so that when its final result comes back empty, logImplDiag can explain
+// why -- the client's own view of an empty result is otherwise identical
+// whether that means "genuinely no implementers" or a resolution step
+// silently failing along the way. This is what closed the exact gap a real
+// monorepo report hit: an interface whose method signatures reference a
+// module dependency's type (gorm.io/gorm's *gorm.DB) kept answering "no
+// implementation found" with nothing in the server log explaining why --
+// every candidate's resolveNamed call was failing to decode that
+// dependency's export data, silently dropped by a bare `continue`. Nothing
+// here is client-visible; see Resolver.SetLogger.
+type implDiag struct {
+	methodNames []string       // the interface/type's own method set, in query order
+	perName     map[string]int // LookupMethod's raw candidate count per method name, before kind filtering
+	skipped     []string       // "pkgPath.name: err" for each candidate whose export data failed to decode
+	survivors   int            // candidates that passed types.Implements, across every implementingTypes/implementedInterfaces call this diag was threaded through
+}
+
+// newImplDiag starts an implDiag for a query over methodNames.
+func newImplDiag(methodNames []string) *implDiag {
+	return &implDiag{methodNames: methodNames, perName: make(map[string]int, len(methodNames))}
+}
+
+// recordLookup records name's raw LookupMethod candidate count.
+func (d *implDiag) recordLookup(name string, count int) {
+	d.perName[name] = count
+}
+
+// skip records that pkgPath's name candidate was dropped because its
+// export data could not be decoded -- implementingTypes/implementedInterfaces
+// call this in place of the bare `continue` they used to silently take.
+func (d *implDiag) skip(pkgPath, name string, err error) {
+	d.skipped = append(d.skipped, fmt.Sprintf("%s.%s: %v", pkgPath, name, err))
+}
+
+// logImplDiag emits diag's summary via r.logger (a no-op if unset; see
+// SetLogger) for queryDesc's empty result: one line of counts always, plus
+// a second line listing every export-data decode failure only when there
+// was at least one -- the specific, actionable signal for the monorepo
+// symptom implDiag's own doc describes. Two lines at most, and only when a
+// query already came back empty, keeps this from ever becoming log noise
+// on the overwhelmingly common non-empty path.
+func (r *Resolver) logImplDiag(queryDesc string, diag *implDiag) {
+	if r.logger == nil {
+		return
+	}
+	r.logger.Printf("xref: %s found no results: methods=%v lookup-candidates-by-name=%v post-types.Implements-survivors=%d",
+		queryDesc, diag.methodNames, diag.perName, diag.survivors)
+	if len(diag.skipped) > 0 {
+		r.logger.Printf("xref: %s: %d candidate(s) skipped, export data undecodable: %s",
+			queryDesc, len(diag.skipped), strings.Join(diag.skipped, "; "))
+	}
 }

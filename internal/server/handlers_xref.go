@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"go/parser"
+	"go/token"
 	"math"
 	"os"
 	"strings"
@@ -130,6 +132,9 @@ func (s *Server) definitionFallback(ctx context.Context, u uri.URI, pos protocol
 	if !cf.ok {
 		return nil
 	}
+	if loc, ok := s.importDefinition(cf); ok {
+		return s.toLSPLocations([]xref.Location{loc})
+	}
 	info, err := langfeat.SamePackageDefinition(cf.cp, cf.path, cf.offset)
 	if err != nil {
 		s.logger.Printf("server: same-package definition %s: %v", cf.path, err)
@@ -217,6 +222,75 @@ func (s *Server) dependencyDefinition(cf checkedFileResult) (xref.Location, bool
 	// this degrades to a zero-width location at the start of the
 	// declaration's line rather than guessing.
 	return xref.Location{File: info.Filename, Line: uint32(info.Line), Col: 1, EndCol: 1}, true
+}
+
+// importDefinition is definitionFallback's path for the cursor being inside
+// an import spec's path string (e.g. the quoted "encoding/json"): facts
+// extraction never indexes an *ast.ImportSpec (see
+// langfeat.ImportPathDefinition's doc), and neither SamePackageDefinition
+// nor DependencyDefinition finds an *ast.Ident there to resolve, so without
+// this the query answers nothing at all -- the gap this exists to close.
+//
+// Per gopls, "Go to Definition" on an import path jumps into the imported
+// package. internal/graph's Snapshot already has every package in the
+// workspace's transitive import graph -- root, module dependency, AND
+// standard library alike, since internal/graph's loadMode requests
+// NeedFiles for the whole closure, not just root packages -- with real,
+// on-disk Go files, so (unlike documentLinkTarget in handlers_nav.go, which
+// substitutes a pkg.go.dev URL for anything outside the workspace)
+// resolving an import path here never needs that same distinction: any
+// package the graph loaded degrades only when it has no Go files
+// (unsafe/builtin, or a load failure), not by origin.
+//
+// gopls itself returns one location per file of the resolved package (see
+// golang.org/x/tools/gopls's importDefinition); this instead points at just
+// the package's first Go file's package-clause identifier -- the same
+// single-file simplification handlers_codeaction.go's packageNameOf
+// already makes for the identical "read a package's own declared name"
+// need. A definition result needs one always-present, unambiguous
+// location, and this still lands the cursor inside the target package,
+// without a query-time parse of every one of its files for marginal
+// benefit.
+func (s *Server) importDefinition(cf checkedFileResult) (xref.Location, bool) {
+	pkgPath, ok := langfeat.ImportPathDefinition(cf.cp, cf.path, cf.offset)
+	if !ok {
+		return xref.Location{}, false
+	}
+	ws := s.workspace()
+	if ws == nil {
+		return xref.Location{}, false
+	}
+	pkg, ok := ws.snap.Package(pkgPath)
+	if !ok || len(pkg.GoFiles) == 0 {
+		return xref.Location{}, false
+	}
+	return packageClauseLocation(pkg.GoFiles[0])
+}
+
+// packageClauseLocation parses file's package clause fresh from disk (like
+// packageNameOf in handlers_codeaction.go) and returns a Location for its
+// package name identifier -- e.g. the "io" in "package io" -- rather than
+// the bare "package" keyword, consistent with every other Location this
+// package returns pointing at a name span, not a keyword.
+func packageClauseLocation(file string) (xref.Location, bool) {
+	fset := token.NewFileSet()
+	astFile, err := parser.ParseFile(fset, file, nil, parser.PackageClauseOnly)
+	if err != nil || astFile.Name == nil {
+		return xref.Location{}, false
+	}
+	start := fset.Position(astFile.Name.Pos())
+	end := fset.Position(astFile.Name.End())
+	if start.Line <= 0 || int64(start.Line) > math.MaxUint32 ||
+		start.Column <= 0 || int64(start.Column) > math.MaxUint32 ||
+		end.Column <= 0 || int64(end.Column) > math.MaxUint32 {
+		return xref.Location{}, false
+	}
+	return xref.Location{
+		File:   file,
+		Line:   uint32(start.Line),
+		Col:    uint32(start.Column),
+		EndCol: uint32(end.Column),
+	}, true
 }
 
 func (s *Server) handleReferences(ctx context.Context, params json.RawMessage) (any, error) {
