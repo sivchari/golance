@@ -3,4 +3,4 @@
 package golance
 
 // Version is the current version of golance.
-const Version = "0.1.7"
+const Version = "0.1.8"
