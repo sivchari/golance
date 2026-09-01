@@ -13,6 +13,7 @@ import (
 	"go.lsp.dev/protocol"
 
 	"github.com/sivchari/golance/internal/check"
+	"github.com/sivchari/golance/internal/depcheck"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/typecheck"
 )
@@ -97,6 +98,7 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	depCache := newDepCacheHolder(snap)
 	imp := depCache.importer
 	engine := check.New(src, s.overlay, imp, check.Options{OnResult: s.publishDiagnostics})
+	depProvider := depcheck.NewProvider(depcheck.NewGraphMetadataSource(snap), depcheck.Options{})
 
 	fileToPkg := make(map[string]string)
 	dirToPkg := make(map[string]string, len(snap.Packages))
@@ -127,7 +129,7 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	}
 	s.ws.Store(&workspace{
 		root: root, snap: snap, engine: engine, fileToPkg: fileToPkg, dirToPkg: dirToPkg,
-		depCache: depCache, pkgNameIndex: pkgNameIndex,
+		depCache: depCache, depProvider: depProvider, pkgNameIndex: pkgNameIndex,
 	})
 
 	if idx := s.idx.Load(); idx != nil {

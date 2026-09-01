@@ -1,16 +1,13 @@
 package langfeat
 
 import (
+	"context"
 	"go/ast"
-	"go/token"
 	"go/types"
-	"os"
-	"os/exec"
 	"strconv"
-	"strings"
-	"sync"
 
 	"github.com/sivchari/golance/internal/check"
+	"github.com/sivchari/golance/internal/depcheck"
 	"golang.org/x/tools/go/ast/astutil"
 )
 
@@ -47,8 +44,9 @@ func ImportPathDefinition(cp *check.CheckedPackage, file string, offset int) (pk
 
 // SamePackageDefInfo is the result of a SamePackageDefinition query: the
 // identifier's own declaring identifier, located entirely from cp's
-// already-parsed files and FileSet — unlike DependencyDefinitionInfo's
-// export-data position, this is exact to the column, not just the line.
+// already-parsed files and FileSet — exact to the column, like
+// DependencyDefinitionInfo's own position (see DependencyDefinition's doc),
+// but resolved from cp itself rather than a depcheck.Provider.
 type SamePackageDefInfo struct {
 	File  string
 	Range Range
@@ -64,9 +62,8 @@ type SamePackageDefInfo struct {
 //
 // This exists for handleDefinition's fallback when the workspace facts
 // index cannot answer at all: resolving straight from cp's own
-// AST/types.Info/FileSet needs no index and, unlike a declaration recorded
-// there or DependencyDefinition's export-data position, is exact down to
-// the column.
+// AST/types.Info/FileSet needs no index, unlike a declaration recorded
+// there.
 func SamePackageDefinition(cp *check.CheckedPackage, file string, offset int) (*SamePackageDefInfo, error) {
 	astFile, pos, _, err := locate(cp, file, offset)
 	if err != nil {
@@ -121,35 +118,34 @@ func embeddedFieldTarget(info *types.Info, id *ast.Ident, obj types.Object) type
 
 // DependencyDefinitionInfo is the result of a DependencyDefinition query:
 // where the identifier at the cursor is declared, for an object outside the
-// checked package.
+// checked package. Unlike the export-data-era result this replaces, Col and
+// EndCol are the real, byte-exact column span of the declaring identifier
+// (a depcheck.Provider type-checks the dependency's own real source — see
+// DependencyDefinition's doc), not a degraded column-1 placeholder.
 type DependencyDefinitionInfo struct {
 	PkgPath  string
 	Filename string
 	Line     int
+	Col      int
+	EndCol   int
 }
 
-// goRootPlaceholder is the literal string gcexportdata leaves in a stdlib
-// package's export-data file paths in place of the actual GOROOT, for build
-// reproducibility (see cmd/internal/objabi.AbsFile upstream). Callers must
-// expand it themselves; see expandGoroot.
-const goRootPlaceholder = "$GOROOT"
-
 // DependencyDefinition resolves the identifier at offset (a byte offset from
-// the start of file) to the types.Object it refers to, and returns where
-// that object is declared, resolved through depFset — the *token.FileSet
-// the dependency importer decoded cp's dependencies' export data into (see
-// internal/typecheck.Importer, internal/server's depCacheHolder). It returns
-// (nil, nil) if offset is not on an identifier, the identifier resolves to
-// no object, the object is predeclared (e.g. error, any — no Pkg()), or the
-// object is declared in cp's own package: the caller already has a source
-// position for that case (see internal/xref's workspace facts index) and
+// the start of file) to the types.Object it refers to, and returns exactly
+// where that object is declared: dp type-checks the dependency's own real
+// source files (internal/depcheck.Provider, never compiler/gcexportdata
+// export data) and locates the declaring identifier there directly, so the
+// result is exact to the column and — unlike the previous export-data path
+// — resolves an unexported dependency object too (reachable, e.g., when cp
+// is itself a dependency package navigated into from a stdlib/module-cache
+// file already open; see Provider.Decl's doc for exactly which unexported
+// cases this covers). It returns (nil, nil) if offset is not on an
+// identifier, the identifier resolves to no object, the object is
+// predeclared (e.g. error, any — no Pkg()), or the object is declared in
+// cp's own package: the caller already has a source position for that case
+// (see internal/xref's workspace facts index, or SamePackageDefinition) and
 // should prefer it.
-//
-// Unlike a declaration recorded in the workspace facts index, export data
-// does not preserve column information (see internal/xref.methodFuncLocation's
-// doc), so the returned position always addresses the start of the
-// declaration's line.
-func DependencyDefinition(cp *check.CheckedPackage, depFset *token.FileSet, file string, offset int) (*DependencyDefinitionInfo, error) {
+func DependencyDefinition(ctx context.Context, cp *check.CheckedPackage, dp *depcheck.Provider, file string, offset int) (*DependencyDefinitionInfo, error) {
 	astFile, pos, _, err := locate(cp, file, offset)
 	if err != nil {
 		return nil, err
@@ -163,48 +159,17 @@ func DependencyDefinition(cp *check.CheckedPackage, depFset *token.FileSet, file
 	if obj == nil || obj.Pkg() == nil || obj.Pkg() == cp.Package() {
 		return nil, nil
 	}
-	objPos := obj.Pos()
-	if !objPos.IsValid() {
-		return nil, nil
+	declID, fset, err := dp.Decl(ctx, obj.Pkg().Path(), obj)
+	if err != nil {
+		return nil, err
 	}
-	tpos := depFset.Position(objPos)
-	if !tpos.IsValid() || tpos.Line <= 0 {
-		return nil, nil
-	}
+	start := fset.Position(declID.Pos())
+	end := fset.Position(declID.End())
 	return &DependencyDefinitionInfo{
 		PkgPath:  obj.Pkg().Path(),
-		Filename: expandGoroot(tpos.Filename),
-		Line:     tpos.Line,
+		Filename: start.Filename,
+		Line:     start.Line,
+		Col:      start.Column,
+		EndCol:   end.Column,
 	}, nil
 }
-
-// expandGoroot replaces a leading $GOROOT placeholder (see
-// goRootPlaceholder) with the toolchain's actual GOROOT — the same
-// substitution golang.org/x/tools' own internal gcimporter tests apply to
-// positions decoded from stdlib export data. A module dependency's export
-// data already carries an absolute path and passes through unchanged. If
-// GOROOT cannot be determined the placeholder is left as is; the caller's
-// file-exists check then rejects the location, degrading to no result.
-func expandGoroot(filename string) string {
-	if !strings.HasPrefix(filename, goRootPlaceholder) {
-		return filename
-	}
-	root := goroot()
-	if root == "" {
-		return filename
-	}
-	return strings.Replace(filename, goRootPlaceholder, root, 1)
-}
-
-// goroot resolves the toolchain's GOROOT once: "go env GOROOT" is the
-// supported way to locate it (runtime.GOROOT is deprecated since Go 1.24
-// and wrong for a relocated binary), with the GOROOT environment variable
-// as a fallback when the go binary is not on PATH.
-var goroot = sync.OnceValue(func() string {
-	if out, err := exec.Command("go", "env", "GOROOT").Output(); err == nil {
-		if root := strings.TrimSpace(string(out)); root != "" {
-			return root
-		}
-	}
-	return os.Getenv("GOROOT")
-})
