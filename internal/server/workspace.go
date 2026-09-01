@@ -118,6 +118,52 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	if idx := s.idx.Load(); idx != nil {
 		s.idx.Store(&indexState{db: idx.db, cas: idx.cas, resolver: xref.New(idx.db, idx.cas, snap, RelativeIndexPaths(root))})
 	}
+
+	s.refreshOnWorkspaceReady()
+}
+
+// refreshOnWorkspaceReady tells a capability-declaring client that
+// workspace-wide state it may have cached (inlay hints, semantic tokens) can
+// now be re-requested, because setWorkspace just installed a new snapshot —
+// either the very first one (handleInitialize) or a later
+// reload/revalidation (revalidateGraph). Without this, a client that asked
+// for inlay hints or semantic tokens before this workspace snapshot existed
+// gets one empty answer (see handleInlayHint/semanticTokensForFile's
+// ws == nil case) and, per the LSP spec, is not expected to re-request on
+// its own — it would otherwise show nothing until an unrelated recheck
+// happened to publish diagnostics and fire a refresh first.
+//
+// Each refresh runs detached via s.rpc.Go (not awaited here), like
+// publishDiagnostics's own refresh calls: s.rpc.Request blocks until the
+// client responds, and setWorkspace must not block on that, nor is this
+// called while holding any lock.
+func (s *Server) refreshOnWorkspaceReady() {
+	for _, refresh := range s.workspaceReadyRefreshes() {
+		s.rpc.Go(refresh)
+	}
+}
+
+// workspaceReadyRefreshes returns the refresh calls refreshOnWorkspaceReady
+// should fire, gated on client capabilities and s.clientInitialized (see its
+// doc): nil whenever the client's "initialized" notification has not
+// arrived yet, which is always true for the very first setWorkspace call —
+// it happens synchronously inside handleInitialize, before the client can
+// have sent "initialized" — so that call's own refresh is correctly
+// suppressed rather than violating the LSP's server-request ordering rule.
+// Split out from refreshOnWorkspaceReady so this gating decision can be
+// tested without needing to observe an actual s.rpc.Go dispatch.
+func (s *Server) workspaceReadyRefreshes() []func(context.Context) {
+	if !s.clientInitialized.Load() {
+		return nil
+	}
+	var refreshes []func(context.Context)
+	if s.inlayHintRefreshSupport.Load() {
+		refreshes = append(refreshes, s.refreshInlayHints)
+	}
+	if s.semanticTokensRefreshSupport.Load() {
+		refreshes = append(refreshes, s.refreshSemanticTokens)
+	}
+	return refreshes
 }
 
 // revalidateGraph reloads the import graph from scratch and installs it as

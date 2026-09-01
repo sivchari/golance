@@ -15,6 +15,11 @@ import (
 // answers cannot leak the goroutine publishDiagnostics starts for it.
 const refreshInlayHintsTimeout = 5 * time.Second
 
+// refreshSemanticTokensTimeout bounds how long refreshSemanticTokens waits
+// for the client's workspace/semanticTokens/refresh response, matching
+// refreshInlayHintsTimeout's reasoning.
+const refreshSemanticTokensTimeout = 5 * time.Second
+
 // publishDiagnostics is registered as check.Options.OnResult: it converts a
 // recheck's diagnostics into textDocument/publishDiagnostics notifications,
 // one per file. Every open file in res.Dir gets a notification: files with
@@ -86,6 +91,18 @@ func (s *Server) refreshInlayHints(ctx context.Context) {
 	defer cancel()
 	if _, err := s.rpc.Request(ctx, protocol.MethodWorkspaceInlayHintRefresh, nil); err != nil {
 		s.logger.Printf("server: refresh inlay hints: %v", err)
+	}
+}
+
+// refreshSemanticTokens sends workspace/semanticTokens/refresh, asking the
+// client to re-request semantic tokens for every currently shown document.
+// Per the LSP spec this refresh is global (the request carries no params),
+// matching refreshInlayHints.
+func (s *Server) refreshSemanticTokens(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, refreshSemanticTokensTimeout)
+	defer cancel()
+	if _, err := s.rpc.Request(ctx, protocol.MethodWorkspaceSemanticTokensRefresh, nil); err != nil {
+		s.logger.Printf("server: refresh semantic tokens: %v", err)
 	}
 }
 

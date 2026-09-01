@@ -44,6 +44,7 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 	s.setHintsEnabled(parseHintsSettings(p.InitializationOptions))
 	s.watchDynamicReg.Store(clientSupportsWatchedFilesRegistration(&p))
 	s.inlayHintRefreshSupport.Store(clientSupportsInlayHintRefresh(&p))
+	s.semanticTokensRefreshSupport.Store(clientSupportsSemanticTokensRefresh(&p))
 	root, err := rootFromInitializeParams(&p, params)
 	if err != nil {
 		return nil, err
@@ -119,12 +120,28 @@ func clientSupportsInlayHintRefresh(p *protocol.InitializeParams) bool {
 	return rs != nil && *rs
 }
 
+// clientSupportsSemanticTokensRefresh reports whether p's client
+// capabilities declare workspace.semanticTokens.refreshSupport: without it,
+// a workspace/semanticTokens/refresh request (see refreshSemanticTokens)
+// would be sending the client a request it never asked for and may not
+// handle.
+func clientSupportsSemanticTokensRefresh(p *protocol.InitializeParams) bool {
+	if p.Capabilities.Workspace == nil || p.Capabilities.Workspace.SemanticTokens == nil {
+		return false
+	}
+	rs := p.Capabilities.Workspace.SemanticTokens.RefreshSupport
+	return rs != nil && *rs
+}
+
 // handleInitialized responds to the "initialized" notification — the LSP
 // spec requires servers to wait for it before sending any server-initiated
-// request, including client/registerCapability — by asking the client (in
-// the background) to register interest in .go file changes, if it declared
-// support for that at "initialize" (see clientSupportsWatchedFilesRegistration).
+// request, including client/registerCapability — by recording that the
+// wait is over (s.clientInitialized; see its doc and
+// workspaceReadyRefreshes) and asking the client (in the background) to
+// register interest in .go file changes, if it declared support for that
+// at "initialize" (see clientSupportsWatchedFilesRegistration).
 func (s *Server) handleInitialized(ctx context.Context, _ json.RawMessage) error {
+	s.clientInitialized.Store(true)
 	if !s.watchDynamicReg.Load() {
 		return nil
 	}
