@@ -8,6 +8,18 @@ import (
 	"path/filepath"
 )
 
+// cacheVersion guards against loading a diskCache written by an older
+// golance build whose Package shape is missing a field a newer one now
+// relies on — in particular Package.Name, added for unimported-completion
+// candidates: LoadCache from an old cache would otherwise silently succeed
+// with every package's Name empty (a zero-value JSON field is
+// indistinguishable from "actually blank"), leaving unimported completion
+// quietly broken until something else happens to trigger a full reload
+// (see Stale, which only watches go.mod/go.sum/go.work — a Name-less cache
+// is not "stale" by that definition). Bump this whenever diskCache's shape
+// changes in a way an old cache cannot satisfy.
+const cacheVersion = 2
+
 // diskCache is the on-disk JSON envelope for a persisted Snapshot. Patterns
 // and BuildFlags are folded into the cache key: LoadCache refuses to serve
 // a cache built for a different pattern set or BuildFlags, since either
@@ -17,6 +29,7 @@ import (
 // embedFiles/embedPrefixes) is not ported; a non-Go file change under an
 // embed pattern will not invalidate the cache.
 type diskCache struct {
+	Version    int                 `json:"version"`
 	Root       string              `json:"root"`
 	Patterns   []string            `json:"patterns"`
 	BuildFlags []string            `json:"buildFlags,omitempty"`
@@ -54,7 +67,7 @@ func LoadCache(root string, patterns, buildFlags []string) (snap *Snapshot, ok b
 	if err := json.Unmarshal(data, &saved); err != nil {
 		return nil, false
 	}
-	if saved.Root != root || !equalStrings(saved.Patterns, patterns) || !equalStrings(saved.BuildFlags, buildFlags) {
+	if saved.Version != cacheVersion || saved.Root != root || !equalStrings(saved.Patterns, patterns) || !equalStrings(saved.BuildFlags, buildFlags) {
 		return nil, false
 	}
 	snap, err = newSnapshot(saved.Packages, saved.Root, saved.BuildFlags)
@@ -74,7 +87,7 @@ func SaveCache(root string, patterns, buildFlags []string, snap *Snapshot) error
 			existed[f] = true
 		}
 	}
-	saved := diskCache{Root: root, Patterns: patterns, BuildFlags: buildFlags, Packages: snap.Packages, ModuleFiles: existed}
+	saved := diskCache{Version: cacheVersion, Root: root, Patterns: patterns, BuildFlags: buildFlags, Packages: snap.Packages, ModuleFiles: existed}
 	b, err := json.Marshal(saved)
 	if err != nil {
 		return fmt.Errorf("graph: marshal cache: %w", err)

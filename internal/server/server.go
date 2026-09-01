@@ -65,6 +65,14 @@ type workspace struct {
 	// internal/check.GraphSource.PackageForFile's identical fallback, built
 	// from the same snap.Packages.
 	dirToPkg map[string]string
+	// pkgNameIndex maps a graph-known package's declared name (e.g.
+	// "strings") to the sorted import paths of every package sharing that
+	// name — the candidate source for unimported-package completion (see
+	// unimportedPackageCandidates/unimportedMemberCandidates). Built once
+	// per snapshot from snap.Packages' already-loaded Name field (free —
+	// see graph.Package.Name's doc), never touched again until the next
+	// setWorkspace, so a completion request never walks the graph itself.
+	pkgNameIndex map[string][]string
 }
 
 // indexState bundles the per-root index database, the CAS its facts and

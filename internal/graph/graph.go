@@ -28,7 +28,14 @@ const loadMode = packages.NeedName | packages.NeedFiles | packages.NeedImports |
 // Package is one node in the import graph: a single Go package as reported
 // by go/packages, without any type or syntax information.
 type Package struct {
-	ImportPath string   `json:"importPath"`
+	ImportPath string `json:"importPath"`
+	// Name is the package's declared name (e.g. "yaml" for the import path
+	// "gopkg.in/yaml.v2", which can differ from its last path segment).
+	// go/packages.NeedName already resolves this as part of loadMode, so it
+	// costs nothing beyond what Load already pays for — see
+	// internal/langfeat's unimported-completion candidate index, the reason
+	// this field exists.
+	Name       string   `json:"name,omitempty"`
 	Dir        string   `json:"dir"`
 	GoFiles    []string `json:"goFiles"`
 	Imports    []string `json:"imports"` // import paths of direct dependencies present in the graph
@@ -129,6 +136,7 @@ func fromPackages(pkgs []*packages.Package, rootSet map[string]bool) map[string]
 		sort.Strings(imports)
 		out[p.PkgPath] = &Package{
 			ImportPath: p.PkgPath,
+			Name:       p.Name,
 			Dir:        p.Dir,
 			GoFiles:    p.GoFiles,
 			Imports:    imports,
