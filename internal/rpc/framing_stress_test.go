@@ -287,8 +287,11 @@ type testRand struct{ state uint64 }
 
 func newTestRand(seed uint64) *testRand { return &testRand{state: seed*2654435761 + 1} }
 
-// intn returns a deterministic value in [0, n).
+// intn returns a deterministic value in [0, n). n must be positive.
 func (r *testRand) intn(n int) int {
+	if n <= 0 {
+		return 0
+	}
 	r.state ^= r.state << 13
 	r.state ^= r.state >> 7
 	r.state ^= r.state << 17
