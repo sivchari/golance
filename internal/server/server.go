@@ -103,7 +103,19 @@ type Server struct {
 	watch           *watchDebouncer // coalesces workspace/didChangeWatchedFiles .go events into revalidateWorkspace passes
 	watchDynamicReg atomic.Bool     // client declared workspace.didChangeWatchedFiles.dynamicRegistration support at initialize (see handleInitialized)
 
-	inlayHintRefreshSupport atomic.Bool // client declared workspace.inlayHint.refreshSupport at initialize (see refreshInlayHints)
+	inlayHintRefreshSupport      atomic.Bool // client declared workspace.inlayHint.refreshSupport at initialize (see refreshInlayHints)
+	semanticTokensRefreshSupport atomic.Bool // client declared workspace.semanticTokens.refreshSupport at initialize (see refreshSemanticTokens)
+
+	// clientInitialized reports whether the client's "initialized"
+	// notification has been received (set by handleInitialized). The LSP
+	// spec forbids any server-initiated request before that point.
+	// setWorkspace's own workspace-ready refresh (see
+	// workspaceReadyRefreshes) needs this explicit check because its very
+	// first call happens synchronously inside handleInitialize — well
+	// before the client can have sent "initialized" — unlike
+	// registerWatchedFiles, which is safe by construction simply because
+	// handleInitialized is its only caller.
+	clientInitialized atomic.Bool
 }
 
 // New constructs a Server and registers its LSP handlers on rpcServer.
