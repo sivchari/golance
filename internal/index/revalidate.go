@@ -109,11 +109,22 @@ func packageChanged(ctx context.Context, db *store.DB, keys *keyTable, snap *gra
 		return true, nil
 	}
 
+	// effectiveFiles must mirror processUnit's own file set exactly (see
+	// testFilesInPackage's doc): otherwise a stat/content-hash comparison
+	// against pkg.GoFiles alone would never match what Build last recorded
+	// for a package with in-package test files (its stored Files/
+	// ContentHash always cover them too), making Revalidate report every
+	// such package as changed on every call regardless of whether anything
+	// actually did. Always disk-based (readFileDisk): unlike Reindex,
+	// Revalidate never runs against an editor overlay.
+	testFiles := testFilesInPackage(pkg, readFileDisk)
+	effectiveFiles := effectiveGoFiles(pkg.GoFiles, testFiles)
+
 	var ownHash uint64
-	if len(old.Files) > 0 && filesStatMatch(pkg.GoFiles, old.Files, root, relative) {
+	if len(old.Files) > 0 && filesStatMatch(effectiveFiles, old.Files, root, relative) {
 		ownHash = old.ContentHash
 	} else {
-		h, err := contentHash(pkg.GoFiles, buildFlagsFP, readFileDisk, root, relative)
+		h, err := contentHash(effectiveFiles, buildFlagsFP, readFileDisk, root, relative)
 		if err != nil {
 			return false, err
 		}

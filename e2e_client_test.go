@@ -526,6 +526,23 @@ func (c *lspClient) changeFile(t *testing.T, path string, version int32, newText
 	})
 }
 
+// saveFile writes newText to path on disk (as a real editor save would
+// before ever notifying the server — see handleDidSave's doc) and sends
+// textDocument/didSave with that same content, so the server both sees the
+// save notification and, if it independently lists path's directory (see
+// internal/index's testFilesInPackage), finds the file already on disk with
+// this content.
+func (c *lspClient) saveFile(t *testing.T, path, newText string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(newText), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	c.notify(t, protocol.MethodTextDocumentDidSave, &protocol.DidSaveTextDocumentParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(path)},
+		Text:         &newText,
+	})
+}
+
 // waitForDiagnostics blocks until a publishDiagnostics notification for path
 // arrives, or e2eRequestBudget elapses.
 func (c *lspClient) waitForDiagnostics(t *testing.T, path string) []protocol.Diagnostic {

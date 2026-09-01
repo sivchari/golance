@@ -10,7 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sivchari/golance/internal/graph"
+	"github.com/sivchari/golance/internal/index"
+	"github.com/sivchari/golance/internal/rpc"
 	"github.com/sivchari/golance/internal/store"
+	"github.com/sivchari/golance/internal/xref"
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 )
@@ -24,6 +28,95 @@ func writeFrame(t *testing.T, w io.Writer, method string, v any) {
 	body := fmt.Sprintf(`{"jsonrpc":"2.0","method":%q,"params":%s}`, method, params)
 	if _, err := fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(body), body); err != nil {
 		t.Fatalf("write frame: %v", err)
+	}
+}
+
+// writeModuleFile writes content to rel under dir, creating parent
+// directories as needed, and returns its absolute path.
+func writeModuleFile(t *testing.T, dir, rel, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	return path
+}
+
+// TestHandleDidSave_TestFileReindexesNewSymbol is a regression test for
+// pkgPathForFile's directory fallback (see server.go): before it existed,
+// saving an in-package _test.go file resolved no package at all — ws.
+// fileToPkg is built from graph.Package.GoFiles alone, which never
+// includes test files (see internal/graph's loadMode) — so handleDidSave
+// silently returned without ever reindexing it. It saves greet_test.go
+// with a newly added, test-only exported symbol and polls workspace/symbol
+// until that symbol is findable, verifying the save's reindex actually
+// fired and reprocessed the test file. Uses its own synthetic module
+// rather than testdata/module, so adding a _test.go file here does not
+// perturb any other test's package/symbol-count assumptions against that
+// shared fixture.
+func TestHandleDidSave_TestFileReindexesNewSymbol(t *testing.T) {
+	dir := t.TempDir()
+	writeModuleFile(t, dir, "go.mod", "module example.com/didsavetest\n\ngo 1.23\n")
+	writeModuleFile(t, dir, "greet/greet.go", "package greet\n\n// Hello returns a greeting.\nfunc Hello() string { return \"hi\" }\n")
+	const testSrc = "package greet\n\nimport \"testing\"\n\nfunc TestHello(t *testing.T) {\n\tif Hello() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n"
+	testFile := writeModuleFile(t, dir, "greet/greet_test.go", testSrc)
+
+	snap, err := graph.Load(graph.Options{Dir: dir}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+
+	db, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("db.Close: %v", err)
+		}
+	})
+	cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	if _, err := index.Build(context.Background(), snap, db, cas, index.Options{}); err != nil {
+		t.Fatalf("index.Build: %v", err)
+	}
+
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	s.setWorkspace(dir, snap)
+	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+
+	openDoc(t, s, testFile, testSrc)
+
+	const newSymbol = "TestOnlyHelperXYZ"
+	edited := testSrc + "\n// " + newSymbol + " is declared only in this in-package test file.\nfunc " + newSymbol + "() int { return 1 }\n"
+
+	saveParams := mustMarshal(t, &protocol.DidSaveTextDocumentParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(testFile)},
+		Text:         &edited,
+	})
+	if err := s.handleDidSave(context.Background(), saveParams); err != nil {
+		t.Fatalf("handleDidSave: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err := s.handleWorkspaceSymbol(context.Background(), mustMarshal(t, &protocol.WorkspaceSymbolParams{Query: newSymbol}))
+		if err != nil {
+			t.Fatalf("handleWorkspaceSymbol: %v", err)
+		}
+		if syms, ok := resp.(protocol.SymbolInformationSlice); ok && len(syms) > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not become visible via workspace/symbol after saving the in-package test file; the didSave-triggered reindex may not have fired for it", newSymbol)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
