@@ -126,6 +126,30 @@ func TestE2E(t *testing.T) {
 	t.Run("hover_and_inlay_hint_in_package_test_file", func(t *testing.T) {
 		checkE2EHoverAndInlayHintInPackageTestFile(t, c, &locs)
 	})
+
+	// references_includes_in_package_test_file_call_site and
+	// definition_from_inside_test_file cover the facts-index gap fixed
+	// alongside hover/inlay hints above: an in-package "_test.go" file
+	// contributed nothing to the facts index at all (see
+	// internal/index.testFilesInPackage), so references on a workspace
+	// symbol silently omitted its own test file's call sites, and
+	// definition/references invoked from a position inside a test file
+	// found nothing.
+	t.Run("references_includes_in_package_test_file_call_site", func(t *testing.T) {
+		checkE2EReferencesIncludesTestFileCallSite(t, c, &locs)
+	})
+
+	t.Run("definition_from_inside_test_file", func(t *testing.T) {
+		checkE2EDefinitionFromInsideTestFile(t, c, &locs)
+	})
+
+	// didsave_test_file_adds_new_test_only_symbol verifies the write path:
+	// saving an edited in-package test file reindexes it (internal/server's
+	// handleDidSave -> reindex -> index.Reindex), and a symbol newly added
+	// only in that test file becomes findable afterward.
+	t.Run("didsave_test_file_adds_new_test_only_symbol", func(t *testing.T) {
+		checkE2EDidSaveTestFileAddsNewSymbol(t, c, &locs)
+	})
 }
 
 func checkE2EUnsavedNewFileJoinsPackage(t *testing.T, c *lspClient, locs *e2eLocs) {
@@ -205,6 +229,81 @@ func checkE2EHoverAndInlayHintInPackageTestFile(t *testing.T, c *lspClient, locs
 	hints := requestInlayHints(t, c, locs.utilTestFile, protocol.Range{End: endOfDocument(locs.utilTestSrc)})
 	if len(hints) == 0 {
 		t.Fatal("want at least one inlay hint inside the in-package test file, got none")
+	}
+}
+
+// checkE2EReferencesIncludesTestFileCallSite verifies that references on
+// Sum's declaration (in util.go) includes util_test.go's own call site
+// (sumTotal's Sum(4, 5)), alongside the cross-package call sites
+// checkE2EReferencesCrossFile already covers.
+func checkE2EReferencesIncludesTestFileCallSite(t *testing.T, c *lspClient, locs *e2eLocs) {
+	t.Helper()
+	got := c.waitForNonEmptyLocations(t, protocol.MethodTextDocumentReferences, &protocol.ReferenceParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.utilFile)},
+			Position:     locs.sumDecl,
+		},
+		Context: protocol.ReferenceContext{IncludeDeclaration: false},
+	}, e2eRequestBudget)
+	var found bool
+	for _, l := range got {
+		if l.URI.FsPath() == locs.utilTestFile && l.Range.Start.Line == locs.sumCallInUtilTest.Line {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("references on Sum missing its call site in the in-package test file %s; got %d location(s): %+v", locs.utilTestFile, len(got), got)
+	}
+}
+
+// checkE2EDefinitionFromInsideTestFile verifies that a definition query
+// issued from a position inside an in-package test file (the Sum(4, 5) call
+// in util_test.go) resolves to Sum's declaration in util.go.
+func checkE2EDefinitionFromInsideTestFile(t *testing.T, c *lspClient, locs *e2eLocs) {
+	t.Helper()
+	got := c.waitForNonEmptyLocations(t, protocol.MethodTextDocumentDefinition, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.utilTestFile)},
+			Position:     locs.sumCallInUtilTest,
+		},
+	}, e2eRequestBudget)
+	if len(got) != 1 {
+		t.Fatalf("definition from inside the test file returned %d locations, want 1: %+v", len(got), got)
+	}
+	if gotPath := got[0].URI.FsPath(); gotPath != locs.utilFile || got[0].Range.Start.Line != locs.sumDecl.Line {
+		t.Fatalf("definition = %s:%d, want %s:%d", gotPath, got[0].Range.Start.Line, locs.utilFile, locs.sumDecl.Line)
+	}
+}
+
+// checkE2EDidSaveTestFileAddsNewSymbol edits util_test.go to add a new
+// exported, test-only function (Helper, declared nowhere else in the
+// package) and saves it, then polls workspace/symbol until Helper is
+// findable — verifying handleDidSave's reindex path picks up a test file's
+// own edit end to end, not just Build's initial pass.
+func checkE2EDidSaveTestFileAddsNewSymbol(t *testing.T, c *lspClient, locs *e2eLocs) {
+	t.Helper()
+	updated := locs.utilTestSrc + "\n// Helper is declared only in this in-package test file.\nfunc Helper() int {\n\treturn 42\n}\n"
+	c.saveFile(t, locs.utilTestFile, updated)
+
+	deadline := time.Now().Add(e2eIndexBudget)
+	for {
+		resp := c.call(t, protocol.MethodWorkspaceSymbol, &protocol.WorkspaceSymbolParams{Query: "Helper"}, e2eRequestBudget)
+		if len(resp.Error) > 0 {
+			t.Fatalf("workspace/symbol failed: %s", resp.Error)
+		}
+		var infos protocol.SymbolInformationSlice
+		if err := protocol.Unmarshal(resp.Result, &infos); err != nil {
+			t.Fatalf("unmarshal workspace/symbol result: %v", err)
+		}
+		for _, info := range infos {
+			if info.Name == "Helper" && info.Location.URI.FsPath() == locs.utilTestFile {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("workspace/symbol never found Helper (added to %s and saved) within %s; got %+v", locs.utilTestFile, e2eIndexBudget, infos)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

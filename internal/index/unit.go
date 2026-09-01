@@ -68,12 +68,21 @@ func processUnit(ctx context.Context, fset *token.FileSet, imp *typecheck.Import
 	pkgHash := store.Hash(path)
 	root := snap.Dir()
 
+	// testFiles are pkg's in-package _test.go files (see
+	// testFilesInPackage's doc); effectiveFiles is the full set every
+	// stat/content-hash comparison and, ultimately, checkOnePackage's facts
+	// pass below indexes for this unit. checkOnePackage still receives
+	// pkg.GoFiles and testFiles separately: its own export-data pass must
+	// stay derived from pkg.GoFiles alone (see its doc).
+	testFiles := testFilesInPackage(pkg, reader)
+	effectiveFiles := effectiveGoFiles(pkg.GoFiles, testFiles)
+
 	old, oldErr := db.GetUnit(ctx, pkgHash)
 	haveOld := oldErr == nil
 	trusted := haveOld && old.ToolchainFingerprint == opts.ToolchainFingerprint
 
-	statOK := trustStat && trusted && len(old.Files) > 0 && filesStatMatch(pkg.GoFiles, old.Files, root, opts.RelativePaths)
-	ownHash, err := resolveOwnHash(pkg, opts, reader, root, statOK, old.ContentHash)
+	statOK := trustStat && trusted && len(old.Files) > 0 && filesStatMatch(effectiveFiles, old.Files, root, opts.RelativePaths)
+	ownHash, err := resolveOwnHash(effectiveFiles, opts, reader, root, statOK, old.ContentHash)
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -85,7 +94,7 @@ func processUnit(ctx context.Context, fset *token.FileSet, imp *typecheck.Import
 	combined := computeUnitKey(ownHash, deps)
 
 	if trusted && combined == old.BlobKey {
-		return unchangedOutcome(pkgHash, path, old, pkg, opts, root, statOK, trustStat, keys), true, false, nil
+		return unchangedOutcome(pkgHash, path, old, effectiveFiles, opts, root, statOK, trustStat, keys), true, false, nil
 	}
 
 	// The combined key differs from what was last recorded (or there is no
@@ -105,7 +114,7 @@ func processUnit(ctx context.Context, fset *token.FileSet, imp *typecheck.Import
 
 	// Miss: nobody has ever built this exact combination. Actually
 	// parse/type-check it.
-	outcome, err = checkAndStoreOutcome(fset, imp, cas, exp, keys, pkgHash, path, pkg, combined, ownHash, opts, reader, root, trustStat)
+	outcome, err = checkAndStoreOutcome(fset, imp, cas, exp, keys, pkgHash, path, pkg, testFiles, combined, ownHash, opts, reader, root, trustStat)
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -114,18 +123,21 @@ func processUnit(ctx context.Context, fset *token.FileSet, imp *typecheck.Import
 
 // resolveOwnHash returns pkg's own content hash: the already-recorded
 // old.ContentHash when statOK confirms nothing on disk has moved, or a
-// fresh recompute through reader otherwise.
-func resolveOwnHash(pkg *graph.Package, opts Options, reader FileReader, root string, statOK bool, oldContentHash uint64) (uint64, error) {
+// fresh recompute through reader otherwise. goFiles is the unit's full
+// effective file set (see effectiveGoFiles).
+func resolveOwnHash(goFiles []string, opts Options, reader FileReader, root string, statOK bool, oldContentHash uint64) (uint64, error) {
 	if statOK {
 		return oldContentHash, nil
 	}
-	return contentHash(pkg.GoFiles, opts.BuildFlagsFingerprint, reader, root, opts.RelativePaths)
+	return contentHash(goFiles, opts.BuildFlagsFingerprint, reader, root, opts.RelativePaths)
 }
 
 // unchangedOutcome handles the case where the combined key still matches
 // what db last recorded for path: nothing needs writing except possibly a
 // refreshed stat snapshot, and the package is always skipped either way.
-func unchangedOutcome(pkgHash uint64, path string, old store.UnitPointer, pkg *graph.Package, opts Options, root string, statOK, trustStat bool, keys *keyTable) *unitOutcome {
+// effectiveFiles is the unit's full effective file set (see
+// effectiveGoFiles).
+func unchangedOutcome(pkgHash uint64, path string, old store.UnitPointer, effectiveFiles []string, opts Options, root string, statOK, trustStat bool, keys *keyTable) *unitOutcome {
 	keys.set(path, unitKeyRecord{blobKey: old.BlobKey, exportHash: old.ExportHash})
 	if statOK {
 		return nil
@@ -144,7 +156,7 @@ func unchangedOutcome(pkgHash uint64, path string, old store.UnitPointer, pkg *g
 	}
 	// The content-hash fallback confirmed nothing changed; refresh the
 	// stat snapshot so a later run can skip by stat alone again.
-	files, sErr := statFiles(pkg.GoFiles, root, opts.RelativePaths)
+	files, sErr := statFiles(effectiveFiles, root, opts.RelativePaths)
 	if sErr != nil {
 		return nil
 	}
@@ -168,10 +180,11 @@ func casHitOutcome(pkgHash uint64, path string, combined, ownHash uint64, blob [
 	return &unitOutcome{pkgHash: pkgHash, entry: &store.UnitEntry{PkgHash: pkgHash, Pointer: pointer, Index: u.Index}}, nil
 }
 
-// checkAndStoreOutcome type-checks pkg, writes the result to cas under
-// combined, and folds it into the outcome processUnit returns.
-func checkAndStoreOutcome(fset *token.FileSet, imp *typecheck.Importer, cas *store.CAS, exp *casExportSource, keys *keyTable, pkgHash uint64, path string, pkg *graph.Package, combined, ownHash uint64, opts Options, reader FileReader, root string, trustStat bool) (*unitOutcome, error) {
-	result, err := checkOnePackage(fset, imp, path, pkg.GoFiles, reader, root, opts.RelativePaths)
+// checkAndStoreOutcome type-checks pkg (plus testFiles, pkg's in-package
+// _test.go files — see checkOnePackage's doc), writes the result to cas
+// under combined, and folds it into the outcome processUnit returns.
+func checkAndStoreOutcome(fset *token.FileSet, imp *typecheck.Importer, cas *store.CAS, exp *casExportSource, keys *keyTable, pkgHash uint64, path string, pkg *graph.Package, testFiles []string, combined, ownHash uint64, opts Options, reader FileReader, root string, trustStat bool) (*unitOutcome, error) {
+	result, err := checkOnePackage(fset, imp, path, pkg.GoFiles, testFiles, reader, root, opts.RelativePaths)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +195,7 @@ func checkAndStoreOutcome(fset *token.FileSet, imp *typecheck.Importer, cas *sto
 	// content.
 	var files []store.FileStat
 	if trustStat {
-		if f, sErr := statFiles(pkg.GoFiles, root, opts.RelativePaths); sErr == nil {
+		if f, sErr := statFiles(effectiveGoFiles(pkg.GoFiles, testFiles), root, opts.RelativePaths); sErr == nil {
 			files = f
 		}
 	}
@@ -226,11 +239,32 @@ type checkResult struct {
 }
 
 // checkOnePackage parses goFiles (via readFile), type-checks them as
-// pkgPath using imp, and extracts facts and export data. It does not itself
-// write anything: the returned checkResult is for the caller to fold into a
-// [store.UnitBlob]. root and relative control whether the facts blob's file
-// table stores paths relative to root (see Options.RelativePaths).
-func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath string, goFiles []string, readFile func(string) ([]byte, error), root string, relative bool) (checkResult, error) {
+// pkgPath using imp, and extracts export data from that result exactly as
+// before. If testFiles is non-empty (pkg's in-package _test.go files, see
+// testFilesInPackage), it also runs a second, test-inclusive type-check —
+// goFiles plus testFiles — and extracts facts from that result instead, so
+// a test file's own definitions and its usages of the rest of the package
+// are indexed too (mirroring internal/check.Engine, which has folded these
+// in since v0.1.7 for hover/completion/inlay hints). When testFiles is
+// empty this is exactly the single type-check checkOnePackage has always
+// done; the extra pass only runs for packages that actually declare
+// in-package test files.
+//
+// Export data is always derived from goFiles alone, deliberately never from
+// the test-inclusive pass: a downstream importer never sees a package's
+// test files (nothing ever imports them), so folding them into the
+// type-check that produces Export would both leak test-only symbols into
+// what importers see and change [store.UnitPointer].ExportHash on every
+// test-only edit, forcing needless dependent rebuilds (see
+// computeUnitKey's doc for why ExportHash soundness matters). This is the
+// same test/non-test "variant" split gopls itself draws, applied minimally
+// here: only the facts pass ever sees testFiles.
+//
+// checkOnePackage does not itself write anything: the returned checkResult
+// is for the caller to fold into a [store.UnitBlob]. root and relative
+// control whether the facts blob's file table stores paths relative to root
+// (see Options.RelativePaths).
+func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath string, goFiles, testFiles []string, readFile func(string) ([]byte, error), root string, relative bool) (checkResult, error) {
 	files, fileList := parseGoFiles(fset, goFiles, readFile)
 	if len(files) == 0 {
 		return checkResult{}, fmt.Errorf("index: no parseable files for %s", pkgPath)
@@ -240,18 +274,30 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 	if tpkg == nil {
 		return checkResult{}, fmt.Errorf("index: type-check %s produced no package", pkgPath)
 	}
-
-	pkgHash := store.Hash(pkgPath)
-	b := store.NewBuilder()
-	idx := extractFacts(fset, pkgHash, tpkg, info, files, fileList, b, root, relative)
-	factsBlob, err := b.Build()
-	if err != nil {
-		return checkResult{}, fmt.Errorf("index: build facts blob for %s: %w", pkgPath, err)
-	}
-
 	exportBlob, err := typecheck.WriteExport(tpkg, fset)
 	if err != nil {
 		return checkResult{}, fmt.Errorf("index: write export data for %s: %w", pkgPath, err)
+	}
+
+	factsTpkg, factsInfo := tpkg, info
+	factsFiles, factsFileList := files, fileList
+	if len(testFiles) > 0 {
+		testASTs, testFileList := parseGoFiles(fset, testFiles, readFile)
+		factsFiles = append(append([]*ast.File(nil), files...), testASTs...)
+		factsFileList = append(append([]string(nil), fileList...), testFileList...)
+		ftpkg, finfo, _ := typecheck.CheckPackage(fset, factsFiles, pkgPath, imp)
+		if ftpkg == nil {
+			return checkResult{}, fmt.Errorf("index: type-check %s (with test files) produced no package", pkgPath)
+		}
+		factsTpkg, factsInfo = ftpkg, finfo
+	}
+
+	pkgHash := store.Hash(pkgPath)
+	b := store.NewBuilder()
+	idx := extractFacts(fset, pkgHash, factsTpkg, factsInfo, factsFiles, factsFileList, b, root, relative)
+	factsBlob, err := b.Build()
+	if err != nil {
+		return checkResult{}, fmt.Errorf("index: build facts blob for %s: %w", pkgPath, err)
 	}
 
 	return checkResult{Facts: factsBlob, Export: exportBlob, Index: idx}, nil

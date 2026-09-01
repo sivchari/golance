@@ -99,10 +99,12 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	engine := check.New(src, s.overlay, imp, check.Options{OnResult: s.publishDiagnostics})
 
 	fileToPkg := make(map[string]string)
+	dirToPkg := make(map[string]string, len(snap.Packages))
 	for pkgPath, pkg := range snap.Packages {
 		for _, f := range pkg.GoFiles {
 			fileToPkg[f] = pkgPath
 		}
+		dirToPkg[pkg.Dir] = pkgPath
 	}
 
 	// Stop the outgoing workspace's engine before installing the new one:
@@ -113,7 +115,7 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	if old := s.ws.Load(); old != nil {
 		old.engine.Stop()
 	}
-	s.ws.Store(&workspace{root: root, snap: snap, engine: engine, fileToPkg: fileToPkg, depCache: depCache})
+	s.ws.Store(&workspace{root: root, snap: snap, engine: engine, fileToPkg: fileToPkg, dirToPkg: dirToPkg, depCache: depCache})
 
 	if idx := s.idx.Load(); idx != nil {
 		s.idx.Store(&indexState{db: idx.db, cas: idx.cas, resolver: xref.New(idx.db, idx.cas, snap, RelativeIndexPaths(root))})

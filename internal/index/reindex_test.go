@@ -109,6 +109,90 @@ func Shout(name string, n int) string {
 	}
 }
 
+// TestReindex_TestFileEditProcessedButExportUnchanged verifies three things
+// about editing an in-package _test.go file:
+//   - it is processed and actually type-checked (its content, and so
+//     [store.UnitPointer].ContentHash/BlobKey, changed);
+//   - it does not propagate to the package's reverse-dependency closure,
+//     since a test file never contributes to a package's exported API (see
+//     checkOnePackage's doc); and
+//   - a symbol newly declared only in the edited test file is indexed
+//     afterward, confirming the reindex actually re-covers test files, not
+//     just re-hashes them.
+func TestReindex_TestFileEditProcessedButExportUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "go.mod", "module example.com/testreindex\n\ngo 1.23\n")
+	writeFile(t, dir, "def/def.go", `package def
+
+// V returns 1.
+func V() int { return 1 }
+`)
+	const testSrc1 = `package def
+
+import "testing"
+
+func TestV(t *testing.T) {
+	if V() != 1 {
+		t.Fatal("bad")
+	}
+}
+`
+	testPath := filepath.Join(dir, "def", "def_test.go")
+	writeFile(t, dir, "def/def_test.go", testSrc1)
+	writeFile(t, dir, "use/use.go", `package use
+
+import "example.com/testreindex/def"
+
+// Call calls def.V.
+func Call() int { return def.V() }
+`)
+
+	const pkgDef = "example.com/testreindex/def"
+
+	snap := loadSnapshot(t, dir)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+	ctx := context.Background()
+
+	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+		t.Fatalf("initial Build: %v", err)
+	}
+	before, err := db.GetUnit(ctx, store.Hash(pkgDef))
+	if err != nil {
+		t.Fatalf("GetUnit(def): %v", err)
+	}
+
+	const testSrc2 = testSrc1 + `
+// helperV is declared only in this in-package test file.
+func helperV() int { return V() }
+`
+	reader := overlayReader(t, testPath, []byte(testSrc2))
+
+	stats, err := Reindex(ctx, snap, db, cas, pkgDef, reader, Options{})
+	if err != nil {
+		t.Fatalf("Reindex: %v", err)
+	}
+	if stats.Processed != 1 {
+		t.Errorf("Processed = %d, want 1 (def only; a test-file-only edit must not force use to be revisited)", stats.Processed)
+	}
+	if stats.TypeChecked != 1 {
+		t.Errorf("TypeChecked = %d, want 1 (content changed, so a real type-check, not a skip)", stats.TypeChecked)
+	}
+
+	after, err := db.GetUnit(ctx, store.Hash(pkgDef))
+	if err != nil {
+		t.Fatalf("GetUnit(def) after Reindex: %v", err)
+	}
+	if after.ExportHash != before.ExportHash {
+		t.Errorf("ExportHash changed after a test-file-only edit (before=%d after=%d); export data must be derived from non-test files alone", before.ExportHash, after.ExportHash)
+	}
+	if after.BlobKey == before.BlobKey {
+		t.Error("BlobKey unchanged after a test-file-only content edit, want it to change (own content hash must cover in-package test files)")
+	}
+
+	findSymbolByName(t, db, cas, pkgDef, "helperV")
+}
+
 // TestReindex_FatalPersistFailureAbortsClosureWalk verifies that a db
 // persist failure during the reverse-dependency closure walk is surfaced
 // as fatal and stops the walk, instead of being swallowed as an ordinary

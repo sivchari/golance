@@ -7,6 +7,7 @@ package server
 
 import (
 	"log"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,6 +58,13 @@ type workspace struct {
 	engine    *check.Engine
 	depCache  *depCacheHolder
 	fileToPkg map[string]string
+	// dirToPkg maps a package's directory to its import path, the fallback
+	// pkgPathForFile uses for a file fileToPkg does not itself know about —
+	// in particular an in-package _test.go file, which graph.Package.GoFiles
+	// never includes (see internal/graph's loadMode). Mirrors
+	// internal/check.GraphSource.PackageForFile's identical fallback, built
+	// from the same snap.Packages.
+	dirToPkg map[string]string
 }
 
 // indexState bundles the per-root index database, the CAS its facts and
@@ -215,12 +223,19 @@ func (s *Server) Stop() {
 func (s *Server) workspace() *workspace { return s.ws.Load() }
 
 // pkgPathForFile returns the import path of the package containing path, if
-// path is part of the loaded workspace.
+// path is part of the loaded workspace. If path is not itself a known Go
+// file (e.g. an in-package _test.go file, which ws.fileToPkg never
+// includes — see internal/graph's loadMode), it falls back to matching
+// path's directory against a known package's directory, exactly as
+// internal/check.GraphSource.PackageForFile does for the same case.
 func (s *Server) pkgPathForFile(path string) (string, bool) {
 	ws := s.workspace()
 	if ws == nil {
 		return "", false
 	}
-	p, ok := ws.fileToPkg[path]
+	if p, ok := ws.fileToPkg[path]; ok {
+		return p, true
+	}
+	p, ok := ws.dirToPkg[filepath.Dir(path)]
 	return p, ok
 }

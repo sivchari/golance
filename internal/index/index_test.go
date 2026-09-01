@@ -337,3 +337,145 @@ func TestBuild_EmptyPackageIsSkippedNotFatal(t *testing.T) {
 		t.Errorf("BuildFingerprint = %q, want %q", fp, runtime.Version())
 	}
 }
+
+// findFileIdx returns the index into pkgPath's facts blob file table of the
+// file whose base name is base, failing t if none matches.
+func findFileIdx(t *testing.T, db *store.DB, cas *store.CAS, pkgPath, base string) uint32 {
+	t.Helper()
+	var idx uint32
+	found := false
+	viewFacts(t, db, cas, pkgPath, func(v *store.View) {
+		for i := 0; i < v.FileCount(); i++ {
+			f, err := v.FileAt(i)
+			if err != nil {
+				t.Fatalf("FileAt(%d): %v", i, err)
+			}
+			if filepath.Base(f) == base {
+				idx = uint32(i)
+				found = true
+				return
+			}
+		}
+	})
+	if !found {
+		t.Fatalf("no file named %s in %s's facts blob file table", base, pkgPath)
+	}
+	return idx
+}
+
+// TestBuild_InPackageTestFileFactsIndexed verifies that an in-package
+// _test.go file contributes to the facts index: its own definitions are
+// indexed (helperGreeting, declared only in greet_test.go), and a
+// definition elsewhere in the package (Hello) gets a recorded reference for
+// its usage inside the test file.
+func TestBuild_InPackageTestFileFactsIndexed(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "go.mod", "module example.com/testfacts\n\ngo 1.23\n")
+	writeFile(t, dir, "greet/greet.go", `package greet
+
+// Hello returns a greeting for name.
+func Hello(name string) string {
+	return "hello " + name
+}
+`)
+	writeFile(t, dir, "greet/greet_test.go", `package greet
+
+import "testing"
+
+// helperGreeting is declared only in this in-package test file.
+func helperGreeting() string {
+	return Hello("test")
+}
+
+func TestHello(t *testing.T) {
+	if helperGreeting() == "" {
+		t.Fatal("empty greeting")
+	}
+}
+`)
+
+	snap := loadSnapshot(t, dir)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+
+	if _, err := Build(context.Background(), snap, db, cas, Options{}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	const pkgGreet = "example.com/testfacts/greet"
+
+	// helperGreeting is declared only in greet_test.go: finding it at all
+	// confirms the test file's own definitions are indexed.
+	_ = findSymbolByName(t, db, cas, pkgGreet, "helperGreeting")
+
+	// Hello's own facts must include a reference from inside greet_test.go
+	// (helperGreeting's call to it), the only call site in this package.
+	helloID := findSymbolByName(t, db, cas, pkgGreet, "Hello")
+	testFileIdx := findFileIdx(t, db, cas, pkgGreet, "greet_test.go")
+	var foundRefFromTestFile bool
+	viewFacts(t, db, cas, pkgGreet, func(v *store.View) {
+		for _, r := range v.RefsTo(helloID) {
+			if r.FileIdx() == testFileIdx {
+				foundRefFromTestFile = true
+			}
+		}
+	})
+	if !foundRefFromTestFile {
+		t.Error("Hello has no recorded reference from inside greet_test.go; in-package test file references are not indexed")
+	}
+}
+
+// TestBuild_ExternalTestPackageContributesNothing verifies that a directory
+// containing both an ordinary package and an external "_test"-suffixed test
+// package indexes only the ordinary package's own files: the external test
+// package's symbols must never leak into the facts index.
+func TestBuild_ExternalTestPackageContributesNothing(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "go.mod", "module example.com/exttest\n\ngo 1.23\n")
+	writeFile(t, dir, "mixed/mixed.go", `package mixed
+
+// V returns 1.
+func V() int { return 1 }
+`)
+	writeFile(t, dir, "mixed/mixed_test.go", `package mixed_test
+
+import (
+	"testing"
+
+	"example.com/exttest/mixed"
+)
+
+// externalOnlyHelper exists only in the external "_test" package.
+func externalOnlyHelper() int { return mixed.V() }
+
+func TestV(t *testing.T) {
+	if externalOnlyHelper() != 1 {
+		t.Fatal("bad")
+	}
+}
+`)
+
+	snap := loadSnapshot(t, dir)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+
+	if _, err := Build(context.Background(), snap, db, cas, Options{}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	const pkgMixed = "example.com/exttest/mixed"
+	viewFacts(t, db, cas, pkgMixed, func(v *store.View) {
+		if v.FileCount() != 1 {
+			t.Errorf("FileCount() = %d, want 1 (mixed.go only; the external \"_test\" package's file must be excluded)", v.FileCount())
+		}
+		for i := 0; i < v.SymbolCount(); i++ {
+			sym, err := v.SymbolAt(i)
+			if err != nil {
+				t.Fatalf("SymbolAt(%d): %v", i, err)
+			}
+			if sym.Name() == "externalOnlyHelper" {
+				t.Error("externalOnlyHelper (declared in the external \"_test\" package) leaked into mixed's facts index")
+			}
+		}
+	})
+}
