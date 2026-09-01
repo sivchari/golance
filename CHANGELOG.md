@@ -1,6 +1,6 @@
 # Changelog
 
-## [v0.1.10](https://github.com/sivchari/golance/compare/v0.1.9...v0.1.10) - 2026-09-01
+## [v0.2.0](https://github.com/sivchari/golance/compare/v0.1.9...v0.2.0) - 2026-09-01
 - docs: add PR #32 to the v0.1.9 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/34
 - feat: index in-package test files for cross-reference queries by @sivchari in https://github.com/sivchari/golance/pull/36
 - feat: type-check ad-hoc packages for files outside the workspace graph by @sivchari in https://github.com/sivchari/golance/pull/37
