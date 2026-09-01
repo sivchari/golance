@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 
+	"github.com/sivchari/golance/internal/index"
 	"github.com/sivchari/golance/internal/store"
 )
 
@@ -53,6 +54,28 @@ func (r *Resolver) Definition(ctx context.Context, file string, line, col int) (
 // searching only the defining package plus its reverse-dependency closure
 // (see package doc). includeDecl controls whether the declaration itself is
 // included.
+//
+// When the symbol is an interface method, the result also includes
+// references to each workspace implementer's corresponding method (see
+// correspondingMethodSymbols): a call through a concretely-typed value
+// resolves to the concrete method's own SymbolID, not the interface
+// method's, so exact-SymbolID matching alone would otherwise miss every
+// such call site even though it is exactly the kind of call gopls's own
+// References treats as a reference to the interface method. Declarations of
+// those corresponding methods are never added (includeDecl only ever
+// controls target's own declaration), matching Definition/Rename's existing
+// "one symbol, one declaration" behavior.
+//
+// The reverse direction -- a concrete method also pulling in its satisfied
+// interfaces' references -- is deliberately NOT implemented: unlike the
+// interface -> implementers direction (bounded by the queried interface's
+// own method count via implementingTypes' intersection), finding a concrete
+// type's satisfied interfaces unions LookupMethod candidates across every
+// name in its OWN method set (implementedInterfaces), which is unbounded by
+// anything the query controls. References, unlike the explicitly
+// user-invoked Implementation, is cheap and common enough (any method,
+// including ones named e.g. Close or String) that paying that cost on every
+// call would regress a hot path for a comparatively rare payoff.
 func (r *Resolver) References(ctx context.Context, file string, line, col int, includeDecl bool) ([]Location, error) {
 	l, c, err := toUint32Pos(line, col)
 	if err != nil {
@@ -62,7 +85,48 @@ func (r *Resolver) References(ctx context.Context, file string, line, col int, i
 	if err != nil {
 		return nil, err
 	}
-	return r.locationsFor(ctx, target, includeDecl)
+	out, err := r.locationsFor(ctx, target, includeDecl)
+	if err != nil {
+		return nil, err
+	}
+	if target.Kind != index.KindMethod {
+		return out, nil
+	}
+	corresponding, err := r.correspondingMethodSymbols(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	for _, sym := range corresponding {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		locs, err := r.locationsFor(ctx, sym, false)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, locs...)
+	}
+	out = dedupeLocations(out)
+	sortLocations(out)
+	return out, nil
+}
+
+// dedupeLocations removes duplicate Locations (comparing every field),
+// preserving the first occurrence's position otherwise. References can
+// merge several independently-sorted location lists (target's own plus one
+// per corresponding method), so a location that -- however unlikely --
+// turns up in more than one of them must still be reported only once.
+func dedupeLocations(locs []Location) []Location {
+	seen := make(map[Location]bool, len(locs))
+	out := locs[:0]
+	for _, l := range locs {
+		if seen[l] {
+			continue
+		}
+		seen[l] = true
+		out = append(out, l)
+	}
+	return out
 }
 
 // locationsFor collects every location referencing target across its
