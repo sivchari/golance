@@ -19,6 +19,10 @@ type e2eLocs struct {
 	utilSrc  string            // lib/util/util.go's original source, for the unsaved-edit hover subtest
 	sumDecl  protocol.Position // "Sum" in "func Sum(a, b int) int"
 
+	utilTestFile      string            // lib/util/util_test.go, an on-disk in-package test file
+	utilTestSrc       string            // its source, for the full-document inlay hint request
+	sumCallInUtilTest protocol.Position // "Sum" in the Sum(4, 5) call inside util_test.go
+
 	appFile      string            // app/app.go, imports lib/util and lib/store
 	sumCallInApp protocol.Position // "Sum" in the util.Sum call inside app.go
 
@@ -35,7 +39,8 @@ type e2eLocs struct {
 
 // writeE2EModule writes a single-module synthetic workspace into a temp dir:
 //
-//	lib/util    Sum, called by app and extra
+//	lib/util    Sum, called by app and extra; also has an on-disk in-package
+//	            "_test.go" file for the directory-fallback subtest
 //	lib/store   Store, whose method set drives the selector completion subtest
 //	app         imports lib/util and lib/store
 //	extra       imports lib/util only (a second cross-package reference)
@@ -69,6 +74,25 @@ func Sum(a, b int) int {
 	locs.utilFile = writeE2EFile(t, root, "lib/util/util.go", utilSrc)
 	locs.utilSrc = utilSrc
 	locs.sumDecl = mustPos(t, utilSrc, "func Sum", "Sum")
+
+	// utilTestSrc is an on-disk in-package "_test.go" file: packages.Load's
+	// non-Tests GoFiles list omits it entirely (see internal/graph.loadMode),
+	// so it exercises the directory fallback the same way an unsaved new
+	// file does, but for a file that was already on disk when the workspace
+	// loaded. sumTotal's short variable declaration and parameterized call
+	// to Sum (defined in util.go, another file in the package) give both a
+	// cross-file hover target and at least one inlay hint.
+	const utilTestSrc = `package util
+
+// sumTotal calls Sum, defined in util.go.
+func sumTotal() int {
+	total := Sum(4, 5)
+	return total
+}
+`
+	locs.utilTestFile = writeE2EFile(t, root, "lib/util/util_test.go", utilTestSrc)
+	locs.utilTestSrc = utilTestSrc
+	locs.sumCallInUtilTest = mustPos(t, utilTestSrc, "Sum(4, 5)", "Sum")
 
 	const storeSrc = `package store
 

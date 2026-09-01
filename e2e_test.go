@@ -3,6 +3,7 @@ package golance_test
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -105,6 +106,106 @@ func TestE2E(t *testing.T) {
 	t.Run("concurrent_edits_no_error_responses", func(t *testing.T) {
 		checkE2EConcurrentEditsNoErrorResponses(t, c, &locs)
 	})
+
+	// unsaved_new_file_joins_package covers Phase 1 of the ad-hoc package
+	// design (design-adhoc-packages.md): a brand-new .go file created in an
+	// editor, never written to disk, still gets full language features in
+	// its directory's known package — hover resolves a symbol declared in
+	// another file of that package, and diagnostics for the new file's own
+	// type error are published.
+	t.Run("unsaved_new_file_joins_package", func(t *testing.T) {
+		checkE2EUnsavedNewFileJoinsPackage(t, c, &locs)
+	})
+
+	// hover_and_inlay_hint_in_package_test_file covers the same directory
+	// fallback for the other symptom it fixes: an on-disk in-package
+	// "_test.go" file, which packages.Load's non-Tests GoFiles list omits
+	// entirely — hover resolves a symbol declared in another file of the
+	// package, and inlay hints (which share the same engine.Get + FileText
+	// path) are returned too.
+	t.Run("hover_and_inlay_hint_in_package_test_file", func(t *testing.T) {
+		checkE2EHoverAndInlayHintInPackageTestFile(t, c, &locs)
+	})
+}
+
+func checkE2EUnsavedNewFileJoinsPackage(t *testing.T, c *lspClient, locs *e2eLocs) {
+	t.Helper()
+
+	const newSrc = `package extra
+
+// NewFunc calls Double, defined in extra.go: cross-file resolution for an
+// unsaved new file that never touched disk.
+func NewFunc() int {
+	return Double(3)
+}
+
+// Broken has a type error, so diagnostics for the new file itself can be
+// asserted too.
+func Broken() int {
+	return "not an int"
+}
+`
+	newFile := filepath.Join(filepath.Dir(locs.extraFile), "new_unsaved.go")
+	doubleCallPos := mustPos(t, newSrc, "Double(3)", "Double")
+
+	c.openNewFile(t, newFile, newSrc)
+
+	diags := c.waitForDiagnostics(t, newFile)
+	if len(diags) == 0 {
+		t.Fatal("want at least one diagnostic for the unsaved new file's own type error, got none")
+	}
+
+	resp := c.call(t, protocol.MethodTextDocumentHover, &protocol.HoverParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(newFile)},
+			Position:     doubleCallPos,
+		},
+	}, e2eRequestBudget)
+	if len(resp.Error) > 0 {
+		t.Fatalf("hover failed: %s", resp.Error)
+	}
+	var hover protocol.Hover
+	if err := protocol.Unmarshal(resp.Result, &hover); err != nil {
+		t.Fatalf("unmarshal hover result: %v", err)
+	}
+	md, ok := hover.Contents.(*protocol.MarkupContent)
+	if !ok {
+		t.Fatalf("hover contents type = %T, want *protocol.MarkupContent", hover.Contents)
+	}
+	if !strings.Contains(md.Value, "Double") {
+		t.Errorf("hover on Double (defined in extra.go, another file of the same package) = %q, want it to mention Double", md.Value)
+	}
+}
+
+func checkE2EHoverAndInlayHintInPackageTestFile(t *testing.T, c *lspClient, locs *e2eLocs) {
+	t.Helper()
+	c.openFile(t, locs.utilTestFile)
+
+	resp := c.call(t, protocol.MethodTextDocumentHover, &protocol.HoverParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.utilTestFile)},
+			Position:     locs.sumCallInUtilTest,
+		},
+	}, e2eRequestBudget)
+	if len(resp.Error) > 0 {
+		t.Fatalf("hover failed: %s", resp.Error)
+	}
+	var hover protocol.Hover
+	if err := protocol.Unmarshal(resp.Result, &hover); err != nil {
+		t.Fatalf("unmarshal hover result: %v", err)
+	}
+	md, ok := hover.Contents.(*protocol.MarkupContent)
+	if !ok {
+		t.Fatalf("hover contents type = %T, want *protocol.MarkupContent", hover.Contents)
+	}
+	if !strings.Contains(md.Value, "Sum") {
+		t.Errorf("hover on Sum (defined in util.go, another file of the same package) inside the in-package test file = %q, want it to mention Sum", md.Value)
+	}
+
+	hints := requestInlayHints(t, c, locs.utilTestFile, protocol.Range{End: endOfDocument(locs.utilTestSrc)})
+	if len(hints) == 0 {
+		t.Fatal("want at least one inlay hint inside the in-package test file, got none")
+	}
 }
 
 func checkE2EInitializeCapabilities(t *testing.T, result *protocol.InitializeResult) {
