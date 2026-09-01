@@ -101,6 +101,15 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	fileToPkg := make(map[string]string)
 	dirToPkg := make(map[string]string, len(snap.Packages))
 	for pkgPath, pkg := range snap.Packages {
+		// Skip a ForTest-tagged entry: a synthesized test-only node (most
+		// commonly an external "_test" package) that can share pkg.Dir
+		// with the ordinary package it tests under a different PkgPath —
+		// see internal/check.GraphSource's identical exclusion for why
+		// indexing it here too would risk misrouting a new file in that
+		// directory to an unimportable PkgPath.
+		if pkg.ForTest != "" {
+			continue
+		}
 		for _, f := range pkg.GoFiles {
 			fileToPkg[f] = pkgPath
 		}
@@ -132,13 +141,15 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 // unimported-package completion (see workspace.pkgNameIndex's doc). A
 // package with no Name (a pre-Name-field on-disk cache — see
 // graph.cacheVersion — or a package go/packages could not resolve a name
-// for) or named "main" (never importable) is skipped; the latter mirrors
-// gopls's own unimportedPackages, which excludes "main" packages from its
-// candidate set the same way.
+// for), named "main" (never importable), or ForTest-tagged (a synthesized
+// test-only node — e.g. an external "_test" package — never a path
+// anything can legitimately import) is skipped; the "main" exclusion
+// mirrors gopls's own unimportedPackages, which excludes "main" packages
+// from its candidate set the same way.
 func buildPkgNameIndex(snap *graph.Snapshot) map[string][]string {
 	idx := make(map[string][]string)
 	for path, pkg := range snap.Packages {
-		if pkg.Name == "" || pkg.Name == "main" {
+		if pkg.Name == "" || pkg.Name == "main" || pkg.ForTest != "" {
 			continue
 		}
 		idx[pkg.Name] = append(idx[pkg.Name], path)
