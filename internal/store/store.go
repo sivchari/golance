@@ -52,7 +52,15 @@ var buildFingerprintKey = []byte("\x00golance:fingerprint")
 // directory that was never populated from the same build that wrote this
 // database — see casDir's doc in internal/server). A decode-error check
 // alone cannot catch that; this version marker can.
-const schemaVersion uint16 = 1
+//
+// Bumped to 2 for [MethodEntry]'s three new fields (MethodPkgHash,
+// MethodIDHash, Fingerprint — see its doc): methodEntrySize grew from 16 to
+// 40 bytes, so a version-1 "method" bucket's posting lists would otherwise
+// misdecode under the new fixed stride instead of erroring outright. See
+// internal/index's factsSchemaVersion for the matching CAS-side key bump
+// (this field alone does not force a rebuild of the [CAS] blobs a discarded
+// database's fresh Open would otherwise point right back at).
+const schemaVersion uint16 = 2
 
 // schemaVersionKey is a reserved bucketMeta key recording the schemaVersion
 // the database's buckets were last (re)written under.
@@ -509,17 +517,45 @@ func (db *DB) LookupNamePrefix(ctx context.Context, prefix string) (map[string][
 	return result, nil
 }
 
-// MethodEntry identifies one method's receiver type and defining package,
-// as recorded via [DB.AddMethodSymbol].
+// MethodEntry identifies one method: its receiver type's defining package
+// and own SymbolID hash (PkgHash, TypeSymbolIDHash), plus — since the
+// unexported-implementer fix — enough about the method itself to confirm
+// interface satisfaction and resolve its own declaration without ever
+// decoding the receiver type's export data:
+//
+//   - MethodPkgHash/MethodIDHash identify the method's OWN definition (its
+//     [Symbol] entry in MethodPkgHash's facts blob), resolvable directly —
+//     no export data involved. These differ from PkgHash/TypeSymbolIDHash
+//     for a promoted method (one the receiver type gets via struct
+//     embedding): MethodPkgHash is then the EMBEDDED type's defining
+//     package, since that is where the method is actually declared (see
+//     internal/xref's methodFuncSymbol, whose decode-time computation this
+//     mirrors at index time instead).
+//   - Fingerprint is a hash of the method's canonical, fully-package-
+//     qualified signature (see internal/index's registerMethodSet/
+//     MethodFingerprint) — comparable across independently-indexed packages
+//     without decoding either side's export data. It is 0 for a method
+//     whose receiver has type parameters (a generic type is not indexed
+//     with a fingerprint at all; see registerMethodSet's doc), the sentinel
+//     internal/xref's confirmation step treats as "must fall back to
+//     decoding this candidate instead."
 type MethodEntry struct {
 	PkgHash          uint64
 	TypeSymbolIDHash uint64
+	MethodPkgHash    uint64
+	MethodIDHash     uint64
+	Fingerprint      uint64
 }
 
 // AddMethodSymbol records that a method named methodName exists with
 // receiver type e.TypeSymbolIDHash in package e.PkgHash. Callers use this
-// as the sound first-pass filter for implementation queries, then load
-// export data for the surviving candidates to confirm with types.Implements.
+// as the sound first-pass filter for implementation queries: the
+// interface -> implementers direction (internal/xref's implementingTypes)
+// confirms a survivor by comparing e.Fingerprint against the interface's
+// own, needing no further decode; a candidate whose receiver is generic
+// (e.Fingerprint == 0) or whose fingerprint does not match still falls back
+// to loading export data and confirming with types.Implements, exactly as
+// every candidate used to.
 func (db *DB) AddMethodSymbol(methodName string, e MethodEntry) error {
 	key := []byte(methodName)
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
@@ -728,13 +764,16 @@ func containsUint64(list []byte, v uint64) bool {
 	return false
 }
 
-const methodEntrySize = 16
+const methodEntrySize = 40
 
 func appendMethodEntry(list []byte, e MethodEntry) []byte {
 	out := make([]byte, len(list)+methodEntrySize)
 	copy(out, list)
 	binary.LittleEndian.PutUint64(out[len(list):], e.PkgHash)
 	binary.LittleEndian.PutUint64(out[len(list)+8:], e.TypeSymbolIDHash)
+	binary.LittleEndian.PutUint64(out[len(list)+16:], e.MethodPkgHash)
+	binary.LittleEndian.PutUint64(out[len(list)+24:], e.MethodIDHash)
+	binary.LittleEndian.PutUint64(out[len(list)+32:], e.Fingerprint)
 	return out
 }
 
@@ -747,6 +786,9 @@ func decodeMethodEntryList(list []byte) []MethodEntry {
 		out = append(out, MethodEntry{
 			PkgHash:          binary.LittleEndian.Uint64(list[i:]),
 			TypeSymbolIDHash: binary.LittleEndian.Uint64(list[i+8:]),
+			MethodPkgHash:    binary.LittleEndian.Uint64(list[i+16:]),
+			MethodIDHash:     binary.LittleEndian.Uint64(list[i+24:]),
+			Fingerprint:      binary.LittleEndian.Uint64(list[i+32:]),
 		})
 	}
 	return out

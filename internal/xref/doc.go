@@ -17,13 +17,30 @@
 //
 // Implementation resolves candidates in two passes: a name-based first pass
 // over [internal/store.DB.LookupMethod] that is sound (never omits a real
-// implementer) but can over-approximate, followed by loading each surviving
-// candidate's export data and confirming with go/types.Implements. A
-// [Resolver] decodes export data through one shared internal/typecheck.Cache
-// and token.FileSet for its lifetime, so that types.Implements sees
-// consistent object identity for any package an interface and a candidate
-// both depend on. Neither is evicted, so long-lived Resolvers should be
-// recycled periodically.
+// implementer) but can over-approximate, followed by a confirmation pass.
+// For the interface -> implementers direction (implementingTypes), that
+// confirmation compares each candidate's index-recorded, canonical
+// signature fingerprint (internal/index.MethodFingerprint) against the
+// queried interface's own — needing no export data at all, which is what
+// makes an UNEXPORTED implementer resolvable (export data only ever
+// carries exported package-scope objects) and immune to a second class of
+// false negative go/types.Implements is prone to: two independently
+// decoded packages referencing what is structurally the same dependency
+// type are, to go/types, two DIFFERENT *types.Named objects unless decoded
+// through a shared imports map, so types.Implements can report "does not
+// implement" for a candidate that genuinely does (see implementingTypes'
+// own doc for the full soundness argument). A candidate whose receiver is
+// generic (fingerprinting excluded, see internal/index's registerMethodSet)
+// or whose fingerprint does not match still falls back to loading its
+// export data and confirming with go/types.Implements, exactly as every
+// candidate used to before this fix. The concrete type -> interfaces
+// direction (implementedInterfaces) keeps the original decode-based
+// confirmation unconditionally — see its own doc for why that asymmetry is
+// intentional. A [Resolver] decodes export data through one shared
+// internal/typecheck.Cache and token.FileSet for its lifetime, so that a
+// decode-based confirmation sees consistent object identity for any
+// package an interface and a candidate both depend on. Neither is evicted,
+// so long-lived Resolvers should be recycled periodically.
 //
 // An implementation query's own diagnostics (implDiag/logImplDiag, in
 // implementation.go) never see the LSP session's live, already

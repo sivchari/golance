@@ -19,6 +19,24 @@ type depExportEntry struct {
 	exportHash uint64
 }
 
+// factsSchemaVersion is folded into every computeUnitKey call so that
+// upgrading facts extraction's UnitBlob-index encoding (see
+// store.unitVersion/store.schemaVersion's matching bumps) invalidates every
+// existing [store.CAS] entry's key, even for a package whose source content
+// has not changed on disk. Without this, computeUnitKey is a pure function
+// of on-disk content plus dependency export hashes: an untouched package
+// would resolve to the exact same key after an upgrade as before it, and
+// casHitOutcome's store.DecodeUnitBlob call would then try to decode a CAS
+// blob still written under the OLD encoding (the [CAS] directory is shared
+// across worktrees and outlives any single database's schemaVersion-driven
+// discard — see store.Open's doc) — this mirrors internal/graph's
+// cacheVersion, the same "bump a constant to force everything downstream to
+// treat existing on-disk state as absent" pattern applied to CAS keys
+// instead of the workspace graph cache. Bump this alongside
+// store.unitVersion/store.schemaVersion whenever the facts extraction pass
+// or the UnitBlob/index-entry encoding it produces changes.
+const factsSchemaVersion uint16 = 2
+
 // computeUnitKey returns the CAS blob key for a package whose own source
 // content hashes to ownContentHash and whose direct workspace dependencies'
 // current export data hashes are deps.
@@ -56,6 +74,9 @@ func computeUnitKey(ownContentHash uint64, deps []depExportEntry) uint64 {
 
 	h := fnv.New64a()
 	var buf [8]byte
+	var vbuf [2]byte
+	binary.LittleEndian.PutUint16(vbuf[:], factsSchemaVersion)
+	_, _ = h.Write(vbuf[:])
 	binary.LittleEndian.PutUint64(buf[:], ownContentHash)
 	_, _ = h.Write(buf[:])
 	_, _ = h.Write([]byte{0})
