@@ -105,8 +105,11 @@ func (r *Resolver) methodReceiver(ctx context.Context, pkgPath string, target re
 // returns the matching method of every type on the other side of the same
 // interface/implementer relationship implementationOfMethod would list
 // Locations for, as resolvedSymbols a caller can feed back into
-// locationsFor. Only the interface -> implementers direction is wired into
-// References today (see its doc for why the reverse direction is omitted).
+// locationsFor. Both directions are wired in: an interface method's
+// implementers (methodImplementationSymbols) and, symmetrically, a concrete
+// method's satisfied interfaces (interfacesSatisfiedByMethod) -- see the
+// latter's doc for why that direction no longer carries the cost that used
+// to keep it out of References.
 func (r *Resolver) correspondingMethodSymbols(ctx context.Context, target resolvedSymbol) ([]resolvedSymbol, error) {
 	pkgPath, ok := r.pkgPathByHash[target.PkgHash]
 	if !ok {
@@ -116,10 +119,91 @@ func (r *Resolver) correspondingMethodSymbols(ctx context.Context, target resolv
 	if err != nil {
 		return nil, err
 	}
-	if !types.IsInterface(named) {
-		return nil, nil
+	if types.IsInterface(named) {
+		return r.methodImplementationSymbols(ctx, named, target.Name)
 	}
-	return r.methodImplementationSymbols(ctx, named, target.Name)
+	return r.interfacesSatisfiedByMethod(ctx, named, target.Name)
+}
+
+// interfacesSatisfiedByMethod is correspondingMethodSymbols' concrete ->
+// interfaces direction: given named's own methodName method, it returns the
+// matching method of every workspace interface named satisfies that also
+// declares a method by this name -- what a call through an interface-typed
+// variable resolves to, and so what References on the concrete method must
+// union in alongside target's own direct call sites.
+//
+// Candidate gathering is deliberately bounded to a SINGLE
+// [store.DB.LookupMethod] posting list (methodName alone), unlike
+// methodInterfaceSymbols/implementedInterfaces (Implementation's own
+// concrete -> interfaces query, which unions candidates across EVERY name in
+// named's whole method set): that whole-method-set union is exactly the
+// unbounded cost References' package doc used to cite for deferring this
+// direction entirely. A single name is bounded by whatever the workspace
+// declares under it, the same bound implementingTypes' interface ->
+// implementers direction already relies on, and is cheap enough for
+// References' hot path.
+//
+// Confirmation still decodes each candidate's export data and calls
+// types.Implements, exactly as implementedInterfaces: unlike a queried
+// interface (already live and decoded by the time implementingTypes runs),
+// a LookupMethod candidate here is only known to have SOME method named
+// methodName -- its full method set (whether it needs anything else besides)
+// is not recoverable from the index without decoding it, so there is no
+// index-only fingerprint shortcut available on this side either, the same
+// reasoning implementedInterfaces' own doc gives for staying decode-based.
+// That decode is affordable now: r.unitBlob/r.cache cache every export data
+// decode for this Resolver's whole lifetime (see unitCache's doc and
+// package doc), so a candidate package already visited elsewhere in the
+// same query -- or a shared dependency two candidates both import -- decodes
+// only once. Generic candidates and generic receivers fall back to the same
+// types.Implements call as the non-generic case, exactly like
+// methodInterfaceSymbols/implementedInterfaces already do -- no separate
+// generic handling needed here.
+//
+// Unlike Implementation's own queries, an empty result here is the
+// overwhelmingly common case (most methods satisfy no interface at all),
+// so -- unlike implementedInterfaces -- this deliberately skips implDiag/
+// logImplDiag: logging every miss would be log noise on References' hot
+// path, not the rare, actionable signal implDiag exists for. ctx is checked
+// once per candidate, mirroring implementedInterfaces' own loop.
+func (r *Resolver) interfacesSatisfiedByMethod(ctx context.Context, named *types.Named, methodName string) ([]resolvedSymbol, error) {
+	diag := newImplDiag([]string{methodName})
+	candidates, err := r.methodEntriesOfKind(ctx, methodName, index.KindInterface, diag)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []resolvedSymbol
+	for key := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		iname, _, _, ok := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
+		if !ok {
+			continue
+		}
+		ipath, ok := r.pkgPathByHash[key.PkgHash]
+		if !ok {
+			continue
+		}
+		inamed, err := r.resolveNamed(ctx, ipath, iname)
+		if err != nil {
+			continue
+		}
+		iface, ok := inamed.Underlying().(*types.Interface)
+		if !ok {
+			continue
+		}
+		if !types.Implements(types.NewPointer(named), iface) {
+			continue
+		}
+		sym, ok := r.interfaceMethodSymbol(iface, methodName)
+		if !ok {
+			continue
+		}
+		out = append(out, sym)
+	}
+	return out, nil
 }
 
 // resolveMethodFunc decodes pkgPath's export data and looks up the

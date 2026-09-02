@@ -55,27 +55,30 @@ func (r *Resolver) Definition(ctx context.Context, file string, line, col int) (
 // (see package doc). includeDecl controls whether the declaration itself is
 // included.
 //
-// When the symbol is an interface method, the result also includes
-// references to each workspace implementer's corresponding method (see
-// correspondingMethodSymbols): a call through a concretely-typed value
-// resolves to the concrete method's own SymbolID, not the interface
-// method's, so exact-SymbolID matching alone would otherwise miss every
-// such call site even though it is exactly the kind of call gopls's own
-// References treats as a reference to the interface method. Declarations of
-// those corresponding methods are never added (includeDecl only ever
-// controls target's own declaration), matching Definition/Rename's existing
-// "one symbol, one declaration" behavior.
+// When the symbol is a method, the result also includes references to its
+// corresponding method on "the other side" of an interface-satisfaction
+// relationship (see correspondingMethodSymbols), in both directions:
 //
-// The reverse direction -- a concrete method also pulling in its satisfied
-// interfaces' references -- is deliberately NOT implemented: unlike the
-// interface -> implementers direction (bounded by the queried interface's
-// own method count via implementingTypes' intersection), finding a concrete
-// type's satisfied interfaces unions LookupMethod candidates across every
-// name in its OWN method set (implementedInterfaces), which is unbounded by
-// anything the query controls. References, unlike the explicitly
-// user-invoked Implementation, is cheap and common enough (any method,
-// including ones named e.g. Close or String) that paying that cost on every
-// call would regress a hot path for a comparatively rare payoff.
+//   - Interface method -> every workspace implementer's matching method
+//     (methodImplementationSymbols): a call through a concretely-typed
+//     value resolves to the concrete method's own SymbolID, not the
+//     interface method's.
+//   - Concrete method -> every workspace interface it satisfies that
+//     declares a method by this name (interfacesSatisfiedByMethod): a call
+//     through an interface-typed value resolves to the interface method's
+//     own SymbolID, not the concrete method's.
+//
+// Either way, exact-SymbolID matching alone would otherwise miss every such
+// call site, even though it is exactly the kind of call gopls's own
+// References treats as a reference to "the same" method. The concrete ->
+// interfaces direction used to be omitted here as too expensive (unioning
+// LookupMethod candidates across a concrete type's entire method set), but
+// interfacesSatisfiedByMethod bounds candidate gathering to a single
+// posting list -- this method's own name -- instead, removing that cost;
+// see its doc for the full reasoning. Declarations of those corresponding
+// methods are never added (includeDecl only ever controls target's own
+// declaration), matching Definition/Rename's existing "one symbol, one
+// declaration" behavior.
 func (r *Resolver) References(ctx context.Context, file string, line, col int, includeDecl bool) ([]Location, error) {
 	l, c, err := toUint32Pos(line, col)
 	if err != nil {
