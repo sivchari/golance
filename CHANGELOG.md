@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.4.4](https://github.com/sivchari/golance/compare/v0.4.3...v0.4.4) - 2026-09-02
+- perf: cache decoded unit blobs in the resolver by @sivchari in https://github.com/sivchari/golance/pull/64
+- fix: resolve lint findings in the unit cache by @sivchari in https://github.com/sivchari/golance/pull/66
+
 ## [v0.4.3](https://github.com/sivchari/golance/compare/v0.4.2...v0.4.3) - 2026-09-02
 - fix: keep the dependency type-check cache across workspace reloads by @sivchari in https://github.com/sivchari/golance/pull/62
 
