@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.4.3](https://github.com/sivchari/golance/compare/v0.4.2...v0.4.3) - 2026-09-02
+- fix: keep the dependency type-check cache across workspace reloads by @sivchari in https://github.com/sivchari/golance/pull/62
+
 ## [v0.4.2](https://github.com/sivchari/golance/compare/v0.4.1...v0.4.2) - 2026-09-02
 - feat: navigate builtins to their builtin.go declarations by @sivchari in https://github.com/sivchari/golance/pull/60
 
