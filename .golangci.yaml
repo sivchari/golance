@@ -79,6 +79,14 @@ linters:
       - path: "_test\\.go"
         linters:
           - goconst
+      # Test files build and write fixtures under t.TempDir(); gosec's path
+      # traversal rules treat every joined path as attacker-controlled and
+      # flag the shared helpers, but a test's own temp tree is not an attack
+      # surface. Production code keeps both rules.
+      - path: "_test\\.go"
+        linters:
+          - gosec
+        text: "G(304|703)"
 formatters:
   enable:
     - gofmt
