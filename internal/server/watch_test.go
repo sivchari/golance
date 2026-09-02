@@ -352,11 +352,11 @@ func TestHandleDidChangeWatchedFiles_RepeatedNoOpEventIsSuppressed(t *testing.T)
 
 	// Third event, after a genuine on-disk change (size changes, so this is
 	// immune to coarse mtime resolution): must schedule again.
-	data, err := os.ReadFile(knownFile)
+	data, err := os.ReadFile(filepath.Clean(knownFile))
 	if err != nil {
 		t.Fatalf("read %s: %v", knownFile, err)
 	}
-	if err := os.WriteFile(knownFile, append(data, '\n'), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Clean(knownFile), append(data, '\n'), 0o600); err != nil {
 		t.Fatalf("write %s: %v", knownFile, err)
 	}
 	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
