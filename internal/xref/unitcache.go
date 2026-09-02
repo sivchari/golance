@@ -83,7 +83,7 @@ func (c *unitCache) stats() (hits, misses int64) {
 // would only mean a concurrent goroutine decoded the identical
 // content-addressed bytes first, in which case keeping its (byte-identical)
 // entry is fine.
-func (c *unitCache) put(blobKey uint64, u store.UnitBlob) {
+func (c *unitCache) put(blobKey uint64, u *store.UnitBlob) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.index[blobKey]; ok {
@@ -93,7 +93,7 @@ func (c *unitCache) put(blobKey uint64, u store.UnitBlob) {
 	if c.order.Len() >= unitCacheCapacity {
 		c.evictOldest()
 	}
-	el := c.order.PushFront(&unitCacheEntry{blobKey: blobKey, unit: u})
+	el := c.order.PushFront(&unitCacheEntry{blobKey: blobKey, unit: *u})
 	c.index[blobKey] = el
 }
 

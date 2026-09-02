@@ -146,7 +146,7 @@ func (r *Resolver) unitBlob(ctx context.Context, pkgHash uint64) (store.UnitBlob
 	if err != nil {
 		return store.UnitBlob{}, err
 	}
-	r.units.put(ptr.BlobKey, u)
+	r.units.put(ptr.BlobKey, &u)
 	return u, nil
 }
 
