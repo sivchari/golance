@@ -470,6 +470,19 @@ func (r *Resolver) methodInterfaces(ctx context.Context, named *types.Named, met
 // methodInterfaceSymbols is methodInterfaces' resolvedSymbol counterpart:
 // every satisfied interface's matching method as a resolvedSymbol rather
 // than its declaration Location.
+//
+// When methodName is a method a satisfied interface only has via embedding
+// the builtin error (e.g. querying "Implementation" on a concrete type's
+// own Error method, where the satisfied interface is `interface { error;
+// ... }`), interfaceMethodSymbol's underlying methodFuncSymbol call
+// deliberately returns no match for that interface: the universe's own
+// error.Error has no declaring package and so no location in the workspace
+// to point at (see methodFuncSymbol's doc). That interface is silently
+// skipped here rather than included with a made-up or missing Location —
+// this only affects the method-granular query; querying "Implementation" on
+// the concrete type's own NAME still finds the interface via
+// interfacesImplementedBy, which resolves the interface's own declaration
+// Location and never needs to resolve the individual method's.
 func (r *Resolver) methodInterfaceSymbols(ctx context.Context, named *types.Named, methodName string) ([]resolvedSymbol, error) {
 	ms := types.NewMethodSet(types.NewPointer(named))
 	names := make([]string, ms.Len())
@@ -585,8 +598,19 @@ func (r *Resolver) interfaceMethodSymbol(iface *types.Interface, methodName stri
 // embedder's package instead (as this used to) builds a SymbolID nothing
 // was ever indexed under, silently dropping every implementation/reference
 // that only exists via struct or interface embedding.
+//
+// fn.Pkg() is nil for a method belonging to the predeclared universe scope
+// (e.g. error's Error method, reached whenever fn was promoted from an
+// embedded builtin error). Such a method has no declaring package and so no
+// indexed declaration to resolve to; report no match instead of panicking
+// on fn.Pkg().Path(), mirroring internal/index's methodEntrySelf, which
+// leaves the very same case unresolved at index time.
 func (r *Resolver) methodFuncSymbol(fn *types.Func) (resolvedSymbol, bool) {
-	pkgPath := fn.Pkg().Path()
+	pkg := fn.Pkg()
+	if pkg == nil {
+		return resolvedSymbol{}, false
+	}
+	pkgPath := pkg.Path()
 	enc := new(objectpath.Encoder)
 	objPath, err := enc.For(fn)
 	if err != nil {

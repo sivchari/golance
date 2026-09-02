@@ -254,12 +254,31 @@ func registerInterfaceMethodSet(idx *store.PackageIndexEntries, pkgHash, typeIDH
 // separately — see symbolID's doc for why this always lands on the same
 // IDHash addDef already recorded for fn) plus, unless generic, its
 // canonical signature fingerprint.
+//
+// fn.Pkg() is nil for a method belonging to the predeclared universe scope
+// (concretely: error's Error method, reached whenever an indexed interface
+// or struct embeds the builtin error — extremely common, e.g. `interface {
+// error; Code() int }`). Such a method has no declaring package and can
+// never itself be a workspace jump target, so MethodPkgHash/MethodIDHash
+// are left at their zero sentinel instead of deriving them from fn (which
+// would otherwise panic on fn.Pkg().Path()): internal/xref's
+// methodEntriesOfKind re-resolves every entry's self-symbol before trusting
+// it and silently drops one that does not resolve, which is exactly the
+// "degraded but non-crashing" outcome wanted here. The method's Name is
+// still recorded by the caller under idx.Methods regardless, so the
+// candidate-intersection first pass (finding implementers of an
+// error-embedding interface) is unaffected — see registerMethodSet/
+// registerInterfaceMethodSet's callers. The Fingerprint is unaffected too:
+// it is computed from fn's signature alone (no package involved for
+// Error() string) and remains valid for confirming a real implementer.
 func methodEntrySelf(pkgHash, typeIDHash uint64, fn *types.Func, generic bool, enc *objectpath.Encoder, fset *token.FileSet) store.MethodEntry {
 	e := store.MethodEntry{
 		PkgHash:          pkgHash,
 		TypeSymbolIDHash: typeIDHash,
-		MethodPkgHash:    store.Hash(fn.Pkg().Path()),
-		MethodIDHash:     store.Hash(symbolID(fn, enc, fset)),
+	}
+	if pkg := fn.Pkg(); pkg != nil {
+		e.MethodPkgHash = store.Hash(pkg.Path())
+		e.MethodIDHash = store.Hash(symbolID(fn, enc, fset))
 	}
 	if !generic {
 		if sig, ok := fn.Type().(*types.Signature); ok {

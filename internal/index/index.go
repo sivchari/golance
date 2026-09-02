@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"go/token"
+	"log"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -154,7 +156,30 @@ func runBuildJob(ctx context.Context, sem *semaphore.Weighted, fset *token.FileS
 	if err := sem.Acquire(ctx, 1); err != nil {
 		return results.recordFatal(err)
 	}
-	outcome, skipped, typeChecked, err := processUnit(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, readFileDisk, true)
+	outcome, skipped, typeChecked, err := processUnitRecovered(ctx, fset, imp, exp, snap, db, cas, keys, opts, path)
 	sem.Release(1)
 	return results.record(outcome, skipped, typeChecked, err)
+}
+
+// processUnitRecovered wraps processUnit with a panic recovery so that one
+// poisoned package (e.g. a type-checker edge case facts extraction does not
+// yet handle) degrades that single package into a processing error instead
+// of crashing the whole indexer subprocess mid-run, taking down every other
+// package's results with it. This mirrors record's existing fatal-vs-
+// per-package split (see buildResults.record's doc): a recovered panic is
+// reported exactly like any other single-package processUnit error, never
+// as the fatal error Build itself returns. The panic value and package path
+// are logged (via the standard logger, since Options carries none) because
+// record itself only counts a per-package error into Stats.Errors and
+// otherwise discards it — without this, a panic's cause would vanish
+// entirely instead of merely being contained.
+func processUnitRecovered(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, snap *graph.Snapshot, db *store.DB, cas *store.CAS, keys *keyTable, opts Options, path string) (outcome *unitOutcome, skipped, typeChecked bool, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("index: panic processing package %s: %v\n%s", path, rec, debug.Stack())
+			outcome, skipped, typeChecked = nil, false, false
+			err = fmt.Errorf("index: panic processing package %s: %v", path, rec)
+		}
+	}()
+	return processUnit(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, readFileDisk, true)
 }
