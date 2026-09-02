@@ -303,6 +303,74 @@ func TestHandleDidChangeWatchedFiles_NonGoFileIsIgnored(t *testing.T) {
 	}
 }
 
+// TestHandleDidChangeWatchedFiles_RepeatedNoOpEventIsSuppressed verifies the
+// watchFingerprints short-circuit: a workspace/didChangeWatchedFiles event
+// re-reporting a path whose on-disk (size, mtime) exactly matches what the
+// last real event for it already recorded — the shape of an editor's
+// periodic no-op watched-files batch — must never reach s.watch, so it never
+// pays for a workspace-wide revalidateWorkspace pass (installSpyWatch is
+// this test's counting seam: a call landing on calls is exactly one such
+// pass). A later event reporting a genuine on-disk change to the same path
+// must still schedule one.
+func TestHandleDidChangeWatchedFiles_RepeatedNoOpEventIsSuppressed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := copyTestdataModule(t)
+	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+	s := newWorkspaceOnlyServerAt(t, root, snap)
+	knownFile := s.workspace().snap.Packages["example.com/servermod/greet"].GoFiles[0]
+
+	calls := installSpyWatch(s)
+
+	// First event: watchFingerprints remembers nothing yet for this path,
+	// so it is always treated as a real change.
+	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
+	})); err != nil {
+		t.Fatalf("handleDidChangeWatchedFiles: %v", err)
+	}
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch was never scheduled for the first event")
+	}
+
+	// Second event for the same path, file untouched on disk in between: a
+	// no-op the editor re-reported, must not schedule another pass.
+	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
+	})); err != nil {
+		t.Fatalf("handleDidChangeWatchedFiles: %v", err)
+	}
+	select {
+	case c := <-calls:
+		t.Fatalf("watch was scheduled for a repeated no-op event: %+v", c)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Third event, after a genuine on-disk change (size changes, so this is
+	// immune to coarse mtime resolution): must schedule again.
+	data, err := os.ReadFile(knownFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", knownFile, err)
+	}
+	if err := os.WriteFile(knownFile, append(data, '\n'), 0o600); err != nil {
+		t.Fatalf("write %s: %v", knownFile, err)
+	}
+	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
+	})); err != nil {
+		t.Fatalf("handleDidChangeWatchedFiles: %v", err)
+	}
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch was never scheduled after a genuine on-disk change")
+	}
+}
+
 // watchCall records one s.watch run invocation, for installSpyWatch.
 type watchCall struct {
 	root   string

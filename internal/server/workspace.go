@@ -340,10 +340,15 @@ func (s *Server) revalidateGraph(opts graph.Options, patterns []string) {
 //     graph unconditionally and immediately, in the background: any of
 //     these can change what packages.Load would compute for the whole
 //     workspace, and such a change is comparatively rare.
-//   - .go files changing (created, edited, or deleted) are handed to
-//     s.watch (see watch.go), which debounces and coalesces them — a
-//     `git pull` can touch thousands of files in one burst — into a
-//     single revalidateWorkspace pass once things go quiet.
+//   - .go files changing (created, edited, or deleted) are first checked
+//     against s.watchFP (see watchFingerprints): an event whose path's
+//     on-disk (size, mtime) exactly matches what the last real event for it
+//     already recorded is a no-op — some clients' watchers periodically
+//     re-report unchanged files this way — and is dropped here rather than
+//     handed onward. A genuine one is handed to s.watch (see watch.go),
+//     which debounces and coalesces them — a `git pull` can touch thousands
+//     of files in one burst — into a single revalidateWorkspace pass once
+//     things go quiet.
 //
 // A batch containing both is handled as a go.mod-style reload only: that
 // already implies everything a .go-file-driven revalidation would also
@@ -370,6 +375,13 @@ func (s *Server) handleDidChangeWatchedFiles(_ context.Context, params json.RawM
 	for _, ch := range p.Changes {
 		path := ch.URI.FsPath()
 		if !strings.HasSuffix(path, ".go") {
+			continue
+		}
+		if !s.watchFP.changed(path, ch.Type) {
+			// Same (size, mtime) as the last event this path actually acted
+			// on: an editor re-reporting a no-op (see watchFingerprints),
+			// not a real change. Skip it rather than paying for a
+			// workspace-wide revalidateWorkspace pass over nothing.
 			continue
 		}
 		sawGoFile = true
