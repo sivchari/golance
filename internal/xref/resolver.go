@@ -51,6 +51,7 @@ type Resolver struct {
 	fset *token.FileSet
 
 	cache *typecheck.Cache
+	units *unitCache
 
 	fileToPkg     map[string]string
 	dirToPkg      map[string]string
@@ -105,6 +106,7 @@ func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool) *Res
 		snap:          snap,
 		fset:          token.NewFileSet(),
 		cache:         typecheck.NewCache(),
+		units:         newUnitCache(),
 		fileToPkg:     fileToPkg,
 		dirToPkg:      dirToPkg,
 		pkgPathByHash: pkgPathByHash,
@@ -114,14 +116,24 @@ func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool) *Res
 }
 
 // unitBlob loads and decodes pkgHash's current [store.UnitBlob] via db's
-// UnitPointer and cas. It returns [store.ErrNotFound] if pkgHash has never
-// been indexed. A canceled ctx surfaces as ctx's own error (see
-// [store.DB.GetUnit] and [store.CAS.Get]), letting a caller distinguish a
-// real cancellation from an ordinary "not found" miss.
+// UnitPointer and cas, serving a repeat call for the same content from
+// r.units instead of re-reading and re-decoding the CAS blob. It returns
+// [store.ErrNotFound] if pkgHash has never been indexed. A canceled ctx
+// surfaces as ctx's own error (see [store.DB.GetUnit] and [store.CAS.Get]),
+// letting a caller distinguish a real cancellation from an ordinary "not
+// found" miss.
+//
+// db.GetUnit's own bbolt read always runs first, even on what turns out to
+// be a cache hit: it is the only way to learn pkgHash's CURRENT BlobKey,
+// which is what r.units is keyed by (see its doc) — cheap relative to the
+// os.ReadFile plus decode a cache hit then goes on to skip.
 func (r *Resolver) unitBlob(ctx context.Context, pkgHash uint64) (store.UnitBlob, error) {
 	ptr, err := r.db.GetUnit(ctx, pkgHash)
 	if err != nil {
 		return store.UnitBlob{}, err
+	}
+	if u, ok := r.units.get(ptr.BlobKey); ok {
+		return u, nil
 	}
 	blob, ok, err := r.cas.Get(ctx, ptr.BlobKey)
 	if err != nil {
@@ -130,7 +142,12 @@ func (r *Resolver) unitBlob(ctx context.Context, pkgHash uint64) (store.UnitBlob
 	if !ok {
 		return store.UnitBlob{}, store.ErrNotFound
 	}
-	return store.DecodeUnitBlob(blob)
+	u, err := store.DecodeUnitBlob(blob)
+	if err != nil {
+		return store.UnitBlob{}, err
+	}
+	r.units.put(ptr.BlobKey, u)
+	return u, nil
 }
 
 // resolvedSymbol identifies one symbol definition: the defining package's
@@ -281,6 +298,11 @@ func (r *Resolver) SetLogger(l *log.Logger) {
 // pkgPath's now-superseded one (e.g. an embedded interface or struct
 // field), so it must be dropped and re-decoded too, even though its own
 // source content did not change.
+//
+// r.units needs no equivalent treatment here: it is keyed by BlobKey, the
+// CAS content address a reindex necessarily changes (see unitCache's doc),
+// so a stale entry simply stops being looked up on its own rather than
+// needing an explicit drop.
 func (r *Resolver) Invalidate(pkgPaths []string) {
 	for _, p := range pkgPaths {
 		r.cache.Delete(p)
