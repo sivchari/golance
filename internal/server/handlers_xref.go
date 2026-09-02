@@ -337,6 +337,9 @@ func (s *Server) handleReferences(ctx context.Context, params json.RawMessage) (
 	if !ok {
 		return protocol.LocationSlice(nil), nil
 	}
+	if pt := phaseTimerFrom(ctx); pt != nil {
+		ctx = xref.WithStatsSink(ctx, pt)
+	}
 	locs, err := resolver.References(ctx, path, line, col, p.Context.IncludeDeclaration)
 	if err != nil {
 		// See handleDefinition's comment: most errors here are an ordinary

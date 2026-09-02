@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -84,6 +85,47 @@ func (c *CAS) Get(ctx context.Context, key uint64) (blob []byte, ok bool, err er
 		c.touch(path, fi)
 	}
 	return data, true, nil
+}
+
+// GetFacts returns only key's blob's Facts section (see [UnitFactsRange]),
+// reading its small fixed header plus the Facts byte range instead of the
+// whole file. This exists for a caller like internal/xref's References
+// closure walk, which needs Facts from potentially hundreds of units in a
+// single query but never Export: Export commonly dwarfs Facts (a large
+// package's decoded type/method signatures versus its own file's identifier
+// occurrences), so reading the whole blob for every unit in the closure pays
+// for data the walk never looks at. ok/err semantics mirror Get; the mtime
+// touch is the same best-effort refresh Get performs.
+func (c *CAS) GetFacts(ctx context.Context, key uint64) (facts []byte, ok bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	path := c.blobPath(key)
+	f, err := os.Open(filepath.Clean(path))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("store: open CAS blob %x: %w", key, err)
+	}
+	defer f.Close()
+
+	header := make([]byte, unitHeaderSize)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return nil, false, fmt.Errorf("store: read CAS blob %x header: %w", key, err)
+	}
+	off, ln, err := UnitFactsRange(header)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: CAS blob %x: %w", key, err)
+	}
+	facts = make([]byte, ln)
+	if _, err := f.ReadAt(facts, int64(off)); err != nil {
+		return nil, false, fmt.Errorf("store: read CAS blob %x facts: %w", key, err)
+	}
+	if fi, statErr := f.Stat(); statErr == nil {
+		c.touch(path, fi)
+	}
+	return facts, true, nil
 }
 
 // touch bumps path's mtime to now if it was last touched more than

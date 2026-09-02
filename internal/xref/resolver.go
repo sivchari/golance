@@ -179,6 +179,42 @@ func (r *Resolver) unitBlob(ctx context.Context, pkgHash uint64) (store.UnitBlob
 	return u, nil
 }
 
+// unitFacts loads pkgHash's current Facts section alone, the same
+// BlobKey-driven cache lookup unitBlob performs but through
+// [store.CAS.GetFacts] instead of [store.CAS.Get]: it reads only the
+// Facts byte range off disk rather than the whole blob (Export, plus the
+// per-file stat snapshot and index-entry sections neither this method nor
+// its one caller reads).
+//
+// Only locationsForAll's closure walk uses this, deliberately -- not
+// resolveAt or symbolByHash, even though neither reads Export directly
+// either (see symbolByHash's own doc for why: both are shared by call
+// chains that very commonly need Export for that SAME package moments
+// later, where a Facts-only read here would cost a wasted extra full read
+// once Export turns out to be needed after all). locationsForAll's walk is
+// different: it visits a whole reverse-dependency closure's worth of OTHER
+// packages a query has no independent reason to ever decode Export for, so
+// Facts-only there is a clear win with no such follow-up read to worry
+// about. Error/not-found semantics match unitBlob.
+func (r *Resolver) unitFacts(ctx context.Context, pkgHash uint64) ([]byte, error) {
+	ptr, err := r.db.GetUnit(ctx, pkgHash)
+	if err != nil {
+		return nil, err
+	}
+	if facts, ok := r.units.getFacts(ptr.BlobKey); ok {
+		return facts, nil
+	}
+	facts, ok, err := r.cas.GetFacts(ctx, ptr.BlobKey)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, store.ErrNotFound
+	}
+	r.units.putFacts(ptr.BlobKey, facts)
+	return facts, nil
+}
+
 // resolvedSymbol identifies one symbol definition: the defining package's
 // hash, its SymbolID hash within that package's facts, its kind, and its
 // name.
@@ -198,6 +234,14 @@ func (r *Resolver) resolveAt(ctx context.Context, file string, line, col uint32)
 	}
 	pkgHash := store.Hash(pkgPath)
 
+	// unitBlob (full), not unitFacts: resolveAt's own package is very
+	// commonly re-visited moments later needing Export too (e.g. a method
+	// query's correspondingMethodSymbols -> resolveMethodFunc decoding
+	// this SAME package's export data) — see symbolByHash's doc for why
+	// switching a shared helper like this to Facts-only regressed exactly
+	// that pattern into a wasted double read (a partial Facts read
+	// immediately followed by a full read once Export turned out to be
+	// needed after all).
 	u, err := r.unitBlob(ctx, pkgHash)
 	if err != nil {
 		return resolvedSymbol{}, fmt.Errorf("xref: read facts for %s: %w", pkgPath, err)
@@ -236,6 +280,16 @@ func (r *Resolver) resolveRefTarget(ctx context.Context, ref store.Ref) (resolve
 
 // symbolByHash returns the name, kind, and declaration location recorded for
 // idHash in pkgHash's facts blob.
+//
+// Deliberately unitBlob (full), not unitFacts: symbolByHash is shared by
+// implementation.go's candidate-confirmation loops, where a symbolByHash
+// call (get a candidate's name) is almost always followed moments later by
+// a resolveNamed call needing that SAME package's Export (decode it and
+// call types.Implements). Facts-only here would cost a partial Facts read
+// now and a full read again right after once Export turns out to be
+// needed — strictly more bytes than one full read up front. locationsForAll
+// (References' own closure walk, which never needs Export for any package
+// in the closure) calls unitFacts directly instead of going through this.
 func (r *Resolver) symbolByHash(ctx context.Context, pkgHash, idHash uint64) (name string, kind uint8, loc Location, ok bool) {
 	u, err := r.unitBlob(ctx, pkgHash)
 	if err != nil {

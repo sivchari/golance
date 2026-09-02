@@ -76,6 +76,43 @@ func TestUnitBlobEmpty(t *testing.T) {
 	}
 }
 
+// TestUnitFactsRange_MatchesDecodedFacts verifies UnitFactsRange's own
+// (offset, length) range, applied directly to an encoded blob, slices out
+// exactly the same bytes DecodeUnitBlob's full decode returns as Facts --
+// the property [CAS.GetFacts] relies on to read only that range instead of
+// the whole blob.
+func TestUnitFactsRange_MatchesDecodedFacts(t *testing.T) {
+	want := UnitBlob{Facts: []byte("facts-bytes"), Export: []byte("export-bytes-longer-than-facts")}
+	encoded := EncodeUnitBlob(&want)
+
+	off, ln, err := UnitFactsRange(encoded)
+	if err != nil {
+		t.Fatalf("UnitFactsRange() error = %v", err)
+	}
+	if got := encoded[off : off+ln]; !bytes.Equal(got, want.Facts) {
+		t.Errorf("UnitFactsRange() range = %q, want %q", got, want.Facts)
+	}
+
+	decoded, err := DecodeUnitBlob(encoded)
+	if err != nil {
+		t.Fatalf("DecodeUnitBlob() error = %v", err)
+	}
+	if !bytes.Equal(decoded.Facts, encoded[off:off+ln]) {
+		t.Error("UnitFactsRange()'s range disagrees with DecodeUnitBlob's own Facts")
+	}
+}
+
+func TestUnitFactsRange_RejectsShortOrBadHeader(t *testing.T) {
+	if _, _, err := UnitFactsRange([]byte("short")); err == nil {
+		t.Error("UnitFactsRange(too short) = nil error, want an error")
+	}
+	encoded := EncodeUnitBlob(&UnitBlob{Facts: []byte("hello")})
+	binary.LittleEndian.PutUint16(encoded[4:6], unitVersion-1)
+	if _, _, err := UnitFactsRange(encoded); err == nil {
+		t.Error("UnitFactsRange(old version) = nil error, want an error")
+	}
+}
+
 func TestUnitBlobTruncatedErrors(t *testing.T) {
 	encoded := EncodeUnitBlob(&UnitBlob{Facts: []byte("hello"), Files: []FileStat{{Path: "a.go", Size: 1, ModTimeNanos: 2}}})
 	if _, err := DecodeUnitBlob(encoded[:len(encoded)-2]); err == nil {

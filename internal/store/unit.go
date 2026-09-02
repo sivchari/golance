@@ -28,7 +28,32 @@ const (
 	// factsSchemaVersion forces every CAS key to change so a fresh build
 	// never asks casHitOutcome to decode a stale version-1 blob at all).
 	unitVersion = 2
+	// unitHeaderSize is EncodeUnitBlob's fixed-size header length (magic,
+	// version, reserved, factsLen, exportLen, fileCount, namesCount -- see
+	// its doc for the exact byte layout). Facts begins immediately after
+	// it, which is what makes [UnitFactsRange] possible: a caller that
+	// wants only Facts can read this many header bytes plus exactly
+	// factsLen more, instead of the whole blob.
+	unitHeaderSize = 24
 )
+
+// UnitFactsRange validates header -- a unit blob's first unitHeaderSize
+// bytes are enough, the whole blob is not required -- and returns the byte
+// offset and length of its Facts section within the blob:
+// [offset, offset+length). [CAS.GetFacts] uses this to read exactly that
+// range instead of the whole file; DecodeUnitBlob uses it for its own
+// header validation.
+func UnitFactsRange(header []byte) (offset, length int, err error) {
+	if len(header) < unitHeaderSize || string(header[0:4]) != unitMagic {
+		return 0, 0, fmt.Errorf("store: bad unit blob header")
+	}
+	version := binary.LittleEndian.Uint16(header[4:6])
+	if version != unitVersion {
+		return 0, 0, fmt.Errorf("store: unsupported unit blob version %d (want %d)", version, unitVersion)
+	}
+	factsLen := int(binary.LittleEndian.Uint32(header[8:12]))
+	return unitHeaderSize, factsLen, nil
+}
 
 // EncodeUnitBlob serializes u as:
 //
@@ -135,19 +160,14 @@ func putIndexEntries(b []byte, off int, idx PackageIndexEntries) int {
 // os.ReadFile result, not a memory-mapped transaction view) may keep them as
 // is.
 func DecodeUnitBlob(b []byte) (UnitBlob, error) {
-	if len(b) < 24 || string(b[0:4]) != unitMagic {
-		return UnitBlob{}, fmt.Errorf("store: bad unit blob header")
+	off, factsLen, err := UnitFactsRange(b)
+	if err != nil {
+		return UnitBlob{}, err
 	}
-	version := binary.LittleEndian.Uint16(b[4:6])
-	if version != unitVersion {
-		return UnitBlob{}, fmt.Errorf("store: unsupported unit blob version %d (want %d)", version, unitVersion)
-	}
-	factsLen := int(binary.LittleEndian.Uint32(b[8:12]))
 	exportLen := int(binary.LittleEndian.Uint32(b[12:16]))
 	fileCount := int(binary.LittleEndian.Uint32(b[16:20]))
 	nameCount := int(binary.LittleEndian.Uint32(b[20:24]))
 
-	off := 24
 	facts, off, err := takeBytes(b, off, factsLen)
 	if err != nil {
 		return UnitBlob{}, fmt.Errorf("store: unit blob facts: %w", err)

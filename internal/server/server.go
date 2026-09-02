@@ -238,7 +238,7 @@ func (s *Server) wire() {
 	s.registerSemanticHandlers()
 
 	s.rpc.Handle(protocol.MethodTextDocumentDefinition, rpc.Background, s.instrument(protocol.MethodTextDocumentDefinition, s.handleDefinition))
-	s.rpc.Handle(protocol.MethodTextDocumentReferences, rpc.Background, s.handleReferences)
+	s.rpc.Handle(protocol.MethodTextDocumentReferences, rpc.Background, s.instrument(protocol.MethodTextDocumentReferences, s.handleReferences))
 	s.rpc.Handle(protocol.MethodTextDocumentImplementation, rpc.Background, s.instrument(protocol.MethodTextDocumentImplementation, s.handleImplementation))
 	s.rpc.Handle(protocol.MethodWorkspaceSymbol, rpc.Background, s.handleWorkspaceSymbol)
 	s.rpc.Handle(protocol.MethodTextDocumentRename, rpc.Background, s.handleRename)
@@ -249,24 +249,30 @@ func (s *Server) wire() {
 // slowRequestThreshold is logged at INFO: method, duration, and — for a
 // handler whose own call chain threads the request's phaseTimer through
 // (see withPhaseTimer/phaseTimerFrom; currently handleDefinition,
-// handleImplementation, and every resolveCheckedPackage caller, i.e. hover
-// and the definition/type-definition fallback paths) — the single phase
-// that took longest, e.g. "engine.Get" versus "depcheck.check" versus
-// "facts". This exists so a field report of an intermittently slow
-// navigation query ("worked fast at first, then stalled") can be diagnosed
-// straight from a user's server log, without asking them to reproduce it
-// under a profiler. A request that finishes under the threshold costs one
-// time.Since call and nothing else — no allocation, no log line.
+// handleImplementation, handleReferences, and every resolveCheckedPackage
+// caller, i.e. hover and the definition/type-definition fallback paths) —
+// the single phase that took longest, e.g. "engine.Get" versus
+// "depcheck.check" versus "facts". This exists so a field report of an
+// intermittently slow navigation query ("worked fast at first, then
+// stalled") can be diagnosed straight from a user's server log, without
+// asking them to reproduce it under a profiler. handleReferences also
+// installs pt as an internal/xref.StatsSink (see its own doc), so a slow
+// References query's line additionally reports how many closure-walk units
+// it visited and how many bytes/records that cost (see
+// phaseTimer.countsSuffix) — "" for every other handler, unaffected. A
+// request that finishes under the threshold costs one time.Since call and
+// nothing else — no allocation, no log line.
 func (s *Server) instrument(method string, h rpc.RequestHandler) rpc.RequestHandler {
 	return func(ctx context.Context, params json.RawMessage) (any, error) {
 		ctx, pt := withPhaseTimer(ctx)
 		start := time.Now()
 		result, err := h(ctx, params)
 		if d := time.Since(start); d >= slowRequestThreshold {
+			counts := pt.countsSuffix()
 			if phase, phaseDur := pt.dominant(); phase != "" {
-				s.logger.Printf("golance: slow request: method=%s duration=%s dominant_phase=%s dominant_phase_duration=%s", method, d, phase, phaseDur)
+				s.logger.Printf("golance: slow request: method=%s duration=%s dominant_phase=%s dominant_phase_duration=%s%s", method, d, phase, phaseDur, counts)
 			} else {
-				s.logger.Printf("golance: slow request: method=%s duration=%s", method, d)
+				s.logger.Printf("golance: slow request: method=%s duration=%s%s", method, d, counts)
 			}
 		}
 		return result, err
