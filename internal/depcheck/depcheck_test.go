@@ -2,11 +2,17 @@ package depcheck
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -343,5 +349,125 @@ func TestProvider_DocAt_NotFound(t *testing.T) {
 
 	if _, err := p.DocAt(context.Background(), "example.com/depcheckmod/dep", "NoSuchSymbol"); err == nil {
 		t.Error("DocAt for a nonexistent objPath returned no error, want one")
+	}
+}
+
+// chainIndexMetadataSource serves a synthetic linear import chain
+// "test/pkg0" -> "test/pkg1" -> ... -> "test/pkg{n-1}", each package's
+// single Go file written to dir by writeChainFixture, for
+// TestProvider_Check_ContextCanceledMidClosure: a deep-enough closure that
+// canceling ctx partway through is observable as "the descent stopped",
+// not just "the whole thing finished, error or not". cancelAfter, if > 0,
+// cancels ctx the instant the cancelAfter'th Package call is made — always
+// the metadata lookup for the NEXT package check is about to descend
+// into, so this pins exactly how far the closure got before the ctxImporter
+// checkpoint (see its doc) should stop it.
+type chainIndexMetadataSource struct {
+	dir         string
+	n           int
+	cancelAfter int32
+	cancel      context.CancelFunc
+
+	calls int32
+}
+
+func (c *chainIndexMetadataSource) Package(pkgPath string) (dir string, goFiles, imports []string, ok bool) {
+	i, ok := chainIndex(pkgPath)
+	if !ok || i >= c.n {
+		return "", nil, nil, false
+	}
+	if n := atomic.AddInt32(&c.calls, 1); c.cancelAfter > 0 && n == c.cancelAfter {
+		c.cancel()
+	}
+	var imp []string
+	if i+1 < c.n {
+		imp = []string{chainPkgPath(i + 1)}
+	}
+	return c.dir, []string{filepath.Join(c.dir, chainFileName(i))}, imp, true
+}
+
+const chainPkgPrefix = "test/pkg"
+
+func chainPkgPath(i int) string  { return fmt.Sprintf("%s%d", chainPkgPrefix, i) }
+func chainFileName(i int) string { return fmt.Sprintf("pkg%d.go", i) }
+func chainPkgName(i int) string  { return fmt.Sprintf("pkg%d", i) }
+
+// chainIndex parses pkgPath produced by chainPkgPath back into its index.
+func chainIndex(pkgPath string) (int, bool) {
+	if !strings.HasPrefix(pkgPath, chainPkgPrefix) {
+		return 0, false
+	}
+	i, err := strconv.Atoi(strings.TrimPrefix(pkgPath, chainPkgPrefix))
+	if err != nil {
+		return 0, false
+	}
+	return i, true
+}
+
+// chainFixtureLen is the fixed chain length TestProvider_Check_ContextCanceledMidClosure
+// and its control both build against.
+const chainFixtureLen = 20
+
+// writeChainFixture writes chainFixtureLen .go files to dir, package i
+// importing package i+1 (the last package imports nothing), matching
+// chainIndexMetadataSource's own view of the chain.
+func writeChainFixture(t *testing.T, dir string) {
+	t.Helper()
+	for i := range chainFixtureLen {
+		var imp string
+		if i+1 < chainFixtureLen {
+			imp = fmt.Sprintf("import _ %q\n", chainPkgPath(i+1))
+		}
+		src := fmt.Sprintf("package %s\n\n%svar X = %d\n", chainPkgName(i), imp, i)
+		path := filepath.Join(dir, chainFileName(i))
+		if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+}
+
+// TestProvider_Check_ContextCanceledMidClosure verifies that check aborts
+// promptly once ctx is canceled partway through a deep import closure,
+// instead of continuing to check every remaining package in the chain —
+// the correctness half of the ctxImporter fix (see its doc): a query whose
+// caller has already given up must stop burning CPU on packages it will
+// never need, not run the recursive descent to completion regardless.
+func TestProvider_Check_ContextCanceledMidClosure(t *testing.T) {
+	const cancelAfter = 5 // cancel while resolving pkg4, well before the chain's end
+	dir := t.TempDir()
+	writeChainFixture(t, dir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	meta := &chainIndexMetadataSource{dir: dir, n: chainFixtureLen, cancelAfter: cancelAfter, cancel: cancel}
+	p := NewProvider(meta, Options{})
+
+	_, err := p.Package(ctx, chainPkgPath(0))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Package(%s) error = %v, want context.Canceled", chainPkgPath(0), err)
+	}
+	if got := atomic.LoadInt32(&meta.calls); got != cancelAfter {
+		t.Errorf("MetadataSource.Package called %d times, want exactly %d (the closure should have stopped at cancellation, never reaching later packages in the chain)", got, cancelAfter)
+	}
+}
+
+// TestProvider_Check_UncanceledClosureStillCompletes is
+// TestProvider_Check_ContextCanceledMidClosure's control: with the same
+// chain fixture and NO cancellation, every package in the chain is
+// resolved — proving the previous test's early stop is really about
+// cancellation, not some unrelated fixture bug that just happens to also
+// stop the descent early.
+func TestProvider_Check_UncanceledClosureStillCompletes(t *testing.T) {
+	dir := t.TempDir()
+	writeChainFixture(t, dir)
+
+	meta := &chainIndexMetadataSource{dir: dir, n: chainFixtureLen}
+	p := NewProvider(meta, Options{})
+
+	if _, err := p.Package(context.Background(), chainPkgPath(0)); err != nil {
+		t.Fatalf("Package(%s): %v", chainPkgPath(0), err)
+	}
+	if got := atomic.LoadInt32(&meta.calls); got != chainFixtureLen {
+		t.Errorf("MetadataSource.Package called %d times, want exactly %d (the whole chain, since nothing was canceled)", got, chainFixtureLen)
 	}
 }

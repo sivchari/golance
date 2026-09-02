@@ -94,6 +94,7 @@ func (s *Server) handleDefinition(ctx context.Context, params json.RawMessage) (
 	if !ok {
 		return protocol.LocationSlice(nil), nil
 	}
+	phaseTimerFrom(ctx).enter("facts.Definition")
 	locs, err := resolver.Definition(ctx, path, line, col)
 	if err != nil {
 		// Most errors here mean "no symbol at this position" — a routine
@@ -212,6 +213,7 @@ func (s *Server) dependencyDefinition(ctx context.Context, cf checkedFileResult)
 	if ws == nil {
 		return xref.Location{}, false
 	}
+	phaseTimerFrom(ctx).enter("depcheck.Decl")
 	info, err := langfeat.DependencyDefinition(ctx, cf.cp, ws.depProvider, cf.path, cf.offset)
 	if err != nil {
 		s.logger.Printf("server: dependency definition %s: %v", cf.path, err)
@@ -360,6 +362,7 @@ func (s *Server) handleImplementation(ctx context.Context, params json.RawMessag
 	if !ok {
 		return protocol.LocationSlice(nil), nil
 	}
+	phaseTimerFrom(ctx).enter("facts.Implementation")
 	locs, err := resolver.Implementation(ctx, path, line, col)
 	if err != nil {
 		// See handleDefinition's comment: most errors here are an ordinary

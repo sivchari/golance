@@ -403,6 +403,9 @@ func unsafePackage() *CheckedPackage {
 // jump target's signature/doc); doc comments come from parser.ParseComments
 // regardless of that setting.
 func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool) (*CheckedPackage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	dir, goFiles, _, ok := p.meta.Package(pkgPath)
 	if !ok {
 		return nil, fmt.Errorf("depcheck: %s is not known to the import graph", pkgPath)
@@ -430,7 +433,7 @@ func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool) (
 		Implicits:  make(map[ast.Node]types.Object),
 	}
 	conf := types.Config{
-		Importer:         (*importer)(p),
+		Importer:         &ctxImporter{p: p, ctx: ctx},
 		IgnoreFuncBodies: !withBodies,
 		Error:            func(error) {}, // best-effort: a dependency's own source is immutable and assumed to compile; a type error here degrades to a possibly-incomplete pkg rather than failing the whole check.
 	}
@@ -441,14 +444,36 @@ func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool) (
 	return &CheckedPackage{pkgPath: pkgPath, dir: dir, files: files, pkg: pkg, info: info}, nil
 }
 
-// importer implements types.ImporterFrom by resolving each import back
-// through the same Provider, recursively — the "re-entrant check on
-// demand" callback pattern gopls's own getImportPackage uses (see the
-// package doc's Q2 reference), needed because an imported dependency can
-// itself have been evicted from the LRU since it was last checked.
-type importer Provider
+// ctxImporter implements types.ImporterFrom by resolving each import back
+// through the same Provider, recursively — the "re-entrant check on demand"
+// callback pattern gopls's own getImportPackage uses (see the package doc's
+// Q2 reference), needed because an imported dependency can itself have been
+// evicted from the LRU since it was last checked. Built fresh by check for
+// each top-level check call (one small allocation on a cache/singleflight
+// miss — the only path that reaches check at all) rather than being a cast
+// of *Provider itself, specifically so it can carry that call's own ctx
+// through every recursive import: without this, a huge dependency closure
+// (a large monorepo's shared internal package, say) had no way to notice
+// its caller gave up partway through — types.Config.Check invokes
+// ImportFrom synchronously, once per import, as it walks the package's own
+// import list, so checking ctx.Err() at the top of ImportFrom is a
+// checkpoint between each package the recursive descent is about to check
+// next, not just at the very start and end of the top-level call.
+//
+// Fairness caveat: a check already shared via singleflight (see
+// Package/PackageWithBodies) uses only the LEADER's ctx, so if the leader's
+// own request is canceled but a follower's is not, this can still fail the
+// follower's call too — the same tradeoff the pre-existing ctx.Err() checks
+// in check/Package already made (a canceled leader could already leave a
+// follower waiting on a check that keeps running to completion regardless);
+// this only makes that check happen sooner, so an abandoned closure check
+// stops burning CPU promptly instead of only at the very end.
+type ctxImporter struct {
+	p   *Provider
+	ctx context.Context
+}
 
-func (imp *importer) Import(path string) (*types.Package, error) {
+func (imp *ctxImporter) Import(path string) (*types.Package, error) {
 	return imp.ImportFrom(path, "", 0)
 }
 
@@ -456,12 +481,14 @@ func (imp *importer) Import(path string) (*types.Package, error) {
 // a package the caller also has open (via PackageWithBodies) shares its
 // exact *types.Package identity instead of triggering a second, divergent
 // declarations-only check — see PackageWithBodies's doc.
-func (imp *importer) ImportFrom(path, _ string, _ types.ImportMode) (*types.Package, error) {
-	prov := (*Provider)(imp)
-	if cp, ok := prov.getFull(path); ok {
+func (imp *ctxImporter) ImportFrom(path, _ string, _ types.ImportMode) (*types.Package, error) {
+	if err := imp.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if cp, ok := imp.p.getFull(path); ok {
 		return cp.Types(), nil
 	}
-	cp, err := prov.Package(context.Background(), path)
+	cp, err := imp.p.Package(imp.ctx, path)
 	if err != nil {
 		return nil, err
 	}

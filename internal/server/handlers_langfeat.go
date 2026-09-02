@@ -37,8 +37,10 @@ import (
 func (s *Server) resolveCheckedPackage(ctx context.Context, ws *workspace, path string) (*check.CheckedPackage, error) {
 	pkgPath, ok := ws.nonWorkspacePackageForFile(path)
 	if !ok {
+		phaseTimerFrom(ctx).enter("engine.Get")
 		return ws.engine.Get(ctx, path)
 	}
+	phaseTimerFrom(ctx).enter("depcheck.check")
 	dcp, err := ws.depProvider.PackageWithBodies(ctx, pkgPath)
 	if err != nil {
 		return nil, err
