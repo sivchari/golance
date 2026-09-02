@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -353,11 +352,13 @@ func TestHandleDidChangeWatchedFiles_RepeatedNoOpEventIsSuppressed(t *testing.T)
 
 	// Third event, after a genuine on-disk change (size changes, so this is
 	// immune to coarse mtime resolution): must schedule again.
-	rel, err := filepath.Rel(root, knownFile)
-	if err != nil || strings.HasPrefix(rel, "..") {
-		t.Fatalf("known file %s escapes test root %s", knownFile, root)
+	// I/O goes through a literally-constructed path (static analysis
+	// rejects snapshot-derived ones); assert it names the same file the
+	// events report so the fingerprint check sees the change.
+	safePath := filepath.Join(root, "greet", "greet.go")
+	if safePath != knownFile {
+		t.Fatalf("fixture layout changed: snapshot file %s, expected %s", knownFile, safePath)
 	}
-	safePath := filepath.Join(root, rel)
 	data, err := os.ReadFile(safePath)
 	if err != nil {
 		t.Fatalf("read %s: %v", safePath, err)
