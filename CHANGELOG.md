@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.4.1](https://github.com/sivchari/golance/compare/v0.4.0...v0.4.1) - 2026-09-02
+- fix: survive universe-scope methods in the facts index by @sivchari in https://github.com/sivchari/golance/pull/58
+
 ## [v0.4.0](https://github.com/sivchari/golance/compare/v0.3.1...v0.4.0) - 2026-09-01
 - docs: add PR #51 to the v0.3.1 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/53
 - feat: load complete package metadata including test variants by @sivchari in https://github.com/sivchari/golance/pull/55
