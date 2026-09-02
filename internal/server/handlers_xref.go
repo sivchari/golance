@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"go/parser"
 	"go/token"
 	"math"
@@ -23,10 +24,14 @@ import (
 // showMessage: the index building is routine, not a failure, and some
 // clients render showMessage as a blocking modal — see logMessage's doc);
 // later calls stay silent so a burst of queries during index build does not
-// spam the log. Callers still answer with an ordinary empty result (see
-// handleDefinition et al.) rather than an error, since an empty result is
-// exactly how a client already renders "nothing found" — $/progress (see
-// relayIndexProgress) is what actually tells the user a build is under way.
+// spam the log. handleDefinition is the one caller that still answers an
+// ok=false result via its own fallback chain (definitionFallback, which
+// serves useful results without the index at all) rather than an error;
+// every other cross-reference handler
+// (references/implementation/workspaceSymbol/rename) answers with
+// indexUnavailableError instead of an ordinary empty result — see its own
+// doc for why an empty result is not safe here even though $/progress (see
+// relayIndexProgress) also tells the user a build is under way.
 func (s *Server) resolverOrWarn() (*xref.Resolver, bool) {
 	idx := s.idx.Load()
 	if idx == nil {
@@ -36,6 +41,33 @@ func (s *Server) resolverOrWarn() (*xref.Resolver, bool) {
 		return nil, false
 	}
 	return idx.resolver, true
+}
+
+// indexUnavailableError is the LSP error references/implementation/
+// workspaceSymbol/rename answer with while resolverOrWarn reports ok=false,
+// instead of an ordinary empty result: an automated client (e.g. an AI
+// coding agent) cannot otherwise tell "0 matches because the index has not
+// finished building yet" apart from a genuine "0 matches, this symbol is
+// really unused" — a real field report traced exactly that misread back to
+// an empty references result returned during index build. Blocking the
+// request instead, the way gopls generally waits for its own snapshot to
+// become ready, is not acceptable here since a cold-start build can take
+// minutes; LSPErrorCodesRequestFailed (a request that was syntactically
+// fine but cannot currently be answered) makes the two states
+// machine-distinguishable without making the client wait.
+//
+// The message itself distinguishes a build genuinely in flight from one
+// that already failed (s.indexFailedWarned — set only when a build attempt
+// finished leaving no index open at all, see warnIndexUnavailable's
+// callers): claiming "still building" in the failed case would be
+// inaccurate and mislead a caller into thinking a retry will eventually
+// succeed on its own. feature names the specific request kind (e.g.
+// "references") for the message.
+func (s *Server) indexUnavailableError(feature string) error {
+	if s.indexFailedWarned.Load() {
+		return rpc.NewError(int32(protocol.LSPErrorCodesRequestFailed), fmt.Sprintf("golance: the workspace index failed to build; %s is unavailable until the next successful build", feature))
+	}
+	return rpc.NewError(int32(protocol.LSPErrorCodesRequestFailed), fmt.Sprintf("golance: the workspace index is still building; %s is unavailable until it completes", feature))
 }
 
 // xrefPosition converts an LSP Position for path's current editor buffer
@@ -330,7 +362,7 @@ func (s *Server) handleReferences(ctx context.Context, params json.RawMessage) (
 	}
 	resolver, ok := s.resolverOrWarn()
 	if !ok {
-		return protocol.LocationSlice(nil), nil
+		return nil, s.indexUnavailableError("references")
 	}
 	path := p.TextDocument.URI.FsPath()
 	line, col, ok := s.xrefPosition(path, p.Position)
@@ -358,7 +390,7 @@ func (s *Server) handleImplementation(ctx context.Context, params json.RawMessag
 	}
 	resolver, ok := s.resolverOrWarn()
 	if !ok {
-		return protocol.LocationSlice(nil), nil
+		return nil, s.indexUnavailableError("implementation")
 	}
 	path := p.TextDocument.URI.FsPath()
 	line, col, ok := s.xrefPosition(path, p.Position)
@@ -384,7 +416,7 @@ func (s *Server) handleWorkspaceSymbol(ctx context.Context, params json.RawMessa
 	}
 	resolver, ok := s.resolverOrWarn()
 	if !ok {
-		return protocol.SymbolInformationSlice(nil), nil
+		return nil, s.indexUnavailableError("workspace symbol")
 	}
 	infos, err := resolver.WorkspaceSymbol(ctx, p.Query)
 	if err != nil {
@@ -420,7 +452,7 @@ func (s *Server) handleRename(ctx context.Context, params json.RawMessage) (any,
 	}
 	resolver, ok := s.resolverOrWarn()
 	if !ok {
-		return nil, rpc.NewError(int32(protocol.ErrorCodesInternalError), "golance: the workspace index is still building; rename is unavailable until it completes")
+		return nil, s.indexUnavailableError("rename")
 	}
 	path := p.TextDocument.URI.FsPath()
 	line, col, ok := s.xrefPosition(path, p.Position)

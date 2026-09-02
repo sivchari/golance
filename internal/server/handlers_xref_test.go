@@ -16,8 +16,11 @@ import (
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
+	"github.com/sivchari/golance/internal/index"
 	"github.com/sivchari/golance/internal/overlay"
 	"github.com/sivchari/golance/internal/rpc"
+	"github.com/sivchari/golance/internal/store"
+	"github.com/sivchari/golance/internal/xref"
 )
 
 // TestResolverOrWarn_UsesLogMessageNotShowMessage verifies that the
@@ -69,6 +72,226 @@ func TestResolverOrWarn_UsesLogMessageNotShowMessage(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Errorf("resolverOrWarn() second call sent %q, want nothing (one-time notice already sent)", out.String())
+	}
+}
+
+// checkIndexUnavailableError asserts err is the distinct
+// LSPErrorCodesRequestFailed error indexUnavailableError returns — never an
+// ordinary nil (empty-result) error — so a caller (e.g. an automated
+// client) can tell "the index is not available yet" apart from a genuine
+// "0 matches" answer.
+func checkIndexUnavailableError(t *testing.T, name string, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s: error = nil, want a distinct index-unavailable error", name)
+	}
+	var rpcErr *rpc.Error
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("%s: error type = %T, want *rpc.Error", name, err)
+	}
+	if rpcErr.Code != int32(protocol.LSPErrorCodesRequestFailed) {
+		t.Errorf("%s: error code = %d, want %d (LSPErrorCodesRequestFailed)", name, rpcErr.Code, protocol.LSPErrorCodesRequestFailed)
+	}
+}
+
+// TestIndexUnavailable_ReturnsDistinctErrorNotEmptyResult pins the
+// unavailable-vs-empty contract for references/implementation/
+// workspaceSymbol/rename: while the facts index has not finished building
+// (s.idx nil — the same state a still-running cold-start buildIndex, or a
+// failed tryWarmOpen, leaves it in; see newTestServerNoIndex), each of
+// these must answer with indexUnavailableError's distinct error rather than
+// an ordinary empty result. A field report traced an automated client
+// misreading an empty references result as "this symbol is unused," when
+// the real cause was querying mid-build — see indexUnavailableError's doc.
+// handleDefinition is deliberately excluded: it keeps answering through its
+// own fallback chain (definitionFallback), which serves useful results
+// without the index at all.
+func TestIndexUnavailable_ReturnsDistinctErrorNotEmptyResult(t *testing.T) {
+	s, snap := newTestServerNoIndex(t)
+	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+	pos := identPosition(t, file, 1) // Hello's declaration
+
+	t.Run("references", func(t *testing.T) {
+		result, err := s.handleReferences(context.Background(), mustMarshal(t, &protocol.ReferenceParams{
+			TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+				TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+				Position:     pos,
+			},
+		}))
+		checkIndexUnavailableError(t, "references", err)
+		if result != nil {
+			t.Errorf("references: result = %#v, want nil", result)
+		}
+	})
+
+	t.Run("implementation", func(t *testing.T) {
+		result, err := s.handleImplementation(context.Background(), mustMarshal(t, &protocol.ImplementationParams{
+			TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+				TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+				Position:     pos,
+			},
+		}))
+		checkIndexUnavailableError(t, "implementation", err)
+		if result != nil {
+			t.Errorf("implementation: result = %#v, want nil", result)
+		}
+	})
+
+	t.Run("workspaceSymbol", func(t *testing.T) {
+		result, err := s.handleWorkspaceSymbol(context.Background(), mustMarshal(t, &protocol.WorkspaceSymbolParams{Query: "Hello"}))
+		checkIndexUnavailableError(t, "workspaceSymbol", err)
+		if result != nil {
+			t.Errorf("workspaceSymbol: result = %#v, want nil", result)
+		}
+	})
+
+	t.Run("rename", func(t *testing.T) {
+		result, err := s.handleRename(context.Background(), mustMarshal(t, &protocol.RenameParams{
+			TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+				TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+				Position:     pos,
+			},
+			NewName: "Greeting2",
+		}))
+		checkIndexUnavailableError(t, "rename", err)
+		if result != nil {
+			t.Errorf("rename: result = %#v, want nil", result)
+		}
+	})
+
+	t.Run("definition_keeps_fallback", func(t *testing.T) {
+		result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
+			TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+				TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+				Position:     identPosition(t, file, 2), // useHello's call site, resolvable via SamePackageDefinition
+			},
+		}))
+		if err != nil {
+			t.Fatalf("handleDefinition: error = %v, want nil (definitionFallback answers without the index)", err)
+		}
+		locs, ok := result.(protocol.LocationSlice)
+		if !ok || len(locs) == 0 {
+			t.Fatalf("handleDefinition: result = %#v, want at least one location from definitionFallback", result)
+		}
+	})
+}
+
+// TestReferences_TransitionsFromIndexUnavailableToResults exercises the
+// full unavailable -> ready transition against one Server: the very same
+// query at the very same position must switch from
+// indexUnavailableError's distinct error to a real answer once the facts
+// index is installed via s.idx.Store — the same action
+// openIndexAfterBuild takes on a successful build — pinning that the new
+// error path only ever reflects "no index yet," not a permanent
+// degradation for that position.
+func TestReferences_TransitionsFromIndexUnavailableToResults(t *testing.T) {
+	s, snap := newTestServerNoIndex(t)
+	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+	pos := identPosition(t, file, 1) // Hello's declaration
+
+	params := mustMarshal(t, &protocol.ReferenceParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+		Context: protocol.ReferenceContext{IncludeDeclaration: false},
+	})
+
+	if _, err := s.handleReferences(context.Background(), params); err == nil {
+		t.Fatal("handleReferences before index ready: error = nil, want indexUnavailableError")
+	}
+
+	db, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("db.Close: %v", err)
+		}
+	})
+	cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	if _, err := index.Build(context.Background(), snap, db, cas, index.Options{}); err != nil {
+		t.Fatalf("index.Build: %v", err)
+	}
+	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+
+	result, err := s.handleReferences(context.Background(), params)
+	if err != nil {
+		t.Fatalf("handleReferences after index ready: %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) == 0 {
+		t.Fatalf("handleReferences after index ready: result = %#v, want at least one location", result)
+	}
+}
+
+// TestWorkspaceSymbol_TransitionsFromIndexUnavailableToResults is
+// TestReferences_TransitionsFromIndexUnavailableToResults's counterpart for
+// workspace/symbol.
+func TestWorkspaceSymbol_TransitionsFromIndexUnavailableToResults(t *testing.T) {
+	s, snap := newTestServerNoIndex(t)
+
+	params := mustMarshal(t, &protocol.WorkspaceSymbolParams{Query: "Hello"})
+
+	if _, err := s.handleWorkspaceSymbol(context.Background(), params); err == nil {
+		t.Fatal("handleWorkspaceSymbol before index ready: error = nil, want indexUnavailableError")
+	}
+
+	db, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("db.Close: %v", err)
+		}
+	})
+	cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	if _, err := index.Build(context.Background(), snap, db, cas, index.Options{}); err != nil {
+		t.Fatalf("index.Build: %v", err)
+	}
+	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+
+	result, err := s.handleWorkspaceSymbol(context.Background(), params)
+	if err != nil {
+		t.Fatalf("handleWorkspaceSymbol after index ready: %v", err)
+	}
+	syms, ok := result.(protocol.SymbolInformationSlice)
+	if !ok || len(syms) == 0 {
+		t.Fatalf("handleWorkspaceSymbol after index ready: result = %#v, want at least one symbol", result)
+	}
+}
+
+// TestIndexUnavailableError_DistinguishesFailedFromBuilding pins
+// indexUnavailableError's wording: it must say the index failed to build,
+// not that it is "still building" (which would wrongly suggest a retry is
+// already under way and will eventually succeed on its own), once
+// warnIndexUnavailable has recorded a build attempt that left no index
+// open at all (s.indexFailedWarned) — see its own doc.
+func TestIndexUnavailableError_DistinguishesFailedFromBuilding(t *testing.T) {
+	s, _ := newTestServerNoIndex(t)
+
+	if err := s.indexUnavailableError("references"); strings.Contains(err.Error(), "failed") {
+		t.Errorf("indexUnavailableError() before any failure = %q, want it to describe an in-flight build, not a failure", err.Error())
+	} else if !strings.Contains(err.Error(), "still building") {
+		t.Errorf("indexUnavailableError() before any failure = %q, want it to mention the build is still in progress", err.Error())
+	}
+
+	s.indexFailedWarned.Store(true)
+
+	err := s.indexUnavailableError("references")
+	if !strings.Contains(err.Error(), "failed") {
+		t.Errorf("indexUnavailableError() after indexFailedWarned = %q, want it to describe a failed build, not a routine still-building state", err.Error())
+	}
+	if strings.Contains(err.Error(), "still building") {
+		t.Errorf("indexUnavailableError() after indexFailedWarned = %q, want it not to claim the index is still building", err.Error())
 	}
 }
 

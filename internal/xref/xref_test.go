@@ -336,6 +336,41 @@ func TestWorkspaceSymbol_PrefixMatch(t *testing.T) {
 	}
 }
 
+// TestWorkspaceSymbol_IncludesUnexported pins workspace/symbol's parity
+// with gopls: an unexported symbol must be findable too, not just an
+// exported one — see internal/index/facts.go's addDef, which used to gate
+// the name index behind obj.Exported() even though findReferences already
+// resolved the very same unexported symbol just fine (the facts index
+// itself always knew about it; only the name-lookup bucket excluded it).
+func TestWorkspaceSymbol_IncludesUnexported(t *testing.T) {
+	r, snap := newTestResolver(t)
+
+	results, err := r.WorkspaceSymbol(context.Background(), "unexportedHelper")
+	if err != nil {
+		t.Fatalf("WorkspaceSymbol: %v", err)
+	}
+
+	inpkgtestFile := goFile(t, snap, pkgInpkgtest, "inpkgtest.go")
+	wantLine, wantCol := identOccurrence(t, inpkgtestFile, "unexportedHelper")
+
+	found := false
+	for _, s := range results {
+		if s.Name != "unexportedHelper" {
+			continue
+		}
+		found = true
+		if s.Container != pkgInpkgtest {
+			t.Errorf("unexportedHelper.Container = %q, want %q", s.Container, pkgInpkgtest)
+		}
+		if s.Location.File != inpkgtestFile || int(s.Location.Line) != wantLine || int(s.Location.Col) != wantCol {
+			t.Errorf("unexportedHelper.Location = %+v, want %s:%d:%d", s.Location, inpkgtestFile, wantLine, wantCol)
+		}
+	}
+	if !found {
+		t.Errorf("WorkspaceSymbol(%q) did not return unexportedHelper: %+v", "unexportedHelper", results)
+	}
+}
+
 func TestWorkspaceSymbol_NoMatch(t *testing.T) {
 	r, _ := newTestResolver(t)
 

@@ -120,9 +120,18 @@ func addDef(fset *token.FileSet, pkgHash uint64, tpkg *types.Package, fileIdx ma
 	})
 
 	idx.SymStrs = append(idx.SymStrs, store.SymStrEntry{IDHash: idHash, SymbolID: sid})
-	if obj.Exported() {
-		idx.Names = append(idx.Names, store.NameEntry{Name: obj.Name(), IDHash: idHash})
-	}
+	// Every definition is indexed by name, exported or not: workspace/symbol
+	// (internal/xref's WorkspaceSymbol, via store.LookupNamePrefix) matches
+	// gopls's own behavior of ranking every name by fuzzy score alone, with
+	// no visibility filter — an unexported func/const is exactly as
+	// findable there as an exported one already is via findReferences.
+	// Gating this on obj.Exported() used to silently drop every unexported
+	// symbol from workspace/symbol results even though the facts index
+	// otherwise knows about it (see findReferences, which never applied
+	// this filter). See factsSchemaVersion's doc for why this change alone
+	// forces a one-time rebuild instead of relying on already-indexed
+	// packages to somehow gain the data retroactively.
+	idx.Names = append(idx.Names, store.NameEntry{Name: obj.Name(), IDHash: idHash})
 
 	tn, ok := obj.(*types.TypeName)
 	if !ok {

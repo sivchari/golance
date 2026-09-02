@@ -186,7 +186,12 @@ func checkE2EAdhocSamePackageDefinition(t *testing.T, c *lspClient, locs *e2eAdh
 
 func checkE2EAdhocReferencesDegradeToEmpty(t *testing.T, c *lspClient, locs *e2eAdhocLocs) {
 	t.Helper()
-	resp := c.call(t, protocol.MethodTextDocumentReferences, &protocol.ReferenceParams{
+	// callRetryIndexUnavailable rides out the short, pre-existing race
+	// window right after waitForIndexReady (see its own doc): this subtest
+	// asserts on the facts index's steady-state answer for an ad-hoc
+	// package (always empty, by design), not on whether the index has
+	// finished installing yet.
+	resp := c.callRetryIndexUnavailable(t, protocol.MethodTextDocumentReferences, &protocol.ReferenceParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
 			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.helperFile)},
 			Position:     locs.callPos,
@@ -207,7 +212,9 @@ func checkE2EAdhocReferencesDegradeToEmpty(t *testing.T, c *lspClient, locs *e2e
 
 func checkE2EAdhocFactsIndexExcludesSymbol(t *testing.T, c *lspClient) {
 	t.Helper()
-	resp := c.call(t, protocol.MethodWorkspaceSymbol, &protocol.WorkspaceSymbolParams{Query: "AdhocOnlySymbol"}, e2eRequestBudget)
+	// See checkE2EAdhocReferencesDegradeToEmpty's comment on
+	// callRetryIndexUnavailable.
+	resp := c.callRetryIndexUnavailable(t, protocol.MethodWorkspaceSymbol, &protocol.WorkspaceSymbolParams{Query: "AdhocOnlySymbol"}, e2eRequestBudget)
 	if len(resp.Error) > 0 {
 		t.Fatalf("workspace/symbol failed: %s", resp.Error)
 	}
