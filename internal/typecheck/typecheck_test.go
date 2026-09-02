@@ -131,6 +131,89 @@ func TestReadExport(t *testing.T) {
 	}
 }
 
+// TestReadExport_CachesSuccessWithoutRedecoding confirms a second
+// ReadExport call for the same pkgPath against the same cache does not
+// re-run gcexportdata.Read: Cache.Decodes() must stay at 1 after the
+// second call.
+func TestReadExport_CachesSuccessWithoutRedecoding(t *testing.T) {
+	fset := token.NewFileSet()
+	depFile := parseTestdata(t, fset, "dep/dep.go")
+	writeCache := NewCache()
+	imp := NewImporter(fset, nil, stdlibExportFiles{}, writeCache)
+	depPkg, _, errs := CheckPackage(fset, []*ast.File{depFile}, "example.com/tcmod/dep", imp)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected type errors: %v", errs)
+	}
+	blob, err := WriteExport(depPkg, fset)
+	if err != nil {
+		t.Fatalf("WriteExport: %v", err)
+	}
+
+	readFset := token.NewFileSet()
+	readCache := NewCache()
+	if _, err := ReadExport(blob, readFset, "example.com/tcmod/dep", readCache); err != nil {
+		t.Fatalf("first ReadExport: %v", err)
+	}
+	if got := readCache.Decodes(); got != 1 {
+		t.Fatalf("Decodes() after first ReadExport = %d, want 1", got)
+	}
+	if _, err := ReadExport(blob, readFset, "example.com/tcmod/dep", readCache); err != nil {
+		t.Fatalf("second ReadExport: %v", err)
+	}
+	if got := readCache.Decodes(); got != 1 {
+		t.Errorf("Decodes() after second ReadExport = %d, want still 1 (repeat call must be served from cache.pkgs)", got)
+	}
+}
+
+// TestReadExport_CachesFailure confirms a pkgPath whose export data fails
+// to decode has that failure cached: a second call for the same pkgPath
+// must return the SAME error without attempting gcexportdata.Read again,
+// closing the field symptom of a ~1s decode cost repeating on every query
+// for a package that can never successfully decode.
+func TestReadExport_CachesFailure(t *testing.T) {
+	fset := token.NewFileSet()
+	cache := NewCache()
+	badData := []byte("not export data")
+
+	_, err1 := ReadExport(badData, fset, "example.com/broken", cache)
+	if err1 == nil {
+		t.Fatal("ReadExport with malformed data: got nil error, want a decode error")
+	}
+	if got := cache.FailedLen(); got != 1 {
+		t.Fatalf("FailedLen() after first failed ReadExport = %d, want 1", got)
+	}
+
+	_, err2 := ReadExport(badData, fset, "example.com/broken", cache)
+	if err2 == nil || err2.Error() != err1.Error() {
+		t.Errorf("second ReadExport error = %v, want the identical cached error %v", err2, err1)
+	}
+	if got := cache.FailedLen(); got != 1 {
+		t.Errorf("FailedLen() after second failed ReadExport = %d, want still 1", got)
+	}
+}
+
+// TestCache_DeleteClearsFailure confirms Delete drops a cached decode
+// failure too, not just a cached success, so a package reindexed after an
+// earlier decode failure gets a genuine retry instead of the stale error
+// forever (mirroring Resolver.Invalidate's existing contract for a
+// successful decode).
+func TestCache_DeleteClearsFailure(t *testing.T) {
+	fset := token.NewFileSet()
+	cache := NewCache()
+	if _, err := ReadExport([]byte("not export data"), fset, "example.com/broken", cache); err == nil {
+		t.Fatal("expected a decode error")
+	}
+	if got := cache.FailedLen(); got != 1 {
+		t.Fatalf("FailedLen() before Delete = %d, want 1", got)
+	}
+
+	cache.Delete("example.com/broken")
+
+	if got := cache.FailedLen(); got != 0 {
+		t.Errorf("FailedLen() after Delete = %d, want 0", got)
+	}
+}
+
 // TestCheckPackage_CollectsErrors verifies every type error is collected,
 // not just the first.
 func TestCheckPackage_CollectsErrors(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"math"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/store"
@@ -61,6 +62,30 @@ type Resolver struct {
 	relative bool   // whether db's UnitPointers and cas's blobs store paths relative to root
 
 	logger *log.Logger // server-side diagnostics only; see SetLogger
+
+	// decodeFailureLogged records which pkgPaths a decode failure has
+	// already been logged for (see logDecodeFailureOnce), so r.cache's own
+	// decode-failure cache -- which serves the SAME cached error on every
+	// later resolveNamed/resolveMethodFunc call for a pkgPath that never
+	// successfully decodes (see typecheck.Cache's doc) -- does not turn
+	// into one log line per query.
+	decodeFailureLogged sync.Map // pkgPath (string) -> struct{}
+}
+
+// Option configures optional Resolver behavior beyond New's required
+// arguments, following the same functional-options shape as
+// internal/rpc.Option.
+type Option func(*Resolver)
+
+// WithUnitCacheBytes overrides r.units' default total-byte bound
+// (defaultUnitCacheBytes) with n. Callers with an unusually large or small
+// memory budget for a session (e.g. an E2E test asserting eviction
+// behavior against a small bound) use this instead of the default; every
+// other caller gets defaultUnitCacheBytes by not passing this Option.
+func WithUnitCacheBytes(n int64) Option {
+	return func(r *Resolver) {
+		r.units = newUnitCache(n)
+	}
 }
 
 // New returns a Resolver over db's per-root index, cas's content-addressed
@@ -70,7 +95,7 @@ type Resolver struct {
 // that decision): it tells New whether a stored file path needs joining
 // back onto snap.Dir() to become the absolute path every Location this
 // Resolver returns must carry.
-func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool) *Resolver {
+func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool, opts ...Option) *Resolver {
 	fileToPkg := make(map[string]string)
 	dirToPkg := make(map[string]string, len(snap.Packages))
 	pkgPathByHash := make(map[uint64]string, len(snap.Packages))
@@ -100,19 +125,23 @@ func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool) *Res
 		}
 		dirToPkg[pkg.Dir] = path
 	}
-	return &Resolver{
+	r := &Resolver{
 		db:            db,
 		cas:           cas,
 		snap:          snap,
 		fset:          token.NewFileSet(),
 		cache:         typecheck.NewCache(),
-		units:         newUnitCache(),
+		units:         newUnitCache(defaultUnitCacheBytes),
 		fileToPkg:     fileToPkg,
 		dirToPkg:      dirToPkg,
 		pkgPathByHash: pkgPathByHash,
 		root:          snap.Dir(),
 		relative:      relative,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // unitBlob loads and decodes pkgHash's current [store.UnitBlob] via db's
@@ -237,6 +266,7 @@ func (r *Resolver) resolveNamed(ctx context.Context, pkgPath, name string) (*typ
 	}
 	tpkg, err := typecheck.ReadExport(u.Export, r.fset, pkgPath, r.cache)
 	if err != nil {
+		r.logDecodeFailureOnce(pkgPath, err)
 		return nil, fmt.Errorf("xref: decode export data for %s: %w", pkgPath, err)
 	}
 	obj := tpkg.Scope().Lookup(name)
@@ -264,10 +294,26 @@ func (r *Resolver) resolveNamed(ctx context.Context, pkgPath, name string) (*typ
 // signature referencing a module dependency's type). r logs nowhere until
 // this is called (the zero value), so every existing New call site --
 // production and this package's own test helpers alike -- keeps its
-// current four-argument shape and its current silent behavior unless a
-// caller opts in.
+// current silent behavior unless a caller opts in.
 func (r *Resolver) SetLogger(l *log.Logger) {
 	r.logger = l
+}
+
+// logDecodeFailureOnce logs err via r.logger the first time r observes a
+// decode failure for pkgPath, deduping every later occurrence. This
+// matters because typecheck.ReadExport caches a decode failure and
+// returns the identical error on every later resolveNamed/
+// resolveMethodFunc call for the same pkgPath (see its doc) — without
+// this, that would turn into one log line per query for a package that
+// can never successfully decode, for as long as the session runs.
+func (r *Resolver) logDecodeFailureOnce(pkgPath string, err error) {
+	if r.logger == nil {
+		return
+	}
+	if _, alreadyLogged := r.decodeFailureLogged.LoadOrStore(pkgPath, struct{}{}); alreadyLogged {
+		return
+	}
+	r.logger.Printf("xref: %s", err)
 }
 
 // Invalidate drops pkgPaths' decoded *types.Package entries from r's shared
@@ -303,9 +349,17 @@ func (r *Resolver) SetLogger(l *log.Logger) {
 // CAS content address a reindex necessarily changes (see unitCache's doc),
 // so a stale entry simply stops being looked up on its own rather than
 // needing an explicit drop.
+//
+// r.cache.Delete also drops pkgPath's cached ReadExport FAILURE, if any
+// (see typecheck.Cache's doc) — a package that failed to decode before
+// this reindex deserves a genuine retry, not the stale error forever —
+// and this also resets r.decodeFailureLogged for pkgPath, so a failure
+// that recurs after reindexing logs again instead of staying silent from
+// logDecodeFailureOnce's earlier dedup.
 func (r *Resolver) Invalidate(pkgPaths []string) {
 	for _, p := range pkgPaths {
 		r.cache.Delete(p)
+		r.decodeFailureLogged.Delete(p)
 	}
 }
 

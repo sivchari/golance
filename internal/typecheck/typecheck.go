@@ -51,22 +51,28 @@ type ExportFileSource interface {
 type Cache struct {
 	mu      sync.Mutex
 	pkgs    map[string]*types.Package
-	bytes   int64 // sum of decoded export-data blob sizes, a naive proxy for memory held
-	decodes int64 // number of gcexportdata.Read calls this Cache has performed (cache misses)
+	failed  map[string]error // pkgPath -> ReadExport's error, see ReadExport's doc
+	bytes   int64            // sum of decoded export-data blob sizes, a naive proxy for memory held
+	decodes int64            // number of gcexportdata.Read calls this Cache has performed (cache misses)
 }
 
 // NewCache returns an empty Cache.
 func NewCache() *Cache {
-	return &Cache{pkgs: make(map[string]*types.Package)}
+	return &Cache{pkgs: make(map[string]*types.Package), failed: make(map[string]error)}
 }
 
-// Delete removes pkgPath's cached *types.Package, if any. A later
-// ImportFrom(pkgPath, ...) re-decodes it from export data. Callers use this
-// to evict dependencies once every importer that needed them has finished,
-// bounding cache growth independent of workspace size.
+// Delete removes pkgPath's cached *types.Package and any cached ReadExport
+// failure for it, if either exists. A later ImportFrom/ReadExport call for
+// pkgPath re-decodes it from export data instead of serving a stale
+// success or a stale failure. Callers use this to evict dependencies once
+// every importer that needed them has finished, bounding cache growth
+// independent of workspace size, and to invalidate a reindexed package's
+// entry (see internal/xref.Resolver.Invalidate, ReadExport's only caller
+// that also calls this).
 func (c *Cache) Delete(pkgPath string) {
 	c.mu.Lock()
 	delete(c.pkgs, pkgPath)
+	delete(c.failed, pkgPath)
 	c.mu.Unlock()
 }
 
@@ -95,6 +101,17 @@ func (c *Cache) Decodes() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.decodes
+}
+
+// FailedLen returns the number of pkgPaths currently holding a cached
+// ReadExport failure. Test-observability hook for asserting that a
+// package whose export data fails to decode is recorded (see ReadExport's
+// doc for why this matters: without it, the same expensive failed decode
+// repeats on every call for that pkgPath).
+func (c *Cache) FailedLen() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.failed)
 }
 
 // Importer implements types.ImporterFrom over an ExportSource and an

@@ -77,8 +77,9 @@ func generateBenchModule(tb testing.TB, numPkgs int) string {
 // newBenchResolver loads root's module, builds its facts/export index, and
 // returns a Resolver over it plus the snapshot -- the benchmark counterpart
 // of xref_test.go's newResolverForDir, parameterized over testing.TB so it
-// works from both *testing.T and *testing.B.
-func newBenchResolver(tb testing.TB, root string) (*Resolver, *graph.Snapshot) {
+// works from both *testing.T and *testing.B. opts is forwarded to New,
+// e.g. WithUnitCacheBytes for a test that needs a non-default byte bound.
+func newBenchResolver(tb testing.TB, root string, opts ...Option) (*Resolver, *graph.Snapshot) {
 	tb.Helper()
 	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
 	if err != nil {
@@ -107,7 +108,7 @@ func newBenchResolver(tb testing.TB, root string) (*Resolver, *graph.Snapshot) {
 		tb.Fatalf("index.Build: %d errors", stats.Errors)
 	}
 
-	return New(db, cas, snap, false), snap
+	return New(db, cas, snap, false, opts...), snap
 }
 
 // benchIdentPos returns the (line, col) of name's first identifier
