@@ -1,6 +1,7 @@
 # Changelog
 
 ## [v0.4.6](https://github.com/sivchari/golance/compare/v0.4.5...v0.4.6) - 2026-09-02
+- perf: batch reference scans and read only the facts section by @sivchari in https://github.com/sivchari/golance/pull/75
 - docs: add PR #71 to the v0.4.5 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/73
 
 ## [v0.4.5](https://github.com/sivchari/golance/compare/v0.4.4...v0.4.5) - 2026-09-02
