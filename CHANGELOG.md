@@ -1,6 +1,7 @@
 # Changelog
 
 ## [v0.4.7](https://github.com/sivchari/golance/compare/v0.4.6...v0.4.7) - 2026-09-02
+- fix: include unexported symbols in workspace/symbol and make index readiness explicit by @sivchari in https://github.com/sivchari/golance/pull/79
 - docs: add PR #75 to the v0.4.6 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/77
 
 ## [v0.4.6](https://github.com/sivchari/golance/compare/v0.4.5...v0.4.6) - 2026-09-02
