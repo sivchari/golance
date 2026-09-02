@@ -48,14 +48,43 @@ func Hover(cp *check.CheckedPackage, file string, offset int) (*HoverInfo, error
 		Signature: types.ObjectString(obj, qualifier(cp.Package())),
 		Range:     rangeOf(tf, id.Pos(), id.End()),
 	}
-	if obj.Pkg() == cp.Package() {
+	switch {
+	case obj.Pkg() == cp.Package():
 		info.Doc = docForObject(cp, obj)
-	} else if obj.Pkg() != nil {
+	case obj.Pkg() == nil:
+		hoverBuiltin(obj, info)
+	default:
 		if objPath, err := objectpath.For(obj); err == nil {
 			info.PkgPath, info.ObjPath = obj.Pkg().Path(), string(objPath)
 		}
 	}
 	return info, nil
+}
+
+// hoverBuiltin fills in info.Signature/Doc for obj, a universe
+// (predeclared) object or the error interface's Error method
+// (obj.Pkg() == nil) — mirrors gopls's own hoverBuiltin (gopls@v0.23.0's
+// internal/golang/hover.go): the Error method keeps info's
+// already-computed types.ObjectString signature and gets no doc (gopls's
+// own simplification for that one case — see its TODO — mirrored here
+// rather than improved on, for parity); every other builtin gets its
+// builtin.go declaration (rendered with its doc comment stripped out) as
+// Signature, and that doc comment as Doc. info.Signature is left as its
+// already-computed types.ObjectString fallback if GOROOT/builtin.go cannot
+// be resolved or parsed (a missing or corrupt toolchain install).
+func hoverBuiltin(obj types.Object, info *HoverInfo) {
+	if obj.Name() == "Error" {
+		return
+	}
+	id, file, fset, ok := resolveBuiltinIdent(obj)
+	if !ok {
+		return
+	}
+	signature, doc := builtinDeclText(fset, file, id)
+	if signature != "" {
+		info.Signature = signature
+	}
+	info.Doc = doc
 }
 
 // identAt returns the innermost *ast.Ident in path, or nil if path's

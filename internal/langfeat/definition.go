@@ -116,6 +116,58 @@ func embeddedFieldTarget(info *types.Info, id *ast.Ident, obj types.Object) type
 	return obj
 }
 
+// BuiltinDefInfo is the result of a BuiltinDefinition query: where a
+// universe (predeclared) identifier — or the error interface's Error
+// method — is declared in the toolchain's $GOROOT/src/builtin/builtin.go,
+// the pseudo-package gopls resolves these same identifiers against (see
+// gopls@v0.23.0's internal/golang/definition.go, builtinDecl). Unlike
+// SamePackageDefInfo/DependencyDefinitionInfo's positions, builtin.go is
+// parsed into its own dedicated *token.FileSet (see resolveBuiltinIdent),
+// never cp's own or a depcheck.Provider's, so this carries a plain 1-based
+// line/column span instead — the same shape DependencyDefinitionInfo uses,
+// letting the server layer's existing correctResultRange conversion
+// (dirty-buffer-aware, stat-guarded) handle it identically.
+type BuiltinDefInfo struct {
+	Filename string
+	Line     int
+	Col      int
+	EndCol   int
+}
+
+// BuiltinDefinition resolves the identifier at offset (a byte offset from
+// the start of file) to its declaration in builtin.go, for a universe
+// (predeclared) object — nil, error, len, int, iota, true, any, ... — or
+// the error interface's Error method, all identified by
+// types.Object.Pkg() == nil. It returns (nil, nil) if offset is not on an
+// identifier, the identifier resolves to no object or a non-builtin one
+// (Pkg() != nil — see SamePackageDefinition/DependencyDefinition for those
+// cases instead), or GOROOT/builtin.go could not be resolved or parsed (a
+// missing or corrupt toolchain install — degraded to "no result" like
+// every other resolution miss in this file, not an error, since there is
+// nothing else to try).
+func BuiltinDefinition(cp *check.CheckedPackage, file string, offset int) (*BuiltinDefInfo, error) {
+	astFile, pos, _, err := locate(cp, file, offset)
+	if err != nil {
+		return nil, err
+	}
+	path, _ := astutil.PathEnclosingInterval(astFile, pos, pos)
+	id := identAt(path)
+	if id == nil {
+		return nil, nil
+	}
+	obj := embeddedFieldTarget(cp.Info(), id, cp.Info().ObjectOf(id))
+	if obj == nil || obj.Pkg() != nil {
+		return nil, nil
+	}
+	declID, _, fset, ok := resolveBuiltinIdent(obj)
+	if !ok {
+		return nil, nil
+	}
+	start := fset.Position(declID.Pos())
+	end := fset.Position(declID.End())
+	return &BuiltinDefInfo{Filename: start.Filename, Line: start.Line, Col: start.Column, EndCol: end.Column}, nil
+}
+
 // DependencyDefinitionInfo is the result of a DependencyDefinition query:
 // where the identifier at the cursor is declared, for an object outside the
 // checked package. Unlike the export-data-era result this replaces, Col and

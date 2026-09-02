@@ -136,6 +136,9 @@ func (s *Server) definitionFallback(ctx context.Context, u uri.URI, pos protocol
 	if loc, ok := s.importDefinition(cf); ok {
 		return s.toLSPLocations([]xref.Location{loc})
 	}
+	if loc, ok := s.builtinDefinition(cf); ok {
+		return s.toLSPLocations([]xref.Location{loc})
+	}
 	info, err := langfeat.SamePackageDefinition(cf.cp, cf.path, cf.offset)
 	if err != nil {
 		s.logger.Printf("server: same-package definition %s: %v", cf.path, err)
@@ -162,6 +165,34 @@ func (s *Server) samePackageDefinitionLocation(info *langfeat.SamePackageDefInfo
 		return nil
 	}
 	return protocol.LocationSlice{{URI: uri.File(info.File), Range: rng}}
+}
+
+// builtinDefinition is definitionFallback's path for a universe
+// (predeclared) identifier or the error interface's Error method — Pkg()
+// == nil, unambiguous from the identifier's own resolved types.Object, so
+// this runs before SamePackageDefinition/dependencyDefinition's own
+// (redundant, since both decline Pkg() == nil already) resolution attempt
+// — resolved into the toolchain's $GOROOT/src/builtin/builtin.go, gopls's
+// own resolution target for these same identifiers (see
+// langfeat.BuiltinDefinition's doc).
+func (s *Server) builtinDefinition(cf checkedFileResult) (xref.Location, bool) {
+	info, err := langfeat.BuiltinDefinition(cf.cp, cf.path, cf.offset)
+	if err != nil {
+		s.logger.Printf("server: builtin definition %s: %v", cf.path, err)
+		return xref.Location{}, false
+	}
+	if info == nil {
+		return xref.Location{}, false
+	}
+	if _, err := os.Stat(info.Filename); err != nil {
+		return xref.Location{}, false
+	}
+	if info.Line <= 0 || int64(info.Line) > math.MaxUint32 ||
+		info.Col <= 0 || int64(info.Col) > math.MaxUint32 ||
+		info.EndCol <= 0 || int64(info.EndCol) > math.MaxUint32 {
+		return xref.Location{}, false
+	}
+	return xref.Location{File: info.Filename, Line: uint32(info.Line), Col: uint32(info.Col), EndCol: uint32(info.EndCol)}, true
 }
 
 // dependencyDefinition is definitionFallback's path for a symbol the
