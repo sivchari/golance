@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.4.2](https://github.com/sivchari/golance/compare/v0.4.1...v0.4.2) - 2026-09-02
+- feat: navigate builtins to their builtin.go declarations by @sivchari in https://github.com/sivchari/golance/pull/60
+
 ## [v0.4.1](https://github.com/sivchari/golance/compare/v0.4.0...v0.4.1) - 2026-09-02
 - fix: survive universe-scope methods in the facts index by @sivchari in https://github.com/sivchari/golance/pull/58
 
