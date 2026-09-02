@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"go/token"
 	"go/types"
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"go.lsp.dev/protocol"
 
@@ -88,6 +90,113 @@ func (d *depCacheHolder) invalidate(pkgPaths []string) {
 	}
 }
 
+// depMetadataSource is a depcheck.MetadataSource whose backing
+// *graph.Snapshot can be swapped in place (see retarget). This is what lets
+// a single, long-lived depcheck.Provider (see ensureDepProvider) keep
+// answering dependency-package metadata lookups correctly across a
+// setWorkspace snapshot swap, without needing a fresh Provider — and so
+// without losing its type-check cache — every time: the Provider is built
+// once against this wrapper, and only the wrapper's target snapshot moves.
+// Safe for concurrent use: retarget and Package can race (a query in flight
+// when a new snapshot lands), backed by an atomic.Pointer rather than a
+// mutex since Package is on Provider's hot path.
+type depMetadataSource struct {
+	snap atomic.Pointer[graph.Snapshot]
+}
+
+// retarget points d at snap, so every subsequent Package call resolves
+// against it instead of whatever snapshot was current before.
+func (d *depMetadataSource) retarget(snap *graph.Snapshot) { d.snap.Store(snap) }
+
+// Package implements depcheck.MetadataSource against d's current snapshot.
+func (d *depMetadataSource) Package(pkgPath string) (dir string, goFiles, imports []string, ok bool) {
+	snap := d.snap.Load()
+	if snap == nil {
+		return "", nil, nil, false
+	}
+	pkg, ok := snap.Package(pkgPath)
+	if !ok {
+		return "", nil, nil, false
+	}
+	return pkg.Dir, pkg.GoFiles, pkg.Imports, true
+}
+
+// depsKey returns a stable digest of snap's non-workspace package set — the
+// standard library and module-cache dependencies depcheck.Provider resolves
+// (see workspace.depProvider's doc; a Root package, by contrast, is always
+// routed to ws.engine instead — see nonWorkspacePackageForFile). Two
+// snapshots produce the same key exactly when reusing a Provider built for
+// one to serve the other cannot answer with stale content: a dependency
+// version bump changes its resolved module-cache directory (Go's module
+// cache paths are version-suffixed and immutable per version), and a GOROOT
+// upgrade — the only way stdlib content itself could change — implies a
+// process restart in practice, so this needs no separate go.mod/go.sum
+// content hash, no filesystem I/O beyond what graph.Load already did, and
+// no separate accounting for go.work's multi-module fan-out: whatever
+// changed about the dependency set, it shows up here.
+func depsKey(snap *graph.Snapshot) string {
+	paths := make([]string, 0, len(snap.Packages))
+	for path, pkg := range snap.Packages {
+		if pkg.Root {
+			continue
+		}
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	h := sha256.New()
+	for _, path := range paths {
+		pkg := snap.Packages[path]
+		_, _ = h.Write([]byte(path))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(pkg.Dir))
+		_, _ = h.Write([]byte{0})
+		files := append([]string(nil), pkg.GoFiles...)
+		sort.Strings(files)
+		for _, f := range files {
+			_, _ = h.Write([]byte(f))
+			_, _ = h.Write([]byte{0})
+		}
+		_, _ = h.Write([]byte{'\n'})
+	}
+	return string(h.Sum(nil))
+}
+
+// ensureDepProvider returns the depcheck.Provider setWorkspace should
+// install into the workspace it is building over snap: the server's current
+// one, retargeted at snap, if snap's dependency set (depsKey) matches the
+// one the current Provider was built for — otherwise a fresh Provider (and
+// a fresh depMetadataSource) replacing it.
+//
+// This is the fix for a real production stall (see the caller's own doc):
+// setWorkspace runs on every graph revalidation, not only at initialize —
+// any go.mod/go.sum/go.work change, and any workspace/didChangeWatchedFiles
+// batch that adds or removes a file in an already-known package directory
+// (see needsGraphReload) — which, before this, discarded depProvider's
+// entire type-check cache every time. Since depProvider exists specifically
+// to answer navigation into the standard library and module dependencies —
+// content that does not change just because the user edited a workspace
+// file — that discard bought nothing but forced the next dependency-facing
+// query to re-type-check its whole import closure cold, sometimes tens of
+// seconds' worth of work for a large monorepo's shared dependencies.
+// Reusing the Provider whenever the dependency set itself is unchanged
+// removes that cost entirely for the common case (an ordinary edit inside
+// the workspace), while still rebuilding it — correctly, from scratch —
+// whenever the dependency set genuinely could have changed.
+func (s *Server) ensureDepProvider(snap *graph.Snapshot) *depcheck.Provider {
+	key := depsKey(snap)
+
+	s.depProviderMu.Lock()
+	defer s.depProviderMu.Unlock()
+	if s.depProviderVal == nil || key != s.depProviderKey {
+		s.depProviderSrc = &depMetadataSource{}
+		s.depProviderVal = depcheck.NewProvider(s.depProviderSrc, depcheck.Options{})
+		s.depProviderKey = key
+	}
+	s.depProviderSrc.retarget(snap)
+	return s.depProviderVal
+}
+
 // setWorkspace builds a fresh workspace bundle over snap and installs it,
 // replacing whatever workspace (if any) was loaded before. If a facts
 // index is already open, its Resolver is rebuilt over the new snapshot too
@@ -98,7 +207,7 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	depCache := newDepCacheHolder(snap)
 	imp := depCache.importer
 	engine := check.New(src, s.overlay, imp, check.Options{OnResult: s.publishDiagnostics})
-	depProvider := depcheck.NewProvider(depcheck.NewGraphMetadataSource(snap), depcheck.Options{})
+	depProvider := s.ensureDepProvider(snap)
 
 	fileToPkg := make(map[string]string)
 	dirToPkg := make(map[string]string, len(snap.Packages))

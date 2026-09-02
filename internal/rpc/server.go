@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"runtime"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -89,7 +90,7 @@ func WithLogger(l *log.Logger) Option {
 }
 
 // WithBackgroundWorkers bounds how many Background-priority requests run
-// concurrently. n <= 0 means unbounded. The default is 4.
+// concurrently. n <= 0 means unbounded. The default is defaultBackgroundWorkers().
 func WithBackgroundWorkers(n int) Option {
 	return func(s *Server) { s.pools[Background] = newPool(n) }
 }
@@ -98,6 +99,27 @@ func WithBackgroundWorkers(n int) Option {
 // concurrently. n <= 0 means unbounded, which is the default.
 func WithInteractiveWorkers(n int) Option {
 	return func(s *Server) { s.pools[Interactive] = newPool(n) }
+}
+
+// defaultBackgroundWorkers is WithBackgroundWorkers' default pool size.
+// Background carries every workspace-wide/navigation query (definition,
+// implementation, references, workspace/symbol, rename — see priority.go's
+// doc), so a flat, small cap risks queuing one of them behind another that
+// happens to be slow (a cold dependency closure check, a large references
+// search) even though none of them contends for anything that makes them
+// need to run one at a time — unlike Interactive, which is already
+// unbounded by default. Tied to runtime.NumCPU (with a floor, so a
+// single-core CI sandbox still gets a little headroom) rather than a flat
+// constant, mirroring how a batch type-checker like gopls itself sizes its
+// own worker pools: enough concurrency that a handful of queries in flight
+// at once — several editor windows sharing one session, or a user jumping
+// through a few dependency symbols in quick succession — never serialize
+// behind each other purely because of this bound.
+func defaultBackgroundWorkers() int {
+	if n := runtime.NumCPU(); n > 4 {
+		return n
+	}
+	return 4
 }
 
 // NewServer constructs a Server. Register handlers with Handle and
@@ -109,7 +131,7 @@ func NewServer(opts ...Option) *Server {
 		notificationHandlers: make(map[string]NotificationHandler),
 		pools: map[Priority]*pool{
 			Interactive: newPool(0),
-			Background:  newPool(4),
+			Background:  newPool(defaultBackgroundWorkers()),
 		},
 		queues:  make(map[string]*notifQueue),
 		pending: make(map[string]chan *message),

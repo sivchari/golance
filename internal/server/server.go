@@ -6,6 +6,8 @@
 package server
 
 import (
+	"context"
+	"encoding/json"
 	"log"
 	"path/filepath"
 	"sync"
@@ -63,13 +65,14 @@ type workspace struct {
 	// source on demand (internal/depcheck), for navigation consumers that
 	// need an exact declaration position or unexported visibility into a
 	// dependency — currently only langfeat.DependencyDefinition (see
-	// dependencyDefinition in handlers_xref.go). Unlike depCache, which
-	// internal/check.Engine's own compilation of WORKSPACE packages still
-	// depends on (export data stays the right tool there — see
-	// internal/depcheck's package doc), nothing else in this workspace
-	// depends on depProvider's cache surviving a reload, so — like depCache
-	// — a fresh one is simply built per setWorkspace call rather than
-	// carried forward.
+	// dependencyDefinition in handlers_xref.go). Unlike depCache, this
+	// Provider is a server-lifetime value setWorkspace installs by pointer
+	// (see (*Server).ensureDepProvider): it is only rebuilt from scratch
+	// when the workspace's dependency set has actually changed, and simply
+	// retargeted at the new snapshot otherwise, so its type-check cache
+	// survives an ordinary workspace edit's setWorkspace call instead of
+	// being discarded and rebuilt cold every time (see ensureDepProvider's
+	// own doc for the production stall this fixes).
 	depProvider *depcheck.Provider
 	fileToPkg   map[string]string
 	// dirToPkg maps a package's directory to its import path, the fallback
@@ -110,6 +113,17 @@ type Server struct {
 	ws    atomic.Pointer[workspace]
 	idx   atomic.Pointer[indexState]
 	hints atomic.Pointer[map[langfeat.HintKind]bool] // enabled inlay hint kinds; nil until "initialize" or workspace/didChangeConfiguration sets it, meaning every kind enabled (see hintsEnabled)
+
+	// depProviderMu guards depProviderKey/depProviderSrc/depProviderVal — the
+	// server-lifetime depcheck.Provider setWorkspace installs into each new
+	// workspace's own depProvider field (see ensureDepProvider). Kept here,
+	// not per-workspace, precisely so it can OUTLIVE a workspace: its whole
+	// reason to exist is surviving a setWorkspace swap that leaves the
+	// dependency set (see depsKey) unchanged.
+	depProviderMu  sync.Mutex
+	depProviderKey string
+	depProviderSrc *depMetadataSource
+	depProviderVal *depcheck.Provider
 
 	// idxMu serializes every revalidateIndex/buildIndex invocation: without
 	// it, the once-per-session post-initialize background check
@@ -215,7 +229,7 @@ func (s *Server) wire() {
 	s.rpc.HandleNotification(protocol.MethodWorkspaceDidChangeWatchedFiles, s.handleDidChangeWatchedFiles)
 	s.rpc.HandleNotification(protocol.MethodWorkspaceDidChangeConfiguration, s.handleDidChangeConfiguration)
 
-	s.rpc.Handle(protocol.MethodTextDocumentHover, rpc.Interactive, s.handleHover)
+	s.rpc.Handle(protocol.MethodTextDocumentHover, rpc.Interactive, s.instrument(protocol.MethodTextDocumentHover, s.handleHover))
 	s.rpc.Handle(protocol.MethodTextDocumentSignatureHelp, rpc.Interactive, s.handleSignatureHelp)
 	s.rpc.Handle(protocol.MethodTextDocumentDocumentSymbol, rpc.Interactive, s.handleDocumentSymbol)
 	s.rpc.Handle(protocol.MethodTextDocumentInlayHint, rpc.Interactive, s.handleInlayHint)
@@ -223,12 +237,40 @@ func (s *Server) wire() {
 	s.registerCodeActionHandlers()
 	s.registerSemanticHandlers()
 
-	s.rpc.Handle(protocol.MethodTextDocumentDefinition, rpc.Background, s.handleDefinition)
+	s.rpc.Handle(protocol.MethodTextDocumentDefinition, rpc.Background, s.instrument(protocol.MethodTextDocumentDefinition, s.handleDefinition))
 	s.rpc.Handle(protocol.MethodTextDocumentReferences, rpc.Background, s.handleReferences)
-	s.rpc.Handle(protocol.MethodTextDocumentImplementation, rpc.Background, s.handleImplementation)
+	s.rpc.Handle(protocol.MethodTextDocumentImplementation, rpc.Background, s.instrument(protocol.MethodTextDocumentImplementation, s.handleImplementation))
 	s.rpc.Handle(protocol.MethodWorkspaceSymbol, rpc.Background, s.handleWorkspaceSymbol)
 	s.rpc.Handle(protocol.MethodTextDocumentRename, rpc.Background, s.handleRename)
 	s.registerNavHandlers()
+}
+
+// instrument wraps h so that, after it returns, a total duration at or past
+// slowRequestThreshold is logged at INFO: method, duration, and — for a
+// handler whose own call chain threads the request's phaseTimer through
+// (see withPhaseTimer/phaseTimerFrom; currently handleDefinition,
+// handleImplementation, and every resolveCheckedPackage caller, i.e. hover
+// and the definition/type-definition fallback paths) — the single phase
+// that took longest, e.g. "engine.Get" versus "depcheck.check" versus
+// "facts". This exists so a field report of an intermittently slow
+// navigation query ("worked fast at first, then stalled") can be diagnosed
+// straight from a user's server log, without asking them to reproduce it
+// under a profiler. A request that finishes under the threshold costs one
+// time.Since call and nothing else — no allocation, no log line.
+func (s *Server) instrument(method string, h rpc.RequestHandler) rpc.RequestHandler {
+	return func(ctx context.Context, params json.RawMessage) (any, error) {
+		ctx, pt := withPhaseTimer(ctx)
+		start := time.Now()
+		result, err := h(ctx, params)
+		if d := time.Since(start); d >= slowRequestThreshold {
+			if phase, phaseDur := pt.dominant(); phase != "" {
+				s.logger.Printf("golance: slow request: method=%s duration=%s dominant_phase=%s dominant_phase_duration=%s", method, d, phase, phaseDur)
+			} else {
+				s.logger.Printf("golance: slow request: method=%s duration=%s", method, d)
+			}
+		}
+		return result, err
+	}
 }
 
 // Stop releases session resources that outlive rpcServer.Serve itself:
