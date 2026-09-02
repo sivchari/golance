@@ -1,6 +1,7 @@
 package golance_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -58,6 +59,19 @@ func TestE2E(t *testing.T) {
 	// report), a client had no way to learn such a file is clean.
 	t.Run("diagnostics_on_open_clean_file", func(t *testing.T) {
 		checkE2EDiagnosticsOnOpenCleanFile(t, c, &locs)
+	})
+
+	// workspace_symbol_before_index_ready queries the index in the window
+	// right after "initialize" — which already launched the indexer
+	// subprocess in the background (see internal/server.handleInitialize)
+	// — and before waitForIndexReady below: the exact "query mid-build"
+	// state a real field report traced an AI-agent client's "this symbol
+	// is unused" misread back to (see internal/server/handlers_xref.go's
+	// indexUnavailableError doc). Deliberately run before openFile/
+	// waitForIndexReady, so it races the indexer subprocess rather than
+	// waiting for it.
+	t.Run("workspace_symbol_before_index_ready", func(t *testing.T) {
+		checkE2EWorkspaceSymbolBeforeIndexReady(t, c)
 	})
 
 	// Cross-reference queries need the facts index; opening a file starts
@@ -484,6 +498,48 @@ func checkE2ETestingTHover(t *testing.T, c *lspClient, locs *e2eLocs) {
 	}
 	if !strings.Contains(md.Value, "testing.T") {
 		t.Errorf("hover on testing.T = %q, want it to mention testing.T", md.Value)
+	}
+}
+
+// checkE2EWorkspaceSymbolBeforeIndexReady queries workspace/symbol for a
+// known symbol (Sum, declared in lib/util) in the window between
+// "initialize" and the indexer subprocess completing its build, pinning
+// the unavailable-vs-empty contract (internal/server's
+// indexUnavailableError) end to end: whichever way the race against the
+// real indexer subprocess resolves, the response must never be an
+// ordinary "0 results" success — either the build is still in flight and
+// the server answers with a distinguishable LSPErrorCodesRequestFailed
+// error, or the build already finished, in which case it must answer with
+// Sum for real. A silent empty success read as "this symbol does not
+// exist" is exactly the field-reported misread this guards against.
+func checkE2EWorkspaceSymbolBeforeIndexReady(t *testing.T, c *lspClient) {
+	t.Helper()
+	resp := c.call(t, protocol.MethodWorkspaceSymbol, &protocol.WorkspaceSymbolParams{Query: "Sum"}, e2eRequestBudget)
+
+	if len(resp.Error) > 0 {
+		var rpcErr struct {
+			Code    int32  `json:"code"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(resp.Error, &rpcErr); err != nil {
+			t.Fatalf("unmarshal workspace/symbol error: %v (%s)", err, resp.Error)
+		}
+		if rpcErr.Code != int32(protocol.LSPErrorCodesRequestFailed) {
+			t.Errorf("workspace/symbol before index ready: error code = %d, want %d (LSPErrorCodesRequestFailed): %q", rpcErr.Code, protocol.LSPErrorCodesRequestFailed, rpcErr.Message)
+		}
+		return
+	}
+
+	// The race resolved the other way: the build finished before this
+	// request landed. The response must then be a genuine answer, never an
+	// empty result masquerading as "no matches" — that ambiguity is exactly
+	// what the RequestFailed error above exists to rule out.
+	var syms protocol.SymbolInformationSlice
+	if err := protocol.Unmarshal(resp.Result, &syms); err != nil {
+		t.Fatalf("unmarshal workspace/symbol result: %v (%s)", err, resp.Result)
+	}
+	if len(syms) == 0 {
+		t.Fatal("workspace/symbol before index ready succeeded with 0 results: want either a RequestFailed error or a real match, never an ambiguous empty success")
 	}
 }
 

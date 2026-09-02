@@ -117,6 +117,42 @@ func TestOpenIndexAfterBuild_Success(t *testing.T) {
 	}
 }
 
+// TestOpenIndexAfterBuild_SuccessResetsWarnFlags verifies that a successful
+// build resets indexBuildingWarned/indexFailedWarned: indexUnavailableError
+// and resolverOrWarn's own logMessage key their wording off these flags
+// (see indexUnavailableError's doc), so leaving them permanently true from
+// an earlier build attempt would keep describing that stale attempt (e.g.
+// still claiming "failed to build") the next time s.idx goes nil again,
+// long after a later rebuild actually succeeded.
+func TestOpenIndexAfterBuild_SuccessResetsWarnFlags(t *testing.T) {
+	s := newWorkspaceOnlyServer(t)
+	snap := s.workspace().snap
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	buildTestIndexDB(t, snap, dbPath, openTestCAS(t))
+
+	s.indexBuildingWarned.Store(true)
+	s.indexFailedWarned.Store(true)
+
+	s.openIndexAfterBuild(context.Background(), dbPath, nil, "")
+
+	idx := s.idx.Load()
+	if idx == nil {
+		t.Fatal("idx is nil after a successful build")
+	}
+	t.Cleanup(func() {
+		if err := idx.db.Close(); err != nil {
+			t.Errorf("db.Close: %v", err)
+		}
+	})
+
+	if s.indexBuildingWarned.Load() {
+		t.Error("indexBuildingWarned still true after a successful build, want reset to false")
+	}
+	if s.indexFailedWarned.Load() {
+		t.Error("indexFailedWarned still true after a successful build, want reset to false")
+	}
+}
+
 // TestTryWarmOpen_MatchingFingerprintOpensDirectly verifies that a
 // database already built with the running toolchain is opened directly,
 // without the caller needing to launch the indexer subprocess.

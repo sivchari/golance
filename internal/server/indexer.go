@@ -545,6 +545,16 @@ func (s *Server) openIndexAfterBuild(ctx context.Context, dbPath string, waitErr
 		return false
 	}
 	s.idx.Store(&indexState{db: db, cas: cas, resolver: s.newResolver(db, cas, ws.snap, RelativeIndexPaths(ws.root))})
+	// Reset both one-time notice flags now that the index is genuinely
+	// queryable again: indexUnavailableError and resolverOrWarn's own
+	// logMessage key their wording off indexFailedWarned/indexBuildingWarned,
+	// which — left permanently true from an earlier failed or in-flight
+	// build — would otherwise keep describing a now-stale state (e.g. still
+	// claiming "failed to build" long after a later revalidateIndex rebuild
+	// succeeded) the next time s.idx goes nil again.
+	s.indexBuildingWarned.Store(false)
+	s.indexFailedWarned.Store(false)
+	s.logger.Printf("golance: workspace index is now ready")
 	s.drainDirty(ctx, ws)
 	return false
 }

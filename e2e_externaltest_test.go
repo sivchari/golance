@@ -185,7 +185,12 @@ func checkE2EExternalTestSamePackageDefinition(t *testing.T, c *lspClient, locs 
 
 func checkE2EExternalTestReferencesDegradeToEmpty(t *testing.T, c *lspClient, locs *e2eExternalTestLocs) {
 	t.Helper()
-	resp := c.call(t, protocol.MethodTextDocumentReferences, &protocol.ReferenceParams{
+	// See e2e_adhoc_test.go's checkE2EAdhocReferencesDegradeToEmpty comment
+	// on callRetryIndexUnavailable: this subtest asserts on the facts
+	// index's steady-state answer for an external test package (always
+	// empty, by design), not on whether the index has finished installing
+	// yet.
+	resp := c.callRetryIndexUnavailable(t, protocol.MethodTextDocumentReferences, &protocol.ReferenceParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
 			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.extFile)},
 			Position:     locs.helperPos,

@@ -606,18 +606,68 @@ func parseIndexStats(t *testing.T, msg string) indexStats {
 	return s
 }
 
-// waitForNonEmptyLocations polls method (a definition/references-shaped
-// request) until it returns at least one location, or timeout elapses. The
-// indexer subprocess's $/progress "end" notification (see
-// waitForIndexReady) fires once it exits, but the server still has to open
-// the resulting facts database and rebuild its Resolver before cross-
-// reference queries answer (internal/server.buildIndex): a single request
-// right after waitForIndexReady can legitimately race that short window.
-func (c *lspClient) waitForNonEmptyLocations(t *testing.T, method string, params any, timeout time.Duration) protocol.LocationSlice {
+// indexUnavailableRPCCode is the JSON-RPC error code
+// internal/server.indexUnavailableError answers a cross-reference request
+// with while the facts index is not yet queryable there (see its own
+// doc) — including the brief, pre-existing window between the indexer
+// subprocess's own "STATS" summary line (which is what fires
+// waitForIndexReady's "end" notification, below) and the server actually
+// installing the resulting Resolver (internal/server's
+// runIndexBuild/openIndexAfterBuild): a request right after
+// waitForIndexReady can legitimately still race that short window and see
+// this exact error once. isIndexUnavailableError and
+// callRetryIndexUnavailable retry on precisely this code — never on any
+// other error, which still fails a test immediately, exactly as a bare
+// c.call would.
+const indexUnavailableRPCCode = int32(protocol.LSPErrorCodesRequestFailed)
+
+// isIndexUnavailableError reports whether resp carries the specific error
+// indexUnavailableRPCCode identifies.
+func isIndexUnavailableError(resp *message) bool {
+	if len(resp.Error) == 0 {
+		return false
+	}
+	var rpcErr struct {
+		Code int32 `json:"code"`
+	}
+	if err := json.Unmarshal(resp.Error, &rpcErr); err != nil {
+		return false
+	}
+	return rpcErr.Code == indexUnavailableRPCCode
+}
+
+// callRetryIndexUnavailable is c.call, retried while (and only while) the
+// response is indexUnavailableRPCCode's transient error, until it gets a
+// different response or timeout elapses — see that constant's doc for the
+// short race window this exists to ride out.
+func (c *lspClient) callRetryIndexUnavailable(t *testing.T, method string, params any, timeout time.Duration) *message {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
 		resp := c.call(t, method, params, e2eRequestBudget)
+		if !isIndexUnavailableError(resp) {
+			return resp
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s kept answering index-unavailable for %s after the index became ready: %s", method, timeout, resp.Error)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// waitForNonEmptyLocations polls method (a definition/references-shaped
+// request) until it returns at least one location, or timeout elapses,
+// riding out both the transient index-unavailable error
+// (callRetryIndexUnavailable) and an ordinary empty result: the server
+// still has to open the resulting facts database and rebuild its Resolver
+// after the indexer subprocess exits (internal/server.buildIndex), so a
+// request right after waitForIndexReady can legitimately race that short
+// window either way.
+func (c *lspClient) waitForNonEmptyLocations(t *testing.T, method string, params any, timeout time.Duration) protocol.LocationSlice {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		resp := c.callRetryIndexUnavailable(t, method, params, timeout)
 		if len(resp.Error) > 0 {
 			t.Fatalf("%s failed: %s", method, resp.Error)
 		}

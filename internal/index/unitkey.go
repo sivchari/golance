@@ -35,7 +35,18 @@ type depExportEntry struct {
 // instead of the workspace graph cache. Bump this alongside
 // store.unitVersion/store.schemaVersion whenever the facts extraction pass
 // or the UnitBlob/index-entry encoding it produces changes.
-const factsSchemaVersion uint16 = 2
+//
+// Bumped to 3 for addDef's own-content change (not a wire-encoding change:
+// [store.NameEntry]'s byte layout is untouched, and store.schemaVersion is
+// deliberately NOT bumped alongside this — see its own doc's "same byte
+// layout" note): addDef now records every definition's name/IDHash pair,
+// not just exported ones (see its doc), so an already-built package's CAS
+// blob still carries the old, exported-only Names section. Without this
+// bump, an unchanged package's computeUnitKey would resolve to the exact
+// key it already has a CAS hit for, and workspace/symbol would keep
+// silently missing that package's unexported symbols forever — this forces
+// exactly one real rebuild per package instead.
+const factsSchemaVersion uint16 = 3
 
 // computeUnitKey returns the CAS blob key for a package whose own source
 // content hashes to ownContentHash and whose direct workspace dependencies'
