@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.4.8](https://github.com/sivchari/golance/compare/v0.4.7...v0.4.8) - 2026-09-02
+- docs: add PR #79 to the v0.4.7 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/81
+- fix: drop repeated no-op watched-file notifications cheaply by @sivchari in https://github.com/sivchari/golance/pull/82
+
 ## [v0.4.7](https://github.com/sivchari/golance/compare/v0.4.6...v0.4.7) - 2026-09-02
 - fix: include unexported symbols in workspace/symbol and make index readiness explicit by @sivchari in https://github.com/sivchari/golance/pull/79
 - docs: add PR #75 to the v0.4.6 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/77
