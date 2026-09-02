@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -30,6 +31,17 @@ type phaseTimer struct {
 	phase        string
 	longestPhase string
 	longestDur   time.Duration
+
+	// unitsVisited/bytesRead/recordsScanned accumulate
+	// internal/xref.References' own closure-walk counts (see AddUnit,
+	// which implements xref.StatsSink): zero for every handler except
+	// handleReferences, which is the only one that installs a phaseTimer
+	// as a stats sink (see WithStatsSink). countsSuffix reports these on
+	// the slow-request log line only when unitsVisited is nonzero, so
+	// every other handler's line is unaffected.
+	unitsVisited   int
+	bytesRead      int64
+	recordsScanned int
 }
 
 // enter marks the start of phase name, first crediting whatever phase was
@@ -71,6 +83,41 @@ func (p *phaseTimer) dominant() (name string, dur time.Duration) {
 	p.creditOpenPhase(time.Now())
 	p.phase = ""
 	return p.longestPhase, p.longestDur
+}
+
+// EnterPhase implements xref.StatsSink for a References query, so
+// internal/xref's own resolve/closureWalk/sortDedup sub-stages can compete
+// for "dominant phase" on p's usual timeline (see enter) exactly like
+// engine.Get/depcheck.check/facts.* already do -- xref cannot call enter
+// directly (phaseTimer is unexported to the server package, and xref
+// cannot import server without a cycle), so it calls this instead, threaded
+// through ctx via xref.WithStatsSink (see handleReferences).
+func (p *phaseTimer) EnterPhase(name string) {
+	p.enter(name)
+}
+
+// AddUnit implements xref.StatsSink, accumulating one References
+// closure-walk unit's Facts size and scanned-record count (see
+// unitsVisited's doc).
+func (p *phaseTimer) AddUnit(bytesRead int64, recordsScanned int) {
+	if p == nil {
+		return
+	}
+	p.unitsVisited++
+	p.bytesRead += bytesRead
+	p.recordsScanned += recordsScanned
+}
+
+// countsSuffix formats p's References closure-walk counts (see AddUnit) as
+// a slow-request log line suffix, or "" if AddUnit was never called for
+// this request (every handler except References today) -- appended to
+// (*Server).instrument's own log line so a slow References query reports
+// how many units it actually visited without a second log line.
+func (p *phaseTimer) countsSuffix() string {
+	if p == nil || p.unitsVisited == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" units_visited=%d bytes_read=%d records_scanned=%d", p.unitsVisited, p.bytesRead, p.recordsScanned)
 }
 
 // phaseTimerKey is the context key withPhaseTimer/phaseTimerFrom use.

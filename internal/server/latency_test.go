@@ -58,6 +58,58 @@ func TestPhaseTimerFrom_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestPhaseTimer_AddUnitAndCountsSuffix verifies AddUnit accumulates across
+// several calls and countsSuffix formats them, versus reporting "" when
+// AddUnit was never called — the distinction that keeps every non-References
+// handler's slow-request line unaffected (see phaseTimer.countsSuffix).
+func TestPhaseTimer_AddUnitAndCountsSuffix(t *testing.T) {
+	pt := &phaseTimer{}
+	if got := pt.countsSuffix(); got != "" {
+		t.Errorf("countsSuffix() before any AddUnit = %q, want \"\"", got)
+	}
+
+	pt.AddUnit(100, 5)
+	pt.AddUnit(50, 3)
+
+	want := " units_visited=2 bytes_read=150 records_scanned=8"
+	if got := pt.countsSuffix(); got != want {
+		t.Errorf("countsSuffix() = %q, want %q", got, want)
+	}
+}
+
+// TestPhaseTimer_AddUnitNilSafe verifies AddUnit and countsSuffix tolerate
+// a nil receiver, the same property TestPhaseTimer_NilSafe pins for enter/
+// dominant — a call site (e.g. xref's addUnit helper) never needs its own
+// nil check.
+func TestPhaseTimer_AddUnitNilSafe(t *testing.T) {
+	var pt *phaseTimer
+	pt.AddUnit(10, 1)
+	if got := pt.countsSuffix(); got != "" {
+		t.Errorf("countsSuffix() on a nil *phaseTimer = %q, want \"\"", got)
+	}
+}
+
+// TestPhaseTimer_EnterPhaseImplementsStatsSink verifies EnterPhase (xref.
+// StatsSink's method) behaves exactly like phaseTimer's own enter, so xref's
+// resolve/closureWalk/sortDedup stages compete for "dominant phase" on the
+// SAME timeline every other instrumented handler's phases do.
+func TestPhaseTimer_EnterPhaseImplementsStatsSink(t *testing.T) {
+	pt := &phaseTimer{}
+	pt.EnterPhase("resolve")
+	time.Sleep(2 * time.Millisecond)
+	pt.EnterPhase("closureWalk")
+	time.Sleep(10 * time.Millisecond)
+	pt.EnterPhase("sortDedup")
+
+	name, dur := pt.dominant()
+	if name != "closureWalk" {
+		t.Errorf("dominant() phase = %q, want %q", name, "closureWalk")
+	}
+	if dur < 8*time.Millisecond {
+		t.Errorf("dominant() duration = %s, want at least ~10ms", dur)
+	}
+}
+
 // TestServerInstrument_LogsSlowRequestWithDominantPhase verifies instrument
 // logs a slow (>= slowRequestThreshold) request's method, duration, and
 // dominant phase, when the wrapped handler entered one via its ctx.
@@ -85,6 +137,34 @@ func TestServerInstrument_LogsSlowRequestWithDominantPhase(t *testing.T) {
 	}
 	if !strings.Contains(logged, "dominant_phase=depcheck.check") {
 		t.Errorf("log line %q does not mention the dominant phase", logged)
+	}
+}
+
+// TestServerInstrument_LogsReferencesCounts verifies instrument's slow-
+// request log line includes the units_visited/bytes_read/records_scanned
+// suffix (see phaseTimer.countsSuffix) when the wrapped handler reports
+// AddUnit calls through its ctx's phaseTimer — the shape handleReferences
+// installs itself as an xref.StatsSink for (see handlers_xref.go).
+func TestServerInstrument_LogsReferencesCounts(t *testing.T) {
+	var buf bytes.Buffer
+	s := New(rpc.NewServer(), Options{Logger: log.New(&buf, "", 0)})
+
+	h := s.instrument("textDocument/references", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		pt := phaseTimerFrom(ctx)
+		pt.enter("closureWalk")
+		pt.AddUnit(1024, 40)
+		pt.AddUnit(512, 20)
+		time.Sleep(slowRequestThreshold + 10*time.Millisecond)
+		return "result", nil
+	})
+
+	if _, err := h(context.Background(), nil); err != nil {
+		t.Fatalf("instrument-wrapped handler returned error: %v", err)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "units_visited=2 bytes_read=1536 records_scanned=60") {
+		t.Errorf("log line %q does not contain the expected counts suffix", logged)
 	}
 }
 

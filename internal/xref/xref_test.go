@@ -415,15 +415,14 @@ func TestQueries_HonorCanceledContext(t *testing.T) {
 	}
 }
 
-// TestLocationsFor_HonorsCanceledContext exercises the per-package loop
-// boundary check inside locationsFor directly (rather than only the
+// TestLocationsForAll_HonorsCanceledContext exercises the per-unit loop
+// boundary check inside locationsForAll directly (rather than only the
 // entry-point check in resolveAt, which TestQueries_HonorCanceledContext
 // already covers indirectly): resolveAt runs first, uncanceled, to obtain a
-// real target; ctx is then canceled before locationsFor's own closure-unit
-// loop ever runs. includeDecl is false so the very first thing locationsFor
-// does is enter that loop, whose ctx.Err() check (checked once per package,
-// see locationsFor's doc) must fire on its first iteration.
-func TestLocationsFor_HonorsCanceledContext(t *testing.T) {
+// real target; ctx is then canceled before locationsForAll's own
+// closure-unit loop ever runs. Its ctx.Err() check (checked once per unit,
+// see locationsForAll's doc) must fire on its first iteration.
+func TestLocationsForAll_HonorsCanceledContext(t *testing.T) {
 	r, snap := newTestResolver(t)
 	implFile := goFile(t, snap, pkgImpl, "impl.go")
 	line, col := identOccurrence(t, implFile, "Person")
@@ -440,8 +439,8 @@ func TestLocationsFor_HonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if _, err := r.locationsFor(ctx, target, false); !errors.Is(err, context.Canceled) {
-		t.Errorf("locationsFor with a canceled context: err = %v, want context.Canceled", err)
+	if _, err := r.locationsForAll(ctx, []resolvedSymbol{target}); !errors.Is(err, context.Canceled) {
+		t.Errorf("locationsForAll with a canceled context: err = %v, want context.Canceled", err)
 	}
 }
 

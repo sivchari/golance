@@ -273,6 +273,37 @@ func TestHandleReferences(t *testing.T) {
 	}
 }
 
+// TestHandleReferences_ReportsStatsToPhaseTimer verifies handleReferences
+// installs ctx's phaseTimer as an xref.StatsSink (see its own doc), so a
+// real query through the full server -> xref.Resolver path leaves the
+// phaseTimer with nonzero closure-walk counts by the time the request
+// completes -- the plumbing (*Server).instrument's slow-request line relies
+// on for a References query's units_visited/bytes_read/records_scanned
+// suffix.
+func TestHandleReferences_ReportsStatsToPhaseTimer(t *testing.T) {
+	s, snap, _ := newTestServer(t)
+	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+	pos := identPosition(t, file, 1) // declaration
+
+	ctx, pt := withPhaseTimer(context.Background())
+	if _, err := s.handleReferences(ctx, mustMarshal(t, &protocol.ReferenceParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+		Context: protocol.ReferenceContext{IncludeDeclaration: false},
+	})); err != nil {
+		t.Fatalf("handleReferences: %v", err)
+	}
+
+	if pt.unitsVisited == 0 {
+		t.Error("phaseTimer.unitsVisited = 0, want > 0 (handleReferences must install itself as a StatsSink)")
+	}
+	if pt.bytesRead == 0 {
+		t.Error("phaseTimer.bytesRead = 0, want > 0")
+	}
+}
+
 func TestHandleDocumentSymbol(t *testing.T) {
 	s, snap, _ := newTestServer(t)
 	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]

@@ -51,9 +51,10 @@ func (r *Resolver) Definition(ctx context.Context, file string, line, col int) (
 }
 
 // References returns every reference to the symbol at (file, line, col),
-// searching only the defining package plus its reverse-dependency closure
-// (see package doc). includeDecl controls whether the declaration itself is
-// included.
+// searching only the union of the defining package's (and, for a method,
+// every corresponding method's own defining package's) reverse-dependency
+// closures (see package doc and locationsForAll). includeDecl controls
+// whether the declaration itself is included.
 //
 // When the symbol is a method, the result also includes references to its
 // corresponding method on "the other side" of an interface-satisfaction
@@ -84,31 +85,38 @@ func (r *Resolver) References(ctx context.Context, file string, line, col int, i
 	if err != nil {
 		return nil, err
 	}
+	enterPhase(ctx, "resolve")
 	target, err := r.resolveAt(ctx, file, l, c)
 	if err != nil {
 		return nil, err
 	}
-	out, err := r.locationsFor(ctx, target, includeDecl)
-	if err != nil {
-		return nil, err
-	}
-	if target.Kind != index.KindMethod {
-		return out, nil
-	}
-	corresponding, err := r.correspondingMethodSymbols(ctx, target)
-	if err != nil {
-		return nil, err
-	}
-	for _, sym := range corresponding {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		locs, err := r.locationsFor(ctx, sym, false)
+
+	wanted := []resolvedSymbol{target}
+	if target.Kind == index.KindMethod {
+		corresponding, err := r.correspondingMethodSymbols(ctx, target)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, locs...)
+		wanted = append(wanted, corresponding...)
 	}
+
+	var out []Location
+	if includeDecl {
+		_, _, loc, ok := r.symbolByHash(ctx, target.PkgHash, target.IDHash)
+		if !ok {
+			return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
+		}
+		out = append(out, loc)
+	}
+
+	enterPhase(ctx, "closureWalk")
+	refs, err := r.locationsForAll(ctx, wanted)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, refs...)
+
+	enterPhase(ctx, "sortDedup")
 	out = dedupeLocations(out)
 	sortLocations(out)
 	return out, nil
@@ -132,55 +140,117 @@ func dedupeLocations(locs []Location) []Location {
 	return out
 }
 
-// locationsFor collects every location referencing target across its
-// defining package's reverse-dependency closure. ctx is checked once per
-// package in the closure (rather than per reference within a package): a
-// canceled query stops before starting the next package's facts read
-// instead of running to completion regardless.
-func (r *Resolver) locationsFor(ctx context.Context, target resolvedSymbol, includeDecl bool) ([]Location, error) {
-	defPkgPath, ok := r.pkgPathByHash[target.PkgHash]
-	if !ok {
-		return nil, fmt.Errorf("xref: unknown defining package for hash %d", target.PkgHash)
+// wantedSymbolKey identifies one symbol as a locationsForAll scan target,
+// independent of its Kind/Name (a unit's own recorded Ref carries only a
+// (ToPkgHash, ToSymbolIDHash) pair to match against — see store.Ref).
+type wantedSymbolKey struct {
+	PkgHash uint64
+	IDHash  uint64
+}
+
+// locationsForAll collects every location referencing any symbol in wanted,
+// across the UNION of their defining packages' reverse-dependency closures,
+// visiting each unit in that union exactly once regardless of how many of
+// wanted's symbols its own closure would individually include: a reference
+// to a symbol can only ever be recorded in a unit whose package
+// transitively imports that symbol's defining package (see
+// [internal/graph.Snapshot.ClosureUnits]), so checking every wanted symbol
+// against a unit outside its own individual closure costs a few no-op map
+// lookups, never a false match.
+//
+// This replaces what used to be one full closure walk per wanted symbol
+// (locationsFor, called once for References' own target plus once more per
+// corresponding method — see References' doc): a method with K
+// corresponding symbols used to re-walk and re-read up to K+1 overlapping
+// closures, each its own os.ReadFile plus O(refsCount) store.View.RefsTo
+// scan; this does it in one pass, checking every wanted symbol against
+// each visited unit's ref records in a single O(refsCount) scan instead of
+// K+1 separate O(refsCount) RefsTo calls.
+//
+// ctx is checked once per unit in the union (rather than per reference
+// within a unit): a canceled query stops before starting the next unit's
+// facts read instead of running to completion regardless.
+func (r *Resolver) locationsForAll(ctx context.Context, wanted []resolvedSymbol) ([]Location, error) {
+	wantedSet, units, err := r.wantedClosure(wanted)
+	if err != nil {
+		return nil, err
 	}
 
 	var out []Location
-	if includeDecl {
-		_, _, loc, ok := r.symbolByHash(ctx, target.PkgHash, target.IDHash)
-		if !ok {
-			return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
-		}
-		out = append(out, loc)
-	}
-
-	for _, p := range r.snap.ClosureUnits(defPkgPath) {
+	for p := range units {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		pkgHash := store.Hash(p)
-		u, err := r.unitBlob(ctx, pkgHash)
+		locs, err := r.scanUnitForWanted(ctx, p, wantedSet)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				continue
 			}
 			return nil, err
 		}
-		v, err := store.NewView(u.Facts)
-		if err != nil {
-			return nil, err
-		}
-		for _, ref := range v.RefsTo(target.IDHash) {
-			if ref.ToPkgHash() != target.PkgHash {
-				continue // idHash collision with an unrelated symbol
-			}
-			path, err := v.FileAt(int(ref.FileIdx()))
-			if err != nil {
-				continue
-			}
-			out = append(out, Location{File: absPath(r.root, path, r.relative), Line: ref.Line(), Col: ref.Col(), EndCol: ref.EndCol()})
-		}
+		out = append(out, locs...)
 	}
 
 	sortLocations(out)
+	return out, nil
+}
+
+// wantedClosure builds locationsForAll's two inputs from wanted: the set of
+// (PkgHash, IDHash) keys a visited unit's own ref records are checked
+// against, and the union of every wanted symbol's defining package's
+// reverse-dependency closure (the set of units that union is checked
+// against).
+func (r *Resolver) wantedClosure(wanted []resolvedSymbol) (map[wantedSymbolKey]struct{}, map[string]struct{}, error) {
+	wantedSet := make(map[wantedSymbolKey]struct{}, len(wanted))
+	units := make(map[string]struct{})
+	for _, w := range wanted {
+		wantedSet[wantedSymbolKey{PkgHash: w.PkgHash, IDHash: w.IDHash}] = struct{}{}
+		defPkgPath, ok := r.pkgPathByHash[w.PkgHash]
+		if !ok {
+			return nil, nil, fmt.Errorf("xref: unknown defining package for hash %d", w.PkgHash)
+		}
+		for _, p := range r.snap.ClosureUnits(defPkgPath) {
+			units[p] = struct{}{}
+		}
+	}
+	return wantedSet, units, nil
+}
+
+// scanUnitForWanted reads pkgPath's Facts and returns every location whose
+// ref record matches a key in wantedSet, scanning the whole ref table in
+// one pass (see locationsForAll's doc for why this replaces one
+// store.View.RefsTo call per wanted symbol). Reports pkgPath's own read
+// size and ref-record count to ctx's installed StatsSink (see addUnit),
+// unconditionally -- including when out ends up empty, since the read and
+// scan cost was paid either way.
+func (r *Resolver) scanUnitForWanted(ctx context.Context, pkgPath string, wantedSet map[wantedSymbolKey]struct{}) ([]Location, error) {
+	facts, err := r.unitFacts(ctx, store.Hash(pkgPath))
+	if err != nil {
+		return nil, err
+	}
+	v, err := store.NewView(facts)
+	if err != nil {
+		return nil, err
+	}
+
+	n := v.RefsCount()
+	var out []Location
+	for i := 0; i < n; i++ {
+		ref, err := v.RefAt(i)
+		if err != nil {
+			continue
+		}
+		key := wantedSymbolKey{PkgHash: ref.ToPkgHash(), IDHash: ref.ToSymbolIDHash()}
+		if _, ok := wantedSet[key]; !ok {
+			continue
+		}
+		path, err := v.FileAt(int(ref.FileIdx()))
+		if err != nil {
+			continue
+		}
+		out = append(out, Location{File: absPath(r.root, path, r.relative), Line: ref.Line(), Col: ref.Col(), EndCol: ref.EndCol()})
+	}
+	addUnit(ctx, int64(len(facts)), n)
 	return out, nil
 }
 
@@ -259,10 +329,17 @@ func (r *Resolver) Rename(ctx context.Context, file string, line, col int, newNa
 	if err != nil {
 		return nil, err
 	}
-	locs, err := r.locationsFor(ctx, target, true)
+
+	_, _, declLoc, ok := r.symbolByHash(ctx, target.PkgHash, target.IDHash)
+	if !ok {
+		return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
+	}
+	refs, err := r.locationsForAll(ctx, []resolvedSymbol{target})
 	if err != nil {
 		return nil, err
 	}
+	locs := append([]Location{declLoc}, refs...)
+	sortLocations(locs)
 
 	edits := make(map[string][]Edit)
 	for _, loc := range locs {
