@@ -236,6 +236,7 @@ func (r *Resolver) resolveMethodFunc(ctx context.Context, pkgPath string, idHash
 	}
 	tpkg, err := typecheck.ReadExport(u.Export, r.fset, pkgPath, r.cache)
 	if err != nil {
+		r.logDecodeFailureOnce(pkgPath, err)
 		return nil, fmt.Errorf("xref: decode export data for %s: %w", pkgPath, err)
 	}
 	obj, err := objectpath.Object(tpkg, objectpath.Path(objPath))
