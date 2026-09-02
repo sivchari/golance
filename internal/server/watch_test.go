@@ -359,13 +359,11 @@ func TestHandleDidChangeWatchedFiles_RepeatedNoOpEventIsSuppressed(t *testing.T)
 	if safePath != knownFile {
 		t.Fatalf("fixture layout changed: snapshot file %s, expected %s", knownFile, safePath)
 	}
-	data, err := os.ReadFile(safePath)
+	data, err := os.ReadFile(filepath.Clean(safePath))
 	if err != nil {
 		t.Fatalf("read %s: %v", safePath, err)
 	}
-	if err := os.WriteFile(safePath, append(data, '\n'), 0o600); err != nil {
-		t.Fatalf("write %s: %v", safePath, err)
-	}
+	writeTempFile(t, filepath.Join(root, "greet"), "greet.go", string(data)+"\n")
 	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
 		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
 	})); err != nil {
