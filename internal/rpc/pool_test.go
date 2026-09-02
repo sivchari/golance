@@ -28,7 +28,7 @@ func TestBackgroundPool_SlowRequestDoesNotSerializeFastOne(t *testing.T) {
 	release := make(chan struct{})
 	slowStarted := make(chan struct{})
 	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
-	s.Handle("slow", Background, func(ctx context.Context, _ json.RawMessage) (any, error) {
+	s.Handle("slow", Background, func(_ context.Context, _ json.RawMessage) (any, error) {
 		close(slowStarted)
 		<-release
 		return "slow-done", nil
@@ -91,7 +91,7 @@ func TestBackgroundPool_BoundedSizeSerializesExcessRequests(t *testing.T) {
 	release := make(chan struct{})
 	slowStarted := make(chan struct{})
 	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
-	s.Handle("slow", Background, func(ctx context.Context, _ json.RawMessage) (any, error) {
+	s.Handle("slow", Background, func(_ context.Context, _ json.RawMessage) (any, error) {
 		close(slowStarted)
 		<-release
 		return "slow-done", nil
