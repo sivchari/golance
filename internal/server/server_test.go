@@ -180,6 +180,50 @@ func TestHandleHover(t *testing.T) {
 	}
 }
 
+// TestHandleHover_Builtin covers hover on a universe (predeclared)
+// identifier: unlike a same-package or cross-package object, its
+// types.Object has no Pkg() at all, so this pins Hover's new builtin
+// branch (langfeat.hoverBuiltin) resolving into the toolchain's own
+// builtin.go declaration and doc comment through the full handleHover
+// request path.
+func TestHandleHover_Builtin(t *testing.T) {
+	s, snap, _ := newTestServer(t)
+	pkg, ok := snap.Packages["example.com/servermod/builtinuse"]
+	if !ok || len(pkg.GoFiles) == 0 {
+		t.Fatal("builtinuse package not found in test workspace")
+	}
+	file := pkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	pos := identPositionIn(t, file, data, "len", 1) // len(v) call site
+
+	result, err := s.handleHover(context.Background(), mustMarshal(t, &protocol.HoverParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleHover(len): %v", err)
+	}
+	hover, ok := result.(*protocol.Hover)
+	if !ok || hover == nil {
+		t.Fatalf("handleHover(len): result = %#v, want *protocol.Hover", result)
+	}
+	md, ok := hover.Contents.(*protocol.MarkupContent)
+	if !ok {
+		t.Fatalf("hover.Contents = %#v, want *protocol.MarkupContent", hover.Contents)
+	}
+	if want := "func len(v Type) int"; !contains(md.Value, want) {
+		t.Fatalf("hover content = %q, want it to contain %q", md.Value, want)
+	}
+	if want := "The len built-in function returns the length of v"; !contains(md.Value, want) {
+		t.Fatalf("hover content = %q, want it to contain %q (builtin.go's doc comment)", md.Value, want)
+	}
+}
+
 func TestHandleDefinition(t *testing.T) {
 	s, snap, _ := newTestServer(t)
 	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]

@@ -536,3 +536,44 @@ func TestHandleDefinition_WorkspaceSymbolPreferred(t *testing.T) {
 		t.Errorf("definition start = %+v, want %+v (Greeting's declaration, exact column from the facts index)", locs[0].Range.Start, want)
 	}
 }
+
+// TestHandleDefinition_Builtin covers "go to definition" on a universe
+// (predeclared) identifier — the workspace facts index never has an entry
+// for one (nothing declares it anywhere in the workspace), so this pins
+// handleDefinition's fallthrough into definitionFallback's new
+// builtinDefinition step landing inside the toolchain's own
+// $GOROOT/src/builtin/builtin.go, even with a fully built index available.
+func TestHandleDefinition_Builtin(t *testing.T) {
+	s, snap, _ := newTestServer(t)
+	pkg, ok := snap.Packages["example.com/servermod/builtinuse"]
+	if !ok || len(pkg.GoFiles) == 0 {
+		t.Fatal("builtinuse package not found in test workspace")
+	}
+	file := pkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	pos := identPositionIn(t, file, data, "len", 1) // len(v) call site
+
+	result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleDefinition(len): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleDefinition(len): result = %#v, want a single location", result)
+	}
+	target := locs[0].URI.FsPath()
+	if !strings.HasSuffix(filepath.ToSlash(target), "builtin/builtin.go") {
+		t.Errorf("definition file = %q, want it to end with builtin/builtin.go (inside GOROOT)", target)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("definition file %s does not exist on disk: %v", target, err)
+	}
+}
