@@ -108,7 +108,8 @@ func (c *CAS) GetFacts(ctx context.Context, key uint64) (facts []byte, ok bool, 
 	if err != nil {
 		return nil, false, fmt.Errorf("store: open CAS blob %x: %w", key, err)
 	}
-	defer f.Close()
+	// Read-only handle: a Close error cannot lose data.
+	defer func() { _ = f.Close() }()
 
 	header := make([]byte, unitHeaderSize)
 	if _, err := io.ReadFull(f, header); err != nil {
