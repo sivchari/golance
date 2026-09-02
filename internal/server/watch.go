@@ -1,8 +1,11 @@
 package server
 
 import (
+	"os"
 	"sync"
 	"time"
+
+	"go.lsp.dev/protocol"
 )
 
 // defaultWatchDebounce is the Options.WatchDebounce default: how long
@@ -130,4 +133,71 @@ func (w *watchDebouncer) Stop() {
 	}
 	w.mu.Unlock()
 	w.runWG.Wait()
+}
+
+// fileFingerprint is a cheap (size, mtime) snapshot of a file's on-disk
+// state, used by watchFingerprints to recognize a workspace/didChangeWatchedFiles
+// event that reports no genuine change.
+type fileFingerprint struct {
+	size    int64
+	modTime int64
+}
+
+// watchFingerprints remembers, per path, the fileFingerprint last observed
+// by a non-suppressed handleDidChangeWatchedFiles event, so a later
+// notification reporting the exact same (size, mtime) for that path — the
+// shape of an editor re-sending a periodic no-op watched-files batch, e.g. a
+// filesystem watcher that polls and reports mtime-identical files as
+// "changed" — can be recognized and skipped before it ever reaches
+// s.watch/revalidateWorkspace's workspace-wide revalidation fan-out.
+//
+// It deliberately remembers nothing about a path before the first event
+// handleDidChangeWatchedFiles has actually seen for it: the workspace's
+// initial graph.Snapshot is never consulted to pre-populate this, so the
+// very first notification for any path is always treated as a real change
+// (matching the behavior handleDidChangeWatchedFiles already had before
+// this existed) — only a *repeat* notification reporting an identical
+// on-disk (size, mtime) is ever suppressed.
+type watchFingerprints struct {
+	mu   sync.Mutex
+	seen map[string]fileFingerprint
+}
+
+// newWatchFingerprints returns an empty watchFingerprints.
+func newWatchFingerprints() *watchFingerprints {
+	return &watchFingerprints{seen: make(map[string]fileFingerprint)}
+}
+
+// changed reports whether the event described by (path, typ) represents a
+// genuine change worth acting on — false only when a prior call already
+// recorded the exact same (size, mtime) for path and typ is not a deletion.
+// As a side effect it updates what is remembered for path: a deletion
+// forgets it entirely (so a file later re-created at the same path is
+// compared against nothing, i.e. treated as a real change again, rather
+// than against stale pre-deletion stat data), and any other event records
+// path's current on-disk (size, mtime). If the stat itself fails (a
+// created-then-immediately-deleted file racing this call, for instance)
+// this conservatively reports a real change without touching what is
+// remembered, leaving a later event to settle it once the file's state
+// stabilizes.
+func (f *watchFingerprints) changed(path string, typ protocol.FileChangeType) bool {
+	if typ == protocol.FileChangeTypeDeleted {
+		f.mu.Lock()
+		delete(f.seen, path)
+		f.mu.Unlock()
+		return true
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return true
+	}
+	fp := fileFingerprint{size: fi.Size(), modTime: fi.ModTime().UnixNano()}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if old, ok := f.seen[path]; ok && old == fp {
+		return false
+	}
+	f.seen[path] = fp
+	return true
 }

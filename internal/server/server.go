@@ -150,8 +150,9 @@ type Server struct {
 	indexBuildingWarned atomic.Bool // one-time window/logMessage while the index is still building
 	indexFailedWarned   atomic.Bool // one-time window/showMessage after an indexer failure
 
-	watch           *watchDebouncer // coalesces workspace/didChangeWatchedFiles .go events into revalidateWorkspace passes
-	watchDynamicReg atomic.Bool     // client declared workspace.didChangeWatchedFiles.dynamicRegistration support at initialize (see handleInitialized)
+	watch           *watchDebouncer    // coalesces workspace/didChangeWatchedFiles .go events into revalidateWorkspace passes
+	watchFP         *watchFingerprints // recognizes and suppresses a no-op watched-files event before it reaches s.watch (see watchFingerprints)
+	watchDynamicReg atomic.Bool        // client declared workspace.didChangeWatchedFiles.dynamicRegistration support at initialize (see handleInitialized)
 
 	inlayHintRefreshSupport      atomic.Bool // client declared workspace.inlayHint.refreshSupport at initialize (see refreshInlayHints)
 	semanticTokensRefreshSupport atomic.Bool // client declared workspace.semanticTokens.refreshSupport at initialize (see refreshSemanticTokens)
@@ -209,6 +210,7 @@ func New(rpcServer *rpc.Server, opts Options) *Server {
 		sessionID: newSessionID(),
 	}
 	s.watch = newWatchDebouncer(opts.WatchDebounce, s.revalidateWorkspace)
+	s.watchFP = newWatchFingerprints()
 	s.wire()
 	return s
 }

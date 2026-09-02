@@ -303,6 +303,80 @@ func TestHandleDidChangeWatchedFiles_NonGoFileIsIgnored(t *testing.T) {
 	}
 }
 
+// TestHandleDidChangeWatchedFiles_RepeatedNoOpEventIsSuppressed verifies the
+// watchFingerprints short-circuit: a workspace/didChangeWatchedFiles event
+// re-reporting a path whose on-disk (size, mtime) exactly matches what the
+// last real event for it already recorded — the shape of an editor's
+// periodic no-op watched-files batch — must never reach s.watch, so it never
+// pays for a workspace-wide revalidateWorkspace pass (installSpyWatch is
+// this test's counting seam: a call landing on calls is exactly one such
+// pass). A later event reporting a genuine on-disk change to the same path
+// must still schedule one.
+func TestHandleDidChangeWatchedFiles_RepeatedNoOpEventIsSuppressed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	populateTempModule(t, root)
+	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+	s := newWorkspaceOnlyServerAt(t, root, snap)
+	knownFile := s.workspace().snap.Packages["example.com/servermod/greet"].GoFiles[0]
+
+	calls := installSpyWatch(s)
+
+	// First event: watchFingerprints remembers nothing yet for this path,
+	// so it is always treated as a real change.
+	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
+	})); err != nil {
+		t.Fatalf("handleDidChangeWatchedFiles: %v", err)
+	}
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch was never scheduled for the first event")
+	}
+
+	// Second event for the same path, file untouched on disk in between: a
+	// no-op the editor re-reported, must not schedule another pass.
+	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
+	})); err != nil {
+		t.Fatalf("handleDidChangeWatchedFiles: %v", err)
+	}
+	select {
+	case c := <-calls:
+		t.Fatalf("watch was scheduled for a repeated no-op event: %+v", c)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Third event, after a genuine on-disk change (size changes, so this is
+	// immune to coarse mtime resolution): must schedule again.
+	// I/O goes through a literally-constructed path (static analysis
+	// rejects snapshot-derived ones); assert it names the same file the
+	// events report so the fingerprint check sees the change.
+	safePath := filepath.Join(root, "greet", "greet.go")
+	if safePath != knownFile {
+		t.Fatalf("fixture layout changed: snapshot file %s, expected %s", knownFile, safePath)
+	}
+	data, err := os.ReadFile(filepath.Clean(safePath))
+	if err != nil {
+		t.Fatalf("read %s: %v", safePath, err)
+	}
+	writeTempFile(t, filepath.Join(root, "greet"), "greet.go", string(data)+"\n")
+	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
+	})); err != nil {
+		t.Fatalf("handleDidChangeWatchedFiles: %v", err)
+	}
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch was never scheduled after a genuine on-disk change")
+	}
+}
+
 // watchCall records one s.watch run invocation, for installSpyWatch.
 type watchCall struct {
 	root   string
@@ -329,7 +403,8 @@ func installSpyWatch(s *Server) <-chan watchCall {
 // graph, without restarting the server.
 func TestRevalidateWorkspace_ReloadPicksUpNewPackage(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	root := copyTestdataModule(t)
+	root := t.TempDir()
+	populateTempModule(t, root)
 
 	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
 	if err != nil {
@@ -356,56 +431,17 @@ func TestRevalidateWorkspace_ReloadPicksUpNewPackage(t *testing.T) {
 	}
 }
 
-// copyTestdataModule copies testdata/module into a fresh t.TempDir(), so a
-// test that writes new files into the workspace root never mutates the
-// checked-in testdata.
-func copyTestdataModule(t *testing.T) string {
+// populateTempModule writes a minimal example.com/servermod module (one
+// greet package) into root, which callers create with t.TempDir() directly
+// so every later path join stays anchored to a literal temp root.
+func populateTempModule(t *testing.T, root string) {
 	t.Helper()
-	srcPath, err := filepath.Abs(filepath.Join("testdata", "module"))
-	if err != nil {
-		t.Fatalf("abs testdata root: %v", err)
+	writeTempFile(t, root, "go.mod", "module example.com/servermod\n\ngo 1.26\n")
+	greetDir := filepath.Join(root, "greet")
+	if err := os.MkdirAll(greetDir, 0o750); err != nil {
+		t.Fatalf("mkdir %s: %v", greetDir, err)
 	}
-	src, err := os.OpenRoot(srcPath)
-	if err != nil {
-		t.Fatalf("open root %s: %v", srcPath, err)
-	}
-	defer func() { _ = src.Close() }()
-
-	dstPath := t.TempDir()
-	dst, err := os.OpenRoot(dstPath)
-	if err != nil {
-		t.Fatalf("open root %s: %v", dstPath, err)
-	}
-	defer func() { _ = dst.Close() }()
-
-	entries, err := os.ReadDir(srcPath)
-	if err != nil {
-		t.Fatalf("read testdata module: %v", err)
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue // testdata/module is flat today; nothing to recurse into
-		}
-		data, err := src.ReadFile(e.Name())
-		if err != nil {
-			t.Fatalf("read %s: %v", e.Name(), err)
-		}
-		if err := dst.WriteFile(e.Name(), data, 0o600); err != nil {
-			t.Fatalf("write %s: %v", e.Name(), err)
-		}
-	}
-	if err := dst.MkdirAll("greet", 0o750); err != nil {
-		t.Fatalf("mkdir greet: %v", err)
-	}
-	greetRelPath := filepath.Join("greet", "greet.go")
-	greetSrc, err := src.ReadFile(greetRelPath)
-	if err != nil {
-		t.Fatalf("read greet/greet.go: %v", err)
-	}
-	if err := dst.WriteFile(greetRelPath, greetSrc, 0o600); err != nil {
-		t.Fatalf("write greet/greet.go: %v", err)
-	}
-	return dstPath
+	writeTempFile(t, greetDir, "greet.go", "package greet\n\n// Hello returns a greeting.\nfunc Hello() string { return \"hi\" }\n")
 }
 
 // newWorkspaceOnlyServerAt is newWorkspaceOnlyServer parameterized on root
