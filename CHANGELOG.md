@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.4.5](https://github.com/sivchari/golance/compare/v0.4.4...v0.4.5) - 2026-09-02
+- docs: add PR #67 to the v0.4.4 changelog entry by @sivchari in https://github.com/sivchari/golance/pull/69
+
 ## [v0.4.4](https://github.com/sivchari/golance/compare/v0.4.3...v0.4.4) - 2026-09-02
 - perf: cache decoded unit blobs in the resolver by @sivchari in https://github.com/sivchari/golance/pull/64
 - fix: resolve lint findings in the unit cache by @sivchari in https://github.com/sivchari/golance/pull/66
