@@ -39,30 +39,7 @@ func wantBuiltinDeclPosition(t *testing.T, name string) (line, col int) {
 	if err != nil {
 		t.Fatalf("parse builtin.go: %v", err)
 	}
-	var found *ast.Ident
-	for _, decl := range f.Decls {
-		switch d := decl.(type) {
-		case *ast.FuncDecl:
-			if d.Name.Name == name {
-				found = d.Name
-			}
-		case *ast.GenDecl:
-			for _, spec := range d.Specs {
-				switch s := spec.(type) {
-				case *ast.TypeSpec:
-					if s.Name.Name == name {
-						found = s.Name
-					}
-				case *ast.ValueSpec:
-					for _, n := range s.Names {
-						if n.Name == name {
-							found = n
-						}
-					}
-				}
-			}
-		}
-	}
+	found := builtinTopLevelIdent(f, name)
 	if found == nil {
 		t.Fatalf("no top-level declaration named %q in builtin.go", name)
 	}
@@ -247,4 +224,42 @@ func TestHoverBuiltin_ErrorMethod(t *testing.T) {
 	if got.Doc != "" {
 		t.Errorf("Doc = %q, want empty (gopls's own error.Error simplification)", got.Doc)
 	}
+}
+
+// builtinTopLevelIdent returns the declaring identifier named name among
+// f's top-level func, type, const, and var declarations, or nil.
+func builtinTopLevelIdent(f *ast.File, name string) *ast.Ident {
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Name.Name == name {
+				return d.Name
+			}
+		case *ast.GenDecl:
+			if id := builtinSpecIdent(d, name); id != nil {
+				return id
+			}
+		}
+	}
+	return nil
+}
+
+// builtinSpecIdent returns the declaring identifier named name inside a
+// type, const, or var declaration block, or nil.
+func builtinSpecIdent(d *ast.GenDecl, name string) *ast.Ident {
+	for _, spec := range d.Specs {
+		switch s := spec.(type) {
+		case *ast.TypeSpec:
+			if s.Name.Name == name {
+				return s.Name
+			}
+		case *ast.ValueSpec:
+			for _, n := range s.Names {
+				if n.Name == name {
+					return n
+				}
+			}
+		}
+	}
+	return nil
 }
