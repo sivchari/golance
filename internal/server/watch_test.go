@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -352,12 +353,17 @@ func TestHandleDidChangeWatchedFiles_RepeatedNoOpEventIsSuppressed(t *testing.T)
 
 	// Third event, after a genuine on-disk change (size changes, so this is
 	// immune to coarse mtime resolution): must schedule again.
-	data, err := os.ReadFile(filepath.Clean(knownFile))
-	if err != nil {
-		t.Fatalf("read %s: %v", knownFile, err)
+	rel, err := filepath.Rel(root, knownFile)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		t.Fatalf("known file %s escapes test root %s", knownFile, root)
 	}
-	if err := os.WriteFile(filepath.Clean(knownFile), append(data, '\n'), 0o600); err != nil {
-		t.Fatalf("write %s: %v", knownFile, err)
+	safePath := filepath.Join(root, rel)
+	data, err := os.ReadFile(safePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", safePath, err)
+	}
+	if err := os.WriteFile(safePath, append(data, '\n'), 0o600); err != nil {
+		t.Fatalf("write %s: %v", safePath, err)
 	}
 	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
 		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
