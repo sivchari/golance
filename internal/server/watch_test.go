@@ -314,7 +314,8 @@ func TestHandleDidChangeWatchedFiles_NonGoFileIsIgnored(t *testing.T) {
 // must still schedule one.
 func TestHandleDidChangeWatchedFiles_RepeatedNoOpEventIsSuppressed(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	root := copyTestdataModule(t)
+	root := t.TempDir()
+	populateTempModule(t, root)
 	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
 	if err != nil {
 		t.Fatalf("graph.Load: %v", err)
@@ -402,7 +403,8 @@ func installSpyWatch(s *Server) <-chan watchCall {
 // graph, without restarting the server.
 func TestRevalidateWorkspace_ReloadPicksUpNewPackage(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	root := copyTestdataModule(t)
+	root := t.TempDir()
+	populateTempModule(t, root)
 
 	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
 	if err != nil {
@@ -429,56 +431,17 @@ func TestRevalidateWorkspace_ReloadPicksUpNewPackage(t *testing.T) {
 	}
 }
 
-// copyTestdataModule copies testdata/module into a fresh t.TempDir(), so a
-// test that writes new files into the workspace root never mutates the
-// checked-in testdata.
-func copyTestdataModule(t *testing.T) string {
+// populateTempModule writes a minimal example.com/servermod module (one
+// greet package) into root, which callers create with t.TempDir() directly
+// so every later path join stays anchored to a literal temp root.
+func populateTempModule(t *testing.T, root string) {
 	t.Helper()
-	srcPath, err := filepath.Abs(filepath.Join("testdata", "module"))
-	if err != nil {
-		t.Fatalf("abs testdata root: %v", err)
+	writeTempFile(t, root, "go.mod", "module example.com/servermod\n\ngo 1.26\n")
+	greetDir := filepath.Join(root, "greet")
+	if err := os.MkdirAll(greetDir, 0o750); err != nil {
+		t.Fatalf("mkdir %s: %v", greetDir, err)
 	}
-	src, err := os.OpenRoot(srcPath)
-	if err != nil {
-		t.Fatalf("open root %s: %v", srcPath, err)
-	}
-	defer func() { _ = src.Close() }()
-
-	dstPath := t.TempDir()
-	dst, err := os.OpenRoot(dstPath)
-	if err != nil {
-		t.Fatalf("open root %s: %v", dstPath, err)
-	}
-	defer func() { _ = dst.Close() }()
-
-	entries, err := os.ReadDir(srcPath)
-	if err != nil {
-		t.Fatalf("read testdata module: %v", err)
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue // testdata/module is flat today; nothing to recurse into
-		}
-		data, err := src.ReadFile(e.Name())
-		if err != nil {
-			t.Fatalf("read %s: %v", e.Name(), err)
-		}
-		if err := dst.WriteFile(e.Name(), data, 0o600); err != nil {
-			t.Fatalf("write %s: %v", e.Name(), err)
-		}
-	}
-	if err := dst.MkdirAll("greet", 0o750); err != nil {
-		t.Fatalf("mkdir greet: %v", err)
-	}
-	greetRelPath := filepath.Join("greet", "greet.go")
-	greetSrc, err := src.ReadFile(greetRelPath)
-	if err != nil {
-		t.Fatalf("read greet/greet.go: %v", err)
-	}
-	if err := dst.WriteFile(greetRelPath, greetSrc, 0o600); err != nil {
-		t.Fatalf("write greet/greet.go: %v", err)
-	}
-	return dstPath
+	writeTempFile(t, greetDir, "greet.go", "package greet\n\n// Hello returns a greeting.\nfunc Hello() string { return \"hi\" }\n")
 }
 
 // newWorkspaceOnlyServerAt is newWorkspaceOnlyServer parameterized on root
