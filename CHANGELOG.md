@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.5.2](https://github.com/sivchari/golance/compare/v0.5.1...v0.5.2) - 2026-09-03
+- feat: garbage-collect orphaned CAS blobs and compact the index on schema rebuild by @sivchari in https://github.com/sivchari/golance/pull/87
+
 ## [v0.5.1](https://github.com/sivchari/golance/compare/v0.5.0...v0.5.1) - 2026-09-03
 - fix: make workspace initialization non-blocking and worktree-friendly by @sivchari in https://github.com/sivchari/golance/pull/85
 
