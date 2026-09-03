@@ -105,54 +105,6 @@ func TestCASConcurrentPutSameKeySameContent(t *testing.T) {
 	}
 }
 
-// TestCAS_GetFactsReturnsOnlyFactsSection verifies GetFacts returns exactly
-// the same Facts bytes DecodeUnitBlob's full decode would, without needing
-// Export at all — the read path References' closure walk (internal/xref)
-// relies on to avoid paying for Export on every unit it visits.
-func TestCAS_GetFactsReturnsOnlyFactsSection(t *testing.T) {
-	cas := openTestCAS(t)
-	const key = 7
-	want := UnitBlob{Facts: []byte("facts-section"), Export: []byte("export-section-much-longer-than-facts")}
-	if err := cas.Put(key, EncodeUnitBlob(&want)); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-
-	facts, ok, err := cas.GetFacts(context.Background(), key)
-	if err != nil {
-		t.Fatalf("GetFacts() error = %v", err)
-	}
-	if !ok {
-		t.Fatal("GetFacts() ok = false, want true")
-	}
-	if !bytes.Equal(facts, want.Facts) {
-		t.Errorf("GetFacts() = %q, want %q", facts, want.Facts)
-	}
-}
-
-// TestCAS_GetFactsMissingKey verifies GetFacts reports ok=false, nil error
-// for a key that was never Put, mirroring Get's own miss semantics.
-func TestCAS_GetFactsMissingKey(t *testing.T) {
-	cas := openTestCAS(t)
-	facts, ok, err := cas.GetFacts(context.Background(), 999)
-	if err != nil || ok || facts != nil {
-		t.Errorf("GetFacts(missing) = (%v, %v, %v), want (nil, false, nil)", facts, ok, err)
-	}
-}
-
-// TestCAS_GetFactsRejectsBadHeader verifies GetFacts errors (rather than
-// panicking or silently returning garbage) on a blob that is not a valid
-// unit blob at all.
-func TestCAS_GetFactsRejectsBadHeader(t *testing.T) {
-	cas := openTestCAS(t)
-	const key = 5
-	if err := cas.Put(key, []byte("not a unit blob")); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	if _, _, err := cas.GetFacts(context.Background(), key); err == nil {
-		t.Error("GetFacts(bad header) = nil error, want an error")
-	}
-}
-
 func TestCASTrimRemovesOnlyStaleBlobs(t *testing.T) {
 	cas := openTestCAS(t)
 	if err := cas.Put(1, []byte("old")); err != nil {

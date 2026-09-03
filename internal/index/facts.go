@@ -66,7 +66,7 @@ func extractFacts(fset *token.FileSet, pkgHash uint64, tpkg *types.Package, info
 	var idx store.PackageIndexEntries
 
 	addDefs(fset, pkgHash, tpkg, info, fileIdx, docs, enc, b, &idx)
-	addRefs(fset, info, fileIdx, enc, b, &idx)
+	addRefs(fset, info, fileIdx, storedFiles, enc, b, &idx)
 	return idx
 }
 
@@ -163,17 +163,23 @@ func u32pos(n int) uint32 {
 }
 
 // addRefs adds one store ref per outgoing identifier and selector-field/method
-// use recorded in info.
-func addRefs(fset *token.FileSet, info *types.Info, fileIdx map[string]uint32, enc *objectpath.Encoder, b *store.Builder, idx *store.PackageIndexEntries) {
+// use recorded in info, plus a matching [store.PostingEntry] for the reverse
+// reference index (see extractFacts's doc): storedFiles is fileIdx's
+// reverse mapping (index -> path, in the same relative/absolute form the
+// facts blob's own file table stores — see Options.RelativePaths), needed
+// because a posting is stored independently of any one package's facts
+// blob and so cannot resolve a bare FileIdx back to a path itself the way
+// [store.View.FileAt] does.
+func addRefs(fset *token.FileSet, info *types.Info, fileIdx map[string]uint32, storedFiles []string, enc *objectpath.Encoder, b *store.Builder, idx *store.PackageIndexEntries) {
 	for id, obj := range info.Uses {
-		addRef(fset, fileIdx, enc, b, idx, fset.Position(id.Pos()), fset.Position(id.End()), obj)
+		addRef(fset, fileIdx, storedFiles, enc, b, idx, fset.Position(id.Pos()), fset.Position(id.End()), obj)
 	}
 	for sel, selection := range info.Selections {
-		addRef(fset, fileIdx, enc, b, idx, fset.Position(sel.Sel.Pos()), fset.Position(sel.Sel.End()), selection.Obj())
+		addRef(fset, fileIdx, storedFiles, enc, b, idx, fset.Position(sel.Sel.Pos()), fset.Position(sel.Sel.End()), selection.Obj())
 	}
 }
 
-func addRef(fset *token.FileSet, fileIdx map[string]uint32, enc *objectpath.Encoder, b *store.Builder, idx *store.PackageIndexEntries, pos, end token.Position, obj types.Object) {
+func addRef(fset *token.FileSet, fileIdx map[string]uint32, storedFiles []string, enc *objectpath.Encoder, b *store.Builder, idx *store.PackageIndexEntries, pos, end token.Position, obj types.Object) {
 	if obj == nil || isSkippedObject(obj) {
 		return
 	}
@@ -183,15 +189,25 @@ func addRef(fset *token.FileSet, fileIdx map[string]uint32, enc *objectpath.Enco
 	}
 	sid := symbolID(obj, enc, fset)
 	idHash := store.Hash(sid)
+	line, col, endCol := u32pos(pos.Line), u32pos(pos.Column), u32pos(end.Column)
+	toPkgHash := store.Hash(obj.Pkg().Path())
 	b.AddRef(store.RefInput{
 		FileIdx:        fi,
-		Line:           u32pos(pos.Line),
-		Col:            u32pos(pos.Column),
-		EndCol:         u32pos(end.Column),
+		Line:           line,
+		Col:            col,
+		EndCol:         endCol,
 		ToSymbolIDHash: idHash,
-		ToPkgHash:      store.Hash(obj.Pkg().Path()),
+		ToPkgHash:      toPkgHash,
 	})
 	idx.SymStrs = append(idx.SymStrs, store.SymStrEntry{IDHash: idHash, SymbolID: sid})
+	idx.Postings = append(idx.Postings, store.PostingEntry{
+		TargetPkgHash: toPkgHash,
+		TargetIDHash:  idHash,
+		File:          storedFiles[fi],
+		Line:          line,
+		Col:           col,
+		EndCol:        endCol,
+	})
 }
 
 // registerMethodSet records every method in named's pointer method set (a

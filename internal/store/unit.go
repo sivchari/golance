@@ -21,13 +21,22 @@ type UnitBlob struct {
 
 const (
 	unitMagic = "GLUB"
-	// unitVersion is bumped to 2 alongside [MethodEntry]'s three new fields
-	// (see its doc and schemaVersion's matching bump): a version-1 blob's
-	// methods section is encoded one 16-byte record per method, this
-	// package's own decodeMethodEntries now expects (and internal/index's
+	// unitVersion is bumped to 3 for the reverse reference index's
+	// PostingEntry section (see EncodeUnitBlob's doc and schemaVersion's
+	// matching bump): a version-2 blob has no postings section at all, and
+	// internal/index's factsSchemaVersion forces every CAS key to change so
+	// a fresh build never asks casHitOutcome to decode a stale version-2
+	// blob (which would otherwise decode "successfully" with zero
+	// postings, silently under-indexing every already-built package instead
+	// of erroring outright).
+	//
+	// Bumped to 2 alongside [MethodEntry]'s three new fields (see its doc
+	// and schemaVersion's matching bump): a version-1 blob's methods
+	// section is encoded one 16-byte record per method, this package's own
+	// decodeMethodEntries now expects (and internal/index's
 	// factsSchemaVersion forces every CAS key to change so a fresh build
 	// never asks casHitOutcome to decode a stale version-1 blob at all).
-	unitVersion = 2
+	unitVersion = 3
 	// unitHeaderSize is EncodeUnitBlob's fixed-size header length (magic,
 	// version, reserved, factsLen, exportLen, fileCount, namesCount -- see
 	// its doc for the exact byte layout). Facts begins immediately after
@@ -40,9 +49,11 @@ const (
 // UnitFactsRange validates header -- a unit blob's first unitHeaderSize
 // bytes are enough, the whole blob is not required -- and returns the byte
 // offset and length of its Facts section within the blob:
-// [offset, offset+length). [CAS.GetFacts] uses this to read exactly that
-// range instead of the whole file; DecodeUnitBlob uses it for its own
-// header validation.
+// [offset, offset+length). DecodeUnitBlob uses it for its own header
+// validation; a caller that only wants to know how large a blob's Facts
+// section is (without decoding the whole blob) can use it directly, the
+// same way internal/xref's closure-scale benchmarks report it for scale
+// context.
 func UnitFactsRange(header []byte) (offset, length int, err error) {
 	if len(header) < unitHeaderSize || string(header[0:4]) != unitMagic {
 		return 0, 0, fmt.Errorf("store: bad unit blob header")
@@ -64,8 +75,9 @@ func UnitFactsRange(header []byte) (offset, length int, err error) {
 //	namesCount * { [4]nameLen [nameLen]name [8]idHash }
 //	methodsCount * { [4]nameLen [nameLen]name [8]pkgHash [8]typeSymbolIDHash [8]methodPkgHash [8]methodIDHash [8]fingerprint }
 //	symstrCount * { [8]idHash [4]symbolIDLen [symbolIDLen]symbolID }
+//	postingsCount * { [8]targetPkgHash [8]targetIDHash [4]pathLen [pathLen]path [4]line [4]col [4]endCol }
 func EncodeUnitBlob(u *UnitBlob) []byte {
-	size := 24 + 8 + len(u.Facts) + len(u.Export) // +8: methodsCount, symstrCount (see putIndexEntries)
+	size := 24 + 12 + len(u.Facts) + len(u.Export) // +12: methodsCount, symstrCount, postingsCount (see putIndexEntries)
 	for _, f := range u.Files {
 		size += 4 + len(f.Path) + 16
 	}
@@ -77,6 +89,9 @@ func EncodeUnitBlob(u *UnitBlob) []byte {
 	}
 	for _, s := range u.Index.SymStrs {
 		size += 8 + 4 + len(s.SymbolID)
+	}
+	for _, p := range u.Index.Postings {
+		size += 16 + 4 + len(p.File) + 12
 	}
 
 	b := make([]byte, size)
@@ -151,6 +166,23 @@ func putIndexEntries(b []byte, off int, idx PackageIndexEntries) int {
 		off += 4
 		off += copy(b[off:], s.SymbolID)
 	}
+	binary.LittleEndian.PutUint32(b[off:], u32len(len(idx.Postings)))
+	off += 4
+	for _, p := range idx.Postings {
+		binary.LittleEndian.PutUint64(b[off:], p.TargetPkgHash)
+		off += 8
+		binary.LittleEndian.PutUint64(b[off:], p.TargetIDHash)
+		off += 8
+		binary.LittleEndian.PutUint32(b[off:], u32len(len(p.File)))
+		off += 4
+		off += copy(b[off:], p.File)
+		binary.LittleEndian.PutUint32(b[off:], p.Line)
+		off += 4
+		binary.LittleEndian.PutUint32(b[off:], p.Col)
+		off += 4
+		binary.LittleEndian.PutUint32(b[off:], p.EndCol)
+		off += 4
+	}
 	return off
 }
 
@@ -189,7 +221,11 @@ func DecodeUnitBlob(b []byte) (UnitBlob, error) {
 	if err != nil {
 		return UnitBlob{}, err
 	}
-	symStrs, _, err := decodeSymStrEntries(b, off)
+	symStrs, off, err := decodeSymStrEntries(b, off)
+	if err != nil {
+		return UnitBlob{}, err
+	}
+	postings, _, err := decodePostingEntries(b, off)
 	if err != nil {
 		return UnitBlob{}, err
 	}
@@ -198,7 +234,7 @@ func DecodeUnitBlob(b []byte) (UnitBlob, error) {
 		Facts:  facts,
 		Export: export,
 		Files:  files,
-		Index:  PackageIndexEntries{Names: names, Methods: methods, SymStrs: symStrs},
+		Index:  PackageIndexEntries{Names: names, Methods: methods, SymStrs: symStrs, Postings: postings},
 	}, nil
 }
 
@@ -319,6 +355,54 @@ func decodeSymStrEntries(b []byte, off int) ([]SymStrEntry, int, error) {
 		symStrs[i] = SymStrEntry{IDHash: idHash, SymbolID: sid}
 	}
 	return symStrs, off, nil
+}
+
+// decodePostingEntries decodes the postingsCount-prefixed PostingEntry
+// section starting at off.
+func decodePostingEntries(b []byte, off int) ([]PostingEntry, int, error) {
+	count, off, err := takeUint32(b, off)
+	if err != nil {
+		return nil, 0, fmt.Errorf("store: unit blob posting count: %w", err)
+	}
+	postings := make([]PostingEntry, count)
+	for i := range postings {
+		var targetPkgHash, targetIDHash uint64
+		targetPkgHash, off, err = takeUint64(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob posting %d targetPkgHash: %w", i, err)
+		}
+		targetIDHash, off, err = takeUint64(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob posting %d targetIDHash: %w", i, err)
+		}
+		var file string
+		file, off, err = takeString(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob posting %d file: %w", i, err)
+		}
+		var line, col, endCol int
+		line, off, err = takeUint32(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob posting %d line: %w", i, err)
+		}
+		col, off, err = takeUint32(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob posting %d col: %w", i, err)
+		}
+		endCol, off, err = takeUint32(b, off)
+		if err != nil {
+			return nil, 0, fmt.Errorf("store: unit blob posting %d endCol: %w", i, err)
+		}
+		postings[i] = PostingEntry{
+			TargetPkgHash: targetPkgHash,
+			TargetIDHash:  targetIDHash,
+			File:          file,
+			Line:          uint32(line),
+			Col:           uint32(col),
+			EndCol:        uint32(endCol),
+		}
+	}
+	return postings, off, nil
 }
 
 func takeBytes(b []byte, off, n int) ([]byte, int, error) {

@@ -27,31 +27,44 @@ var ErrNotFound = errors.New("store: not found")
 const openTimeout = 5 * time.Second
 
 var (
-	bucketUnit   = []byte("unit")   // pkgPathHash -> UnitPointer (see PutUnit)
-	bucketMeta   = []byte("meta")   // reserved keys, e.g. buildFingerprintKey
-	bucketName   = []byte("name")   // lowercased symbol name -> []symbolIDHash
-	bucketMethod = []byte("method") // method name -> []MethodEntry
-	bucketSymStr = []byte("symstr") // symbolIDHash -> []original SymbolID string
+	bucketUnit               = []byte("unit")            // pkgPathHash -> UnitPointer (see PutUnit)
+	bucketMeta               = []byte("meta")            // reserved keys, e.g. buildFingerprintKey
+	bucketName               = []byte("name")            // lowercased symbol name -> []symbolIDHash
+	bucketMethod             = []byte("method")          // method name -> []MethodEntry
+	bucketSymStr             = []byte("symstr")          // symbolIDHash -> []original SymbolID string
+	bucketRefPostings        = []byte("refposting")      // (targetPkgHash, targetIDHash, srcPkgHash) -> []PostingLocation (see PostingsFor)
+	bucketRefPostingManifest = []byte("refpostmanifest") // srcPkgHash -> [](targetPkgHash, targetIDHash), for exact incremental delete (see applyPostings)
 )
 
-var allBuckets = [][]byte{bucketUnit, bucketMeta, bucketName, bucketMethod, bucketSymStr}
+var allBuckets = [][]byte{bucketUnit, bucketMeta, bucketName, bucketMethod, bucketSymStr, bucketRefPostings, bucketRefPostingManifest}
 
 // buildFingerprintKey is a reserved bucketMeta key for the whole
 // database's build fingerprint (see PutBuildFingerprint).
 var buildFingerprintKey = []byte("\x00golance:fingerprint")
 
 // schemaVersion is the on-disk layout version of the unit/name/method/
-// symstr buckets (see UnitPointer's encoding in encodeUnitPointer). Bump it
-// whenever that encoding changes incompatibly; Open discards and recreates
-// any database it finds recorded under a different version, or under none
-// at all (see discardStale's doc) — the same byte layout has been used
-// since before this check existed, so a stale database's "unit" records
-// decode without error; they are just silently wrong once the [CAS] blobs
-// their BlobKey fields point at are no longer the ones that were current
-// when those records were written (e.g. after a schema change, or a CAS
-// directory that was never populated from the same build that wrote this
-// database — see casDir's doc in internal/server). A decode-error check
-// alone cannot catch that; this version marker can.
+// symstr/refposting/refpostmanifest buckets (see UnitPointer's encoding in
+// encodeUnitPointer). Bump it whenever that encoding changes incompatibly;
+// Open discards and recreates any database it finds recorded under a
+// different version, or under none at all (see discardStale's doc) — the
+// same byte layout has been used since before this check existed, so a
+// stale database's "unit" records decode without error; they are just
+// silently wrong once the [CAS] blobs their BlobKey fields point at are no
+// longer the ones that were current when those records were written (e.g.
+// after a schema change, or a CAS directory that was never populated from
+// the same build that wrote this database — see casDir's doc in
+// internal/server). A decode-error check alone cannot catch that; this
+// version marker can.
+//
+// Bumped to 3 for the reverse reference index (bucketRefPostings/
+// bucketRefPostingManifest, see applyPostings/PostingsFor): a database that
+// predates this change has neither bucket at all, so References would
+// silently return zero results for every symbol instead of erroring — the
+// same "wrong, not merely missing" failure mode every other schemaVersion
+// bump here exists to force a rebuild past. See internal/index's
+// factsSchemaVersion for the matching CAS-side key bump (a discarded
+// database's fresh Open still needs freshly extracted PostingEntry data,
+// not just fresh buckets to put it in).
 //
 // Bumped to 2 for [MethodEntry]'s three new fields (MethodPkgHash,
 // MethodIDHash, Fingerprint — see its doc): methodEntrySize grew from 16 to
@@ -60,7 +73,7 @@ var buildFingerprintKey = []byte("\x00golance:fingerprint")
 // internal/index's factsSchemaVersion for the matching CAS-side key bump
 // (this field alone does not force a rebuild of the [CAS] blobs a discarded
 // database's fresh Open would otherwise point right back at).
-const schemaVersion uint16 = 2
+const schemaVersion uint16 = 3
 
 // schemaVersionKey is a reserved bucketMeta key recording the schemaVersion
 // the database's buckets were last (re)written under.
@@ -422,7 +435,7 @@ func (db *DB) PutUnitsBatch(entries []UnitEntry) error {
 			if err := unitB.Put(hashKey(e.PkgHash), encodeUnitPointer(e.Pointer)); err != nil {
 				return err
 			}
-			if err := applyIndexEntries(tx, e.Index); err != nil {
+			if err := applyIndexEntries(tx, e.PkgHash, e.Index); err != nil {
 				return err
 			}
 		}
@@ -675,9 +688,10 @@ type SymStrEntry struct {
 // e.g. switching back to a previously-seen branch — can repopulate this
 // database's indices without re-type-checking anything.
 type PackageIndexEntries struct {
-	Names   []NameEntry
-	Methods []MethodSymbolEntry
-	SymStrs []SymStrEntry
+	Names    []NameEntry
+	Methods  []MethodSymbolEntry
+	SymStrs  []SymStrEntry
+	Postings []PostingEntry
 }
 
 // applyIndexEntries writes entries' name-index, method-index, and
@@ -689,7 +703,12 @@ type PackageIndexEntries struct {
 // silently skips a lookup that no longer resolves) and self-heals the next
 // time that name is genuinely looked up, so there is nothing to reconcile
 // here beyond appending this blob's own contribution.
-func applyIndexEntries(tx *bbolt.Tx, entries PackageIndexEntries) error {
+//
+// entries.Postings is different: References must never see a stale
+// location a source file no longer actually contains, so applyPostings
+// replaces srcPkgHash's ENTIRE prior contribution to the postings index
+// exactly, rather than appending alongside it — see its own doc.
+func applyIndexEntries(tx *bbolt.Tx, srcPkgHash uint64, entries PackageIndexEntries) error {
 	nameB := tx.Bucket(bucketName)
 	for _, n := range entries.Names {
 		key := []byte(strings.ToLower(n.Name))
@@ -732,7 +751,8 @@ func applyIndexEntries(tx *bbolt.Tx, entries PackageIndexEntries) error {
 			return err
 		}
 	}
-	return nil
+
+	return applyPostings(tx, srcPkgHash, entries.Postings)
 }
 
 // --- fixed-width list encodings for posting-list bucket values ---

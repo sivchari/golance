@@ -78,13 +78,6 @@ type unitCacheEntry struct {
 	blobKey uint64
 	facts   []byte
 	export  []byte
-	// hasExport distinguishes a full entry (put via put, export decoded
-	// and cached) from a facts-only entry (put via putFacts: export was
-	// never fetched, not merely empty) -- get must treat the latter as a
-	// miss so its caller falls back to reading and caching Export
-	// properly, rather than handing back a zero-value Export that looks
-	// indistinguishable from a genuinely empty one.
-	hasExport bool
 }
 
 // size estimates entry's retained heap footprint: its two owned byte
@@ -109,11 +102,7 @@ func newUnitCache(maxBytes int64) *unitCache {
 }
 
 // get returns blobKey's cached UnitBlob, if present, moving it to the front
-// (most recently used). It is a hit only for a full entry (put via put):
-// a facts-only entry (put via putFacts, e.g. by a References closure walk
-// that never needed Export) reports a miss here, so a caller
-// that needs Export always gets it, decoded and cached properly, rather
-// than a zero-value Export indistinguishable from a genuinely empty one.
+// (most recently used).
 func (c *unitCache) get(blobKey uint64) (store.UnitBlob, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -122,33 +111,10 @@ func (c *unitCache) get(blobKey uint64) (store.UnitBlob, bool) {
 		c.misses++
 		return store.UnitBlob{}, false
 	}
-	entry, _ := el.Value.(*unitCacheEntry)
-	if !entry.hasExport {
-		c.misses++
-		return store.UnitBlob{}, false
-	}
 	c.hits++
 	c.order.MoveToFront(el)
+	entry, _ := el.Value.(*unitCacheEntry)
 	return store.UnitBlob{Facts: entry.facts, Export: entry.export}, true
-}
-
-// getFacts returns blobKey's cached Facts alone, if present -- a hit for
-// EITHER a facts-only entry or a full one, since a full entry's Facts is
-// exactly the same bytes a facts-only entry would have cached (both are
-// content-addressed by the same blobKey). Moves the entry to front like
-// get.
-func (c *unitCache) getFacts(blobKey uint64) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	el, ok := c.index[blobKey]
-	if !ok {
-		c.misses++
-		return nil, false
-	}
-	c.hits++
-	c.order.MoveToFront(el)
-	entry, _ := el.Value.(*unitCacheEntry)
-	return entry.facts, true
 }
 
 // stats returns the running hit/miss counts of every get call so far, for
@@ -162,57 +128,20 @@ func (c *unitCache) stats() (hits, misses int64) {
 
 // put copies blobKey's decoded UnitBlob's Facts and Export (see
 // unitCache's doc for why only those two fields, and why copied) and
-// inserts them as a full entry, evicting least-recently-used entries first
-// until both the entry-count and total-bytes bounds are satisfied.
-//
-// If blobKey is already cached as a full entry, put is a no-op — every
-// caller only ever puts a value it just decoded after a get miss, under
-// this same lock, so a duplicate put here would only mean a concurrent
-// goroutine decoded the identical content-addressed bytes first, in which
-// case keeping its (byte-identical) entry is fine. If blobKey is cached as
-// a FACTS-ONLY entry (put via putFacts — e.g. a References closure walk
-// visited this unit before anything needed its Export), put upgrades it
-// in place: Facts is guaranteed byte-identical already (same content
-// address), so only Export needs adding, growing the entry's accounted
-// size by exactly Export's own bytes rather than double-counting Facts.
+// inserts them, evicting least-recently-used entries first until both the
+// entry-count and total-bytes bounds are satisfied. No-op if blobKey is
+// already cached — every caller only ever puts a value it just decoded
+// after a get miss, under this same lock, so a duplicate put here would
+// only mean a concurrent goroutine decoded the identical content-addressed
+// bytes first, in which case keeping its (byte-identical) entry is fine.
 func (c *unitCache) put(blobKey uint64, u *store.UnitBlob) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.index[blobKey]; ok {
-		entry, _ := el.Value.(*unitCacheEntry)
-		c.order.MoveToFront(el)
-		if entry.hasExport {
-			return
-		}
-		before := entry.size()
-		entry.export = bytes.Clone(u.Export)
-		entry.hasExport = true
-		c.numBytes += entry.size() - before
-		return
-	}
-
-	entry := &unitCacheEntry{
-		blobKey:   blobKey,
-		facts:     bytes.Clone(u.Facts),
-		export:    bytes.Clone(u.Export),
-		hasExport: true,
-	}
-	c.insert(entry)
-}
-
-// putFacts copies facts and inserts blobKey as a facts-only entry (no
-// Export), evicting least-recently-used entries first the same way put
-// does. No-op if blobKey is already cached in ANY form (facts-only or
-// full): unlike put, there is nothing to upgrade here, since a facts-only
-// caller never has Export to add.
-func (c *unitCache) putFacts(blobKey uint64, facts []byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if el, ok := c.index[blobKey]; ok {
 		c.order.MoveToFront(el)
 		return
 	}
-	c.insert(&unitCacheEntry{blobKey: blobKey, facts: bytes.Clone(facts)})
+	c.insert(&unitCacheEntry{blobKey: blobKey, facts: bytes.Clone(u.Facts), export: bytes.Clone(u.Export)})
 }
 
 // insert admits entry, evicting least-recently-used entries first until

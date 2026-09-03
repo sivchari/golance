@@ -9,11 +9,16 @@
 // number, in bytes, starting at 1"), not UTF-16 code units. Converting
 // to/from an editor's own coordinate system is the caller's responsibility.
 //
-// References and Rename read only the defining package's facts blob plus
-// the facts blobs of packages in its reverse-dependency closure
-// ([internal/graph.Snapshot.ClosureUnits]), so their cost scales with the
-// number of packages that could reference the symbol and the number of
-// results, not with workspace size.
+// References and Rename resolve their target's own declaration from its
+// defining package's facts blob, then answer via a single
+// [internal/store.DB.PostingsFor] prefix scan over the persisted reverse
+// reference index (internal/store's bucketRefPostings, populated during
+// facts extraction alongside the facts blob itself — see
+// internal/index/facts.go's addRef): cost scales with the number of
+// packages that actually reference the symbol and the number of results,
+// not with the number of packages that transitively COULD (the
+// reverse-dependency closure a naive implementation would otherwise have to
+// walk and read in full).
 //
 // Implementation resolves candidates in two passes: a name-based first pass
 // over [internal/store.DB.LookupMethod] that is sound (never omits a real

@@ -36,6 +36,15 @@ type depExportEntry struct {
 // store.unitVersion/store.schemaVersion whenever the facts extraction pass
 // or the UnitBlob/index-entry encoding it produces changes.
 //
+// Bumped to 4 for addRefs' new [store.PostingEntry] output (see its doc and
+// store.unitVersion/store.schemaVersion's matching bumps): an
+// already-built package's CAS blob has no Postings section at all, so a
+// CAS hit would otherwise repopulate the reverse reference index with
+// nothing for that package, and References would silently return zero
+// results for any symbol only ever referenced from it — this forces
+// exactly one real rebuild per package instead, the same "wrong, not
+// merely missing" failure mode every bump here exists to force past.
+//
 // Bumped to 3 for addDef's own-content change (not a wire-encoding change:
 // [store.NameEntry]'s byte layout is untouched, and store.schemaVersion is
 // deliberately NOT bumped alongside this — see its own doc's "same byte
@@ -46,7 +55,7 @@ type depExportEntry struct {
 // key it already has a CAS hit for, and workspace/symbol would keep
 // silently missing that package's unexported symbols forever — this forces
 // exactly one real rebuild per package instead.
-const factsSchemaVersion uint16 = 3
+const factsSchemaVersion uint16 = 4
 
 // computeUnitKey returns the CAS blob key for a package whose own source
 // content hashes to ownContentHash and whose direct workspace dependencies'

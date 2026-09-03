@@ -26,6 +26,9 @@ func TestUnitBlobRoundTrip(t *testing.T) {
 				{IDHash: 1, SymbolID: "pkg#Foo"},
 				{IDHash: 2, SymbolID: "pkg#Bar"},
 			},
+			Postings: []PostingEntry{
+				{TargetPkgHash: 100, TargetIDHash: 200, File: "a.go", Line: 5, Col: 1, EndCol: 4},
+			},
 		},
 	}
 
@@ -63,6 +66,14 @@ func TestUnitBlobRoundTrip(t *testing.T) {
 			t.Errorf("Index.SymStrs[%d] = %+v, want %+v", i, got.Index.SymStrs[i], want.Index.SymStrs[i])
 		}
 	}
+	if len(got.Index.Postings) != len(want.Index.Postings) {
+		t.Fatalf("Index.Postings = %+v, want %+v", got.Index.Postings, want.Index.Postings)
+	}
+	for i := range want.Index.Postings {
+		if got.Index.Postings[i] != want.Index.Postings[i] {
+			t.Errorf("Index.Postings[%d] = %+v, want %+v", i, got.Index.Postings[i], want.Index.Postings[i])
+		}
+	}
 }
 
 func TestUnitBlobEmpty(t *testing.T) {
@@ -78,9 +89,7 @@ func TestUnitBlobEmpty(t *testing.T) {
 
 // TestUnitFactsRange_MatchesDecodedFacts verifies UnitFactsRange's own
 // (offset, length) range, applied directly to an encoded blob, slices out
-// exactly the same bytes DecodeUnitBlob's full decode returns as Facts --
-// the property [CAS.GetFacts] relies on to read only that range instead of
-// the whole blob.
+// exactly the same bytes DecodeUnitBlob's full decode returns as Facts.
 func TestUnitFactsRange_MatchesDecodedFacts(t *testing.T) {
 	want := UnitBlob{Facts: []byte("facts-bytes"), Export: []byte("export-bytes-longer-than-facts")}
 	encoded := EncodeUnitBlob(&want)

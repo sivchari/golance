@@ -2,7 +2,6 @@ package xref
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -140,52 +139,37 @@ func dedupeLocations(locs []Location) []Location {
 	return out
 }
 
-// wantedSymbolKey identifies one symbol as a locationsForAll scan target,
-// independent of its Kind/Name (a unit's own recorded Ref carries only a
-// (ToPkgHash, ToSymbolIDHash) pair to match against — see store.Ref).
-type wantedSymbolKey struct {
-	PkgHash uint64
-	IDHash  uint64
-}
-
 // locationsForAll collects every location referencing any symbol in wanted,
-// across the UNION of their defining packages' reverse-dependency closures,
-// visiting each unit in that union exactly once regardless of how many of
-// wanted's symbols its own closure would individually include: a reference
-// to a symbol can only ever be recorded in a unit whose package
-// transitively imports that symbol's defining package (see
-// [internal/graph.Snapshot.ClosureUnits]), so checking every wanted symbol
-// against a unit outside its own individual closure costs a few no-op map
-// lookups, never a false match.
+// via one [store.DB.PostingsFor] prefix scan per wanted symbol: each scan
+// costs work proportional to that symbol's own result size (how many
+// packages reference it, and how many locations each contributes), not to
+// the number of packages that COULD reference it — the reverse reference
+// index (internal/store's bucketRefPostings) is keyed by (targetPkgHash,
+// targetIDHash, srcPkgHash) precisely so this lookup never has to fall back
+// to scanning every unit in wanted's defining package's reverse-dependency
+// closure the way locationsFor's predecessor did.
 //
-// This replaces what used to be one full closure walk per wanted symbol
-// (locationsFor, called once for References' own target plus once more per
-// corresponding method — see References' doc): a method with K
-// corresponding symbols used to re-walk and re-read up to K+1 overlapping
-// closures, each its own os.ReadFile plus O(refsCount) store.View.RefsTo
-// scan; this does it in one pass, checking every wanted symbol against
-// each visited unit's ref records in a single O(refsCount) scan instead of
-// K+1 separate O(refsCount) RefsTo calls.
+// A single physical reference location can only ever be posted under ONE
+// wanted symbol's key (store.Ref/store.PostingEntry both carry exactly one
+// (ToPkgHash, ToSymbolIDHash) target), so unioning every wanted symbol's own
+// results here can never introduce a duplicate the way merging overlapping
+// closure walks used to risk — no additional internal dedup is needed
+// beyond References' own top-level dedupeLocations, which exists for a
+// different reason (folding in the declaration location).
 //
-// ctx is checked once per unit in the union (rather than per reference
-// within a unit): a canceled query stops before starting the next unit's
-// facts read instead of running to completion regardless.
+// ctx is checked once per wanted symbol (rather than per posting record):
+// wanted is always small (References' own target plus, for a method, its
+// corresponding-method symbols — see References' doc), so this is a
+// lighter-weight cancellation point than the old per-closure-unit check,
+// not a coarser one.
 func (r *Resolver) locationsForAll(ctx context.Context, wanted []resolvedSymbol) ([]Location, error) {
-	wantedSet, units, err := r.wantedClosure(wanted)
-	if err != nil {
-		return nil, err
-	}
-
 	var out []Location
-	for p := range units {
+	for _, w := range wanted {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		locs, err := r.scanUnitForWanted(ctx, p, wantedSet)
+		locs, err := r.postingsFor(ctx, w.PkgHash, w.IDHash)
 		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				continue
-			}
 			return nil, err
 		}
 		out = append(out, locs...)
@@ -195,62 +179,29 @@ func (r *Resolver) locationsForAll(ctx context.Context, wanted []resolvedSymbol)
 	return out, nil
 }
 
-// wantedClosure builds locationsForAll's two inputs from wanted: the set of
-// (PkgHash, IDHash) keys a visited unit's own ref records are checked
-// against, and the union of every wanted symbol's defining package's
-// reverse-dependency closure (the set of units that union is checked
-// against).
-func (r *Resolver) wantedClosure(wanted []resolvedSymbol) (map[wantedSymbolKey]struct{}, map[string]struct{}, error) {
-	wantedSet := make(map[wantedSymbolKey]struct{}, len(wanted))
-	units := make(map[string]struct{})
-	for _, w := range wanted {
-		wantedSet[wantedSymbolKey{PkgHash: w.PkgHash, IDHash: w.IDHash}] = struct{}{}
-		defPkgPath, ok := r.pkgPathByHash[w.PkgHash]
-		if !ok {
-			return nil, nil, fmt.Errorf("xref: unknown defining package for hash %d", w.PkgHash)
-		}
-		for _, p := range r.snap.ClosureUnits(defPkgPath) {
-			units[p] = struct{}{}
-		}
-	}
-	return wantedSet, units, nil
-}
-
-// scanUnitForWanted reads pkgPath's Facts and returns every location whose
-// ref record matches a key in wantedSet, scanning the whole ref table in
-// one pass (see locationsForAll's doc for why this replaces one
-// store.View.RefsTo call per wanted symbol). Reports pkgPath's own read
-// size and ref-record count to ctx's installed StatsSink (see addUnit),
-// unconditionally -- including when out ends up empty, since the read and
-// scan cost was paid either way.
-func (r *Resolver) scanUnitForWanted(ctx context.Context, pkgPath string, wantedSet map[wantedSymbolKey]struct{}) ([]Location, error) {
-	facts, err := r.unitFacts(ctx, store.Hash(pkgPath))
+// postingsFor returns every location referencing the symbol identified by
+// (targetPkgHash, targetIDHash), read directly from [store.DB]'s postings
+// index rather than any cached facts blob (see store.DB.PostingsFor's doc):
+// a posting is written in the same bbolt transaction as its source
+// package's own unit-pointer swap, so this always sees whatever a query's
+// own db.GetUnit call would too, with no separate cache to invalidate.
+// Reports one AddUnit call per distinct source package's posting record to
+// ctx's installed StatsSink -- bytesRead/recordsScanned now mean the
+// posting record's own encoded size and location count, the direct
+// counterpart of what scanUnitForWanted's predecessor reported per closure
+// unit, just at the new path's actual granularity.
+func (r *Resolver) postingsFor(ctx context.Context, targetPkgHash, targetIDHash uint64) ([]Location, error) {
+	recs, err := r.db.PostingsFor(ctx, targetPkgHash, targetIDHash)
 	if err != nil {
 		return nil, err
 	}
-	v, err := store.NewView(facts)
-	if err != nil {
-		return nil, err
-	}
-
-	n := v.RefsCount()
 	var out []Location
-	for i := 0; i < n; i++ {
-		ref, err := v.RefAt(i)
-		if err != nil {
-			continue
+	for _, rec := range recs {
+		for _, loc := range rec.Locations {
+			out = append(out, Location{File: absPath(r.root, loc.File, r.relative), Line: loc.Line, Col: loc.Col, EndCol: loc.EndCol})
 		}
-		key := wantedSymbolKey{PkgHash: ref.ToPkgHash(), IDHash: ref.ToSymbolIDHash()}
-		if _, ok := wantedSet[key]; !ok {
-			continue
-		}
-		path, err := v.FileAt(int(ref.FileIdx()))
-		if err != nil {
-			continue
-		}
-		out = append(out, Location{File: absPath(r.root, path, r.relative), Line: ref.Line(), Col: ref.Col(), EndCol: ref.EndCol()})
+		addUnit(ctx, rec.Bytes, len(rec.Locations))
 	}
-	addUnit(ctx, int64(len(facts)), n)
 	return out, nil
 }
 
