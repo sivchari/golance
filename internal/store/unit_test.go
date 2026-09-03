@@ -41,7 +41,7 @@ func TestUnitBlobRoundTrip(t *testing.T) {
 	assertBytesEqual(t, "Facts", got.Facts, want.Facts)
 	assertBytesEqual(t, "Export", got.Export, want.Export)
 	assertFilesEqual(t, got.Files, want.Files)
-	assertIndexEqual(t, got.Index, want.Index)
+	assertIndexEqual(t, &got.Index, &want.Index)
 }
 
 // assertBytesEqual reports a t.Errorf for field if got and want differ.
@@ -70,7 +70,7 @@ func assertFilesEqual(t *testing.T, got, want []FileStat) {
 // PackageIndexEntries — one field group at a time, delegating SymStrs and
 // Postings (both list-shaped, needing a length check plus a per-element
 // loop) to their own helpers to keep this function's own complexity low.
-func assertIndexEqual(t *testing.T, got, want PackageIndexEntries) {
+func assertIndexEqual(t *testing.T, got, want *PackageIndexEntries) {
 	t.Helper()
 	if len(got.Names) != len(want.Names) || got.Names[0] != want.Names[0] {
 		t.Errorf("Index.Names = %+v, want %+v", got.Names, want.Names)
