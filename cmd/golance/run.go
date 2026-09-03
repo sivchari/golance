@@ -207,6 +207,10 @@ func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath string) int {
 		return 1
 	}
 	defer func() { _ = db.Close() }()
+	schemaRebuild := db.WasRecreated()
+	if err := db.PutCASDir(casPath); err != nil {
+		_, _ = fmt.Fprintf(stderr, "golance: indexer: record CAS directory: %v\n", err)
+	}
 
 	cas, err := store.OpenCAS(casPath)
 	if err != nil {
@@ -247,14 +251,33 @@ func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath string) int {
 	// wall-clock time (see index.Stats.TypeChecked's doc).
 	_, _ = fmt.Fprintf(stdout, "STATS processed=%d skipped=%d errors=%d typechecked=%d\n", stats.Processed, stats.Skipped, stats.Errors, stats.TypeChecked)
 
-	// Low-frequency GC of unused CAS blobs (see store.CAS.MaybeTrim's doc):
-	// the indexer subprocess is already doing bulk I/O, so this is a better
-	// place to pay an occasional directory walk than the interactive main
-	// process's startup path. Best effort: a failed trim only costs disk
-	// space, never correctness.
-	if err := cas.MaybeTrim(time.Now()); err != nil {
-		_, _ = fmt.Fprintf(stderr, "golance: indexer: trim CAS: %v\n", err)
+	// Schema-forced rebuild: db was just discarded and recreated empty (see
+	// db.WasRecreated's doc), so the file bbolt just finished rewriting is
+	// exactly as bloated as the stale one it replaced — bbolt reuses freed
+	// pages within a file but never shrinks it (see internal/store's package
+	// doc). This is the one point in the whole system where compacting is
+	// cheap relative to the work already just done (a full reindex), so pay
+	// it here rather than on every ordinary incremental build.
+	if schemaRebuild {
+		if err := db.Compact(); err != nil {
+			_, _ = fmt.Fprintf(stderr, "golance: indexer: compact db: %v\n", err)
+		}
 	}
+
+	// Mark-and-sweep GC of unreferenced CAS blobs (see store.CAS.GC's doc):
+	// the indexer subprocess is already doing bulk I/O and — for the
+	// schema-rebuild case — just orphaned a whole generation of blobs, so
+	// this is a better place to pay an occasional directory walk than the
+	// interactive main process's own startup path (see
+	// internal/server.RunCASGC's other caller). force=schemaRebuild bypasses
+	// the usual GCInterval throttle for exactly the event that most needs a
+	// prompt sweep; every ordinary build still only walks the directory once
+	// per GCInterval. Best effort throughout: a failed or skipped GC only
+	// costs disk space, never correctness (see (*store.CAS).GC's own safety
+	// doc).
+	server.RunCASGC(func(format string, args ...any) {
+		_, _ = fmt.Fprintf(stderr, format+"\n", args...)
+	}, casPath, dbPath, db, schemaRebuild)
 	return 0
 }
 

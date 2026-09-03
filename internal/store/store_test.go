@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -467,5 +468,191 @@ func TestOpen_DiscardsDatabaseWithOldSchemaVersion(t *testing.T) {
 
 	if _, err := reopened.GetUnit(context.Background(), 1); !errors.Is(err, ErrNotFound) {
 		t.Errorf("GetUnit(1) after reopening an old-schema-version database = %v, want ErrNotFound (stale data must be discarded, not silently served)", err)
+	}
+	if !reopened.WasRecreated() {
+		t.Error("WasRecreated() = false after Open discarded a stale schema, want true")
+	}
+}
+
+// TestWasRecreated_FreshDatabaseIsFalse verifies WasRecreated is false for a
+// brand new file — there was nothing on disk yet to distrust (see
+// discardStale's doc), so this is not the "schema rebuild" event Compact
+// should key off.
+func TestWasRecreated_FreshDatabaseIsFalse(t *testing.T) {
+	db := openTestDB(t)
+	if db.WasRecreated() {
+		t.Error("WasRecreated() = true for a brand new database, want false")
+	}
+}
+
+// TestWasRecreated_OrdinaryReopenIsFalse verifies that reopening an
+// already-current database (the ordinary warm-open path) does not report
+// WasRecreated — only the Open call that actually discards a stale schema
+// does (see TestOpen_DiscardsDatabaseWithOldSchemaVersion).
+func TestWasRecreated_OrdinaryReopenIsFalse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+	if reopened.WasRecreated() {
+		t.Error("WasRecreated() = true reopening an already-current database, want false")
+	}
+}
+
+// TestPutCASDirRoundTrip verifies CASDir returns whatever PutCASDir last
+// recorded, and ErrNotFound before anything was ever recorded — the meta
+// value internal/server's CAS GC reads back out of every candidate index
+// database to decide which ones share a given CAS directory (see
+// (*DB).CASDir's own doc for why a filename cannot answer this instead).
+func TestPutCASDirRoundTrip(t *testing.T) {
+	db := openTestDB(t)
+
+	if _, err := db.CASDir(); !errors.Is(err, ErrNotFound) {
+		t.Errorf("CASDir() before PutCASDir = %v, want ErrNotFound", err)
+	}
+
+	const dir = "/cache/golance/cas-abc123"
+	if err := db.PutCASDir(dir); err != nil {
+		t.Fatalf("PutCASDir() error = %v", err)
+	}
+	got, err := db.CASDir()
+	if err != nil {
+		t.Fatalf("CASDir() error = %v", err)
+	}
+	if got != dir {
+		t.Errorf("CASDir() = %q, want %q", got, dir)
+	}
+}
+
+// TestCollectBlobKeys verifies CollectBlobKeys adds every stored
+// UnitPointer.BlobKey into the caller's marks set, merging into whatever
+// was already there (the union property internal/server's CAS GC relies on
+// when combining marks from multiple index databases).
+func TestCollectBlobKeys(t *testing.T) {
+	db := openTestDB(t)
+	entries := []UnitEntry{
+		{PkgHash: 1, Pointer: UnitPointer{BlobKey: 101}},
+		{PkgHash: 2, Pointer: UnitPointer{BlobKey: 102}},
+	}
+	if err := db.PutUnitsBatch(entries); err != nil {
+		t.Fatalf("PutUnitsBatch() error = %v", err)
+	}
+
+	marks := map[uint64]struct{}{999: {}} // pre-existing entry from another database
+	if err := db.CollectBlobKeys(marks); err != nil {
+		t.Fatalf("CollectBlobKeys() error = %v", err)
+	}
+
+	want := map[uint64]struct{}{999: {}, 101: {}, 102: {}}
+	if len(marks) != len(want) {
+		t.Fatalf("CollectBlobKeys() marks = %v, want %v", marks, want)
+	}
+	for k := range want {
+		if _, ok := marks[k]; !ok {
+			t.Errorf("CollectBlobKeys() marks missing key %d", k)
+		}
+	}
+}
+
+// TestCompact_ShrinksFileAndPreservesData verifies Compact both reclaims
+// space bbolt's freelist never returns to the OS on its own (see the
+// package doc) and leaves every record intact and queryable afterward.
+func TestCompact_ShrinksFileAndPreservesData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	// Write, then overwrite, a large number of entries so the file grows
+	// well past what its live data alone would need — the same shape a
+	// schema-wipe full rebuild leaves behind.
+	const n = 500
+	for round := 0; round < 3; round++ {
+		entries := make([]UnitEntry, n)
+		for i := 0; i < n; i++ {
+			entries[i] = UnitEntry{
+				PkgHash: uint64(i),
+				Pointer: UnitPointer{BlobKey: uint64(i), ContentHash: uint64(round)},
+				Index: PackageIndexEntries{
+					Names: []NameEntry{{Name: fmt.Sprintf("Symbol%d", i), IDHash: uint64(i)}},
+				},
+			}
+		}
+		if err := db.PutUnitsBatch(entries); err != nil {
+			t.Fatalf("PutUnitsBatch() round %d error = %v", round, err)
+		}
+	}
+
+	fiBefore, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat() before Compact: %v", err)
+	}
+
+	if err := db.Compact(); err != nil {
+		t.Fatalf("Compact() error = %v", err)
+	}
+
+	fiAfter, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat() after Compact: %v", err)
+	}
+	if fiAfter.Size() >= fiBefore.Size() {
+		t.Errorf("file size after Compact = %d, want smaller than before (%d)", fiAfter.Size(), fiBefore.Size())
+	}
+
+	// Data survives: every unit pointer decodes back correctly through the
+	// same (reopened, post-rename) *bbolt.DB handle.
+	for i := 0; i < n; i++ {
+		p, err := db.GetUnit(context.Background(), uint64(i))
+		if err != nil {
+			t.Fatalf("GetUnit(%d) after Compact: %v", i, err)
+		}
+		if p.BlobKey != uint64(i) {
+			t.Errorf("GetUnit(%d) after Compact BlobKey = %d, want %d", i, p.BlobKey, i)
+		}
+	}
+}
+
+// TestCompact_ReadOnlyHandleErrors verifies Compact refuses to run on a
+// read-only handle: it would otherwise try to replace a file this handle
+// has no exclusive claim to.
+func TestCompact_ReadOnlyHandleErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	ro, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly() error = %v", err)
+	}
+	t.Cleanup(func() { _ = ro.Close() })
+
+	if err := ro.Compact(); err == nil {
+		t.Fatal("Compact() on a read-only handle succeeded, want an error")
 	}
 }

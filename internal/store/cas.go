@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -42,61 +44,35 @@ func (c *CAS) blobPath(key uint64) string {
 	return filepath.Join(c.dir, hex[:2], hex[2:]+".blob")
 }
 
-// touchGranularity bounds how often Get/Has refreshes a blob's modification
-// time: a blob already touched within this window is left alone, so a hot
-// query loop does not turn every read into a write. Coarser than trimMaxAge
-// by a wide margin, so "was this used recently enough to survive a trim"
-// stays accurate regardless.
-const touchGranularity = 24 * time.Hour
-
-// Has reports whether key's blob exists, refreshing its last-used time (see
-// [CAS.Get]'s doc) the same way a full read would. Callers that only need to
-// confirm presence — e.g. a revalidation pass that can otherwise skip
-// decoding — should prefer this over Get to avoid an unnecessary read.
+// Has reports whether key's blob exists. Callers that only need to confirm
+// presence — e.g. a revalidation pass that can otherwise skip decoding —
+// should prefer this over Get to avoid an unnecessary read.
 func (c *CAS) Has(key uint64) bool {
-	path := c.blobPath(key)
-	fi, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-	c.touch(path, fi)
-	return true
+	_, err := os.Stat(c.blobPath(key))
+	return err == nil
 }
 
-// Get returns key's blob, refreshing its last-used time (mtime, at
-// [touchGranularity] resolution) so a later [CAS.Trim] treats it as still in
-// use. ok is false if no blob is stored for key. ctx is checked before the
-// read starts, so a caller (e.g. internal/xref, mid a cancelable query)
-// does not pay for a file read its own context has already given up on.
+// Get returns key's blob. ok is false if no blob is stored for key — always
+// a soft miss, never an error on its own: a blob [CAS.GC] swept while it was
+// still the current UnitPointer target for some database GC's mark set
+// happened not to include (see GC's own safety doc) looks identical to one
+// that was simply never computed, and the same recovery applies to both —
+// the caller retypes-checks and re-Puts it, exactly like a GOCACHE miss.
+// ctx is checked before the read starts, so a caller (e.g. internal/xref,
+// mid a cancelable query) does not pay for a file read its own context has
+// already given up on.
 func (c *CAS) Get(ctx context.Context, key uint64) (blob []byte, ok bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	path := c.blobPath(key)
-	data, err := os.ReadFile(filepath.Clean(path))
+	data, err := os.ReadFile(filepath.Clean(c.blobPath(key)))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("store: read CAS blob %x: %w", key, err)
 	}
-	if fi, statErr := os.Stat(path); statErr == nil {
-		c.touch(path, fi)
-	}
 	return data, true, nil
-}
-
-// touch bumps path's mtime to now if it was last touched more than
-// touchGranularity ago. Best effort: a failed Chtimes only risks an
-// unnecessarily early Trim eviction for this one blob, never correctness
-// (a package evicted while still needed is simply retyped-checked and
-// rewritten, exactly like a GOCACHE miss).
-func (c *CAS) touch(path string, fi os.FileInfo) {
-	if time.Since(fi.ModTime()) < touchGranularity {
-		return
-	}
-	now := time.Now()
-	_ = os.Chtimes(path, now, now)
 }
 
 // Put stores blob under key, unless a blob is already stored there. Because
@@ -133,54 +109,75 @@ func (c *CAS) Put(key uint64, blob []byte) error {
 	return nil
 }
 
-// trimStampFile records the last time Trim ran, so MaybeTrim can bound how
-// often a full directory walk happens.
-const trimStampFile = ".trim-stamp"
+// gcStampFile records the last time GC actually walked the CAS directory, so
+// MaybeGC can bound how often that happens.
+const gcStampFile = ".gc-stamp"
 
-// Default GC constants (see the package doc's "GC" design note): deliberately
-// conservative and not flag-configurable for v0.1, mirroring GOCACHE's own
-// unconfigurable defaults.
+// Default GC constants: deliberately conservative and not flag-configurable
+// for v0.1, mirroring GOCACHE's own unconfigurable defaults.
 const (
-	// TrimInterval is how often MaybeTrim actually walks the CAS directory;
-	// calls in between are a cheap timestamp-file stat and no-op.
-	TrimInterval = 24 * time.Hour
-	// TrimMaxAge is how long a blob may go unused (see touchGranularity)
-	// before Trim removes it.
-	TrimMaxAge = 5 * 24 * time.Hour
+	// GCInterval is how often MaybeGC actually walks the CAS directory when
+	// called opportunistically (e.g. every server startup); calls in
+	// between are a cheap timestamp-file stat and no-op. A schema-forced
+	// rebuild calls GC directly instead, bypassing this throttle (see
+	// internal/server's wiring), since that is precisely the rare event
+	// that just orphaned a whole generation of blobs.
+	GCInterval = 24 * time.Hour
+	// GraceWindow is how recently an unreferenced blob may have been
+	// written before GC will remove it. It exists for two reasons, not
+	// one: (1) a blob can be Put before the UnitPointer update that
+	// references it commits, so a GC pass racing that exact window must
+	// not delete work a concurrent build only just produced; (2) this
+	// GC's mark set is necessarily incomplete whenever another live
+	// session's index database cannot be opened read-only within GC's own
+	// short probe timeout (see GC's doc) — that session's own blobs may
+	// simply not have been marked this round, not because they are
+	// unreferenced. A blob only a few hours old is far more likely to be
+	// "just written by a session GC could not read" than "orphaned by a
+	// schema bump that happened days ago", so a wider grace window than a
+	// bare race-condition guard would need trades a slower reclaim for
+	// meaningfully lower risk of evicting something still live.
+	GraceWindow = 48 * time.Hour
 )
 
-// MaybeTrim runs Trim(TrimMaxAge) only if at least TrimInterval has passed
-// since the last time it actually ran (tracked via a small stamp file in the
-// CAS directory, shared by every worktree using this CAS — whichever session
-// happens to observe the interval elapsed pays the walk for all of them).
-// Safe to call on every session startup: the common case is a cheap stat of
-// the stamp file followed by nothing.
-func (c *CAS) MaybeTrim(now time.Time) error {
-	stampPath := filepath.Join(c.dir, trimStampFile)
-	if fi, err := os.Stat(stampPath); err == nil && now.Sub(fi.ModTime()) < TrimInterval {
-		return nil
-	}
-	// Claim the stamp first (best effort, not a lock): a lost race just
-	// means two sessions both walk the directory once in the same window,
-	// which is wasted work, not a correctness problem.
-	if err := os.WriteFile(stampPath, nil, 0o600); err != nil {
-		return fmt.Errorf("store: write CAS trim stamp: %w", err)
-	}
-	_, err := c.Trim(now, TrimMaxAge)
-	return err
+// GCStats summarizes one (*CAS).GC pass, for internal/server's log line
+// (see its own doc for the exact format).
+type GCStats struct {
+	SweptCount int
+	SweptBytes int64
+	KeptCount  int
+	KeptBytes  int64
+	Duration   time.Duration
 }
 
-// Trim removes every blob whose last-used mtime is older than now.Add(-maxAge),
-// reporting how many were removed. Blobs read or written more recently than
-// that (including via a mere [CAS.Has] presence check — see its doc) survive:
-// a currently in-use blob is always touched at least once per golance
-// session that references it, so only a package genuinely unvisited for
-// maxAge is ever collected.
-func (c *CAS) Trim(now time.Time, maxAge time.Duration) (removed int, err error) {
-	cutoff := now.Add(-maxAge)
+// GC removes every blob not present in marks and last written more than
+// GraceWindow before now, reporting what it kept and swept. marks is the
+// union of every UnitPointer.BlobKey currently recorded across every index
+// database that shares this CAS directory (see internal/server's wiring,
+// which builds it via (*DB).CollectBlobKeys across this session's own
+// warm-opened database plus every other index-*.db/*.private-*.db file in
+// the cache directory whose (*DB).CASDir matches — see that meta field's
+// own doc for why a filename cannot answer this instead).
+//
+// Safety: a blob GC removes despite still being the correct target for some
+// database's UnitPointer is not a correctness bug — [CAS.Get] already
+// treats a missing blob as an ordinary cache miss, and the caller
+// retypechecks and re-Puts it exactly as it would after a GOCACHE eviction
+// (see Get's own doc). GC's mark set is therefore allowed to be an
+// under-approximation (built best-effort, skipping any database it cannot
+// read within a short timeout — see internal/server) without risking
+// anything worse than an occasional avoidable recompute; GraceWindow exists
+// to make that occasional case rare in practice, not to make it impossible.
+// GC never reads a blob's own content (only os.Stat/os.Remove on the
+// directory tree), so its own memory footprint stays flat regardless of how
+// large the CAS directory is.
+func (c *CAS) GC(now time.Time, marks map[uint64]struct{}) (GCStats, error) {
+	start := time.Now()
+	var stats GCStats
+	cutoff := now.Add(-GraceWindow)
 	shards, err := os.ReadDir(c.dir)
 	if err != nil {
-		return 0, fmt.Errorf("store: list CAS directory: %w", err)
+		return stats, fmt.Errorf("store: list CAS directory: %w", err)
 	}
 	for _, shard := range shards {
 		if !shard.IsDir() {
@@ -195,14 +192,66 @@ func (c *CAS) Trim(now time.Time, maxAge time.Duration) (removed int, err error)
 			if e.IsDir() {
 				continue
 			}
-			fi, err := e.Info()
-			if err != nil || fi.ModTime().After(cutoff) {
+			key, ok := blobKeyFromFilename(shard.Name(), e.Name())
+			if !ok {
 				continue
 			}
+			fi, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if _, referenced := marks[key]; referenced || fi.ModTime().After(cutoff) {
+				stats.KeptCount++
+				stats.KeptBytes += fi.Size()
+				continue
+			}
+			size := fi.Size()
 			if os.Remove(filepath.Join(shardPath, e.Name())) == nil {
-				removed++
+				stats.SweptCount++
+				stats.SweptBytes += size
 			}
 		}
 	}
-	return removed, nil
+	stats.Duration = time.Since(start)
+	return stats, nil
+}
+
+// MaybeGC runs GC(now, marks) only if at least GCInterval has passed since
+// the last time it actually ran (tracked via a small stamp file in the CAS
+// directory, shared by every worktree using this CAS — whichever session
+// happens to observe the interval elapsed pays the walk for all of them).
+// Safe to call on every session startup: the common case is a cheap stat of
+// the stamp file followed by nothing. ran reports whether GC actually ran
+// (false does not mean "nothing to report", it means "GC was skipped this
+// time" — stats is zero either way).
+func (c *CAS) MaybeGC(now time.Time, marks map[uint64]struct{}) (stats GCStats, ran bool, err error) {
+	stampPath := filepath.Join(c.dir, gcStampFile)
+	if fi, err := os.Stat(stampPath); err == nil && now.Sub(fi.ModTime()) < GCInterval {
+		return GCStats{}, false, nil
+	}
+	// Claim the stamp first (best effort, not a lock): a lost race just
+	// means two sessions both walk the directory once in the same window,
+	// which is wasted work, not a correctness problem.
+	if err := os.WriteFile(stampPath, nil, 0o600); err != nil {
+		return GCStats{}, false, fmt.Errorf("store: write CAS GC stamp: %w", err)
+	}
+	stats, err = c.GC(now, marks)
+	return stats, true, err
+}
+
+// blobKeyFromFilename recovers the uint64 key [CAS.blobPath] encoded into
+// shardName/fileName (the inverse of blobPath's own "hex[:2]/hex[2:].blob"
+// split), reporting ok=false for any directory entry that is not one of
+// this CAS's own blob files (e.g. gcStampFile) rather than erroring — GC
+// must tolerate whatever else has ever been written into this directory.
+func blobKeyFromFilename(shardName, fileName string) (key uint64, ok bool) {
+	hex, found := strings.CutSuffix(fileName, ".blob")
+	if !found || len(shardName) != 2 || len(hex) != 14 {
+		return 0, false
+	}
+	key, err := strconv.ParseUint(shardName+hex, 16, 64)
+	if err != nil {
+		return 0, false
+	}
+	return key, true
 }

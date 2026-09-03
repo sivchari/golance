@@ -134,6 +134,12 @@ func (s *Server) loadWorkspaceAsync(ctx context.Context, root string) {
 	} else {
 		s.buildIndex(ctx, root)
 	}
+
+	// Opportunistic, low-priority CAS GC: see runStartupCASGC's doc. Backgrounded
+	// on its own, separate from loadWorkspaceAsync's own goroutine, so an
+	// unlucky worst case (many other index databases in the cache directory,
+	// each paying otherDBOpenTimeout) cannot delay anything after this point.
+	s.rpc.Go(func(context.Context) { s.runStartupCASGC(root) })
 }
 
 // handleShutdown acknowledges the "shutdown" request. internal/rpc already
