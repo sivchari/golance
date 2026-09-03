@@ -211,7 +211,7 @@ func (s *Server) switchToPrivateIndex() {
 	}
 	const msg = "shared index locked by another session; building a session-private index"
 	s.logger.Printf("golance: %s", msg)
-	s.logMessage(protocol.MessageTypeInfo, "golance: "+msg)
+	s.logMessage("golance: " + msg)
 }
 
 // tryWarmOpen opens root's existing per-root index database and CAS
@@ -618,9 +618,13 @@ func (s *Server) showMessage(typ protocol.MessageType, msg string) {
 // blocking "press ENTER" prompt in a terminal-based editor) — reserve
 // showMessage for failures that genuinely need the user's attention (see
 // warnIndexUnavailable) and use logMessage for everything else, including
-// routine "index still building" notices.
-func (s *Server) logMessage(typ protocol.MessageType, msg string) {
-	err := s.rpc.Notify(protocol.MethodWindowLogMessage, &protocol.LogMessageParams{Type: typ, Message: msg})
+// routine "index still building" notices. Always MessageTypeInfo (every
+// call site wants exactly that — logMessage is reserved for routine,
+// non-actionable notices; anything severe enough to warrant Warning or
+// Error belongs in showMessage instead), so unlike showMessage this takes
+// no MessageType parameter at all.
+func (s *Server) logMessage(msg string) {
+	err := s.rpc.Notify(protocol.MethodWindowLogMessage, &protocol.LogMessageParams{Type: protocol.MessageTypeInfo, Message: msg})
 	if err != nil {
 		s.logger.Printf("server: log message: %v", err)
 	}

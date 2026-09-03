@@ -65,6 +65,7 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 		return nil, fmt.Errorf("server: initialize: unmarshal params: %w", err)
 	}
 	s.setHintsEnabled(parseHintsSettings(p.InitializationOptions))
+	s.setCodeLensesEnabled(parseCodeLensSettings(p.InitializationOptions))
 	s.watchDynamicReg.Store(clientSupportsWatchedFilesRegistration(&p))
 	s.inlayHintRefreshSupport.Store(clientSupportsInlayHintRefresh(&p))
 	s.semanticTokensRefreshSupport.Store(clientSupportsSemanticTokensRefresh(&p))
