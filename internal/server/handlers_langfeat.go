@@ -11,6 +11,7 @@ import (
 
 	"github.com/sivchari/golance/internal/check"
 	"github.com/sivchari/golance/internal/depcheck"
+	"github.com/sivchari/golance/internal/diff"
 	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
 )
@@ -510,12 +511,32 @@ func (s *Server) handleFormatting(_ context.Context, params json.RawMessage) (an
 	if bytes.Equal(text, formatted) {
 		return []protocol.TextEdit{}, nil
 	}
-	end, ok := overlay.UTF16PositionForByteOffset(text, len(text))
+	edits, ok := formattingTextEdits(text, formatted)
 	if !ok {
 		return []protocol.TextEdit{}, nil
 	}
-	return []protocol.TextEdit{{
-		Range:   protocol.Range{Start: protocol.Position{}, End: end},
-		NewText: string(formatted),
-	}}, nil
+	return edits, nil
+}
+
+// formattingTextEdits converts text -> formatted into the minimal set of
+// LSP TextEdits confined to the changed lines (internal/diff.Lines),
+// instead of one edit replacing the whole file -- matching gopls's own
+// textDocument/formatting, which diffs the formatted output against the
+// source rather than replacing it outright (gopls@v0.23.0's
+// internal/golang/format.go, computeTextEdits). ok is false if any edit's
+// byte offset cannot be converted to a UTF-16 position, degraded to "no
+// edits" like every other formatting failure in handleFormatting, rather
+// than a wire error.
+func formattingTextEdits(text, formatted []byte) ([]protocol.TextEdit, bool) {
+	edits := diff.Lines(text, formatted)
+	out := make([]protocol.TextEdit, 0, len(edits))
+	for _, e := range edits {
+		start, ok1 := overlay.UTF16PositionForByteOffset(text, e.Start)
+		end, ok2 := overlay.UTF16PositionForByteOffset(text, e.End)
+		if !ok1 || !ok2 {
+			return nil, false
+		}
+		out = append(out, protocol.TextEdit{Range: protocol.Range{Start: start, End: end}, NewText: e.New})
+	}
+	return out, true
 }

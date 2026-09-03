@@ -9,6 +9,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/index"
+	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
 	"github.com/sivchari/golance/internal/rpc"
 	"github.com/sivchari/golance/internal/store"
@@ -489,6 +492,96 @@ func TestHandleFormatting(t *testing.T) {
 	if len(edits) != 0 {
 		t.Fatalf("handleFormatting: got %d edits for an already-formatted file, want 0", len(edits))
 	}
+}
+
+// TestHandleFormatting_MinimalEdits checks that handleFormatting -- like
+// gopls's own textDocument/formatting (gopls@v0.23.0's
+// internal/golang/format.go, computeTextEdits) -- diffs the formatted
+// output against the source and returns edits confined to the changed
+// lines, not a single edit replacing the whole file, while still producing
+// gofmt/goimports output when applied.
+func TestHandleFormatting_MinimalEdits(t *testing.T) {
+	s, snap, _ := newTestServer(t)
+	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+	disk, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+
+	// Introduce one localized, gofmt-fixable problem (a missing space
+	// before the opening brace) in an otherwise gofmt-clean file, so a
+	// minimal-edit formatter should touch only that one line.
+	const from = "Greeting {"
+	const to = "Greeting{"
+	if !strings.Contains(string(disk), from) {
+		t.Fatalf("test fixture setup: %q not found in greet.go", from)
+	}
+	unformatted := strings.Replace(string(disk), from, to, 1)
+
+	if err := s.handleDidOpen(context.Background(), mustMarshal(t, &protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{URI: uri.File(file), Version: 1, Text: unformatted},
+	})); err != nil {
+		t.Fatalf("handleDidOpen: %v", err)
+	}
+
+	result, err := s.handleFormatting(context.Background(), mustMarshal(t, &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+	}))
+	if err != nil {
+		t.Fatalf("handleFormatting: %v", err)
+	}
+	edits, ok := result.([]protocol.TextEdit)
+	if !ok || len(edits) == 0 {
+		t.Fatalf("handleFormatting: result = %#v, want a non-empty []protocol.TextEdit", result)
+	}
+
+	want, err := langfeat.OrganizeImports(file, []byte(unformatted))
+	if err != nil {
+		t.Fatalf("OrganizeImports: %v", err)
+	}
+	if got := applyTextEdits(t, []byte(unformatted), edits); got != string(want) {
+		t.Fatalf("applying handleFormatting's edits = %q, want gofmt/goimports output %q", got, want)
+	}
+
+	unformattedLines := strings.Count(unformatted, "\n") + 1
+	for _, e := range edits {
+		if e.Range.Start.Line == 0 && int(e.Range.End.Line)+1 >= unformattedLines {
+			t.Errorf("edit %+v spans the whole file (all %d lines), want an edit confined to the one changed line", e, unformattedLines)
+		}
+	}
+}
+
+// applyTextEdits applies edits (assumed non-overlapping) to text, honoring
+// LSP's UTF-16 position coordinates via byteOffsetForPosition -- the same
+// conversion handleFormatting itself uses in reverse.
+func applyTextEdits(t *testing.T, text []byte, edits []protocol.TextEdit) string {
+	t.Helper()
+	type span struct {
+		start, end int
+		newText    string
+	}
+	spans := make([]span, 0, len(edits))
+	for _, e := range edits {
+		start, ok := byteOffsetForPosition(text, e.Range.Start)
+		if !ok {
+			t.Fatalf("byteOffsetForPosition(%+v): not found", e.Range.Start)
+		}
+		end, ok := byteOffsetForPosition(text, e.Range.End)
+		if !ok {
+			t.Fatalf("byteOffsetForPosition(%+v): not found", e.Range.End)
+		}
+		spans = append(spans, span{start: start, end: end, newText: e.NewText})
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	var out []byte
+	last := 0
+	for _, sp := range spans {
+		out = append(out, text[last:sp.start]...)
+		out = append(out, sp.newText...)
+		last = sp.end
+	}
+	out = append(out, text[last:]...)
+	return string(out)
 }
 
 func TestHandleWorkspaceSymbol(t *testing.T) {
