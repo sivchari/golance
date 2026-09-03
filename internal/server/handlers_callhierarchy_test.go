@@ -66,9 +66,9 @@ func outgoingCallsFor(t *testing.T, s *Server, file, funcName string) []protocol
 
 // findOutgoingCall returns the entry of calls whose callee is named name.
 func findOutgoingCall(calls []protocol.CallHierarchyOutgoingCall, name string) (protocol.CallHierarchyOutgoingCall, bool) {
-	for _, c := range calls {
-		if c.To.Name == name {
-			return c, true
+	for i := range calls {
+		if calls[i].To.Name == name {
+			return calls[i], true
 		}
 	}
 	return protocol.CallHierarchyOutgoingCall{}, false
@@ -76,9 +76,9 @@ func findOutgoingCall(calls []protocol.CallHierarchyOutgoingCall, name string) (
 
 // incomingCallsFor calls handleIncomingCalls for item and returns its
 // result.
-func incomingCallsFor(t *testing.T, s *Server, item protocol.CallHierarchyItem) []protocol.CallHierarchyIncomingCall {
+func incomingCallsFor(t *testing.T, s *Server, item *protocol.CallHierarchyItem) []protocol.CallHierarchyIncomingCall {
 	t.Helper()
-	result, err := s.handleIncomingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyIncomingCallsParams{Item: item}))
+	result, err := s.handleIncomingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyIncomingCallsParams{Item: *item}))
 	if err != nil {
 		t.Fatalf("handleIncomingCalls: %v", err)
 	}
@@ -91,9 +91,9 @@ func incomingCallsFor(t *testing.T, s *Server, item protocol.CallHierarchyItem) 
 
 // findIncomingCall returns the entry of calls whose caller is named name.
 func findIncomingCall(calls []protocol.CallHierarchyIncomingCall, name string) (protocol.CallHierarchyIncomingCall, bool) {
-	for _, c := range calls {
-		if c.From.Name == name {
-			return c, true
+	for i := range calls {
+		if calls[i].From.Name == name {
+			return calls[i], true
 		}
 	}
 	return protocol.CallHierarchyIncomingCall{}, false
@@ -219,7 +219,7 @@ func checkIncomingCallsAdd(t *testing.T, s *Server, file, root string) {
 	t.Helper()
 	pos := callhPos(t, file, "Add", 1) // Add's own declaration
 	item := preparedItem(t, s, file, pos)
-	calls := incomingCallsFor(t, s, item)
+	calls := incomingCallsFor(t, s, &item)
 
 	if c, ok := findIncomingCall(calls, "Caller"); !ok {
 		t.Error("incoming calls did not include Caller")
@@ -251,7 +251,7 @@ func checkIncomingCallsRobotGreet(t *testing.T, s *Server, file string) {
 	t.Helper()
 	pos := callhPos(t, file, "Greet", 2) // Robot's own Greet method declaration
 	item := preparedItem(t, s, file, pos)
-	calls := incomingCallsFor(t, s, item)
+	calls := incomingCallsFor(t, s, &item)
 
 	if _, ok := findIncomingCall(calls, "Caller"); !ok {
 		t.Errorf("incoming calls on Robot.Greet did not include Caller (calls it through the Greeter interface): %+v", calls)
@@ -316,11 +316,11 @@ func TestFoldIncomingCalls_ResultOrder(t *testing.T) {
 	file := callhFile(t, root)
 	pos := callhPos(t, file, "Add", 1)
 	item := preparedItem(t, s, file, pos)
-	calls := incomingCallsFor(t, s, item)
+	calls := incomingCallsFor(t, s, &item)
 
 	locs := make([]protocol.Location, len(calls))
-	for i, c := range calls {
-		locs[i] = protocol.Location{URI: c.From.URI, Range: c.From.Range}
+	for i := range calls {
+		locs[i] = protocol.Location{URI: calls[i].From.URI, Range: calls[i].From.Range}
 	}
 	if !sort.SliceIsSorted(locs, func(i, j int) bool { return compareLocation(locs[i], locs[j]) }) {
 		t.Errorf("handleIncomingCalls result is not sorted by (URI, Range.Start): %+v", locs)
