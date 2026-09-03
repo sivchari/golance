@@ -1,6 +1,6 @@
 # Changelog
 
-## [v0.6.1](https://github.com/sivchari/golance/compare/v0.6.0...v0.6.1) - 2026-09-03
+## [v0.7.0](https://github.com/sivchari/golance/compare/v0.6.0...v0.7.0) - 2026-09-03
 - feat: produce dependency export data by source-checking instead of go list -export by @sivchari in https://github.com/sivchari/golance/pull/94
 - fix: dedupe request-driven checks and detach them from requester cancellation by @sivchari in https://github.com/sivchari/golance/pull/96
 
