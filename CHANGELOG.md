@@ -1,6 +1,6 @@
 # Changelog
 
-## [v0.4.9](https://github.com/sivchari/golance/compare/v0.4.8...v0.4.9) - 2026-09-03
+## [v0.5.0](https://github.com/sivchari/golance/compare/v0.4.8...v0.5.0) - 2026-09-03
 - feat: add persisted reverse reference index for O(result) references by @sivchari in https://github.com/sivchari/golance/pull/83
 
 ## [v0.4.8](https://github.com/sivchari/golance/compare/v0.4.7...v0.4.8) - 2026-09-02
