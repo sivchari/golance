@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -12,21 +11,17 @@ import (
 )
 
 // callhFile returns the absolute path to internal/server/testdata/module's
-// callh package file name.
-func callhFile(t *testing.T, snapRoot, name string) string {
+// callh package's callh.go.
+func callhFile(t *testing.T, snapRoot string) string {
 	t.Helper()
-	return filepath.Join(snapRoot, "callh", name)
+	return filepath.Join(snapRoot, "callh", "callh.go")
 }
 
 // callhPos returns the LSP position of the occurrence-th (1-based)
 // identifier named ident in file.
 func callhPos(t *testing.T, file, ident string, occurrence int) protocol.Position {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Clean(file))
-	if err != nil {
-		t.Fatalf("read %s: %v", file, err)
-	}
-	return identPositionIn(t, file, data, ident, occurrence)
+	return identPositionIn(t, file, mustReadFile(t, file), ident, occurrence)
 }
 
 // preparedItem calls handlePrepareCallHierarchy at (file, pos) and returns
@@ -50,9 +45,63 @@ func preparedItem(t *testing.T, s *Server, file string, pos protocol.Position) p
 	return items[0]
 }
 
+// outgoingCallsFor prepares the call hierarchy item at funcName's own
+// declaration in file (its first occurrence) and returns its outgoing
+// calls.
+func outgoingCallsFor(t *testing.T, s *Server, file, funcName string) []protocol.CallHierarchyOutgoingCall {
+	t.Helper()
+	pos := callhPos(t, file, funcName, 1)
+	item := preparedItem(t, s, file, pos)
+
+	result, err := s.handleOutgoingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyOutgoingCallsParams{Item: item}))
+	if err != nil {
+		t.Fatalf("handleOutgoingCalls: %v", err)
+	}
+	calls, ok := result.([]protocol.CallHierarchyOutgoingCall)
+	if !ok {
+		t.Fatalf("handleOutgoingCalls = %#v, want []protocol.CallHierarchyOutgoingCall", result)
+	}
+	return calls
+}
+
+// findOutgoingCall returns the entry of calls whose callee is named name.
+func findOutgoingCall(calls []protocol.CallHierarchyOutgoingCall, name string) (protocol.CallHierarchyOutgoingCall, bool) {
+	for _, c := range calls {
+		if c.To.Name == name {
+			return c, true
+		}
+	}
+	return protocol.CallHierarchyOutgoingCall{}, false
+}
+
+// incomingCallsFor calls handleIncomingCalls for item and returns its
+// result.
+func incomingCallsFor(t *testing.T, s *Server, item protocol.CallHierarchyItem) []protocol.CallHierarchyIncomingCall {
+	t.Helper()
+	result, err := s.handleIncomingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyIncomingCallsParams{Item: item}))
+	if err != nil {
+		t.Fatalf("handleIncomingCalls: %v", err)
+	}
+	calls, ok := result.([]protocol.CallHierarchyIncomingCall)
+	if !ok {
+		t.Fatalf("handleIncomingCalls = %#v, want []protocol.CallHierarchyIncomingCall", result)
+	}
+	return calls
+}
+
+// findIncomingCall returns the entry of calls whose caller is named name.
+func findIncomingCall(calls []protocol.CallHierarchyIncomingCall, name string) (protocol.CallHierarchyIncomingCall, bool) {
+	for _, c := range calls {
+		if c.From.Name == name {
+			return c, true
+		}
+	}
+	return protocol.CallHierarchyIncomingCall{}, false
+}
+
 func TestHandlePrepareCallHierarchy(t *testing.T) {
 	s, _, root := newTestServer(t)
-	file := callhFile(t, root, "callh.go")
+	file := callhFile(t, root)
 
 	t.Run("call site resolves to the declaration", func(t *testing.T) {
 		pos := callhPos(t, file, "Add", 2) // first Add(1, 2) call in Caller
@@ -92,147 +141,121 @@ func TestHandlePrepareCallHierarchy(t *testing.T) {
 
 func TestHandleOutgoingCalls(t *testing.T) {
 	s, _, root := newTestServer(t)
-	file := callhFile(t, root, "callh.go")
+	file := callhFile(t, root)
 
 	t.Run("Caller: direct calls plus an interface-mediated call", func(t *testing.T) {
-		pos := callhPos(t, file, "Caller", 1)
-		item := preparedItem(t, s, file, pos)
-
-		result, err := s.handleOutgoingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyOutgoingCallsParams{Item: item}))
-		if err != nil {
-			t.Fatalf("handleOutgoingCalls: %v", err)
-		}
-		calls, ok := result.([]protocol.CallHierarchyOutgoingCall)
-		if !ok {
-			t.Fatalf("handleOutgoingCalls = %#v, want []protocol.CallHierarchyOutgoingCall", result)
-		}
-		names := make(map[string]int)
-		for _, c := range calls {
-			names[c.To.Name] = len(c.FromRanges)
-		}
-		if names["Add"] != 2 {
-			t.Errorf("Add fromRanges = %d, want 2 (Add is called twice)", names["Add"])
-		}
-		if names["Describe"] != 1 {
-			t.Errorf("Describe fromRanges = %d, want 1", names["Describe"])
-		}
-		if names["Greet"] != 1 {
-			t.Errorf("Greet fromRanges = %d, want 1 (g.Greet() through the Greeter interface)", names["Greet"])
-		}
-		if len(calls) != 3 {
-			t.Errorf("handleOutgoingCalls returned %d entries, want 3 (Add, Describe, Greet): %+v", len(calls), calls)
-		}
+		checkOutgoingCallsCaller(t, s, file)
 	})
 
 	t.Run("Describe: stdlib, a different workspace package, builtin filtered", func(t *testing.T) {
-		pos := callhPos(t, file, "Describe", 1)
-		item := preparedItem(t, s, file, pos)
-
-		result, err := s.handleOutgoingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyOutgoingCallsParams{Item: item}))
-		if err != nil {
-			t.Fatalf("handleOutgoingCalls: %v", err)
-		}
-		calls, ok := result.([]protocol.CallHierarchyOutgoingCall)
-		if !ok {
-			t.Fatalf("handleOutgoingCalls = %#v, want []protocol.CallHierarchyOutgoingCall", result)
-		}
-		var sawDouble bool
-		for _, c := range calls {
-			if c.To.Name == "len" {
-				t.Errorf("outgoing calls included the builtin len, want it filtered: %+v", calls)
-			}
-			if c.To.Name == "Double" {
-				sawDouble = true
-				if !contains(*c.To.Detail, "example.com/servermod/callhdep") {
-					t.Errorf("Double's Detail = %q, want it to name callhdep's package path", *c.To.Detail)
-				}
-			}
-		}
-		if !sawDouble {
-			t.Errorf("outgoing calls did not include callhdep.Double (a different workspace package): %+v", calls)
-		}
-		var sawSprintf bool
-		for _, c := range calls {
-			if c.To.Name == "Sprintf" {
-				sawSprintf = true
-				if !contains(*c.To.Detail, "fmt") {
-					t.Errorf("Sprintf's Detail = %q, want it to name the fmt package", *c.To.Detail)
-				}
-			}
-		}
-		if !sawSprintf {
-			t.Errorf("outgoing calls did not include fmt.Sprintf (the standard library): %+v", calls)
-		}
+		checkOutgoingCallsDescribe(t, s, file)
 	})
+}
+
+// checkOutgoingCallsCaller asserts Caller's outgoing calls are exactly Add
+// (called twice), Describe, and Greet (through the Greeter interface).
+func checkOutgoingCallsCaller(t *testing.T, s *Server, file string) {
+	t.Helper()
+	calls := outgoingCallsFor(t, s, file, "Caller")
+	if len(calls) != 3 {
+		t.Fatalf("handleOutgoingCalls returned %d entries, want 3 (Add, Describe, Greet): %+v", len(calls), calls)
+	}
+	for name, wantFromRanges := range map[string]int{"Add": 2, "Describe": 1, "Greet": 1} {
+		c, ok := findOutgoingCall(calls, name)
+		if !ok {
+			t.Errorf("outgoing calls did not include %s: %+v", name, calls)
+			continue
+		}
+		if len(c.FromRanges) != wantFromRanges {
+			t.Errorf("%s fromRanges = %d, want %d", name, len(c.FromRanges), wantFromRanges)
+		}
+	}
+}
+
+// checkOutgoingCallsDescribe asserts Describe's outgoing calls include
+// callhdep.Double (a different workspace package) and fmt.Sprintf (the
+// standard library), and never the builtin len.
+func checkOutgoingCallsDescribe(t *testing.T, s *Server, file string) {
+	t.Helper()
+	calls := outgoingCallsFor(t, s, file, "Describe")
+
+	if _, ok := findOutgoingCall(calls, "len"); ok {
+		t.Errorf("outgoing calls included the builtin len, want it filtered: %+v", calls)
+	}
+
+	double, ok := findOutgoingCall(calls, "Double")
+	if !ok {
+		t.Errorf("outgoing calls did not include callhdep.Double (a different workspace package): %+v", calls)
+	} else if !contains(*double.To.Detail, "example.com/servermod/callhdep") {
+		t.Errorf("Double's Detail = %q, want it to name callhdep's package path", *double.To.Detail)
+	}
+
+	sprintf, ok := findOutgoingCall(calls, "Sprintf")
+	if !ok {
+		t.Errorf("outgoing calls did not include fmt.Sprintf (the standard library): %+v", calls)
+	} else if !contains(*sprintf.To.Detail, "fmt") {
+		t.Errorf("Sprintf's Detail = %q, want it to name the fmt package", *sprintf.To.Detail)
+	}
 }
 
 func TestHandleIncomingCalls(t *testing.T) {
 	s, _, root := newTestServer(t)
-	file := callhFile(t, root, "callh.go")
+	file := callhFile(t, root)
 
 	t.Run("Add: same-caller aggregation, function literal, cross-package, and test file", func(t *testing.T) {
-		pos := callhPos(t, file, "Add", 1) // Add's own declaration
-		item := preparedItem(t, s, file, pos)
-
-		result, err := s.handleIncomingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyIncomingCallsParams{Item: item}))
-		if err != nil {
-			t.Fatalf("handleIncomingCalls: %v", err)
-		}
-		calls, ok := result.([]protocol.CallHierarchyIncomingCall)
-		if !ok {
-			t.Fatalf("handleIncomingCalls = %#v, want []protocol.CallHierarchyIncomingCall", result)
-		}
-
-		byName := make(map[string]protocol.CallHierarchyIncomingCall)
-		for _, c := range calls {
-			byName[c.From.Name] = c
-		}
-
-		if c, ok := byName["Caller"]; !ok {
-			t.Error("incoming calls did not include Caller")
-		} else if len(c.FromRanges) != 2 {
-			t.Errorf("Caller's FromRanges = %d, want 2 (Add is called twice from Caller)", len(c.FromRanges))
-		}
-
-		if c, ok := byName["WithLiteral"]; !ok {
-			t.Error("incoming calls did not include WithLiteral (called from a nested function literal)")
-		} else if len(c.FromRanges) != 1 {
-			t.Errorf("WithLiteral's FromRanges = %d, want 1", len(c.FromRanges))
-		}
-
-		if c, ok := byName["UseAdd"]; !ok {
-			t.Error("incoming calls did not include UseAdd (a different package, findable only via the index)")
-		} else if c.From.URI.FsPath() != filepath.Join(root, "callhuser", "callhuser.go") {
-			t.Errorf("UseAdd's From.URI = %s, want callhuser.go", c.From.URI.FsPath())
-		}
-
-		if _, ok := byName["TestAddFromTest"]; !ok {
-			t.Error("incoming calls did not include TestAddFromTest (an in-package _test.go file)")
-		}
+		checkIncomingCallsAdd(t, s, file, root)
 	})
 
 	t.Run("interface-mediated: Robot.Greet is reachable through Caller's g.Greet() call", func(t *testing.T) {
-		pos := callhPos(t, file, "Greet", 2) // Robot's own Greet method declaration
-		item := preparedItem(t, s, file, pos)
-
-		result, err := s.handleIncomingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyIncomingCallsParams{Item: item}))
-		if err != nil {
-			t.Fatalf("handleIncomingCalls: %v", err)
-		}
-		calls, ok := result.([]protocol.CallHierarchyIncomingCall)
-		if !ok {
-			t.Fatalf("handleIncomingCalls = %#v, want []protocol.CallHierarchyIncomingCall", result)
-		}
-		var sawCaller bool
-		for _, c := range calls {
-			if c.From.Name == "Caller" {
-				sawCaller = true
-			}
-		}
-		if !sawCaller {
-			t.Errorf("incoming calls on Robot.Greet did not include Caller (calls it through the Greeter interface): %+v", calls)
-		}
+		checkIncomingCallsRobotGreet(t, s, file)
 	})
+}
+
+// checkIncomingCallsAdd asserts Add's incoming calls cover: Caller (called
+// twice, fromRanges aggregation), WithLiteral (called from a nested
+// function literal), UseAdd (a different package, findable only via the
+// index), and TestAddFromTest (an in-package _test.go file).
+func checkIncomingCallsAdd(t *testing.T, s *Server, file, root string) {
+	t.Helper()
+	pos := callhPos(t, file, "Add", 1) // Add's own declaration
+	item := preparedItem(t, s, file, pos)
+	calls := incomingCallsFor(t, s, item)
+
+	if c, ok := findIncomingCall(calls, "Caller"); !ok {
+		t.Error("incoming calls did not include Caller")
+	} else if len(c.FromRanges) != 2 {
+		t.Errorf("Caller's FromRanges = %d, want 2 (Add is called twice from Caller)", len(c.FromRanges))
+	}
+
+	if c, ok := findIncomingCall(calls, "WithLiteral"); !ok {
+		t.Error("incoming calls did not include WithLiteral (called from a nested function literal)")
+	} else if len(c.FromRanges) != 1 {
+		t.Errorf("WithLiteral's FromRanges = %d, want 1", len(c.FromRanges))
+	}
+
+	if c, ok := findIncomingCall(calls, "UseAdd"); !ok {
+		t.Error("incoming calls did not include UseAdd (a different package, findable only via the index)")
+	} else if c.From.URI.FsPath() != filepath.Join(root, "callhuser", "callhuser.go") {
+		t.Errorf("UseAdd's From.URI = %s, want callhuser.go", c.From.URI.FsPath())
+	}
+
+	if _, ok := findIncomingCall(calls, "TestAddFromTest"); !ok {
+		t.Error("incoming calls did not include TestAddFromTest (an in-package _test.go file)")
+	}
+}
+
+// checkIncomingCallsRobotGreet asserts Robot's own Greet method's incoming
+// calls include Caller, which reaches it only through the Greeter
+// interface.
+func checkIncomingCallsRobotGreet(t *testing.T, s *Server, file string) {
+	t.Helper()
+	pos := callhPos(t, file, "Greet", 2) // Robot's own Greet method declaration
+	item := preparedItem(t, s, file, pos)
+	calls := incomingCallsFor(t, s, item)
+
+	if _, ok := findIncomingCall(calls, "Caller"); !ok {
+		t.Errorf("incoming calls on Robot.Greet did not include Caller (calls it through the Greeter interface): %+v", calls)
+	}
 }
 
 // TestHandleIncomingCalls_IndexUnavailable pins incomingCalls' index-required
@@ -290,18 +313,11 @@ func TestHandlePrepareOutgoingCalls_WorkWithoutIndex(t *testing.T) {
 // a client sees the same order across identical requests.
 func TestFoldIncomingCalls_ResultOrder(t *testing.T) {
 	s, _, root := newTestServer(t)
-	file := callhFile(t, root, "callh.go")
+	file := callhFile(t, root)
 	pos := callhPos(t, file, "Add", 1)
 	item := preparedItem(t, s, file, pos)
+	calls := incomingCallsFor(t, s, item)
 
-	result, err := s.handleIncomingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyIncomingCallsParams{Item: item}))
-	if err != nil {
-		t.Fatalf("handleIncomingCalls: %v", err)
-	}
-	calls, ok := result.([]protocol.CallHierarchyIncomingCall)
-	if !ok {
-		t.Fatalf("handleIncomingCalls = %#v, want []protocol.CallHierarchyIncomingCall", result)
-	}
 	locs := make([]protocol.Location, len(calls))
 	for i, c := range calls {
 		locs[i] = protocol.Location{URI: c.From.URI, Range: c.From.Range}

@@ -102,7 +102,7 @@ func TestE2E_CallHierarchy(t *testing.T) {
 	}
 	greetItem := outCalls[0].To
 
-	inCalls := waitForNonEmptyIncomingCalls(t, c, greetItem, e2eIndexBudget)
+	inCalls := waitForNonEmptyIncomingCalls(t, c, &greetItem, e2eIndexBudget)
 	if len(inCalls) != 1 || inCalls[0].From.Name != "Caller" {
 		t.Fatalf("incomingCalls(Greet) = %+v, want a single Caller entry", inCalls)
 	}
@@ -116,11 +116,11 @@ func TestE2E_CallHierarchy(t *testing.T) {
 // the transient index-unavailable error (callRetryIndexUnavailable) and an
 // ordinary empty result -- the same short window waitForNonEmptyLocations
 // rides out for a definition/references-shaped request.
-func waitForNonEmptyIncomingCalls(t *testing.T, c *lspClient, item protocol.CallHierarchyItem, timeout time.Duration) []protocol.CallHierarchyIncomingCall {
+func waitForNonEmptyIncomingCalls(t *testing.T, c *lspClient, item *protocol.CallHierarchyItem, timeout time.Duration) []protocol.CallHierarchyIncomingCall {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		resp := c.callRetryIndexUnavailable(t, protocol.MethodCallHierarchyIncomingCalls, &protocol.CallHierarchyIncomingCallsParams{Item: item}, timeout)
+		resp := c.callRetryIndexUnavailable(t, protocol.MethodCallHierarchyIncomingCalls, &protocol.CallHierarchyIncomingCallsParams{Item: *item}, timeout)
 		if len(resp.Error) > 0 {
 			t.Fatalf("incomingCalls failed: %s", resp.Error)
 		}

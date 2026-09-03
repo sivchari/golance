@@ -74,11 +74,18 @@ func FuncDeclaration(cp *check.CheckedPackage, fn *types.Func) (*FuncDeclInfo, e
 		}
 		return &FuncDeclInfo{SameFile: tf.Name(), Range: rangeOf(tf, declID.Pos(), declID.End())}, nil
 	}
-	objPath, err := objectpath.For(fn)
-	if err != nil {
-		return nil, nil
+	// A non-nil err here means fn is unreachable via objectpath (e.g. a
+	// function-local type's method, which can never actually be fn -- see
+	// this func's own doc); that is an ordinary, expected miss for
+	// FuncDeclaration to report as (nil, nil), not a fault to propagate --
+	// the same intentional-skip contract TypeDefinition already documents
+	// for the identical objectpath.For call on a named type. Checking
+	// err == nil (rather than err != nil { return nil, nil }) keeps that
+	// intent explicit in the control flow itself.
+	if objPath, err := objectpath.For(fn); err == nil {
+		return &FuncDeclInfo{PkgPath: fn.Pkg().Path(), ObjPath: string(objPath)}, nil
 	}
-	return &FuncDeclInfo{PkgPath: fn.Pkg().Path(), ObjPath: string(objPath)}, nil
+	return nil, nil
 }
 
 // OutgoingCall is one entry of an OutgoingCalls result: a callee reached

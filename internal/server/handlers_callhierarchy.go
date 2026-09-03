@@ -144,33 +144,22 @@ func (s *Server) dependencyFuncDeclaration(ctx context.Context, pkgPath, objPath
 	}
 	start := fset.Position(id.Pos())
 	end := fset.Position(id.End())
-	if !validExportPosition(start, end) {
+	// Bounds checked inline, right before the uint32 conversions below,
+	// rather than through a separate helper: gosec's G115 flow analysis
+	// only recognizes a prior range check as covering a conversion within
+	// the SAME function body, matching the identical inlined pattern
+	// dependencyDefinition (handlers_xref.go) and dependencyTypeDeclaration
+	// (handlers_nav.go) already use for their own depcheck results.
+	if _, err := os.Stat(start.Filename); err != nil {
+		return protocol.Location{}, false
+	}
+	if start.Line <= 0 || int64(start.Line) > math.MaxUint32 ||
+		start.Column <= 0 || int64(start.Column) > math.MaxUint32 ||
+		end.Column <= 0 || int64(end.Column) > math.MaxUint32 {
 		return protocol.Location{}, false
 	}
 	loc := xref.Location{File: start.Filename, Line: uint32(start.Line), Col: uint32(start.Column), EndCol: uint32(end.Column)}
 	return s.correctResultLocation(loc)
-}
-
-// validExportPosition reports whether start/end -- a declaring identifier's
-// span resolved through depcheck's own FileSet -- names a real, readable
-// file with line/column values that fit xref.Location's uint32 fields.
-// Mirrors the identical validation dependencyDefinition and
-// dependencyTypeDeclaration each already inline for their own depcheck
-// results (handlers_xref.go/handlers_nav.go).
-func validExportPosition(start, end token.Position) bool {
-	if _, err := os.Stat(start.Filename); err != nil {
-		return false
-	}
-	if start.Line <= 0 || int64(start.Line) > math.MaxUint32 {
-		return false
-	}
-	if start.Column <= 0 || int64(start.Column) > math.MaxUint32 {
-		return false
-	}
-	if end.Column <= 0 || int64(end.Column) > math.MaxUint32 {
-		return false
-	}
-	return true
 }
 
 // handlePrepareCallHierarchy answers textDocument/prepareCallHierarchy: the
