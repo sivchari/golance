@@ -4,9 +4,10 @@
 // internal/typecheck). Results are cached per package directory, kept fresh
 // against overlay/disk content via a content hash. Background rechecks
 // (Invalidate) run on a debounced schedule and supersede-cancel one
-// another; request-driven checks (Get) always run to completion against
-// the content they read, like a gopls snapshot, and are never canceled by
-// that schedule — see Get's doc for the invariant this implies.
+// another; request-driven checks (Get) are deduplicated and run detached
+// from any one requester, on the engine's own lifecycle ctx, so they always
+// run to completion and warm the cache regardless of which caller (if any)
+// is still waiting on them — see Get's doc for the invariant this implies.
 package check
 
 import (
@@ -154,6 +155,18 @@ type dirState struct {
 	pubGen uint64
 }
 
+// flight is one in-flight, detached recheck for a unitKey+contentHash pair,
+// shared by every concurrent Get that would otherwise redundantly recheck
+// the exact same content. See Engine.Get's doc for the design this exists
+// for (deduplication) and Engine.runFlight for the detachment half of it.
+// cp and err are only valid after done is closed.
+type flight struct {
+	hash string
+	done chan struct{}
+	cp   *CheckedPackage
+	err  error
+}
+
 // Engine is an on-demand type checking engine over a workspace. Safe for
 // concurrent use.
 type Engine struct {
@@ -162,11 +175,20 @@ type Engine struct {
 	newImporter Importer
 	opts        Options
 
-	mu    sync.Mutex
-	focus string // directory of the focused package, "" if none — protects every variant of that directory from eviction, see evictLocked
-	dirs  map[unitKey]pkgInfo
-	cache map[unitKey]*cacheEntry
-	jobs  map[unitKey]*dirState
+	// ctx and cancel are the engine's own lifecycle context: every flight
+	// (see runFlight) runs on ctx, not on any individual Get caller's
+	// request ctx, so it keeps running to completion — and can still warm
+	// the cache — after a caller stops waiting on it. cancel is called by
+	// Stop, which is the only thing that ends a flight early.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu      sync.Mutex
+	focus   string // directory of the focused package, "" if none — protects every variant of that directory from eviction, see evictLocked
+	dirs    map[unitKey]pkgInfo
+	cache   map[unitKey]*cacheEntry
+	jobs    map[unitKey]*dirState
+	flights map[unitKey]*flight
 }
 
 // New returns an Engine that resolves files to packages via snap, reads
@@ -179,14 +201,18 @@ func New(snap SnapshotSource, reader overlay.FileReader, imp Importer, opts Opti
 	if opts.DebounceDelay <= 0 {
 		opts.DebounceDelay = defaultDebounceDelay
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Engine{
 		snap:        snap,
 		reader:      reader,
 		newImporter: imp,
 		opts:        opts,
+		ctx:         ctx,
+		cancel:      cancel,
 		dirs:        make(map[unitKey]pkgInfo),
 		cache:       make(map[unitKey]*cacheEntry),
 		jobs:        make(map[unitKey]*dirState),
+		flights:     make(map[unitKey]*flight),
 	}
 }
 
@@ -205,19 +231,35 @@ func (e *Engine) SetFocus(filePath string) {
 }
 
 // Get returns the current CheckedPackage for the package containing
-// filePath, type-checking it synchronously if the cache is missing or
-// stale. It bypasses the debounce delay and, unlike a debounce-triggered
-// background recheck, runs to completion against the content it read at
-// the start of the recheck: it does not register for per-dir supersede
-// cancellation, so a concurrent Invalidate/fireRecheck for the same
-// directory can neither cancel it nor be canceled by it — the two may run
-// concurrently. The only thing that cancels Get is ctx itself (the
-// request's own context, canceled by $/cancelRequest or a dropped
-// connection). Because a request-driven and a background recheck for the
-// same directory can now finish in either order, Get's result is still
-// gated by the generation guard in commit before it is cached or
-// published; Get itself always returns the CheckedPackage it computed,
-// regardless of that guard.
+// filePath, type-checking it if the cache is missing or stale. It bypasses
+// the debounce delay and, unlike a debounce-triggered background recheck,
+// does not register for per-dir supersede cancellation, so a concurrent
+// Invalidate/fireRecheck for the same directory can neither cancel it nor
+// be canceled by it — the two may run concurrently.
+//
+// The recheck itself is deduplicated and detached: concurrent Gets for the
+// same (unitKey, contentHash) join one shared flight (see runFlight)
+// instead of each racing a redundant check, and that flight runs on the
+// engine's own lifecycle ctx — never on any one caller's request ctx — so
+// it always runs to completion and commits to the cache no matter which
+// callers, if any, are still waiting on it when they stop waiting. This is
+// what makes Get immune to an editor that cancels every hover on the next
+// cursor move: that no longer prevents a slow first check from ever
+// finishing, because the check keeps running in the background and the
+// next request hits a warm cache instead of restarting from scratch. The
+// only thing that can make Get itself return early is ctx — the request's
+// own context, canceled by $/cancelRequest or a dropped connection: a
+// waiter whose ctx is canceled stops waiting and returns ctx.Err()
+// immediately, without affecting the flight it was joined to.
+//
+// Because a request-driven flight and a background recheck for the same
+// directory can finish in either order, and because two flights racing an
+// in-place edit (a new contentHash starts a fresh flight rather than
+// joining a stale one — see getOrStartFlight) can also finish in either
+// order, a flight's result is still gated by the generation guard in
+// commit before it is cached or published; a waiter that does not hit
+// ctx.Done() first always gets back the CheckedPackage its flight
+// computed, regardless of that guard.
 func (e *Engine) Get(ctx context.Context, filePath string) (*CheckedPackage, error) {
 	pkgPath, dir, goFiles, ok := e.snap.PackageForFile(filePath)
 	if !ok {
@@ -248,7 +290,61 @@ func (e *Engine) Get(ctx context.Context, filePath string) (*CheckedPackage, err
 	}
 	e.mu.Unlock()
 
-	return e.runRecheck(ctx, key)
+	fl := e.getOrStartFlight(key, hash)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-fl.done:
+		return fl.cp, fl.err
+	}
+}
+
+// getOrStartFlight returns the in-flight recheck for key+hash, joining it
+// if one is already running, or starting a fresh one (see runFlight)
+// otherwise. hash is checked, not just key, because Get computes it before
+// this call: an edit that lands mid-flight changes hash, and must start its
+// own fresh flight rather than join one already committed to stale
+// content — the flight it finds here, if any, could be running against
+// content an edit has since superseded. A flight already running for a
+// different (necessarily older) hash is left alone to run to completion
+// undisturbed; callers simply do not join it, and its eventual commit loses
+// to the newer flight's via commit's generation guard (see Get's doc).
+func (e *Engine) getOrStartFlight(key unitKey, hash string) *flight {
+	e.mu.Lock()
+	if fl, ok := e.flights[key]; ok && fl.hash == hash {
+		e.mu.Unlock()
+		return fl
+	}
+	fl := &flight{hash: hash, done: make(chan struct{})}
+	e.flights[key] = fl
+	e.mu.Unlock()
+
+	go e.runFlight(key, fl)
+	return fl
+}
+
+// runFlight runs key's recheck to completion on e.ctx — the engine's own
+// lifecycle context, canceled only by Stop, never by any individual Get
+// caller's request ctx — and broadcasts the result to every Get waiting on
+// fl.done, then removes fl from e.flights unless a newer flight has since
+// replaced it there (see getOrStartFlight). Recovers a panic from the
+// recheck so a bug there fails every current waiter with an error instead
+// of crashing the whole process: unlike a synchronous per-request call,
+// this goroutine is not covered by rpc.Server.callRequestHandler's own
+// panic recovery, since it can outlive the request that started it.
+func (e *Engine) runFlight(key unitKey, fl *flight) {
+	defer func() {
+		if r := recover(); r != nil {
+			fl.cp, fl.err = nil, fmt.Errorf("check: panic during recheck of %s: %v", key.dir, r)
+		}
+		close(fl.done)
+		e.mu.Lock()
+		if cur, ok := e.flights[key]; ok && cur == fl {
+			delete(e.flights, key)
+		}
+		e.mu.Unlock()
+	}()
+	fl.cp, fl.err = e.runRecheck(e.ctx, key)
 }
 
 // Invalidate schedules a recheck of dir's unit(s) after
@@ -428,16 +524,19 @@ func (e *Engine) commitPublish(gen uint64, st *dirState, cp *CheckedPackage) {
 }
 
 // Stop cancels every directory's pending debounce timer and in-flight
-// background recheck (Invalidate/fireRecheck), so none of them can call
+// background recheck (Invalidate/fireRecheck), and cancels e.ctx — which
+// every request-driven flight runs on (see runFlight) — canceling every
+// flight currently in progress too, so none of them can call
 // Options.OnResult after the caller discards this Engine — e.g. because a
-// fresh Engine over a new import graph snapshot is about to replace it.
-// This has no effect on a request-driven Get already in flight: Get never
-// registers with this per-dir bookkeeping (see its own doc), so it always
-// runs to completion and is still gated at commit time by its own
-// generation. Safe to call more than once.
+// fresh Engine over a new import graph snapshot is about to replace it. A
+// flight's detachment (see Get's doc) is only from any single requester's
+// ctx, not from the engine's own lifetime: Stop still reclaims it, exactly
+// as a server shutdown must be able to reclaim every goroutine it started.
+// Safe to call more than once.
 func (e *Engine) Stop() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.cancel()
 	for _, st := range e.jobs {
 		if st.timer != nil {
 			st.timer.Stop()
