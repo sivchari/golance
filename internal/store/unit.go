@@ -124,7 +124,7 @@ func EncodeUnitBlob(u *UnitBlob) []byte {
 		binary.LittleEndian.PutUint64(b[off:], uint64(mtime))
 		off += 8
 	}
-	off = putIndexEntries(b, off, u.Index)
+	off = putIndexEntries(b, off, &u.Index)
 	return b[:off]
 }
 
@@ -132,7 +132,7 @@ func EncodeUnitBlob(u *UnitBlob) []byte {
 // following the fixed-size header's namesCount-and-earlier fields: the
 // header only reserves space for namesCount because methods/symstrs counts
 // are folded into the trailing sections themselves (see decodeUnitBlob).
-func putIndexEntries(b []byte, off int, idx PackageIndexEntries) int {
+func putIndexEntries(b []byte, off int, idx *PackageIndexEntries) int {
 	for _, n := range idx.Names {
 		binary.LittleEndian.PutUint32(b[off:], u32len(len(n.Name)))
 		off += 4
@@ -393,13 +393,25 @@ func decodePostingEntries(b []byte, off int) ([]PostingEntry, int, error) {
 		if err != nil {
 			return nil, 0, fmt.Errorf("store: unit blob posting %d endCol: %w", i, err)
 		}
+		lineU32, err := uint32Field(line, "unit blob posting line")
+		if err != nil {
+			return nil, 0, err
+		}
+		colU32, err := uint32Field(col, "unit blob posting col")
+		if err != nil {
+			return nil, 0, err
+		}
+		endColU32, err := uint32Field(endCol, "unit blob posting endCol")
+		if err != nil {
+			return nil, 0, err
+		}
 		postings[i] = PostingEntry{
 			TargetPkgHash: targetPkgHash,
 			TargetIDHash:  targetIDHash,
 			File:          file,
-			Line:          uint32(line),
-			Col:           uint32(col),
-			EndCol:        uint32(endCol),
+			Line:          lineU32,
+			Col:           colU32,
+			EndCol:        endColU32,
 		}
 	}
 	return postings, off, nil
@@ -429,6 +441,19 @@ func takeUint32(b []byte, off int) (int, int, error) {
 		return 0, 0, fmt.Errorf("truncated uint32 at offset %d", off)
 	}
 	return int(binary.LittleEndian.Uint32(b[off:])), off + 4, nil
+}
+
+// uint32Field converts n -- a value takeUint32 already decoded from a
+// stored uint32 field, so mathematically always in [0, math.MaxUint32] --
+// back to uint32, erroring instead of silently truncating a negative or
+// overflowing value the way a bare uint32(n) conversion would if that
+// invariant were ever violated (e.g. a corrupted or hand-crafted blob).
+// what identifies the field in the returned error.
+func uint32Field(n int, what string) (uint32, error) {
+	if n < 0 || n > math.MaxUint32 {
+		return 0, fmt.Errorf("store: %s %d out of uint32 range", what, n)
+	}
+	return uint32(n), nil
 }
 
 func takeUint64(b []byte, off int) (uint64, int, error) {

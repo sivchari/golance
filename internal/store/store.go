@@ -435,7 +435,7 @@ func (db *DB) PutUnitsBatch(entries []UnitEntry) error {
 			if err := unitB.Put(hashKey(e.PkgHash), encodeUnitPointer(e.Pointer)); err != nil {
 				return err
 			}
-			if err := applyIndexEntries(tx, e.PkgHash, e.Index); err != nil {
+			if err := applyIndexEntries(tx, e.PkgHash, &e.Index); err != nil {
 				return err
 			}
 		}
@@ -708,7 +708,7 @@ type PackageIndexEntries struct {
 // location a source file no longer actually contains, so applyPostings
 // replaces srcPkgHash's ENTIRE prior contribution to the postings index
 // exactly, rather than appending alongside it — see its own doc.
-func applyIndexEntries(tx *bbolt.Tx, srcPkgHash uint64, entries PackageIndexEntries) error {
+func applyIndexEntries(tx *bbolt.Tx, srcPkgHash uint64, entries *PackageIndexEntries) error {
 	nameB := tx.Bucket(bucketName)
 	for _, n := range entries.Names {
 		key := []byte(strings.ToLower(n.Name))

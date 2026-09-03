@@ -34,16 +34,16 @@ func populatePostingsDB(b *testing.B, numSrcs, locsPerSrc int) (*DB, uint64, uin
 	entries := make([]UnitEntry, numSrcs)
 	for i := 0; i < numSrcs; i++ {
 		src := uint64(i + 100) // never collides with targetPkg (1)
-		postings := make([]PostingEntry, locsPerSrc)
+		postings := make([]PostingEntry, 0, locsPerSrc+1)
 		for j := 0; j < locsPerSrc; j++ {
-			postings[j] = PostingEntry{
+			postings = append(postings, PostingEntry{
 				TargetPkgHash: targetPkg,
 				TargetIDHash:  targetID,
 				File:          fmt.Sprintf("pkg%d/file%d.go", i, j%8),
 				Line:          uint32(j + 1),
 				Col:           1,
 				EndCol:        10,
-			}
+			})
 		}
 		// A handful of unrelated postings, so this src's own manifest and
 		// the bucket as a whole are not artificially tiny.

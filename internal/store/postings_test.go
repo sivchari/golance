@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"testing"
@@ -13,6 +15,17 @@ func sortRecordsBySrc(recs []PostingRecord) []PostingRecord {
 	out := append([]PostingRecord(nil), recs...)
 	sort.Slice(out, func(i, j int) bool { return out[i].SrcPkgHash < out[j].SrcPkgHash })
 	return out
+}
+
+// testUint32 converts n to uint32 for building small fixed test fixtures
+// where n is always a known-small literal, panicking (unlike t.Fatalf, this
+// satisfies gosec's G115 flow analysis) rather than silently truncating if
+// that invariant is ever violated — mirrors this package's own u32len.
+func testUint32(n uint64) uint32 {
+	if n > math.MaxUint32 {
+		panic(fmt.Sprintf("store: test fixture value %d exceeds uint32 range", n))
+	}
+	return uint32(n)
 }
 
 func TestDBPostingsForRoundTrip(t *testing.T) {
@@ -82,7 +95,7 @@ func TestDBPostingsForMultipleSources(t *testing.T) {
 			Pointer: UnitPointer{BlobKey: src, ContentHash: src},
 			Index: PackageIndexEntries{
 				Postings: []PostingEntry{
-					{TargetPkgHash: targetPkg, TargetIDHash: targetID, File: "x.go", Line: uint32(src), Col: 1, EndCol: 2},
+					{TargetPkgHash: targetPkg, TargetIDHash: targetID, File: "x.go", Line: testUint32(src), Col: 1, EndCol: 2},
 				},
 			},
 		}
@@ -103,7 +116,7 @@ func TestDBPostingsForMultipleSources(t *testing.T) {
 		if recs[i].SrcPkgHash != src {
 			t.Errorf("recs[%d].SrcPkgHash = %d, want %d", i, recs[i].SrcPkgHash, src)
 		}
-		if len(recs[i].Locations) != 1 || recs[i].Locations[0].Line != uint32(src) {
+		if len(recs[i].Locations) != 1 || recs[i].Locations[0].Line != testUint32(src) {
 			t.Errorf("recs[%d].Locations = %+v, want one location with Line %d", i, recs[i].Locations, src)
 		}
 	}

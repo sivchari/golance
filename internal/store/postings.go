@@ -144,7 +144,19 @@ func decodePostingLocations(b []byte) ([]PostingLocation, error) {
 		if err != nil {
 			return nil, fmt.Errorf("store: posting location %d endCol: %w", i, err)
 		}
-		locs[i] = PostingLocation{File: file, Line: uint32(line), Col: uint32(col), EndCol: uint32(endCol)}
+		lineU32, err := uint32Field(line, "posting location line")
+		if err != nil {
+			return nil, err
+		}
+		colU32, err := uint32Field(col, "posting location col")
+		if err != nil {
+			return nil, err
+		}
+		endColU32, err := uint32Field(endCol, "posting location endCol")
+		if err != nil {
+			return nil, err
+		}
+		locs[i] = PostingLocation{File: file, Line: lineU32, Col: colU32, EndCol: endColU32}
 	}
 	return locs, nil
 }
