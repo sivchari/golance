@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.5.3](https://github.com/sivchari/golance/compare/v0.5.2...v0.5.3) - 2026-09-03
+- feat: implement LSP call hierarchy by @sivchari in https://github.com/sivchari/golance/pull/89
+- feat: implement LSP type hierarchy by @sivchari in https://github.com/sivchari/golance/pull/91
+- feat: implement code lens and executeCommand by @sivchari in https://github.com/sivchari/golance/pull/92
+- fix: route builtin-typed typeDefinition to builtin.go and return minimal formatting edits by @sivchari in https://github.com/sivchari/golance/pull/93
+
 ## [v0.5.2](https://github.com/sivchari/golance/compare/v0.5.1...v0.5.2) - 2026-09-03
 - feat: garbage-collect orphaned CAS blobs and compact the index on schema rebuild by @sivchari in https://github.com/sivchari/golance/pull/87
 
