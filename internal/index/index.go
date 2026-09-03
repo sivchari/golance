@@ -234,8 +234,5 @@ func processUnitRecovered(ctx context.Context, fset *token.FileSet, imp *typeche
 			err = fmt.Errorf("index: panic processing package %s: %v", path, rec)
 		}
 	}()
-	// processUnit (unit.go) is unflagged and still takes Options by value —
-	// the one deliberate copy at this pointer/value boundary, not repeated
-	// again at each of ITS OWN further internal calls (see its own doc).
-	return processUnit(ctx, fset, imp, exp, snap, db, cas, keys, *opts, path, readFileDisk, true)
+	return processUnit(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, readFileDisk, true)
 }

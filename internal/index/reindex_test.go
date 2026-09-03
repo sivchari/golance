@@ -58,7 +58,7 @@ func Shout(name string) string {
 `)
 	reader := overlayReader(t, midSrcPath, edited)
 
-	stats, err := Reindex(ctx, snap, db, cas, pkgMid, reader, Options{})
+	stats, err := Reindex(ctx, snap, db, cas, pkgMid, reader, &Options{})
 	if err != nil {
 		t.Fatalf("Reindex: %v", err)
 	}
@@ -100,7 +100,7 @@ func Shout(name string, n int) string {
 `)
 	reader := overlayReader(t, midSrcPath, edited)
 
-	stats, err := Reindex(ctx, snap, db, cas, pkgMid, reader, Options{})
+	stats, err := Reindex(ctx, snap, db, cas, pkgMid, reader, &Options{})
 	if err != nil {
 		t.Logf("Reindex returned error (expected: top.go still calls the old 1-arg Shout): %v", err)
 	}
@@ -168,7 +168,7 @@ func helperV() int { return V() }
 `
 	reader := overlayReader(t, testPath, []byte(testSrc2))
 
-	stats, err := Reindex(ctx, snap, db, cas, pkgDef, reader, Options{})
+	stats, err := Reindex(ctx, snap, db, cas, pkgDef, reader, &Options{})
 	if err != nil {
 		t.Fatalf("Reindex: %v", err)
 	}
@@ -261,7 +261,7 @@ func Run(name string) string {
 		}
 	}()
 
-	stats, err := Reindex(ctx, snap, ro, cas, pkgLeaf, readFileDisk, Options{})
+	stats, err := Reindex(ctx, snap, ro, cas, pkgLeaf, readFileDisk, &Options{})
 	if err == nil {
 		t.Fatal("Reindex returned nil error; want a fatal persist failure")
 	}

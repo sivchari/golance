@@ -150,7 +150,7 @@ func Shout(name string) string {
 }
 `)
 	reader := overlayReader(t, midSrcPath, edited)
-	if _, err := Reindex(ctx, snap, db, cas, pkgMid, reader, Options{}); err != nil {
+	if _, err := Reindex(ctx, snap, db, cas, pkgMid, reader, &Options{}); err != nil {
 		t.Fatalf("Reindex: %v", err)
 	}
 

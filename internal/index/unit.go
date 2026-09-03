@@ -55,7 +55,7 @@ type unitOutcome struct {
 // changed, since that call's reader may be an editor overlay whose content
 // differs from disk while disk's own stat stays untouched — trusting stat
 // there would silently skip a genuinely edited-but-unsaved package.
-func processUnit(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, snap *graph.Snapshot, db *store.DB, cas *store.CAS, keys *keyTable, opts Options, path string, reader FileReader, trustStat bool) (outcome *unitOutcome, skipped, typeChecked bool, err error) {
+func processUnit(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, snap *graph.Snapshot, db *store.DB, cas *store.CAS, keys *keyTable, opts *Options, path string, reader FileReader, trustStat bool) (outcome *unitOutcome, skipped, typeChecked bool, err error) {
 	pkg := snap.Packages[path]
 	if len(pkg.GoFiles) == 0 {
 		// go/packages legitimately reports root packages with no GoFiles at
@@ -125,7 +125,7 @@ func processUnit(ctx context.Context, fset *token.FileSet, imp *typecheck.Import
 // old.ContentHash when statOK confirms nothing on disk has moved, or a
 // fresh recompute through reader otherwise. goFiles is the unit's full
 // effective file set (see effectiveGoFiles).
-func resolveOwnHash(goFiles []string, opts Options, reader FileReader, root string, statOK bool, oldContentHash uint64) (uint64, error) {
+func resolveOwnHash(goFiles []string, opts *Options, reader FileReader, root string, statOK bool, oldContentHash uint64) (uint64, error) {
 	if statOK {
 		return oldContentHash, nil
 	}
@@ -137,7 +137,7 @@ func resolveOwnHash(goFiles []string, opts Options, reader FileReader, root stri
 // refreshed stat snapshot, and the package is always skipped either way.
 // effectiveFiles is the unit's full effective file set (see
 // effectiveGoFiles).
-func unchangedOutcome(pkgHash uint64, path string, old store.UnitPointer, effectiveFiles []string, opts Options, root string, statOK, trustStat bool, keys *keyTable) *unitOutcome {
+func unchangedOutcome(pkgHash uint64, path string, old store.UnitPointer, effectiveFiles []string, opts *Options, root string, statOK, trustStat bool, keys *keyTable) *unitOutcome {
 	keys.set(path, unitKeyRecord{blobKey: old.BlobKey, exportHash: old.ExportHash})
 	if statOK {
 		return nil
@@ -168,7 +168,7 @@ func unchangedOutcome(pkgHash uint64, path string, old store.UnitPointer, effect
 // casHitOutcome decodes a CAS hit for combined and folds it into the
 // outcome processUnit returns, recording path's export in exp and its blob
 // key in keys along the way.
-func casHitOutcome(pkgHash uint64, path string, combined, ownHash uint64, blob []byte, opts Options, exp *casExportSource, keys *keyTable) (*unitOutcome, error) {
+func casHitOutcome(pkgHash uint64, path string, combined, ownHash uint64, blob []byte, opts *Options, exp *casExportSource, keys *keyTable) (*unitOutcome, error) {
 	u, err := store.DecodeUnitBlob(blob)
 	if err != nil {
 		return nil, err
@@ -183,7 +183,7 @@ func casHitOutcome(pkgHash uint64, path string, combined, ownHash uint64, blob [
 // checkAndStoreOutcome type-checks pkg (plus testFiles, pkg's in-package
 // _test.go files — see checkOnePackage's doc), writes the result to cas
 // under combined, and folds it into the outcome processUnit returns.
-func checkAndStoreOutcome(fset *token.FileSet, imp *typecheck.Importer, cas *store.CAS, exp *casExportSource, keys *keyTable, pkgHash uint64, path string, pkg *graph.Package, testFiles []string, combined, ownHash uint64, opts Options, reader FileReader, root string, trustStat bool) (*unitOutcome, error) {
+func checkAndStoreOutcome(fset *token.FileSet, imp *typecheck.Importer, cas *store.CAS, exp *casExportSource, keys *keyTable, pkgHash uint64, path string, pkg *graph.Package, testFiles []string, combined, ownHash uint64, opts *Options, reader FileReader, root string, trustStat bool) (*unitOutcome, error) {
 	result, err := checkOnePackage(fset, imp, path, pkg.GoFiles, testFiles, reader, root, opts.RelativePaths)
 	if err != nil {
 		return nil, err

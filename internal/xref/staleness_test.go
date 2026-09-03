@@ -92,7 +92,7 @@ func Declare() impl.Person {
 		t.Fatalf("write %s: %v", userFile, err)
 	}
 
-	if _, err := index.Reindex(context.Background(), snap, db, cas, pkgImpl, os.ReadFile, index.Options{}); err != nil {
+	if _, err := index.Reindex(context.Background(), snap, db, cas, pkgImpl, os.ReadFile, &index.Options{}); err != nil {
 		t.Fatalf("index.Reindex: %v", err)
 	}
 	r.Invalidate(append([]string{pkgImpl}, snap.ClosureUnits(pkgImpl)...))
