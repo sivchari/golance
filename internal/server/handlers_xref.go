@@ -36,7 +36,7 @@ func (s *Server) resolverOrWarn() (*xref.Resolver, bool) {
 	idx := s.idx.Load()
 	if idx == nil {
 		if s.indexBuildingWarned.CompareAndSwap(false, true) {
-			s.logMessage(protocol.MessageTypeInfo, "golance: the workspace index is still building; cross-reference results are unavailable until it completes")
+			s.logMessage("golance: the workspace index is still building; cross-reference results are unavailable until it completes")
 		}
 		return nil, false
 	}

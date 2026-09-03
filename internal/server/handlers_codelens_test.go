@@ -99,39 +99,44 @@ func TestHandleCodeLens_TestSourceEnabled(t *testing.T) {
 	s.setCodeLensesEnabled(map[codeLensSource]bool{codeLensTest: true})
 	lenses := requestCodeLens(t, s, codeLensFile(root, "codelens", "codelens_test.go"))
 
-	var sawTest, sawBenchmark, sawFileBenchmarks int
 	// Indexed, not "for _, l := range lenses": protocol.CodeLens is a
 	// ~120-byte struct (gocritic rangeValCopy), so ranging by value would
 	// copy it every iteration.
+	counts := make(map[string]int, 3)
 	for i := range lenses {
-		l := &lenses[i]
-		if l.Command.Command != commandRunTests {
-			t.Fatalf("unexpected command %q with only the test source enabled", l.Command.Command)
-		}
-		args := unmarshalCommandArg[runTestsArgs](t, l.Command)
-		switch l.Command.Title {
-		case "run test":
-			sawTest++
-			if len(args.Tests) != 1 || args.Tests[0] != "TestAdd" {
-				t.Errorf("run test args = %+v, want Tests = [TestAdd]", args)
-			}
-		case "run benchmark":
-			sawBenchmark++
-			if len(args.Benchmarks) != 1 || args.Benchmarks[0] != "BenchmarkAdd" {
-				t.Errorf("run benchmark args = %+v, want Benchmarks = [BenchmarkAdd]", args)
-			}
-		case "run file benchmarks":
-			sawFileBenchmarks++
-			if len(args.Benchmarks) != 1 || args.Benchmarks[0] != "BenchmarkAdd" {
-				t.Errorf("run file benchmarks args = %+v, want Benchmarks = [BenchmarkAdd]", args)
-			}
-		default:
-			t.Errorf("unexpected lens title %q", l.Command.Title)
-		}
+		counts[checkTestSourceLens(t, &lenses[i])]++
 	}
-	if sawTest != 1 || sawBenchmark != 1 || sawFileBenchmarks != 1 {
-		t.Errorf("saw test=%d benchmark=%d fileBenchmarks=%d, want exactly one of each (FuzzAdd must never lens)", sawTest, sawBenchmark, sawFileBenchmarks)
+	if counts["run test"] != 1 || counts["run benchmark"] != 1 || counts["run file benchmarks"] != 1 {
+		t.Errorf("lens title counts = %+v, want exactly one of each (FuzzAdd must never lens)", counts)
 	}
+}
+
+// checkTestSourceLens asserts l is a well-formed commandRunTests lens with
+// one of TestHandleCodeLens_TestSourceEnabled's three expected titles, and
+// that its arguments match that title's own convention: a single test name
+// for "run test", a single benchmark name for either benchmark title (the
+// fixture has only one Benchmark func, so "run benchmark" and "run file
+// benchmarks" share the same Benchmarks shape here — see testCodeLenses'
+// own doc). Returns l's own title, for the caller's own per-title tally.
+func checkTestSourceLens(t *testing.T, l *protocol.CodeLens) string {
+	t.Helper()
+	if l.Command.Command != commandRunTests {
+		t.Fatalf("unexpected command %q with only the test source enabled", l.Command.Command)
+	}
+	args := unmarshalCommandArg[runTestsArgs](t, l.Command)
+	switch l.Command.Title {
+	case "run test":
+		if len(args.Tests) != 1 || args.Tests[0] != "TestAdd" {
+			t.Errorf("run test args = %+v, want Tests = [TestAdd]", args)
+		}
+	case "run benchmark", "run file benchmarks":
+		if len(args.Benchmarks) != 1 || args.Benchmarks[0] != "BenchmarkAdd" {
+			t.Errorf("%s args = %+v, want Benchmarks = [BenchmarkAdd]", l.Command.Title, args)
+		}
+	default:
+		t.Errorf("unexpected lens title %q", l.Command.Title)
+	}
+	return l.Command.Title
 }
 
 func TestParseCodeLensSettings(t *testing.T) {
@@ -243,5 +248,63 @@ func TestTestNamePattern(t *testing.T) {
 	}
 	if got := testNamePattern("Test.*"); got != "^$" {
 		t.Errorf("testNamePattern(Test.*) = %q, want ^$ (rejects a non-identifier name)", got)
+	}
+}
+
+func TestResolveWorkspaceDir(t *testing.T) {
+	s, _, root := newTestServer(t)
+
+	t.Run("accepts a directory under the workspace root", func(t *testing.T) {
+		dir, err := s.resolveWorkspaceDir(context.Background(), uri.File(filepath.Join(root, "codelens")), true)
+		if err != nil {
+			t.Fatalf("resolveWorkspaceDir: %v", err)
+		}
+		if dir != filepath.Join(root, "codelens") {
+			t.Errorf("dir = %q, want %q", dir, filepath.Join(root, "codelens"))
+		}
+	})
+
+	t.Run("accepts a file's own directory under the workspace root", func(t *testing.T) {
+		dir, err := s.resolveWorkspaceDir(context.Background(), uri.File(codeLensFile(root, "codelens", "codelens.go")), false)
+		if err != nil {
+			t.Fatalf("resolveWorkspaceDir: %v", err)
+		}
+		if dir != filepath.Join(root, "codelens") {
+			t.Errorf("dir = %q, want %q", dir, filepath.Join(root, "codelens"))
+		}
+	})
+
+	t.Run("rejects a directory outside the workspace root", func(t *testing.T) {
+		outside := t.TempDir()
+		if _, err := s.resolveWorkspaceDir(context.Background(), uri.File(outside), true); err == nil {
+			t.Fatalf("resolveWorkspaceDir(%s) = nil error, want a RequestFailed error (outside the workspace root)", outside)
+		}
+	})
+
+	t.Run("rejects the workspace root's own parent directory", func(t *testing.T) {
+		parent := filepath.Dir(root)
+		if _, err := s.resolveWorkspaceDir(context.Background(), uri.File(parent), true); err == nil {
+			t.Fatalf("resolveWorkspaceDir(%s) = nil error, want a RequestFailed error (root's own parent is still outside it)", parent)
+		}
+	})
+}
+
+// TestHandleExecuteCommand_RunTests_OutsideWorkspaceRejected exercises the
+// full handleExecuteCommand round trip (not resolveWorkspaceDir directly)
+// to confirm execRunTests actually wires the validation in: a
+// workspace/executeCommand request naming a file outside the workspace
+// root must fail the request rather than run `go test` there.
+func TestHandleExecuteCommand_RunTests_OutsideWorkspaceRejected(t *testing.T) {
+	s, _, _ := newTestServer(t)
+	outsideDir := t.TempDir()
+	writeTempFile(t, outsideDir, "go.mod", "module example.com/outside\n\ngo 1.23\n")
+	outsideFile := writeTempFile(t, outsideDir, "outside_test.go", "package outside\n\nimport \"testing\"\n\nfunc TestOutside(t *testing.T) {}\n")
+
+	_, err := s.handleExecuteCommand(context.Background(), mustMarshal(t, &protocol.ExecuteCommandParams{
+		Command:   commandRunTests,
+		Arguments: commandArgs(runTestsArgs{URI: uri.File(outsideFile), Tests: []string{"TestOutside"}}),
+	}))
+	if err == nil {
+		t.Fatal("handleExecuteCommand(run_tests) outside the workspace = nil error, want a RequestFailed error")
 	}
 }
