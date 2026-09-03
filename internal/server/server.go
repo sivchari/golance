@@ -19,6 +19,7 @@ import (
 	golance "github.com/sivchari/golance"
 	"github.com/sivchari/golance/internal/check"
 	"github.com/sivchari/golance/internal/depcheck"
+	"github.com/sivchari/golance/internal/depexport"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
@@ -121,16 +122,32 @@ type Server struct {
 	// hints above).
 	codeLenses atomic.Pointer[map[codeLensSource]bool]
 
-	// depProviderMu guards depProviderKey/depProviderSrc/depProviderVal — the
-	// server-lifetime depcheck.Provider setWorkspace installs into each new
-	// workspace's own depProvider field (see ensureDepProvider). Kept here,
-	// not per-workspace, precisely so it can OUTLIVE a workspace: its whole
+	// depProviderMu guards depProviderKey/depProviderSrc/depProviderVal/
+	// depExportsVal — the server-lifetime depcheck.Provider and
+	// depexport.Cache pair setWorkspace installs into each new workspace's
+	// own depProvider field (see ensureDepProvider). Kept here, not
+	// per-workspace, precisely so they can OUTLIVE a workspace: their whole
 	// reason to exist is surviving a setWorkspace swap that leaves the
 	// dependency set (see depsKey) unchanged.
 	depProviderMu  sync.Mutex
 	depProviderKey string
 	depProviderSrc *depMetadataSource
 	depProviderVal *depcheck.Provider
+	// depExportsVal shares depProviderVal/depProviderSrc's identity exactly
+	// (rebuilt alongside them, never independently — see ensureDepProvider),
+	// backed by depExportCAS below for cross-session persistence.
+	depExportsVal *depexport.Cache
+	// depExportCAS is the machine-global, content-addressed store
+	// internal/depexport persists checked non-root dependency export data
+	// into (see its own package doc): unlike depProviderVal, this is opened
+	// ONCE for this Server's entire lifetime in New, never rebuilt by
+	// ensureDepProvider — a dependency's checked export data is repository-
+	// independent, so this is shared across every workspace this session
+	// (or any other golance session on this machine) ever opens. nil if it
+	// could not be opened (logged in New); depexport.Cache tolerates a nil
+	// CAS by resolving every dependency correctly without ever persisting
+	// or reusing the result (see its own doc).
+	depExportCAS *store.CAS
 
 	// idxMu serializes every revalidateIndex/buildIndex invocation: without
 	// it, the once-per-session post-initialize background check
@@ -243,6 +260,16 @@ func New(rpcServer *rpc.Server, opts Options) *Server {
 		diagFiles: make(map[string]map[string]bool),
 		sessionID: newSessionID(),
 		wsReady:   make(chan struct{}),
+	}
+	// depExportCAS is opened once, here, for this Server's entire lifetime
+	// (see its own doc): best-effort, since a failure here must not stop
+	// the server from starting — dependency navigation and checking still
+	// work correctly without it, just without persisting across sessions
+	// (see internal/depexport.Cache's nil-CAS handling).
+	if cas, err := store.OpenCAS(depExportCASDir()); err != nil {
+		logger.Printf("golance: open dependency export cache: %v; dependency navigation and checking will not persist across sessions", err)
+	} else {
+		s.depExportCAS = cas
 	}
 	s.watch = newWatchDebouncer(opts.WatchDebounce, s.revalidateWorkspace)
 	s.watchFP = newWatchFingerprints()

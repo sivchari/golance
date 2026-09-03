@@ -135,7 +135,7 @@ func TestBuild_CrossPackageRefIdentity(t *testing.T) {
 	db := openTestDB(t)
 	cas := openTestCAS(t)
 
-	stats, err := Build(context.Background(), snap, db, cas, Options{})
+	stats, err := Build(context.Background(), snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -199,7 +199,7 @@ func Use(t *defpkg.T) string {
 	db := openTestDB(t)
 	cas := openTestCAS(t)
 
-	stats, err := Build(context.Background(), snap, db, cas, Options{})
+	stats, err := Build(context.Background(), snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestBuild_SecondRunSkipsAll(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	first, err := Build(ctx, snap, db, cas, Options{})
+	first, err := Build(ctx, snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("first Build: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestBuild_SecondRunSkipsAll(t *testing.T) {
 		t.Fatalf("first Build Processed = %d, want 3", first.Processed)
 	}
 
-	second, err := Build(ctx, snap, db, cas, Options{})
+	second, err := Build(ctx, snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("second Build: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestBuild_EmptyPackageIsSkippedNotFatal(t *testing.T) {
 	db := openTestDB(t)
 	cas := openTestCAS(t)
 
-	stats, err := Build(context.Background(), snap, db, cas, Options{})
+	stats, err := Build(context.Background(), snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -398,7 +398,7 @@ func TestHello(t *testing.T) {
 	db := openTestDB(t)
 	cas := openTestCAS(t)
 
-	if _, err := Build(context.Background(), snap, db, cas, Options{}); err != nil {
+	if _, err := Build(context.Background(), snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
@@ -459,7 +459,7 @@ func TestV(t *testing.T) {
 	db := openTestDB(t)
 	cas := openTestCAS(t)
 
-	if _, err := Build(context.Background(), snap, db, cas, Options{}); err != nil {
+	if _, err := Build(context.Background(), snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 

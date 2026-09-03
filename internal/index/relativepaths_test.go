@@ -24,7 +24,7 @@ func TestBuild_RelativePaths_StoresRootRelativeFileTable(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{RelativePaths: true}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{RelativePaths: true}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
@@ -68,7 +68,7 @@ func TestRevalidate_RelativePaths_UnchangedAcrossRoots(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snapA, db, cas, Options{RelativePaths: true}); err != nil {
+	if _, err := Build(ctx, snapA, db, cas, &Options{RelativePaths: true}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 

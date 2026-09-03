@@ -13,6 +13,7 @@ import (
 
 	"github.com/sivchari/golance/internal/check"
 	"github.com/sivchari/golance/internal/depcheck"
+	"github.com/sivchari/golance/internal/depexport"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
@@ -21,11 +22,11 @@ import (
 
 // newCheckedPackageWithProvider is newCheckedPackage plus a depcheck.Provider
 // over the same import graph — the production equivalent of dp is
-// internal/server's workspace.depProvider. cp itself is still compiled with
-// its dependencies resolved from export data (internal/typecheck), exactly
-// as internal/check.Engine does in production: only DependencyDefinition's
-// OWN resolution of the target dependency's declaration uses dp, not cp's
-// compilation.
+// internal/server's workspace.depProvider, and dp is shared with cp's own
+// compilation importer (via depexport.Cache, wired here exactly as
+// internal/server.ensureDepProvider shares one Provider between navigation
+// and dependency compilation), matching production identity: a dependency
+// checked once, for either purpose, is reused for the other.
 func newCheckedPackageWithProvider(t *testing.T, reader overlay.FileReader, pkgDir, file string) (cp *check.CheckedPackage, path string, dp *depcheck.Provider) {
 	t.Helper()
 	root, err := filepath.Abs(filepath.Join("testdata", "module"))
@@ -39,11 +40,13 @@ func newCheckedPackageWithProvider(t *testing.T, reader overlay.FileReader, pkgD
 	src := check.NewGraphSource(snap, reader)
 	depFset := token.NewFileSet()
 	depCache := typecheck.NewCache()
+	depMeta := depcheck.NewGraphMetadataSource(snap)
+	dp = depcheck.NewProvider(depMeta, depcheck.Options{})
+	depExp := depexport.NewCache(nil, depMeta, dp, depexport.Options{})
 	imp := func() types.ImporterFrom {
-		return typecheck.NewImporter(depFset, nil, snap, depCache)
+		return typecheck.NewImporter(depFset, nil, depExp, depCache)
 	}
 	engine := check.New(src, reader, imp, check.Options{})
-	dp = depcheck.NewProvider(depcheck.NewGraphMetadataSource(snap), depcheck.Options{})
 
 	path = filepath.Join(root, pkgDir, file)
 	cp, err = engine.Get(context.Background(), path)

@@ -69,7 +69,7 @@ func newTestServer(t *testing.T) (*Server, *graph.Snapshot, string) {
 	if err != nil {
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
-	if _, err := index.Build(context.Background(), snap, db, cas, index.Options{}); err != nil {
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}
 

@@ -37,7 +37,7 @@ func TestReindex_BodyOnlyEditDoesNotPropagate(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("initial Build: %v", err)
 	}
 
@@ -58,7 +58,7 @@ func Shout(name string) string {
 `)
 	reader := overlayReader(t, midSrcPath, edited)
 
-	stats, err := Reindex(ctx, snap, db, cas, pkgMid, reader, Options{})
+	stats, err := Reindex(ctx, snap, db, cas, pkgMid, reader, &Options{})
 	if err != nil {
 		t.Fatalf("Reindex: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestReindex_SignatureChangePropagates(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("initial Build: %v", err)
 	}
 
@@ -100,7 +100,7 @@ func Shout(name string, n int) string {
 `)
 	reader := overlayReader(t, midSrcPath, edited)
 
-	stats, err := Reindex(ctx, snap, db, cas, pkgMid, reader, Options{})
+	stats, err := Reindex(ctx, snap, db, cas, pkgMid, reader, &Options{})
 	if err != nil {
 		t.Logf("Reindex returned error (expected: top.go still calls the old 1-arg Shout): %v", err)
 	}
@@ -154,7 +154,7 @@ func Call() int { return def.V() }
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("initial Build: %v", err)
 	}
 	before, err := db.GetUnit(ctx, store.Hash(pkgDef))
@@ -168,7 +168,7 @@ func helperV() int { return V() }
 `
 	reader := overlayReader(t, testPath, []byte(testSrc2))
 
-	stats, err := Reindex(ctx, snap, db, cas, pkgDef, reader, Options{})
+	stats, err := Reindex(ctx, snap, db, cas, pkgDef, reader, &Options{})
 	if err != nil {
 		t.Fatalf("Reindex: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestReindex_FatalPersistFailureAbortsClosureWalk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("initial Build: %v", err)
 	}
 	if err := db.Close(); err != nil {
@@ -261,7 +261,7 @@ func Run(name string) string {
 		}
 	}()
 
-	stats, err := Reindex(ctx, snap, ro, cas, pkgLeaf, readFileDisk, Options{})
+	stats, err := Reindex(ctx, snap, ro, cas, pkgLeaf, readFileDisk, &Options{})
 	if err == nil {
 		t.Fatal("Reindex returned nil error; want a fatal persist failure")
 	}

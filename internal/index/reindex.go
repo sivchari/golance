@@ -7,6 +7,8 @@ import (
 	"go/token"
 	"time"
 
+	"github.com/sivchari/golance/internal/depcheck"
+	"github.com/sivchari/golance/internal/depexport"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/store"
 	"github.com/sivchari/golance/internal/typecheck"
@@ -27,8 +29,11 @@ type FileReader func(path string) ([]byte, error)
 // changes changedPkg's own content but not its export data, so nothing
 // downstream of it ever needs revisiting; a signature change does, and
 // each further hop cuts off the same way in turn).
-func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.CAS, changedPkg string, reader FileReader, opts Options) (Stats, error) {
-	opts = opts.withDefaults()
+func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.CAS, changedPkg string, reader FileReader, opts *Options) (Stats, error) {
+	// o is Reindex's own private, defaulted copy of *opts — see Build's
+	// identical comment for why (gocritic hugeParam: &o is threaded through
+	// the call chain in place of a second Options parameter copy per hop).
+	o := opts.withDefaults()
 	start := time.Now()
 
 	if _, ok := snap.Package(changedPkg); !ok {
@@ -38,13 +43,21 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 	fset := token.NewFileSet()
 	keys := newKeyTable(ctx, db)
 	exp := newCASExportSource(ctx, cas, keys)
-	imp := typecheck.NewImporter(fset, exp, snap, typecheck.NewCache())
+	// See Build's identical comments: depExp replaces the removed
+	// graph.Snapshot.ExportFile path for non-root dependency resolution,
+	// and depProvider's cap must be sized to the full non-root package
+	// count (depcheck.RecommendedCap) to avoid LRU thrashing across a
+	// closure walk that can touch many packages in one Reindex call.
+	depMeta := depcheck.NewGraphMetadataSource(snap)
+	depProvider := depcheck.NewProvider(depMeta, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootCount(snap))})
+	depExp := depexport.NewCache(o.DepCAS, depMeta, depProvider, depexport.Options{BuildFlagsFingerprint: o.BuildFlagsFingerprint})
+	imp := typecheck.NewImporter(fset, exp, depExp, typecheck.NewCache())
 
 	var stats Stats
 	// trustStat=false: reader may be an editor overlay whose content
 	// differs from disk while disk's own stat stays untouched (see
 	// processUnit's doc).
-	if _, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, opts, changedPkg, reader, false, &stats); err != nil {
+	if _, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, &o, changedPkg, reader, false, &stats); err != nil {
 		stats.Elapsed = time.Since(start)
 		return stats, err
 	}
@@ -56,7 +69,7 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 			break
 		}
 		// trustStat=true: every closure hop is always read from disk.
-		fatal, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, opts, path, readFileDisk, true, &stats)
+		fatal, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, &o, path, readFileDisk, true, &stats)
 		if err != nil {
 			firstErr = errors.Join(firstErr, err)
 			if fatal {
@@ -106,7 +119,7 @@ func orderedReverseClosure(snap *graph.Snapshot, changedPkg string) []string {
 //
 // A persist failure for the pointer-only refresh path stays best-effort,
 // not fatal — see [buildResults.flushPtrsLocked]'s identical rationale.
-func reindexOne(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, opts Options, path string, reader FileReader, trustStat bool, stats *Stats) (fatal bool, err error) {
+func reindexOne(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, opts *Options, path string, reader FileReader, trustStat bool, stats *Stats) (fatal bool, err error) {
 	outcome, skipped, typeChecked, err := processUnit(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
 	if err != nil {
 		stats.Errors++

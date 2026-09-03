@@ -19,7 +19,7 @@ func TestRevalidate_NothingChanged(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
@@ -42,7 +42,7 @@ func TestRevalidate_ContentChangeDetectedWithoutWriting(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 	before, err := db.GetUnit(context.Background(), store.Hash(pkgLeaf))
@@ -83,7 +83,7 @@ func TestRevalidate_ToolchainMismatchShortCircuits(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{ToolchainFingerprint: "go1.0-fake"}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{ToolchainFingerprint: "go1.0-fake"}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
@@ -114,7 +114,7 @@ func TestRevalidate_NothingChangedWithInPackageTestFile(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 
@@ -142,7 +142,7 @@ func TestRevalidate_InPackageTestFileContentChangeDetected(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 

@@ -218,7 +218,7 @@ func (s *Server) handleDidClose(_ context.Context, params json.RawMessage) error
 // actually change): it is sound either way, and avoids needing Reindex to
 // report exactly which hops in the closure changed.
 func (s *Server) reindex(ctx context.Context, ws *workspace, idx *indexState, pkgPath string) {
-	if _, err := index.Reindex(ctx, ws.snap, idx.db, idx.cas, pkgPath, s.overlay.ReadFile, index.Options{RelativePaths: RelativeIndexPaths(ws.root)}); err != nil {
+	if _, err := index.Reindex(ctx, ws.snap, idx.db, idx.cas, pkgPath, s.overlay.ReadFile, &index.Options{RelativePaths: RelativeIndexPaths(ws.root)}); err != nil {
 		s.logger.Printf("server: reindex %s: %v", pkgPath, err)
 		return
 	}

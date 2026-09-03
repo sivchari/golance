@@ -34,7 +34,7 @@ func TestBuild_RevertedContentIsCASHitNotTypeChecked(t *testing.T) {
 		t.Fatalf("read leaf.go: %v", err)
 	}
 
-	first, err := Build(ctx, snap, db, cas, Options{})
+	first, err := Build(ctx, snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("first Build: %v", err)
 	}
@@ -63,7 +63,7 @@ func Hello(name string) Greeting {
 	if err := root.WriteFile(leafRelPath, edited, 0o600); err != nil {
 		t.Fatalf("edit leaf.go: %v", err)
 	}
-	second, err := Build(ctx, snap, db, cas, Options{})
+	second, err := Build(ctx, snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("second Build: %v", err)
 	}
@@ -74,7 +74,7 @@ func Hello(name string) Greeting {
 	if err := root.WriteFile(leafRelPath, original, 0o600); err != nil {
 		t.Fatalf("revert leaf.go: %v", err)
 	}
-	third, err := Build(ctx, snap, db, cas, Options{})
+	third, err := Build(ctx, snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("third Build: %v", err)
 	}

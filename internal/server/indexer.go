@@ -41,6 +41,11 @@ const (
 	// subprocess writes to (see casDir) — shared across every worktree of
 	// the same repository.
 	EnvCAS = "GOLANCE_CAS"
+	// EnvDepCAS is the machine-global, content-addressed store directory
+	// the indexer subprocess persists non-root dependency export data into
+	// (see depExportCASDir and internal/depexport's package doc) — shared
+	// across every repository this machine ever indexes, unlike EnvCAS.
+	EnvDepCAS = "GOLANCE_DEP_CAS"
 	// EnvIndexJobs mirrors the -index-jobs flag: index.Options.Parallelism.
 	// Empty or non-numeric uses index's own default.
 	EnvIndexJobs = "GOLANCE_INDEX_JOBS"
@@ -96,6 +101,18 @@ func casDir(root string) string {
 	key, _ := repoKey(root)
 	h := sha256.Sum256([]byte(key))
 	return filepath.Join(cacheBaseDir(), "golance", fmt.Sprintf("cas-%x", h[:8]))
+}
+
+// depExportCASDir returns the machine-global content-addressed store
+// directory for internal/depexport's dependency export-data cache (see its
+// own package doc): unlike casDir, this is never per-repository — a
+// standard-library or module-cache dependency's checked export data is
+// identical no matter which repository asked for it first, so every
+// worktree of every repository this machine ever opens shares one
+// directory, computed once per dependency ever instead of once per
+// repository.
+func depExportCASDir() string {
+	return filepath.Join(cacheBaseDir(), "golance", "depexport")
 }
 
 // indexDBFile returns the per-root index database path for root: the small
@@ -430,6 +447,7 @@ func (s *Server) runIndexBuild(ctx context.Context, root, dbPath string) (locked
 		EnvRoot+"="+root,
 		EnvDB+"="+dbPath,
 		EnvCAS+"="+cas,
+		EnvDepCAS+"="+depExportCASDir(),
 		fmt.Sprintf("GOMAXPROCS=%d", max(1, runtime.NumCPU()-1)),
 	)
 	if s.opts.IndexJobs > 0 {

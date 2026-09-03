@@ -13,7 +13,8 @@ import (
 // the shared typecheck.Cache once every package that imports it has
 // finished. Non-root (stdlib/module) dependencies are excluded entirely:
 // they are never scheduled as jobs of their own, only resolved on demand
-// through the shared Importer's export-file fallback.
+// through the shared Importer's fallback ExportSource tier
+// (internal/depexport.Cache — see its own package doc).
 type scheduler struct {
 	snap        *graph.Snapshot
 	cache       *typecheck.Cache

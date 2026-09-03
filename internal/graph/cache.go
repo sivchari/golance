@@ -37,7 +37,15 @@ import (
 // are plain absolute strings for whichever single worktree wrote them and
 // would resolve to nonsense joined onto a different root, so it cannot be
 // reused here even though the JSON shape is otherwise compatible.
-const cacheVersion = 4
+//
+// v5: Package.ExportFile is gone (see internal/depexport's package doc for
+// what replaced `go list -export` entirely); a pre-v5 cache's Packages map
+// still carries populated ExportFile strings that would silently decode
+// into a JSON field nothing reads anymore. Harmless on its own, but bumped
+// anyway so an old, ExportFile-shaped cache is never treated as
+// interchangeable with a new one purely by coincidence of an unrelated
+// field being ignored.
+const cacheVersion = 5
 
 // diskCache is the on-disk JSON envelope for a persisted Snapshot. Patterns
 // and BuildFlags are folded into the cache key: LoadCache refuses to serve
@@ -152,7 +160,7 @@ func LoadCache(root string, patterns, buildFlags []string) (snap *Snapshot, ok b
 	if saved.Version != cacheVersion || !equalStrings(saved.Patterns, patterns) || !equalStrings(saved.BuildFlags, buildFlags) {
 		return nil, false
 	}
-	snap, err = newSnapshot(fromDiskPackages(saved.Packages, root), root, saved.BuildFlags)
+	snap, err = newSnapshot(fromDiskPackages(saved.Packages, root), root)
 	if err != nil {
 		return nil, false
 	}
@@ -164,6 +172,17 @@ func LoadCache(root string, patterns, buildFlags []string) (snap *Snapshot, ok b
 // path under root is stored relative to it (see toDiskPackages); a
 // dependency path outside root (GOROOT, module cache — already stable
 // across worktrees) is stored exactly as-is.
+//
+// Because CacheFile is shared across every worktree of a repository (see
+// its own doc), two SaveCache calls for different worktrees — e.g. the
+// interactive server's background revalidateGraph and a concurrently
+// running indexer subprocess — can race to write it at once. Each call
+// stages its write in its OWN uniquely-named temp file (os.CreateTemp, not
+// a fixed "<file>.tmp" name) before renaming it into place, so the two
+// renames never collide: whichever finishes last simply wins, and the
+// other's rename still succeeds against a temp file only it ever touched,
+// instead of failing with ENOENT because a sibling caller already renamed
+// (and thereby removed) the shared fixed name out from under it.
 func SaveCache(root string, patterns, buildFlags []string, snap *Snapshot) error {
 	files := moduleFiles(root)
 	existed := make(map[string]bool, len(files))
@@ -184,35 +203,43 @@ func SaveCache(root string, patterns, buildFlags []string, snap *Snapshot) error
 		return fmt.Errorf("graph: marshal cache: %w", err)
 	}
 	file := CacheFile(root)
-	if err := os.MkdirAll(filepath.Dir(file), 0o750); err != nil {
+	dir := filepath.Dir(file)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("graph: create cache dir: %w", err)
 	}
-	tmp := file + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return fmt.Errorf("graph: write cache: %w", err)
+	tmp, err := os.CreateTemp(dir, filepath.Base(file)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("graph: create cache temp file: %w", err)
 	}
-	if err := os.Rename(tmp, file); err != nil {
-		_ = os.Remove(tmp)
+	tmpPath := tmp.Name()
+	_, writeErr := tmp.Write(b)
+	closeErr := tmp.Close()
+	if writeErr != nil || closeErr != nil {
+		_ = os.Remove(tmpPath)
+		if writeErr != nil {
+			return fmt.Errorf("graph: write cache: %w", writeErr)
+		}
+		return fmt.Errorf("graph: close cache temp file: %w", closeErr)
+	}
+	if err := os.Rename(tmpPath, file); err != nil {
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("graph: rename cache: %w", err)
 	}
 	return nil
 }
 
-// toDiskPackages returns a copy of pkgs whose Dir/GoFiles/ExportFile are
-// made relative to root wherever they fall under it (relPath) — the
-// transform SaveCache applies before marshaling, so the JSON on disk never
-// embeds an absolute path specific to this one worktree for anything
-// worktree-local. pkgs itself is never mutated: it may be the live
-// snap.Packages map, concurrently read by other request handlers.
+// toDiskPackages returns a copy of pkgs whose Dir/GoFiles are made relative
+// to root wherever they fall under it (relPath) — the transform SaveCache
+// applies before marshaling, so the JSON on disk never embeds an absolute
+// path specific to this one worktree for anything worktree-local. pkgs
+// itself is never mutated: it may be the live snap.Packages map,
+// concurrently read by other request handlers.
 func toDiskPackages(pkgs map[string]*Package, root string) map[string]*Package {
 	out := make(map[string]*Package, len(pkgs))
 	for path, pkg := range pkgs {
 		cp := *pkg
 		cp.Dir = relPath(root, pkg.Dir)
 		cp.GoFiles = relFiles(root, pkg.GoFiles)
-		if pkg.ExportFile != "" {
-			cp.ExportFile = relPath(root, pkg.ExportFile)
-		}
 		out[path] = &cp
 	}
 	return out
@@ -229,9 +256,6 @@ func fromDiskPackages(pkgs map[string]*Package, root string) map[string]*Package
 		cp := *pkg
 		cp.Dir = absPath(root, pkg.Dir)
 		cp.GoFiles = absFiles(root, pkg.GoFiles)
-		if pkg.ExportFile != "" {
-			cp.ExportFile = absPath(root, pkg.ExportFile)
-		}
 		out[path] = &cp
 	}
 	return out

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sivchari/golance/internal/depcheck"
+	"github.com/sivchari/golance/internal/depexport"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
@@ -191,10 +193,9 @@ func assertImportInserted(t *testing.T, text []byte, edit langfeat.Edit, wantImp
 }
 
 // loadFmtPackage decodes the standard library "fmt" package's export data
-// through the same typecheck.Importer/graph.Snapshot machinery
-// internal/server's depCacheHolder uses (graph.Snapshot satisfies
-// typecheck.ExportFileSource), standing in for the *types.Package a real
-// workspace snapshot's on-demand export-data decode would hand
+// through the same typecheck.Importer/depexport.Cache machinery
+// internal/server's depCacheHolder uses, standing in for the *types.Package
+// a real workspace snapshot's on-demand export-data decode would hand
 // UnimportedMemberItems.
 func loadFmtPackage(t *testing.T) *types.Package {
 	t.Helper()
@@ -206,7 +207,9 @@ func loadFmtPackage(t *testing.T) *types.Package {
 	if err != nil {
 		t.Fatalf("graph.Load(fmt): %v", err)
 	}
-	imp := typecheck.NewImporter(token.NewFileSet(), nil, snap, typecheck.NewCache())
+	depMeta := depcheck.NewGraphMetadataSource(snap)
+	depExp := depexport.NewCache(nil, depMeta, depcheck.NewProvider(depMeta, depcheck.Options{}), depexport.Options{})
+	imp := typecheck.NewImporter(token.NewFileSet(), nil, depExp, typecheck.NewCache())
 	pkg, err := imp.ImportFrom("fmt", "", 0)
 	if err != nil {
 		t.Fatalf("ImportFrom(fmt): %v", err)

@@ -1,9 +1,13 @@
 // Package typecheck runs go/types over a single package's already-parsed
 // files, resolving its dependencies from export data rather than
-// re-type-checking them. Two sources are tried in order: a caller-supplied
-// ExportSource (self-authored blobs, e.g. from a prior WriteExport of a
-// workspace package) and an ExportFileSource (the GOCACHE-generated export
-// files go/packages reports for stdlib and module dependencies).
+// re-type-checking them. Two ExportSource values are tried in order: a
+// primary one (typically self-authored blobs, e.g. from a prior
+// WriteExport of a workspace package already checked earlier in the same
+// run) and a fallback (typically internal/depexport.Cache, resolving a
+// non-root, standard-library or module-cache dependency's export data by
+// declaration-only source-checking it — never by invoking the Go
+// toolchain's own compiler; see that package's own doc for why). Either may
+// be nil to skip that tier.
 package typecheck
 
 import (
@@ -14,27 +18,17 @@ import (
 	"go/token"
 	"go/types"
 	"io"
-	"os"
-	"path/filepath"
 	"sync"
 
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/tools/go/gcexportdata"
 )
 
-// ExportSource resolves self-authored export data (written by WriteExport)
-// for a workspace package, keyed by import path. ok is false when the
-// source has no data for pkgPath — the importer then falls back to an
-// ExportFileSource.
+// ExportSource resolves export data for a package, keyed by import path. ok
+// is false when the source has no data for pkgPath — the importer then
+// falls back to its next configured ExportSource, if any (see NewImporter).
 type ExportSource interface {
 	ExportData(pkgPath string) (data []byte, ok bool, err error)
-}
-
-// ExportFileSource resolves the GOCACHE-generated export data file for a
-// package, as reported by go/packages' NeedExportFile mode. graph.Snapshot
-// satisfies this interface.
-type ExportFileSource interface {
-	ExportFile(pkgPath string) (file string, ok bool)
 }
 
 // Cache holds decoded *types.Package values keyed by import path, shared
@@ -114,27 +108,27 @@ func (c *Cache) FailedLen() int {
 	return len(c.failed)
 }
 
-// Importer implements types.ImporterFrom over an ExportSource and an
-// ExportFileSource, decoding through gcexportdata and caching results in
-// cache. Not safe for concurrent use across multiple Importer values
-// sharing the same Cache without external synchronization beyond what
-// Cache itself provides. A single Importer value, however, is designed for
-// concurrent ImportFrom calls (see its doc): only the map-mutating decode
-// step holds Cache's lock, and sf collapses concurrent callers requesting
-// the same path onto one decode.
+// Importer implements types.ImporterFrom over two ExportSource tiers,
+// decoding through gcexportdata and caching results in cache. Not safe for
+// concurrent use across multiple Importer values sharing the same Cache
+// without external synchronization beyond what Cache itself provides. A
+// single Importer value, however, is designed for concurrent ImportFrom
+// calls (see its doc): only the map-mutating decode step holds Cache's
+// lock, and sf collapses concurrent callers requesting the same path onto
+// one decode.
 type Importer struct {
-	fset  *token.FileSet
-	src   ExportSource
-	files ExportFileSource
-	cache *Cache
-	sf    singleflight.Group
+	fset     *token.FileSet
+	src      ExportSource
+	fallback ExportSource
+	cache    *Cache
+	sf       singleflight.Group
 }
 
 // NewImporter returns an Importer that resolves imports via src first, then
-// files, decoding into fset and caching results in cache. Either src or
-// files may be nil to skip that source.
-func NewImporter(fset *token.FileSet, src ExportSource, files ExportFileSource, cache *Cache) *Importer {
-	return &Importer{fset: fset, src: src, files: files, cache: cache}
+// fallback, decoding into fset and caching results in cache. Either src or
+// fallback may be nil to skip that tier.
+func NewImporter(fset *token.FileSet, src, fallback ExportSource, cache *Cache) *Importer {
+	return &Importer{fset: fset, src: src, fallback: fallback, cache: cache}
 }
 
 // Import implements types.Importer.
@@ -150,9 +144,9 @@ func (imp *Importer) Import(path string) (*types.Package, error) {
 // this Importer) only serialize on Cache's lock for the brief map lookup
 // and, per distinct path, the gcexportdata.Read call that mutates the
 // shared imports map. Resolving the export data itself — an ExportSource
-// lookup, or opening and reading an ExportFileSource file — runs outside
-// that lock, and singleflight collapses concurrent callers for the same
-// uncached path onto a single resolve instead of each repeating the I/O.
+// lookup against src, then fallback — runs outside that lock, and
+// singleflight collapses concurrent callers for the same uncached path onto
+// a single resolve instead of each repeating the work.
 func (imp *Importer) ImportFrom(path, _ string, _ types.ImportMode) (*types.Package, error) {
 	if pkg, ok := imp.cacheGet(path); ok {
 		return pkg, nil
@@ -182,10 +176,13 @@ func (imp *Importer) cacheGet(path string) (*types.Package, bool) {
 	return pkg, ok && pkg.Complete()
 }
 
-// resolve locates path's export data — via imp.src first, then imp.files —
-// and decodes it. Locating and reading the data (an ExportSource lookup, or
-// opening and reading an ExportFileSource file) does not touch imp.cache
-// and so needs no lock; only decode does.
+// resolve locates path's export data — via imp.src first, then
+// imp.fallback — and decodes it. Both are self-contained blobs with no
+// archive header (see WriteExport's doc), so either is fed straight to
+// gcexportdata.Read via decode, unlike a GOCACHE-generated `go list
+// -export` file (which this package no longer resolves at all — see the
+// package doc). Locating the data (an ExportSource lookup) does not touch
+// imp.cache and so needs no lock; only decode does.
 func (imp *Importer) resolve(path string) (*types.Package, error) {
 	if imp.src != nil {
 		data, ok, err := imp.src.ExportData(path)
@@ -196,28 +193,16 @@ func (imp *Importer) resolve(path string) (*types.Package, error) {
 			return imp.decode(bytes.NewReader(data), path, int64(len(data)))
 		}
 	}
-
-	if imp.files == nil {
-		return nil, fmt.Errorf("typecheck: no export data for %s", path)
+	if imp.fallback != nil {
+		data, ok, err := imp.fallback.ExportData(path)
+		if err != nil {
+			return nil, fmt.Errorf("typecheck: read export data for %s: %w", path, err)
+		}
+		if ok {
+			return imp.decode(bytes.NewReader(data), path, int64(len(data)))
+		}
 	}
-	file, ok := imp.files.ExportFile(path)
-	if !ok {
-		return nil, fmt.Errorf("typecheck: no export data for %s", path)
-	}
-	f, err := os.Open(filepath.Clean(file))
-	if err != nil {
-		return nil, fmt.Errorf("typecheck: open export file for %s: %w", path, err)
-	}
-	defer func() { _ = f.Close() }()
-	var size int64
-	if fi, err := f.Stat(); err == nil {
-		size = fi.Size()
-	}
-	r, err := gcexportdata.NewReader(f)
-	if err != nil {
-		return nil, fmt.Errorf("typecheck: read export header for %s: %w", path, err)
-	}
-	return imp.decode(r, path, size)
+	return nil, fmt.Errorf("typecheck: no export data for %s", path)
 }
 
 // decode runs gcexportdata.Read under Cache's lock. The call both reads and

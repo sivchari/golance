@@ -35,7 +35,7 @@ func TestBuild_UnchangedStatSkipsWithoutReadingContent(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("first Build: %v", err)
 	}
 
@@ -51,7 +51,7 @@ func TestBuild_UnchangedStatSkipsWithoutReadingContent(t *testing.T) {
 		t.Fatalf("restore mtime: %v", err)
 	}
 
-	stats, err := Build(ctx, snap, db, cas, Options{})
+	stats, err := Build(ctx, snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("second Build: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestBuild_TouchedFileSameContentSkipsAndRefreshesStat(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("first Build: %v", err)
 	}
 
@@ -88,7 +88,7 @@ func TestBuild_TouchedFileSameContentSkipsAndRefreshesStat(t *testing.T) {
 		t.Fatalf("touch leaf.go: %v", err)
 	}
 
-	stats, err := Build(ctx, snap, db, cas, Options{})
+	stats, err := Build(ctx, snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("second Build: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestBuild_ContentChangeTriggersRebuild(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("first Build: %v", err)
 	}
 	firstPtr, err := db.GetUnit(context.Background(), store.Hash(pkgLeaf))
@@ -162,7 +162,7 @@ func Hello(name string) Greeting {
 		t.Fatalf("edit leaf.go: %v", err)
 	}
 
-	stats, err := Build(ctx, snap, db, cas, Options{})
+	stats, err := Build(ctx, snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("second Build: %v", err)
 	}
@@ -197,7 +197,7 @@ func TestBuild_FileAddedOrRemovedTriggersRebuild(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("first Build: %v", err)
 	}
 
@@ -212,7 +212,7 @@ func TestBuild_FileAddedOrRemovedTriggersRebuild(t *testing.T) {
 	}
 
 	snap2 := loadSnapshot(t, dir)
-	stats, err := Build(ctx, snap2, db, cas, Options{})
+	stats, err := Build(ctx, snap2, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("Build after adding a file: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestBuild_FileAddedOrRemovedTriggersRebuild(t *testing.T) {
 		t.Fatalf("remove extra.go: %v", err)
 	}
 	snap3 := loadSnapshot(t, dir)
-	stats, err = Build(ctx, snap3, db, cas, Options{})
+	stats, err = Build(ctx, snap3, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("Build after removing a file: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestBuild_NoStatSnapshotFallsBackToContentHash(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("first Build: %v", err)
 	}
 	ptr, err := db.GetUnit(context.Background(), store.Hash(pkgLeaf))
@@ -264,7 +264,7 @@ func TestBuild_NoStatSnapshotFallsBackToContentHash(t *testing.T) {
 		t.Fatalf("PutUnit(noStat): %v", err)
 	}
 
-	stats, err := Build(ctx, snap, db, cas, Options{})
+	stats, err := Build(ctx, snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("second Build: %v", err)
 	}

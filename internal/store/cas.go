@@ -172,9 +172,35 @@ type GCStats struct {
 // directory tree), so its own memory footprint stays flat regardless of how
 // large the CAS directory is.
 func (c *CAS) GC(now time.Time, marks map[uint64]struct{}) (GCStats, error) {
+	return c.sweep(now, marks, GraceWindow)
+}
+
+// GCAged removes every blob last written more than maxAge before now,
+// ignoring liveness entirely (marks is always nil) — for a CAS directory
+// whose blobs are never referenced by any per-repo index database's
+// UnitPointer at all, so GC's ordinary mark-and-sweep has no mark set it
+// could ever build in the first place (internal/depexport's machine-global
+// dependency export-data cache: nothing about which repository, worktree,
+// or session asked for a dependency's export data is recorded anywhere a
+// mark set could be derived from). A blob is always safely recomputable on
+// a miss (see CAS.Get's doc), so an age-only sweep is exactly as safe here
+// as GOCACHE's own unconditional age-based trim — maxAge simply plays
+// GraceWindow's role, sized by the caller for a cache meant to survive far
+// longer between actual reclaims than a per-repo one (see
+// internal/depexport's own doc: "computed once per machine ever").
+func (c *CAS) GCAged(now time.Time, maxAge time.Duration) (GCStats, error) {
+	return c.sweep(now, nil, maxAge)
+}
+
+// sweep is GC and GCAged's shared directory walk, parameterized by grace —
+// how recently an unmarked blob may have been written before it is
+// removed — so each caller can supply its own tradeoff between reclaim
+// speed and false-eviction risk (see GC's and GCAged's own docs) without
+// duplicating the walk itself.
+func (c *CAS) sweep(now time.Time, marks map[uint64]struct{}, grace time.Duration) (GCStats, error) {
 	start := time.Now()
 	var stats GCStats
-	cutoff := now.Add(-GraceWindow)
+	cutoff := now.Add(-grace)
 	shards, err := os.ReadDir(c.dir)
 	if err != nil {
 		return stats, fmt.Errorf("store: list CAS directory: %w", err)
@@ -236,6 +262,28 @@ func (c *CAS) MaybeGC(now time.Time, marks map[uint64]struct{}) (stats GCStats, 
 		return GCStats{}, false, fmt.Errorf("store: write CAS GC stamp: %w", err)
 	}
 	stats, err = c.GC(now, marks)
+	return stats, true, err
+}
+
+// MaybeGCAged runs GCAged(now, maxAge) only if at least interval has passed
+// since the last time THIS METHOD actually ran (tracked via the same small
+// stamp file MaybeGC uses — safe to share, since GCAged is only ever called
+// against a CAS directory of c's own that MaybeGC never is, e.g.
+// internal/depexport's machine-global directory, never a per-repo one).
+// Mirrors MaybeGC's own throttle-and-run shape exactly, parameterized by
+// maxAge/interval instead of the fixed GraceWindow/GCInterval constants, so
+// a machine-global cache meant to be swept far less often, and with a far
+// longer grace window, than a per-repo one can share this same mechanism
+// rather than reimplementing it.
+func (c *CAS) MaybeGCAged(now time.Time, maxAge, interval time.Duration) (stats GCStats, ran bool, err error) {
+	stampPath := filepath.Join(c.dir, gcStampFile)
+	if fi, err := os.Stat(stampPath); err == nil && now.Sub(fi.ModTime()) < interval {
+		return GCStats{}, false, nil
+	}
+	if err := os.WriteFile(stampPath, nil, 0o600); err != nil {
+		return GCStats{}, false, fmt.Errorf("store: write CAS GC stamp: %w", err)
+	}
+	stats, err = c.GCAged(now, maxAge)
 	return stats, true, err
 }
 

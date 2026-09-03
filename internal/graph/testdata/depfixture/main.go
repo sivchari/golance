@@ -1,8 +1,8 @@
 // Package depfixture is a fixture module with a real external module-cache
 // dependency (golang.org/x/sync/singleflight, already required by golance
 // itself — see the repo's own go.mod), used to test that graph.Load
-// resolves dependency export data without requesting NeedExportFile on the
-// main "./..." load (see loadDepExportFiles).
+// correctly distinguishes a Root package from a real, non-root
+// module-cache dependency (see repokey_test.go and depfixture_test.go).
 package depfixture
 
 import "golang.org/x/sync/singleflight"
