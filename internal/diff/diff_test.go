@@ -1,6 +1,7 @@
 package diff_test
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -87,7 +88,7 @@ func TestLines_ScatteredHunksAreMinimal(t *testing.T) {
 		}
 	}
 	got := apply(t, before, edits)
-	if string(got) != string(after) {
+	if !bytes.Equal(got, after) {
 		t.Errorf("apply(edits, before) = %q, want %q", got, after)
 	}
 }
