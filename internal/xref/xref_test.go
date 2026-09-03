@@ -204,8 +204,24 @@ func TestDefinition_OnDeclarationResolvesToItself(t *testing.T) {
 
 // TestReferences_SpansDefiningAndReferencingPackages verifies References
 // returns every occurrence of impl.Person across impl (its own package,
-// including the declaration and impl's own internal uses) and every
-// importer (user, user2), matching gopls-equivalent completeness by count.
+// including the declaration and impl's own internal uses), every importer
+// (user, user2), AND inpkgtest's in-package "_test.go" file — matching
+// gopls-equivalent completeness by count.
+//
+// The reverse reference index (internal/store's PostingsFor, which
+// locationsForAll now queries instead of walking
+// [internal/graph.Snapshot.ClosureUnits]) is populated directly from each
+// package's own facts extraction pass, which always includes in-package
+// test files (see internal/index/testfiles.go) — unlike the closure walk
+// this replaced, which could only ever reach inpkgtest by way of
+// graph.Package.Imports, and inpkgtest's own import of impl exists ONLY in
+// its _test.go file (graph.Package.TestImports, deliberately excluded from
+// Imports/ClosureUnits — see TestImports' own doc: "for a later phase's
+// closure-based invalidation to pick up deliberately"). This is exactly
+// that later phase: the two extra occurrences below are a genuine
+// completeness fix, not a regression — inpkgtest's own doc comment already
+// flagged this fixture as isolated from this test's counts specifically
+// because the old implementation could never see it.
 func TestReferences_SpansDefiningAndReferencingPackages(t *testing.T) {
 	r, snap := newTestResolver(t)
 
@@ -219,6 +235,7 @@ func TestReferences_SpansDefiningAndReferencingPackages(t *testing.T) {
 
 	userFile := goFile(t, snap, pkgUser, "user.go")
 	user2File := goFile(t, snap, pkgUser2, "user2.go")
+	inpkgtestTestFile := inpkgtestTestFile(t, snap)
 
 	counts := map[string]int{}
 	for _, l := range locs {
@@ -229,14 +246,15 @@ func TestReferences_SpansDefiningAndReferencingPackages(t *testing.T) {
 	// NewPerson composite literal (4) = 4 occurrences of "Person".
 	// user.go: Declare's return type + composite literal = 2.
 	// user2.go: Use2's return type = 1.
-	want := map[string]int{implFile: 4, userFile: 2, user2File: 1}
+	// inpkgtest_test.go: useImplPerson's return type + composite literal = 2.
+	want := map[string]int{implFile: 4, userFile: 2, user2File: 1, inpkgtestTestFile: 2}
 	for file, n := range want {
 		if counts[file] != n {
 			t.Errorf("References in %s = %d, want %d (all locations: %+v)", file, counts[file], n, locs)
 		}
 	}
-	if total := len(locs); total != 7 {
-		t.Errorf("References total = %d, want 7: %+v", total, locs)
+	if total := len(locs); total != 9 {
+		t.Errorf("References total = %d, want 9: %+v", total, locs)
 	}
 }
 
@@ -250,14 +268,29 @@ func TestReferences_ExcludesDeclarationWhenNotIncluded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("References: %v", err)
 	}
-	if len(locs) != 6 {
-		t.Fatalf("References (excl. decl) = %d, want 6: %+v", len(locs), locs)
+	// 9 total (see TestReferences_SpansDefiningAndReferencingPackages) minus
+	// the declaration itself.
+	if len(locs) != 8 {
+		t.Fatalf("References (excl. decl) = %d, want 8: %+v", len(locs), locs)
 	}
 	for _, l := range locs {
 		if l.File == implFile && int(l.Line) == declLine && int(l.Col) == declCol {
 			t.Errorf("References with includeDecl=false still returned the declaration: %+v", l)
 		}
 	}
+}
+
+// inpkgtestTestFile returns the absolute path of inpkgtest's in-package
+// "_test.go" file — never listed in graph.Package.GoFiles (see
+// TestResolveAt_MapsTestFilePositionToUnit's doc), so it is joined onto
+// pkg.Dir directly rather than resolved via the goFile helper.
+func inpkgtestTestFile(t *testing.T, snap *graph.Snapshot) string {
+	t.Helper()
+	pkg, ok := snap.Package(pkgInpkgtest)
+	if !ok {
+		t.Fatalf("package %s not in snapshot", pkgInpkgtest)
+	}
+	return filepath.Join(pkg.Dir, "inpkgtest_test.go")
 }
 
 func TestImplementation_InterfaceToImplementer(t *testing.T) {
@@ -383,6 +416,10 @@ func TestWorkspaceSymbol_NoMatch(t *testing.T) {
 	}
 }
 
+// Rename touches inpkgtest's in-package "_test.go" file too, the same
+// closure-independent completeness fix described in
+// TestReferences_SpansDefiningAndReferencingPackages' doc (Rename shares
+// locationsForAll with References).
 func TestRename_EditsEveryReferenceAcrossFiles(t *testing.T) {
 	r, snap := newTestResolver(t)
 
@@ -396,8 +433,9 @@ func TestRename_EditsEveryReferenceAcrossFiles(t *testing.T) {
 
 	userFile := goFile(t, snap, pkgUser, "user.go")
 	user2File := goFile(t, snap, pkgUser2, "user2.go")
+	inpkgtestTestFile := inpkgtestTestFile(t, snap)
 
-	want := map[string]int{implFile: 4, userFile: 2, user2File: 1}
+	want := map[string]int{implFile: 4, userFile: 2, user2File: 1, inpkgtestTestFile: 2}
 	if len(edits) != len(want) {
 		t.Fatalf("Rename touched %d files, want %d: %+v", len(edits), len(want), edits)
 	}

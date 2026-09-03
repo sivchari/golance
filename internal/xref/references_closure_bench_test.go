@@ -98,11 +98,14 @@ func closureBenchHotFile(tb testing.TB, snap *graph.Snapshot) string {
 // from hot's own reverse-dependency closure, the total on-disk CAS blob
 // size (fullBytes -- what a whole-blob os.ReadFile pays for, Facts, Export,
 // and the trailing Files/Index sections together) versus the Facts
-// section's size alone (factsBytes -- what References actually needs). This
-// is a static property of the generated corpus, independent of whichever
-// unitBlob/unitFacts code path is under test, so it gives a fair "bytes
-// read" before/after comparison without needing runtime instrumentation
-// from the (potentially not-yet-fixed) code being measured.
+// section's size alone (factsBytes). This is a static property of the
+// generated corpus, logged alongside BenchmarkReferences_ClosureScale's own
+// timing purely for scale context: neither number is what References
+// itself reads anymore (locationsForAll answers via
+// [store.DB.PostingsFor], never decoding a closure package's facts blob at
+// all -- see xref.go's doc), but it quantifies just how large the
+// closure-walk read this benchmark's wall-clock improvement replaces used
+// to be.
 func closureBlobBytes(tb testing.TB, r *Resolver, snap *graph.Snapshot) (fullBytes, factsBytes int64) {
 	tb.Helper()
 	for _, pkgPath := range snap.ClosureUnits(closureBenchModuleName + "/hot") {

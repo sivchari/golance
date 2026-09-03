@@ -26,6 +26,9 @@ func TestUnitBlobRoundTrip(t *testing.T) {
 				{IDHash: 1, SymbolID: "pkg#Foo"},
 				{IDHash: 2, SymbolID: "pkg#Bar"},
 			},
+			Postings: []PostingEntry{
+				{TargetPkgHash: 100, TargetIDHash: 200, File: "a.go", Line: 5, Col: 1, EndCol: 4},
+			},
 		},
 	}
 
@@ -35,32 +38,74 @@ func TestUnitBlobRoundTrip(t *testing.T) {
 		t.Fatalf("DecodeUnitBlob() error = %v", err)
 	}
 
-	if !bytes.Equal(got.Facts, want.Facts) {
-		t.Errorf("Facts = %q, want %q", got.Facts, want.Facts)
+	assertBytesEqual(t, "Facts", got.Facts, want.Facts)
+	assertBytesEqual(t, "Export", got.Export, want.Export)
+	assertFilesEqual(t, got.Files, want.Files)
+	assertIndexEqual(t, &got.Index, &want.Index)
+}
+
+// assertBytesEqual reports a t.Errorf for field if got and want differ.
+func assertBytesEqual(t *testing.T, field string, got, want []byte) {
+	t.Helper()
+	if !bytes.Equal(got, want) {
+		t.Errorf("%s = %q, want %q", field, got, want)
 	}
-	if !bytes.Equal(got.Export, want.Export) {
-		t.Errorf("Export = %q, want %q", got.Export, want.Export)
+}
+
+// assertFilesEqual reports a mismatch between got and want's FileStat
+// entries.
+func assertFilesEqual(t *testing.T, got, want []FileStat) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("Files = %+v, want %+v", got, want)
 	}
-	if len(got.Files) != len(want.Files) {
-		t.Fatalf("Files = %+v, want %+v", got.Files, want.Files)
-	}
-	for i := range want.Files {
-		if got.Files[i] != want.Files[i] {
-			t.Errorf("Files[%d] = %+v, want %+v", i, got.Files[i], want.Files[i])
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Files[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
-	if len(got.Index.Names) != len(want.Index.Names) || got.Index.Names[0] != want.Index.Names[0] {
-		t.Errorf("Index.Names = %+v, want %+v", got.Index.Names, want.Index.Names)
+}
+
+// assertIndexEqual reports a mismatch between got and want's
+// PackageIndexEntries — one field group at a time, delegating SymStrs and
+// Postings (both list-shaped, needing a length check plus a per-element
+// loop) to their own helpers to keep this function's own complexity low.
+func assertIndexEqual(t *testing.T, got, want *PackageIndexEntries) {
+	t.Helper()
+	if len(got.Names) != len(want.Names) || got.Names[0] != want.Names[0] {
+		t.Errorf("Index.Names = %+v, want %+v", got.Names, want.Names)
 	}
-	if len(got.Index.Methods) != len(want.Index.Methods) || got.Index.Methods[0] != want.Index.Methods[0] {
-		t.Errorf("Index.Methods = %+v, want %+v", got.Index.Methods, want.Index.Methods)
+	if len(got.Methods) != len(want.Methods) || got.Methods[0] != want.Methods[0] {
+		t.Errorf("Index.Methods = %+v, want %+v", got.Methods, want.Methods)
 	}
-	if len(got.Index.SymStrs) != len(want.Index.SymStrs) {
-		t.Fatalf("Index.SymStrs = %+v, want %+v", got.Index.SymStrs, want.Index.SymStrs)
+	assertSymStrsEqual(t, got.SymStrs, want.SymStrs)
+	assertPostingsEqual(t, got.Postings, want.Postings)
+}
+
+// assertSymStrsEqual reports a mismatch between got and want's SymStrEntry
+// lists.
+func assertSymStrsEqual(t *testing.T, got, want []SymStrEntry) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("Index.SymStrs = %+v, want %+v", got, want)
 	}
-	for i := range want.Index.SymStrs {
-		if got.Index.SymStrs[i] != want.Index.SymStrs[i] {
-			t.Errorf("Index.SymStrs[%d] = %+v, want %+v", i, got.Index.SymStrs[i], want.Index.SymStrs[i])
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Index.SymStrs[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// assertPostingsEqual reports a mismatch between got and want's
+// PostingEntry lists.
+func assertPostingsEqual(t *testing.T, got, want []PostingEntry) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("Index.Postings = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("Index.Postings[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
 }
@@ -78,9 +123,7 @@ func TestUnitBlobEmpty(t *testing.T) {
 
 // TestUnitFactsRange_MatchesDecodedFacts verifies UnitFactsRange's own
 // (offset, length) range, applied directly to an encoded blob, slices out
-// exactly the same bytes DecodeUnitBlob's full decode returns as Facts --
-// the property [CAS.GetFacts] relies on to read only that range instead of
-// the whole blob.
+// exactly the same bytes DecodeUnitBlob's full decode returns as Facts.
 func TestUnitFactsRange_MatchesDecodedFacts(t *testing.T) {
 	want := UnitBlob{Facts: []byte("facts-bytes"), Export: []byte("export-bytes-longer-than-facts")}
 	encoded := EncodeUnitBlob(&want)

@@ -13,8 +13,15 @@
 //     the same bytes harmlessly instead of needing a lock.
 //   - [DB]: a small, per-root (per-worktree) bbolt database recording only
 //     which CAS blob key each package currently resolves to ([UnitPointer]),
-//     plus the name/method/SymbolID-string lookup indices built from those
-//     blobs. Being per-root, it is never shared or contended across golance
+//     plus the name/method/SymbolID-string/reference-posting lookup indices
+//     built from those blobs. The reference-posting index (bucketRefPostings,
+//     queried via [DB.PostingsFor]; see postings.go) is the odd one out
+//     among these: unlike the others, which tolerate a stale entry as
+//     harmless (see applyIndexEntries's doc), a package's postings are
+//     replaced EXACTLY on every reindex, via a per-source manifest
+//     (bucketRefPostingManifest; see applyPostings) — internal/xref's
+//     References needs it to never lag or outlive the facts it mirrors.
+//     Being per-root, DB is never shared or contended across golance
 //     sessions the way a single repository-wide database would be.
 //
 // # Zero-copy facts blobs
