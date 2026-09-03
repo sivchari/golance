@@ -21,17 +21,38 @@ import (
 // for no consumer — dependency source is immutable and assumed to compile
 // (depcheck's own best-effort check.Config.Error), so it has no
 // diagnostics worth publishing either.
+//
+// A didOpen arriving while s.workspace() is still nil — the async window
+// between handleInitialize returning and its background graph load
+// finishing (see lifecycle.go) — is queued via markPendingOpen instead of
+// dropped: setWorkspace's own drainPendingOpens applies the same
+// SetFocus/Invalidate to it once a workspace becomes available, mirroring
+// handleDidSave's identical markDirty/drainDirty queue for a save landing
+// while s.idx is nil — including its own re-check-after-mark race guard
+// (see below): setWorkspace's Store/close/drainPendingOpens sequence can
+// complete entirely in the window between this handler's own workspace()
+// read and its markPendingOpen call, in which case that drain already ran
+// over an empty pending set and would otherwise never see this path again.
 func (s *Server) handleDidOpen(_ context.Context, params json.RawMessage) error {
 	var p protocol.DidOpenTextDocumentParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return err
 	}
 	s.overlay.DidOpen(&p)
+	path := p.TextDocument.URI.FsPath()
 	ws := s.workspace()
 	if ws == nil {
+		s.markPendingOpen(path)
+		// Re-read s.workspace(): if setWorkspace's install-and-drain raced
+		// this call and already finished, ws is non-nil here, and draining
+		// ourselves (a no-op if the race did not actually happen — this
+		// path is simply not in the pending set anymore) closes the gap
+		// rather than leaving path queued with nothing left to drain it.
+		if ws = s.workspace(); ws != nil {
+			s.drainPendingOpens(ws)
+		}
 		return nil
 	}
-	path := p.TextDocument.URI.FsPath()
 	if _, ok := ws.nonWorkspacePackageForFile(path); ok {
 		return nil
 	}

@@ -26,13 +26,17 @@ func (s *Server) registerSemanticHandlers() {
 // later overlay read, so a concurrent edit landing in between can't leave
 // the two disagreeing (langfeat.SemanticTokens requires text to match cp
 // exactly). It returns (nil, nil, nil) — not an error — before the
-// "initialize" request has populated the workspace, and likewise (logged,
-// not surfaced) when path is not part of a known package or
-// langfeat.SemanticTokens finds nothing to classify, matching every other
-// handler's read-only convention for those states.
+// "initialize" request has populated the workspace AND ctx expires before
+// golance's async initial graph load finishes (ws is resolved through
+// waitWorkspace, not workspace() directly — see checkedFile's identical
+// doc — so an ordinary request arriving during that window still gets a
+// real answer instead), and likewise (logged, not surfaced) when path is
+// not part of a known package or langfeat.SemanticTokens finds nothing to
+// classify, matching every other handler's read-only convention for those
+// states.
 func (s *Server) semanticTokensForFile(ctx context.Context, u uri.URI) ([]langfeat.Token, []byte) {
 	path := u.FsPath()
-	ws := s.workspace()
+	ws := s.waitWorkspace(ctx)
 	if ws == nil {
 		return nil, nil
 	}

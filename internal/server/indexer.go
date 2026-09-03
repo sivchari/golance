@@ -59,35 +59,14 @@ const (
 // workspace, which gets its own private CAS exactly as golance behaved
 // before worktree sharing existed; there is nothing to share, and no
 // benefit to paying the relative-path bookkeeping for it).
+//
+// A thin wrapper over graph.RepoKey, which internal/graph's own cache
+// (graph.CacheFile/Shared) uses for the identical decision over the import
+// graph cache: keeping exactly one implementation of the underlying git
+// invocation means the CAS, facts index, and graph cache can never
+// disagree about which worktrees share what.
 func repoKey(root string) (key string, shared bool) {
-	cmd := exec.Command("git", "rev-parse", "--git-common-dir")
-	cmd.Dir = root
-	out, err := cmd.Output()
-	if err != nil {
-		return root, false
-	}
-	dir := strings.TrimSpace(string(out))
-	if dir == "" {
-		return root, false
-	}
-	if !filepath.IsAbs(dir) {
-		dir = filepath.Join(root, dir)
-	}
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		return root, false
-	}
-	// Resolve symlinks so every worktree's key lands on the same string
-	// regardless of which absolute form its own root happened to be given
-	// in: git already returns a symlink-resolved absolute path for a linked
-	// worktree's --git-common-dir (it resolves the worktree's `.git` file
-	// target internally), but the main worktree's own relative "./.git"
-	// answer, joined above onto a possibly-unresolved root, would not
-	// match that without this — e.g. macOS's /var -> /private/var.
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		abs = resolved
-	}
-	return abs, true
+	return graph.RepoKey(root)
 }
 
 // RelativeIndexPaths reports whether root's facts index (CAS blobs and the

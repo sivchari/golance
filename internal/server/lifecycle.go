@@ -28,14 +28,37 @@ const watchedFilesRegistrationID = "golance-watch-go-files"
 // (and reload) the whole workspace's import graph.
 const allPackagesPattern = "./..."
 
-// handleInitialize resolves the workspace root from params, loads the
-// import graph (from cache if warm, else synchronously), and returns
-// golance's server capabilities. The facts index is opened directly
-// whenever a database already exists (tryWarmOpen), with a cheap
-// in-process check (revalidateIndex) running in the background to catch
-// it up if anything changed since it was last built; otherwise it is
-// built from scratch by launching the indexer subprocess in the
-// background (buildIndex).
+// graphLoad indirects graph.Load, called only from loadWorkspaceAsync, so a
+// test can substitute a blocking (or failing) fake without needing a
+// synthetic, monorepo-sized module to reproduce a slow cold-worktree load —
+// see TestHandleInitialize_ReturnsBeforeGraphLoadCompletes.
+var graphLoad = graph.Load
+
+// handleInitialize resolves the workspace root from params and returns
+// golance's server capabilities immediately; the import graph load and
+// everything gated on it (setWorkspace, the facts-index warm-open/build/
+// revalidate decision) run entirely in the background, via
+// loadWorkspaceAsync.
+//
+// Through v0.5.0 this handler ran that whole sequence synchronously before
+// responding. On a brand-new git worktree of a large monorepo that made
+// "initialize" itself take as long as the import graph load — routinely
+// minutes, since GOCACHE is keyed by absolute path and so starts out 100%
+// cold for the new worktree's own workspace packages (see loadMode's own
+// doc in internal/graph for the -export compilation cost this also
+// removes) — comfortably past many editors' own initialize timeout, which
+// tears the connection down with no server at all rather than a slow one.
+// Every handler that needs the workspace already degrades gracefully while
+// s.workspace() is nil (an empty/no-op result, e.g. handlers_langfeat.go's
+// handleDocumentSymbol, or resolverOrWarn's own "index still building"
+// signal for cross-reference queries); checkedFile — hover, completion,
+// signature help, textDocument/definition's index-unavailable fallback,
+// and every other per-position feature — additionally blocks briefly on
+// waitWorkspace, bounded by the request's own ctx, so a query arriving
+// during this now-longer window still gets a real answer once the load
+// finishes rather than silence for its whole duration. handleDidOpen
+// arriving before the workspace is ready is queued (see
+// markPendingOpen/drainPendingOpens) rather than dropped.
 func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (any, error) {
 	var p protocol.InitializeParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
@@ -50,35 +73,11 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 		return nil, err
 	}
 
-	patterns := []string{allPackagesPattern}
-	loadOpts := graph.Options{Dir: root, Offline: s.opts.Offline}
-
-	snap, ok := graph.LoadCache(root, patterns, loadOpts.BuildFlags)
-	if !ok {
-		snap, err = graph.Load(loadOpts, patterns...)
-		if err != nil {
-			return nil, fmt.Errorf("server: initialize: load import graph: %w", err)
-		}
-		if err := graph.SaveCache(root, patterns, loadOpts.BuildFlags, snap); err != nil {
-			s.logger.Printf("server: save graph cache: %v", err)
-		}
-	} else if graph.Stale(root) {
-		go s.revalidateGraph(loadOpts, patterns)
-	}
-	s.setWorkspace(root, snap)
-
-	// revalidateIndex/buildIndex may launch the indexer subprocess, so both
-	// are bound to the session's own lifetime via s.rpc.Go — not this
-	// request's own ctx, which internal/rpc.Server cancels the moment this
-	// handler returns (see dispatchRequest) — and tracked by Serve's wg so
-	// shutdown waits (briefly) for whichever is in flight instead of
-	// leaving it orphaned.
-	if idx, ok := s.tryWarmOpen(root); ok {
-		s.idx.Store(idx)
-		s.rpc.Go(func(ctx context.Context) { s.revalidateIndex(ctx, root) })
-	} else {
-		s.rpc.Go(func(ctx context.Context) { s.buildIndex(ctx, root) })
-	}
+	// Bound to the session's own lifetime via s.rpc.Go — not this request's
+	// own ctx, which internal/rpc.Server cancels the moment this handler
+	// returns (see dispatchRequest) — and tracked by Serve's wg so shutdown
+	// waits (briefly) for it instead of leaving it orphaned.
+	s.rpc.Go(func(ctx context.Context) { s.loadWorkspaceAsync(ctx, root) })
 
 	// Opportunistic, never blocking this request: remove any session-private
 	// index files (see privateIndexDBFile) a crashed prior session left
@@ -89,6 +88,52 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 		Capabilities: s.capabilities(),
 		ServerInfo:   protocol.ServerInfo{Name: "golance", Version: protocol.NewOptional(Version)},
 	}, nil
+}
+
+// loadWorkspaceAsync runs handleInitialize's own former synchronous body:
+// load the import graph (from cache if warm, else via graphLoad), install
+// it with setWorkspace, then warm-open the facts index directly if a
+// database already exists (tryWarmOpen) — with a cheap in-process check
+// (revalidateIndex) catching it up in the background if anything changed
+// since it was last built — or build it from scratch by launching the
+// indexer subprocess (buildIndex) otherwise.
+//
+// A shared graph cache (graph.Shared — every worktree of one git repository
+// reads and writes the same cache file, see graph.CacheFile) is trusted
+// immediately for instant readiness even when it might reflect a different
+// worktree's own file set (a different branch/commit checked out), rather
+// than paying for a `go list` before this worktree's own workspace is ever
+// usable at all: graph.Stale's own mtime heuristic is not a reliable
+// enough staleness signal for a file shared across worktrees this way (see
+// its doc), so a shared cache always additionally kicks a background
+// revalidateGraph pass to self-heal, on top of (not instead of) the
+// existing Stale check a private, non-shared cache still relies on alone.
+func (s *Server) loadWorkspaceAsync(ctx context.Context, root string) {
+	patterns := []string{allPackagesPattern}
+	loadOpts := graph.Options{Dir: root, Offline: s.opts.Offline}
+
+	snap, ok := graph.LoadCache(root, patterns, loadOpts.BuildFlags)
+	if !ok {
+		var err error
+		snap, err = graphLoad(loadOpts, patterns...)
+		if err != nil {
+			s.logger.Printf("server: initialize: load import graph: %v", err)
+			return
+		}
+		if err := graph.SaveCache(root, patterns, loadOpts.BuildFlags, snap); err != nil {
+			s.logger.Printf("server: save graph cache: %v", err)
+		}
+	} else if graph.Shared(root) || graph.Stale(root) {
+		go s.revalidateGraph(loadOpts, patterns)
+	}
+	s.setWorkspace(root, snap)
+
+	if idx, ok := s.tryWarmOpen(root); ok {
+		s.idx.Store(idx)
+		s.revalidateIndex(ctx, root)
+	} else {
+		s.buildIndex(ctx, root)
+	}
 }
 
 // handleShutdown acknowledges the "shutdown" request. internal/rpc already

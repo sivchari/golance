@@ -104,9 +104,18 @@ type checkedFileResult struct {
 // instead (the client already renders that as "nothing here,"
 // matching how handleCompletionResolve treats the identical Engine.Get
 // failure).
+//
+// Resolving ws through waitWorkspace, not workspace() directly, means every
+// caller of this — hover, completion, signature help, and
+// textDocument/definition's index-unavailable fallback — blocks briefly
+// (bounded by ctx) rather than answering empty outright when the workspace
+// has not finished its async initial load yet (see handleInitialize's
+// doc): a query landing in that window still gets a real answer once the
+// load completes, instead of only ever seeing "nothing here" for the
+// window's whole duration.
 func (s *Server) checkedFile(ctx context.Context, u uri.URI, pos protocol.Position) checkedFileResult {
 	path := u.FsPath()
-	ws := s.workspace()
+	ws := s.waitWorkspace(ctx)
 	if ws == nil {
 		return checkedFileResult{path: path}
 	}
@@ -278,13 +287,18 @@ func (s *Server) handleSignatureHelp(ctx context.Context, params json.RawMessage
 	}, nil
 }
 
+// handleDocumentSymbol resolves ws through waitWorkspace, not workspace()
+// directly, for the same reason checkedFile does (see its doc): a request
+// arriving during golance's async initial graph load still gets a real
+// answer, bounded by ctx, instead of an empty result for the window's whole
+// duration.
 func (s *Server) handleDocumentSymbol(ctx context.Context, params json.RawMessage) (any, error) {
 	var p protocol.DocumentSymbolParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
 	path := p.TextDocument.URI.FsPath()
-	ws := s.workspace()
+	ws := s.waitWorkspace(ctx)
 	if ws == nil {
 		return protocol.DocumentSymbolSlice(nil), nil
 	}
@@ -393,13 +407,19 @@ func (s *Server) handleDidChangeConfiguration(_ context.Context, params json.Raw
 	return nil
 }
 
+// handleInlayHint resolves ws through waitWorkspace, not workspace()
+// directly, for the same reason checkedFile does (see its doc): a request
+// arriving during golance's async initial graph load still gets a real
+// answer, bounded by ctx, instead of an empty result for the window's whole
+// duration — refreshOnWorkspaceReady's own workspace/inlayHint/refresh push
+// still covers a client that gave up waiting on this one call.
 func (s *Server) handleInlayHint(ctx context.Context, params json.RawMessage) (any, error) {
 	var p protocol.InlayHintParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
 	path := p.TextDocument.URI.FsPath()
-	ws := s.workspace()
+	ws := s.waitWorkspace(ctx)
 	if ws == nil {
 		return []protocol.InlayHint{}, nil
 	}

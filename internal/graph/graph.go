@@ -33,21 +33,39 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-// exportFileMode is the minimal go/packages.Load mode reloadExportFile uses
-// to recover a single package's export data. See Snapshot.ExportFile's doc
-// for when this runs.
+// exportFileMode is the minimal go/packages.Load mode that resolves export
+// data without also compiling anything Root (see loadMode's doc): used by
+// loadDepExportFiles' batched dependency-export load right after an
+// ordinary Load, and by reloadExportFile to recover a single package's
+// export data later (see Snapshot.ExportFile's doc for when that runs).
 const exportFileMode = packages.NeedName | packages.NeedExportFile
 
-// loadMode is the only go/packages.Load mode graph ever requests. NeedTypes
-// and NeedSyntax must never be added here: loading type/syntax information
-// for the whole workspace is exactly the cost this package exists to avoid.
-// NeedForTest is required for fromPackages to tell a test variant apart
-// from an ordinary package at all: go/packages leaves Package.ForTest
-// permanently "" — even with Config.Tests: true and even though the
-// underlying `go list -json` output does carry it — unless this bit is
-// requested (see golist.go's addFields, gated on cfg.Mode&NeedForTest).
+// loadMode is the main go/packages.Load mode graph requests for the whole
+// workspace. NeedTypes and NeedSyntax must never be added here: loading
+// type/syntax information for the whole workspace is exactly the cost this
+// package exists to avoid. NeedForTest is required for fromPackages to tell
+// a test variant apart from an ordinary package at all: go/packages leaves
+// Package.ForTest permanently "" — even with Config.Tests: true and even
+// though the underlying `go list -json` output does carry it — unless this
+// bit is requested (see golist.go's addFields, gated on cfg.Mode&NeedForTest).
+//
+// NeedExportFile is deliberately NOT included here, unlike through v0.5.0:
+// requesting it makes the underlying `go list` run with `-export=true`,
+// which COMPILES every matched package's export data rather than just
+// resolving metadata — for "./..." over a whole workspace, that means
+// compiling every one of possibly thousands of Root packages. golance never
+// reads a Root package's own ExportFile (Root packages are type-checked
+// straight from source — see internal/index/scheduler.go's doc and
+// internal/check); only a NON-root (stdlib/module-cache) dependency's
+// export data is ever consulted (internal/typecheck.ExportFileSource, wired
+// through workspace.depCache/depProvider). GOCACHE is keyed by absolute
+// path, so on a brand-new git worktree this -export compilation is a 100%
+// cache miss across the whole workspace — the dominant cost of a cold
+// worktree open (routinely minutes on a large monorepo), for data nothing
+// ever reads. Load instead resolves export data only for the packages that
+// can actually need it, via loadDepExportFiles.
 const loadMode = packages.NeedName | packages.NeedFiles | packages.NeedImports |
-	packages.NeedDeps | packages.NeedExportFile | packages.NeedForTest
+	packages.NeedDeps | packages.NeedForTest
 
 // Package is one node in the import graph: a single Go package as reported
 // by go/packages, without any type or syntax information.
@@ -197,7 +215,61 @@ func Load(opts Options, patterns ...string) (*Snapshot, error) {
 		return true
 	}, nil)
 
-	return newSnapshot(fromPackages(all, rootSet), opts.Dir, opts.BuildFlags)
+	pkgs := fromPackages(all, rootSet)
+	loadDepExportFiles(opts, pkgs)
+	return newSnapshot(pkgs, opts.Dir, opts.BuildFlags)
+}
+
+// loadDepExportFiles resolves export data for every NON-root package in
+// pkgs (the stdlib/module-cache dependencies internal/typecheck.
+// ExportFileSource actually needs — see loadMode's doc for why Root
+// packages are excluded) via one batched go/packages.Load, populating each
+// Package.ExportFile in place. Root packages' own ExportFile is left "",
+// exactly as it is never read.
+//
+// This runs as a second `go list -export` limited to the dependency import
+// paths already known from pkgs, rather than the whole "./..." pattern:
+// module-cache and GOROOT paths are stable across every worktree of a
+// repository (unlike the workspace's own absolute path), so GOCACHE is
+// warm for them after the very first build on the machine — this is cheap,
+// not the cost loadMode's doc describes.
+//
+// Best-effort: if the batched load itself fails outright (e.g. a transient
+// build error unrelated to any specific package), pkgs simply keeps
+// whatever ExportFile values it already had (i.e. none), and
+// Snapshot.ExportFile's own per-package reloadExportFile fallback recovers
+// each one lazily on its first actual use instead of leaving the whole
+// Snapshot permanently degraded.
+func loadDepExportFiles(opts Options, pkgs map[string]*Package) {
+	var patterns []string
+	for path, pkg := range pkgs {
+		if !pkg.Root {
+			patterns = append(patterns, path)
+		}
+	}
+	if len(patterns) == 0 {
+		return
+	}
+	sort.Strings(patterns)
+
+	cfg := &packages.Config{
+		Mode:       exportFileMode,
+		Dir:        opts.Dir,
+		BuildFlags: opts.BuildFlags,
+		Env:        os.Environ(),
+	}
+	if opts.Offline {
+		cfg.Env = append(cfg.Env, "GOPROXY=off")
+	}
+	loaded, err := packages.Load(cfg, patterns...)
+	if err != nil {
+		return
+	}
+	for _, p := range loaded {
+		if pkg, ok := pkgs[p.PkgPath]; ok && p.ExportFile != "" {
+			pkg.ExportFile = p.ExportFile
+		}
+	}
 }
 
 // fromPackages converts go/packages results into the graph's own

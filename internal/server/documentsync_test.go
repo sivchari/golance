@@ -45,6 +45,61 @@ func writeModuleFile(t *testing.T, dir, rel, content string) string {
 	return path
 }
 
+// TestHandleDidOpen_QueuedBeforeWorkspaceReadyThenDrained verifies that a
+// didOpen arriving while s.workspace() is still nil — the async window
+// between handleInitialize returning and its background graph load
+// finishing (see lifecycle.go's own doc) — is queued (markPendingOpen)
+// rather than silently dropped, and that the very next setWorkspace call
+// (loadWorkspaceAsync's own first one, in production) drains it
+// (drainPendingOpens), mirroring TestHandleDidSave_
+// ReindexedOnceIndexBecomesAvailable's identical markDirty/drainDirty
+// proof for a save landing while s.idx is nil.
+func TestHandleDidOpen_QueuedBeforeWorkspaceReadyThenDrained(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("testdata", "module"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	file := filepath.Join(root, "greet", "greet.go")
+	text, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+
+	if ws := s.workspace(); ws != nil {
+		t.Fatal("workspace already populated before setWorkspace ever ran; test setup is wrong")
+	}
+
+	openParams := mustMarshal(t, &protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{URI: uri.File(file), Version: 1, Text: string(text)},
+	})
+	if err := s.handleDidOpen(context.Background(), openParams); err != nil {
+		t.Fatalf("handleDidOpen (workspace not ready): %v", err)
+	}
+
+	s.pendingOpensMu.Lock()
+	pending := s.pendingOpens[file]
+	s.pendingOpensMu.Unlock()
+	if !pending {
+		t.Fatal("didOpen while workspace was nil did not record a pending open (markPendingOpen); the save would otherwise be lost")
+	}
+
+	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+	s.setWorkspace(root, snap)
+
+	s.pendingOpensMu.Lock()
+	stillPending := s.pendingOpens[file]
+	s.pendingOpensMu.Unlock()
+	if stillPending {
+		t.Fatal("pending open for the file was not drained by setWorkspace")
+	}
+}
+
 // TestHandleDidSave_TestFileReindexesNewSymbol is a regression test for
 // pkgPathForFile's directory fallback (see server.go): before it existed,
 // saving an in-package _test.go file resolved no package at all — ws.
