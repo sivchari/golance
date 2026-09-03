@@ -137,7 +137,7 @@ func TestHandleDidSave_TestFileReindexesNewSymbol(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
-	if _, err := index.Build(context.Background(), snap, db, cas, index.Options{}); err != nil {
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}
 

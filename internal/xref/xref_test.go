@@ -58,7 +58,7 @@ func newResolverForDir(t *testing.T, root string) (*Resolver, *graph.Snapshot) {
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
 
-	stats, err := index.Build(context.Background(), snap, db, cas, index.Options{})
+	stats, err := index.Build(context.Background(), snap, db, cas, &index.Options{})
 	if err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}
@@ -96,7 +96,7 @@ func newResolverAndStoreForDir(t *testing.T, root string) (*Resolver, *graph.Sna
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
 
-	stats, err := index.Build(context.Background(), snap, db, cas, index.Options{})
+	stats, err := index.Build(context.Background(), snap, db, cas, &index.Options{})
 	if err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}

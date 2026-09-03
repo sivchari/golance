@@ -100,7 +100,7 @@ func newBenchResolver(tb testing.TB, root string, opts ...Option) (*Resolver, *g
 		tb.Fatalf("store.OpenCAS: %v", err)
 	}
 
-	stats, err := index.Build(context.Background(), snap, db, cas, index.Options{})
+	stats, err := index.Build(context.Background(), snap, db, cas, &index.Options{})
 	if err != nil {
 		tb.Fatalf("index.Build: %v", err)
 	}

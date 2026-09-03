@@ -247,7 +247,7 @@ func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath, depCASPath stri
 		defer cancel()
 	}
 
-	stats, err := index.Build(ctx, snap, db, cas, index.Options{
+	stats, err := index.Build(ctx, snap, db, cas, &index.Options{
 		Parallelism:   envInt(server.EnvIndexJobs),
 		RelativePaths: server.RelativeIndexPaths(root),
 		DepCAS:        depCAS,

@@ -83,7 +83,7 @@ func TestBuild_PostingsMatchFactsRefsExactly(t *testing.T) {
 	db := openTestDB(t)
 	cas := openTestCAS(t)
 
-	stats, err := Build(context.Background(), snap, db, cas, Options{})
+	stats, err := Build(context.Background(), snap, db, cas, &Options{})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestReindex_PostingsDropStaleReferenceExactly(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("initial Build: %v", err)
 	}
 
@@ -191,7 +191,7 @@ func TestBuild_CASHitRepopulatesPostingsWithoutTypeChecking(t *testing.T) {
 	ctx := context.Background()
 
 	firstDB := openTestDB(t)
-	if _, err := Build(ctx, snap, firstDB, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, firstDB, cas, &Options{}); err != nil {
 		t.Fatalf("first Build: %v", err)
 	}
 	helloID := findSymbolByName(t, firstDB, cas, pkgLeaf, "Hello")
@@ -200,7 +200,7 @@ func TestBuild_CASHitRepopulatesPostingsWithoutTypeChecking(t *testing.T) {
 	// internal/server's switchToPrivateIndex) against the SAME, already
 	// populated cas.
 	secondDB := openTestDB(t)
-	stats, err := Build(ctx, snap, secondDB, cas, Options{})
+	stats, err := Build(ctx, snap, secondDB, cas, &Options{})
 	if err != nil {
 		t.Fatalf("second Build: %v", err)
 	}

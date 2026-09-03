@@ -140,7 +140,7 @@ func (f fakeMetadataSource) Package(pkgPath string) (string, []string, []string,
 // GOModCache — standing in for a local `replace`-directive dependency,
 // whose content is not identity-stable by directory path alone (see the
 // package doc's "Cache identity" section).
-func writeLocalPackage(t *testing.T) (dir string, goFile string) {
+func writeLocalPackage(t *testing.T) (dir, goFile string) {
 	t.Helper()
 	dir = t.TempDir()
 	goFile = filepath.Join(dir, "local.go")

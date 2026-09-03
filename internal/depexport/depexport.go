@@ -111,9 +111,11 @@ type Options struct {
 	// GOROOT and GOModCache identify the two directory trees Cache treats
 	// as immutable (see the package doc's "Cache identity" section) and so
 	// safe to persist by identity alone. Both default to the running
-	// process's own values (runtime.GOROOT(), and defaultGOModCache's `go
-	// env GOMODCACHE`) when empty; overridable so a test can point Cache at
-	// a throwaway module cache under testdata instead of the real one.
+	// GO TOOLCHAIN's own values (defaultGOROOT's and defaultGOModCache's
+	// `go env GOROOT`/`go env GOMODCACHE`, NOT runtime.GOROOT() — see
+	// defaultGOROOT's own doc for why that distinction matters) when empty;
+	// overridable so a test can point Cache at a throwaway module cache
+	// under testdata instead of the real one.
 	GOROOT     string
 	GOModCache string
 }
@@ -157,7 +159,7 @@ func NewCache(cas *store.CAS, meta depcheck.MetadataSource, provider *depcheck.P
 	}
 	goroot := opts.GOROOT
 	if goroot == "" {
-		goroot = runtime.GOROOT()
+		goroot = defaultGOROOT()
 	}
 	gomodcache := opts.GOModCache
 	if gomodcache == "" {
@@ -260,6 +262,29 @@ func (c *Cache) digest(pkgPath, dir string) uint64 {
 	_, _ = fmt.Fprintf(h, "%d\x00%s\x00%s\x00%s\x00%s\x00", schemaVersion, c.goVersion, c.buildFP, pkgPath, dir)
 	return h.Sum64()
 }
+
+// defaultGOROOT resolves the USER's actual toolchain GOROOT — deliberately
+// NOT runtime.GOROOT(), which returns the GOROOT baked into THIS BINARY's
+// own build (wrong the moment the binary runs on a different machine than
+// it was built on, e.g. a goreleaser-built release binary: SA1019 flags
+// runtime.GOROOT as deprecated for exactly this reason since Go 1.24).
+// Mirrors internal/langfeat's identical goroot resolution (`go env GOROOT`,
+// the officially supported way to locate it, falling back to $GOROOT when
+// the go binary is not on PATH) rather than importing that package's
+// unexported helper: langfeat is a higher-level UI package depending on
+// internal/check/depcheck, not a dependency this low-level package should
+// take on. Computed once per process for the same reason
+// defaultGOModCache is: a `go env` subprocess per Cache construction would
+// add a spawn to every first call for no benefit, and GOROOT cannot change
+// without a process restart in practice.
+var defaultGOROOT = sync.OnceValue(func() string {
+	if out, err := exec.Command("go", "env", "GOROOT").Output(); err == nil {
+		if root := strings.TrimSpace(string(out)); root != "" {
+			return root
+		}
+	}
+	return os.Getenv("GOROOT")
+})
 
 // defaultGOModCache returns the running environment's module cache
 // directory: $GOMODCACHE if set, otherwise `go env GOMODCACHE` (which also

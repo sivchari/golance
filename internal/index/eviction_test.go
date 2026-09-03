@@ -74,7 +74,7 @@ func TestBuild_EvictionBoundsCacheSize(t *testing.T) {
 		},
 	}
 
-	stats, err := Build(context.Background(), snap, db, cas, opts)
+	stats, err := Build(context.Background(), snap, db, cas, &opts)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}

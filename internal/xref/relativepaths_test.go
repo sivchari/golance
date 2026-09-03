@@ -57,7 +57,7 @@ func TestResolver_RelativePaths_RoundTripsAcrossRoots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
-	if _, err := index.Build(context.Background(), snapA, db, cas, index.Options{RelativePaths: true}); err != nil {
+	if _, err := index.Build(context.Background(), snapA, db, cas, &index.Options{RelativePaths: true}); err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}
 

@@ -37,7 +37,7 @@ func TestReindex_BodyOnlyEditDoesNotPropagate(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("initial Build: %v", err)
 	}
 
@@ -75,7 +75,7 @@ func TestReindex_SignatureChangePropagates(t *testing.T) {
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("initial Build: %v", err)
 	}
 
@@ -154,7 +154,7 @@ func Call() int { return def.V() }
 	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("initial Build: %v", err)
 	}
 	before, err := db.GetUnit(ctx, store.Hash(pkgDef))
@@ -213,7 +213,7 @@ func TestReindex_FatalPersistFailureAbortsClosureWalk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	if _, err := Build(ctx, snap, db, cas, Options{}); err != nil {
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
 		t.Fatalf("initial Build: %v", err)
 	}
 	if err := db.Close(); err != nil {

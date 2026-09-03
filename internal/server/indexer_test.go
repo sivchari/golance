@@ -52,7 +52,7 @@ func buildTestIndexDB(t *testing.T, snap *graph.Snapshot, dbPath string, cas *st
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	if _, err := index.Build(context.Background(), snap, db, cas, index.Options{RelativePaths: RelativeIndexPaths(snap.Dir())}); err != nil {
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{RelativePaths: RelativeIndexPaths(snap.Dir())}); err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}
 	if err := db.Close(); err != nil {
