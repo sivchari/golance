@@ -53,5 +53,17 @@ func (s *Server) capabilities() protocol.ServerCapabilities {
 		},
 		CallHierarchyProvider: protocol.Boolean(true),
 		TypeHierarchyProvider: protocol.Boolean(true),
+
+		// CodeLensProvider must be non-nil to enable the capability at all
+		// (matching gopls's own general.go comment to the same effect).
+		// ResolveProvider is deliberately left unset: gopls's own
+		// CodeLensOptions is `&protocol.CodeLensOptions{}` too — every lens
+		// gopls emits already carries its full Command, so codeLens/resolve
+		// is never needed, and golance's handleCodeLens matches that (see
+		// handlers_codelens.go).
+		CodeLensProvider: &protocol.CodeLensOptions{},
+		ExecuteCommandProvider: protocol.ExecuteCommandOptions{
+			Commands: []string{commandGenerate, commandRegenerateCgo, commandRunTests},
+		},
 	}
 }

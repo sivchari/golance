@@ -401,6 +401,7 @@ func (s *Server) handleDidChangeConfiguration(_ context.Context, params json.Raw
 		return err
 	}
 	s.setHintsEnabled(parseHintsSettings(p.Settings))
+	s.setCodeLensesEnabled(parseCodeLensSettings(p.Settings))
 	if s.inlayHintRefreshSupport.Load() {
 		s.rpc.Go(s.refreshInlayHints)
 	}

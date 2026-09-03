@@ -114,6 +114,13 @@ type Server struct {
 	idx   atomic.Pointer[indexState]
 	hints atomic.Pointer[map[langfeat.HintKind]bool] // enabled inlay hint kinds; nil until "initialize" or workspace/didChangeConfiguration sets it, meaning every kind enabled (see hintsEnabled)
 
+	// codeLenses holds the enabled code lens sources; nil until
+	// "initialize" or workspace/didChangeConfiguration sets it, meaning
+	// golance's own defaults apply (see codeLensesEnabled/defaultCodeLenses
+	// in handlers_codelens.go — the same nil-means-default convention as
+	// hints above).
+	codeLenses atomic.Pointer[map[codeLensSource]bool]
+
 	// depProviderMu guards depProviderKey/depProviderSrc/depProviderVal — the
 	// server-lifetime depcheck.Provider setWorkspace installs into each new
 	// workspace's own depProvider field (see ensureDepProvider). Kept here,
@@ -290,6 +297,16 @@ func (s *Server) wire() {
 	s.rpc.Handle(protocol.MethodTextDocumentPrepareTypeHierarchy, rpc.Interactive, s.handlePrepareTypeHierarchy)
 	s.rpc.Handle(protocol.MethodTypeHierarchySupertypes, rpc.Background, s.handleTypeHierarchySupertypes)
 	s.rpc.Handle(protocol.MethodTypeHierarchySubtypes, rpc.Background, s.handleTypeHierarchySubtypes)
+
+	// textDocument/codeLens type-checks a single package like
+	// prepareCallHierarchy/handleDocumentSymbol, needs no facts index, and
+	// is per-file and lightweight, so it runs Interactive alongside them.
+	// workspace/executeCommand runs the commands those lenses emit; each
+	// request already gets its own goroutine (see internal/rpc.pool), so a
+	// slow `go test` invocation cannot block any other Interactive or
+	// Background request. See handlers_codelens.go's doc.
+	s.rpc.Handle(protocol.MethodTextDocumentCodeLens, rpc.Interactive, s.handleCodeLens)
+	s.rpc.Handle(protocol.MethodWorkspaceExecuteCommand, rpc.Interactive, s.handleExecuteCommand)
 }
 
 // instrument wraps h so that, after it returns, a total duration at or past
