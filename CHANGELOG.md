@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.5.1](https://github.com/sivchari/golance/compare/v0.5.0...v0.5.1) - 2026-09-03
+- fix: make workspace initialization non-blocking and worktree-friendly by @sivchari in https://github.com/sivchari/golance/pull/85
+
 ## [v0.5.0](https://github.com/sivchari/golance/compare/v0.4.8...v0.5.0) - 2026-09-03
 - feat: add persisted reverse reference index for O(result) references by @sivchari in https://github.com/sivchari/golance/pull/83
 
