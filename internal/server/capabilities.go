@@ -52,5 +52,6 @@ func (s *Server) capabilities() protocol.ServerCapabilities {
 			Range: protocol.Boolean(true),
 		},
 		CallHierarchyProvider: protocol.Boolean(true),
+		TypeHierarchyProvider: protocol.Boolean(true),
 	}
 }

@@ -282,6 +282,14 @@ func (s *Server) wire() {
 	s.rpc.Handle(protocol.MethodTextDocumentPrepareCallHierarchy, rpc.Interactive, s.handlePrepareCallHierarchy)
 	s.rpc.Handle(protocol.MethodCallHierarchyIncomingCalls, rpc.Background, s.handleIncomingCalls)
 	s.rpc.Handle(protocol.MethodCallHierarchyOutgoingCalls, rpc.Interactive, s.handleOutgoingCalls)
+
+	// prepareTypeHierarchy type-checks a single package like
+	// prepareCallHierarchy, so it runs Interactive; supertypes/subtypes
+	// answer from the persisted facts index (like implementation), so they
+	// run Background alongside it. See handlers_typehierarchy.go's doc.
+	s.rpc.Handle(protocol.MethodTextDocumentPrepareTypeHierarchy, rpc.Interactive, s.handlePrepareTypeHierarchy)
+	s.rpc.Handle(protocol.MethodTypeHierarchySupertypes, rpc.Background, s.handleTypeHierarchySupertypes)
+	s.rpc.Handle(protocol.MethodTypeHierarchySubtypes, rpc.Background, s.handleTypeHierarchySubtypes)
 }
 
 // instrument wraps h so that, after it returns, a total duration at or past
