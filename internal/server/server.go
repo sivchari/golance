@@ -273,6 +273,15 @@ func (s *Server) wire() {
 	s.rpc.Handle(protocol.MethodWorkspaceSymbol, rpc.Background, s.handleWorkspaceSymbol)
 	s.rpc.Handle(protocol.MethodTextDocumentRename, rpc.Background, s.handleRename)
 	s.registerNavHandlers()
+
+	// prepareCallHierarchy/outgoingCalls type-check a single package (the
+	// same checkedFile machinery hover/completion use), so they run
+	// Interactive like those; incomingCalls instead answers from the
+	// persisted reverse reference index (like references), so it runs
+	// Background alongside it. See handlers_callhierarchy.go's doc.
+	s.rpc.Handle(protocol.MethodTextDocumentPrepareCallHierarchy, rpc.Interactive, s.handlePrepareCallHierarchy)
+	s.rpc.Handle(protocol.MethodCallHierarchyIncomingCalls, rpc.Background, s.handleIncomingCalls)
+	s.rpc.Handle(protocol.MethodCallHierarchyOutgoingCalls, rpc.Interactive, s.handleOutgoingCalls)
 }
 
 // instrument wraps h so that, after it returns, a total duration at or past
