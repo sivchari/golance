@@ -38,9 +38,12 @@ func prepareTypeHierarchyItem(t *testing.T, s *Server, file string, pos protocol
 	return items[0]
 }
 
-func supertypesOf(t *testing.T, s *Server, item protocol.TypeHierarchyItem) []protocol.TypeHierarchyItem {
+// supertypesOf and subtypesOf take item by pointer, not value: like
+// relatedTypeHierarchy in production code, this avoids copying the 128-byte
+// protocol.TypeHierarchyItem (gocritic's hugeParam).
+func supertypesOf(t *testing.T, s *Server, item *protocol.TypeHierarchyItem) []protocol.TypeHierarchyItem {
 	t.Helper()
-	result, err := s.handleTypeHierarchySupertypes(context.Background(), mustMarshal(t, &protocol.TypeHierarchySupertypesParams{Item: item}))
+	result, err := s.handleTypeHierarchySupertypes(context.Background(), mustMarshal(t, &protocol.TypeHierarchySupertypesParams{Item: *item}))
 	if err != nil {
 		t.Fatalf("handleTypeHierarchySupertypes: %v", err)
 	}
@@ -51,9 +54,9 @@ func supertypesOf(t *testing.T, s *Server, item protocol.TypeHierarchyItem) []pr
 	return items
 }
 
-func subtypesOf(t *testing.T, s *Server, item protocol.TypeHierarchyItem) []protocol.TypeHierarchyItem {
+func subtypesOf(t *testing.T, s *Server, item *protocol.TypeHierarchyItem) []protocol.TypeHierarchyItem {
 	t.Helper()
-	result, err := s.handleTypeHierarchySubtypes(context.Background(), mustMarshal(t, &protocol.TypeHierarchySubtypesParams{Item: item}))
+	result, err := s.handleTypeHierarchySubtypes(context.Background(), mustMarshal(t, &protocol.TypeHierarchySubtypesParams{Item: *item}))
 	if err != nil {
 		t.Fatalf("handleTypeHierarchySubtypes: %v", err)
 	}
@@ -163,7 +166,7 @@ func TestHandleTypeHierarchySubtypes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			pos := identPositionIn(t, file, mustReadFile(t, file), tt.name, 1)
 			item := prepareTypeHierarchyItem(t, s, file, pos)
-			got := subtypesOf(t, s, item)
+			got := subtypesOf(t, s, &item)
 			assertItemNames(t, got, tt.want...)
 		})
 	}
@@ -187,7 +190,7 @@ func TestHandleTypeHierarchySupertypes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			pos := identPositionIn(t, file, mustReadFile(t, file), tt.name, 1)
 			item := prepareTypeHierarchyItem(t, s, file, pos)
-			got := supertypesOf(t, s, item)
+			got := supertypesOf(t, s, &item)
 			assertItemNames(t, got, tt.want...)
 		})
 	}
@@ -204,7 +207,7 @@ func TestHandleTypeHierarchySubtypes_ItemKindAndLocation(t *testing.T) {
 	file := typehFile(t, root)
 	pos := identPositionIn(t, file, mustReadFile(t, file), "I", 1)
 	item := prepareTypeHierarchyItem(t, s, file, pos)
-	got := subtypesOf(t, s, item)
+	got := subtypesOf(t, s, &item)
 
 	var bs, j *protocol.TypeHierarchyItem
 	for i := range got {
@@ -239,7 +242,7 @@ func TestHandleTypeHierarchySubtypes_ItemKindAndLocation(t *testing.T) {
 	// A returned item's own Range.Start must resolve back through the index
 	// on a further query, the same round trip a real client performs when
 	// expanding a tree node.
-	grandchildren := subtypesOf(t, s, *j)
+	grandchildren := subtypesOf(t, s, j)
 	assertItemNames(t, grandchildren, "S", "BJ", "BS")
 }
 

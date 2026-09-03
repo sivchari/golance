@@ -84,7 +84,7 @@ func (s *Server) handleTypeHierarchySupertypes(ctx context.Context, params json.
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	return s.relatedTypeHierarchy(ctx, p.Item, "supertypes", (*xref.Resolver).Supertypes)
+	return s.relatedTypeHierarchy(ctx, &p.Item, "supertypes", (*xref.Resolver).Supertypes)
 }
 
 // handleTypeHierarchySubtypes answers typeHierarchy/subtypes.
@@ -93,7 +93,7 @@ func (s *Server) handleTypeHierarchySubtypes(ctx context.Context, params json.Ra
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	return s.relatedTypeHierarchy(ctx, p.Item, "subtypes", (*xref.Resolver).Subtypes)
+	return s.relatedTypeHierarchy(ctx, &p.Item, "subtypes", (*xref.Resolver).Subtypes)
 }
 
 // relatedTypeHierarchy answers typeHierarchy/supertypes and
@@ -104,7 +104,7 @@ func (s *Server) handleTypeHierarchySubtypes(ctx context.Context, params json.Ra
 // package first, then name, URI, range) -- see typeHierarchyLess' doc for
 // why no further de-duplication is needed here, unlike gopls's own
 // CompactFunc pass.
-func (s *Server) relatedTypeHierarchy(ctx context.Context, item protocol.TypeHierarchyItem, feature string, query func(*xref.Resolver, context.Context, string, int, int) ([]xref.TypeHierarchyItemInfo, error)) (any, error) {
+func (s *Server) relatedTypeHierarchy(ctx context.Context, item *protocol.TypeHierarchyItem, feature string, query func(*xref.Resolver, context.Context, string, int, int) ([]xref.TypeHierarchyItemInfo, error)) (any, error) {
 	resolver, ok := s.resolverOrWarn()
 	if !ok {
 		return nil, s.indexUnavailableError("type hierarchy " + feature)
