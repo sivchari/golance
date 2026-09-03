@@ -800,3 +800,45 @@ func TestHandleDefinition_Builtin(t *testing.T) {
 		t.Errorf("definition file %s does not exist on disk: %v", target, err)
 	}
 }
+
+// TestHandleTypeDefinition_Builtin covers item 1(a): typeDefinition on an
+// identifier whose static type is a predeclared basic type (here, Count's
+// []int parameter v, whose element type int is predeclared) resolves into
+// builtin.go via handleTypeDefinition's typeDefinitionBuiltin path, the
+// same target TestHandleDefinition_Builtin above pins for plain "Go to
+// Definition" -- before this fix, TypeDefinition returned (nil, nil) for
+// every predeclared type, so this request answered no locations at all.
+func TestHandleTypeDefinition_Builtin(t *testing.T) {
+	s, snap, _ := newTestServer(t)
+	pkg, ok := snap.Packages["example.com/servermod/builtinuse"]
+	if !ok || len(pkg.GoFiles) == 0 {
+		t.Fatal("builtinuse package not found in test workspace")
+	}
+	file := pkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	pos := identPositionIn(t, file, data, "v", 1) // Count(v []int)'s own parameter
+
+	result, err := s.handleTypeDefinition(context.Background(), mustMarshal(t, &protocol.TypeDefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleTypeDefinition(v): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleTypeDefinition(v): result = %#v, want a single location", result)
+	}
+	target := locs[0].URI.FsPath()
+	if !strings.HasSuffix(filepath.ToSlash(target), "builtin/builtin.go") {
+		t.Errorf("type definition file = %q, want it to end with builtin/builtin.go (inside GOROOT)", target)
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Errorf("type definition file %s does not exist on disk: %v", target, err)
+	}
+}

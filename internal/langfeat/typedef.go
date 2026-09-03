@@ -19,21 +19,28 @@ import (
 // SameFile is "" and PkgPath/ObjPath identify it instead, for the server
 // layer to resolve through the on-disk facts index (internal/xref): unlike
 // Hover's docForObject, a different package's source position is not
-// available from cp's own AST/types.Info.
+// available from cp's own AST/types.Info. When the type is predeclared
+// (e.g. error, or a basic type like int -- gopls's own TypeDefinition
+// resolves both the same way, see typeToObjects's *types.Basic case in
+// gopls@v0.23.0's internal/golang/identifier.go), Builtin identifies its
+// declaration in the toolchain's $GOROOT/src/builtin/builtin.go instead,
+// mirroring BuiltinDefInfo's identical role for plain "Go to Definition".
 type TypeDefInfo struct {
 	SameFile string
 	Range    Range
 
 	PkgPath string
 	ObjPath string
+
+	Builtin *BuiltinDefInfo
 }
 
 // TypeDefinition resolves the identifier at offset (a byte offset from the
 // start of file) to the named type of its static type, and returns where
 // that type is declared. It returns (nil, nil) if offset is not on an
 // identifier, the identifier's type is not (and does not contain) a named
-// type, or the type is predeclared (e.g. error, any), which has no
-// declaration to jump to.
+// or predeclared type, or the type is predeclared but GOROOT/builtin.go
+// could not be resolved (see TypeDefInfo's Builtin field).
 func TypeDefinition(cp *check.CheckedPackage, file string, offset int) (*TypeDefInfo, error) {
 	astFile, pos, _, err := locate(cp, file, offset)
 	if err != nil {
@@ -48,14 +55,21 @@ func TypeDefinition(cp *check.CheckedPackage, file string, offset int) (*TypeDef
 	if obj == nil {
 		return nil, nil
 	}
-	named := namedTypeOf(obj.Type())
-	if named == nil {
+	tn := typeNameOf(obj.Type())
+	if tn == nil {
 		return nil, nil
 	}
 
-	tn := named.Obj()
 	if tn.Pkg() == nil {
-		return nil, nil // predeclared type (e.g. error, any): no declaration to jump to
+		// A predeclared type (error, int, string, ...): resolved into
+		// builtin.go, the same pseudo-package gopls's own TypeDefinition
+		// resolves these against (see builtinDecl in
+		// gopls@v0.23.0's internal/golang/definition.go).
+		info, ok := builtinDefInfoFor(tn)
+		if !ok {
+			return nil, nil
+		}
+		return &TypeDefInfo{Builtin: info}, nil
 	}
 	if tn.Pkg() == cp.Package() {
 		return sameFileTypeDef(cp, tn)
@@ -83,13 +97,20 @@ func sameFileTypeDef(cp *check.CheckedPackage, tn *types.TypeName) (*TypeDefInfo
 	return &TypeDefInfo{SameFile: tf.Name(), Range: rangeOf(tf, declID.Pos(), declID.End())}, nil
 }
 
-// namedTypeOf unwraps t through pointer, slice, array, map, and channel
-// element types to find the *types.Named it ultimately names, if any.
-func namedTypeOf(t types.Type) *types.Named {
+// typeNameOf unwraps t through pointer, slice, array, map, and channel
+// element types to find the *types.TypeName it ultimately names, if any: a
+// *types.Named's own Obj(), or -- mirroring gopls's identical *types.Basic
+// case in typeToObjects (gopls@v0.23.0's internal/golang/identifier.go) --
+// a predeclared basic type's (int, string, bool, ...) entry in
+// types.Universe, which has no *types.Named of its own to unwrap through.
+func typeNameOf(t types.Type) *types.TypeName {
 	for range 10 { // bound against implausibly deep nesting
 		switch tt := t.(type) {
 		case *types.Named:
-			return tt
+			return tt.Obj()
+		case *types.Basic:
+			tn, _ := types.Universe.Lookup(tt.Name()).(*types.TypeName)
+			return tn
 		case *types.Pointer:
 			t = tt.Elem()
 		case *types.Slice:

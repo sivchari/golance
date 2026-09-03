@@ -159,13 +159,28 @@ func BuiltinDefinition(cp *check.CheckedPackage, file string, offset int) (*Buil
 	if obj == nil || obj.Pkg() != nil {
 		return nil, nil
 	}
-	declID, _, fset, ok := resolveBuiltinIdent(obj)
+	info, ok := builtinDefInfoFor(obj)
 	if !ok {
 		return nil, nil
 	}
+	return info, nil
+}
+
+// builtinDefInfoFor resolves obj -- a universe (predeclared) object or the
+// error interface's Error method, both identified by types.Object.Pkg()
+// == nil -- into a BuiltinDefInfo, the shared conversion BuiltinDefinition
+// above and TypeDefinition (internal/langfeat/typedef.go, for a predeclared
+// named type like error) both need. ok is false for the same reasons
+// resolveBuiltinIdent's own ok is: obj is not actually a builtin, or
+// GOROOT/builtin.go could not be resolved or parsed.
+func builtinDefInfoFor(obj types.Object) (*BuiltinDefInfo, bool) {
+	declID, _, fset, ok := resolveBuiltinIdent(obj)
+	if !ok {
+		return nil, false
+	}
 	start := fset.Position(declID.Pos())
 	end := fset.Position(declID.End())
-	return &BuiltinDefInfo{Filename: start.Filename, Line: start.Line, Col: start.Column, EndCol: end.Column}, nil
+	return &BuiltinDefInfo{Filename: start.Filename, Line: start.Line, Col: start.Column, EndCol: end.Column}, true
 }
 
 // DependencyDefinitionInfo is the result of a DependencyDefinition query:

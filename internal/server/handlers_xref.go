@@ -217,6 +217,17 @@ func (s *Server) builtinDefinition(cf checkedFileResult) (xref.Location, bool) {
 	if info == nil {
 		return xref.Location{}, false
 	}
+	return builtinDefLocation(info)
+}
+
+// builtinDefLocation converts a BuiltinDefInfo -- builtinDefinition's own
+// (langfeat.BuiltinDefinition) or handleTypeDefinition's (a predeclared
+// named type's TypeDefInfo.Builtin, langfeat.TypeDefinition) -- into an
+// xref.Location. ok is false if builtin.go no longer exists on disk (a
+// relocated or removed toolchain install between resolution and this
+// call) or any coordinate overflows uint32, the same bounds check every
+// other xref.Location construction in this package applies.
+func builtinDefLocation(info *langfeat.BuiltinDefInfo) (xref.Location, bool) {
 	if _, err := os.Stat(info.Filename); err != nil {
 		return xref.Location{}, false
 	}

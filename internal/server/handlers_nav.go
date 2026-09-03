@@ -67,7 +67,27 @@ func (s *Server) handleTypeDefinition(ctx context.Context, params json.RawMessag
 	if info.SameFile != "" {
 		return s.typeDefinitionSameFile(info)
 	}
+	if info.Builtin != nil {
+		return s.typeDefinitionBuiltin(info.Builtin)
+	}
 	return s.typeDefinitionCrossPackage(ctx, info)
+}
+
+// typeDefinitionBuiltin converts a predeclared named type's BuiltinDefInfo
+// (TypeDefInfo.Builtin, langfeat.TypeDefinition's resolution for e.g.
+// error or int) into an LSP location in builtin.go, reusing
+// builtinDefLocation -- the same conversion handleDefinition's own
+// builtinDefinition fallback uses (handlers_xref.go).
+func (s *Server) typeDefinitionBuiltin(info *langfeat.BuiltinDefInfo) (any, error) {
+	loc, ok := builtinDefLocation(info)
+	if !ok {
+		return protocol.LocationSlice(nil), nil
+	}
+	pl, ok := s.correctResultLocation(loc)
+	if !ok {
+		return protocol.LocationSlice(nil), nil
+	}
+	return protocol.LocationSlice{pl}, nil
 }
 
 // typeDefinitionSameFile converts a same-package TypeDefInfo (byte offsets

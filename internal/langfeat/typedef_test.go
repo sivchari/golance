@@ -1,6 +1,8 @@
 package langfeat_test
 
 import (
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sivchari/golance/internal/langfeat"
@@ -74,6 +76,56 @@ func TestTypeDefinition_PointerUnwrap(t *testing.T) {
 	}
 	if got == nil || got.SameFile == "" {
 		t.Fatalf("TypeDefinition = %+v, want a same-package result through the pointer", got)
+	}
+}
+
+// TestTypeDefinition_Builtin covers item 1(a)'s residual hole: typeDefinition
+// on an identifier whose static type is predeclared -- a basic type like
+// int, or a predeclared named type like error -- should resolve into
+// builtin.go the same way BuiltinDefinition already does for plain "Go to
+// Definition" on a builtin identifier itself (see builtin_test.go's
+// TestBuiltinDefinition), rather than the (nil, nil) "no declaration to
+// jump to" this used to return for every predeclared type. Mirrors gopls's
+// own TypeDefinition, which routes both cases through ObjectLocation ->
+// isBuiltin -> builtinDecl (gopls@v0.23.0's internal/golang/
+// type_definition.go's typeToObjects *types.Basic case, and definition.go's
+// isBuiltin/builtinDecl).
+func TestTypeDefinition_Builtin(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "builtinuse", "builtinuse.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		offset   int
+		declName string // top-level identifier wantBuiltinDeclPosition looks up
+	}{
+		{name: "basic type (var of type int)", offset: mustIndex(t, text, "Answer int"), declName: "int"},
+		{name: "predeclared named type (param of type error)", offset: mustIndex(t, text, "err error"), declName: "error"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := langfeat.TypeDefinition(cp, path, tt.offset)
+			if err != nil {
+				t.Fatalf("TypeDefinition: %v", err)
+			}
+			if got == nil || got.Builtin == nil {
+				t.Fatalf("TypeDefinition = %+v, want a Builtin result", got)
+			}
+			if got.SameFile != "" || got.PkgPath != "" {
+				t.Errorf("TypeDefinition = %+v, want only Builtin set", got)
+			}
+			if !strings.HasSuffix(filepath.ToSlash(got.Builtin.Filename), "builtin/builtin.go") {
+				t.Errorf("Builtin.Filename = %s, want it to end in builtin/builtin.go", got.Builtin.Filename)
+			}
+			wantLine, wantCol := wantBuiltinDeclPosition(t, tt.declName)
+			if got.Builtin.Line != wantLine || got.Builtin.Col != wantCol {
+				t.Errorf("Builtin position = %d:%d, want %d:%d (%s's own declaration)", got.Builtin.Line, got.Builtin.Col, wantLine, wantCol, tt.declName)
+			}
+		})
 	}
 }
 
