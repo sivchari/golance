@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/sivchari/golance/internal/check"
+	"github.com/sivchari/golance/internal/depcheck"
+	"github.com/sivchari/golance/internal/depexport"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/overlay"
 	"github.com/sivchari/golance/internal/typecheck"
@@ -29,8 +31,10 @@ func newCheckedPackage(t *testing.T, reader overlay.FileReader, pkgDir, file str
 	src := check.NewGraphSource(snap, reader)
 	depFset := token.NewFileSet()
 	depCache := typecheck.NewCache()
+	depMeta := depcheck.NewGraphMetadataSource(snap)
+	depExp := depexport.NewCache(nil, depMeta, depcheck.NewProvider(depMeta, depcheck.Options{}), depexport.Options{})
 	imp := func() types.ImporterFrom {
-		return typecheck.NewImporter(depFset, nil, snap, depCache)
+		return typecheck.NewImporter(depFset, nil, depExp, depCache)
 	}
 	engine := check.New(src, reader, imp, check.Options{})
 

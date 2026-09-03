@@ -7,6 +7,8 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"golang.org/x/tools/go/packages"
 )
 
 const (
@@ -14,6 +16,21 @@ const (
 	modB = "example.com/simple/b"
 	modC = "example.com/simple/c"
 )
+
+// TestLoadMode_NeverRequestsExportFile is a regression test for the
+// removed `go list -export` path (see internal/depexport's package doc):
+// graph.Load is the ONLY go/packages.Load call site left anywhere in
+// golance (every other package resolves dependency export data via
+// internal/depexport's declaration-only source-checking instead), so
+// asserting loadMode itself never sets packages.NeedExportFile is a
+// complete, load-bearing guarantee that golance never again asks the Go
+// toolchain to compile a package's export data — not merely a check of
+// this one call site among several.
+func TestLoadMode_NeverRequestsExportFile(t *testing.T) {
+	if loadMode&packages.NeedExportFile != 0 {
+		t.Error("loadMode requests packages.NeedExportFile; this forces `go list -export`, compiling every matched package with the Go toolchain — see internal/depexport's package doc for why that must never happen again")
+	}
+}
 
 func loadTestdata(t *testing.T) *Snapshot {
 	t.Helper()
@@ -179,102 +196,6 @@ func TestSnapshot_ClosureUnits(t *testing.T) {
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
 		t.Errorf("ClosureUnits(%s) = %v, want %v", modC, got, want)
-	}
-}
-
-func TestSnapshot_ExportFile(t *testing.T) {
-	snap := loadTestdata(t)
-
-	file, ok := snap.ExportFile(modA)
-	if !ok || file == "" {
-		t.Errorf("ExportFile(%s) = %q, %v; want a non-empty GOCACHE path", modA, file, ok)
-	}
-	if _, ok := snap.ExportFile("example.com/simple/nonexistent"); ok {
-		t.Error("ExportFile for an unknown package should report ok=false")
-	}
-}
-
-// TestSnapshot_ExportFile_RecoversStalePath covers ExportFile's recovery
-// path: a Package whose ExportFile no longer points at a real file (as
-// happens when GOCACHE evicts it, or go list never populated it — see
-// ExportFile's doc) should still resolve, via a fresh single-package
-// packages.Load, instead of permanently reporting ok=false.
-func TestSnapshot_ExportFile_RecoversStalePath(t *testing.T) {
-	snap := loadTestdata(t)
-
-	stale := *snap.Packages[modA]
-	stale.ExportFile = filepath.Join(t.TempDir(), "does-not-exist-d")
-	snap.Packages[modA] = &stale
-
-	file, ok := snap.ExportFile(modA)
-	if !ok || file == "" {
-		t.Fatalf("ExportFile(%s) with a stale path = %q, %v; want recovery to a non-empty GOCACHE path", modA, file, ok)
-	}
-	if file == stale.ExportFile {
-		t.Errorf("ExportFile(%s) returned the stale path unchanged: %s", modA, file)
-	}
-	if _, err := os.Stat(file); err != nil {
-		t.Errorf("recovered ExportFile(%s) = %s does not exist: %v", modA, file, err)
-	}
-}
-
-// TestSnapshot_ExportFile_CachesRecoveredPath verifies that a path recovered
-// via ExportFile's reloadExportFile fallback is cached (see the Snapshot's
-// recovered field) and reused by a later call, instead of re-running the
-// recovery subprocess every time. To prove reuse (rather than merely
-// asserting the same string comes back twice, which a fresh, deterministic
-// recovery would also produce), snap.dir is corrupted after the first call:
-// a second reloadExportFile with that dir would necessarily fail, so a
-// successful, identical second result can only mean the cached path was
-// reused without falling back to recovery again.
-func TestSnapshot_ExportFile_CachesRecoveredPath(t *testing.T) {
-	snap := loadTestdata(t)
-
-	stale := *snap.Packages[modA]
-	stale.ExportFile = filepath.Join(t.TempDir(), "does-not-exist-d")
-	snap.Packages[modA] = &stale
-
-	first, ok := snap.ExportFile(modA)
-	if !ok || first == "" {
-		t.Fatalf("ExportFile(%s) with a stale path = %q, %v; want recovery to succeed", modA, first, ok)
-	}
-
-	snap.dir = filepath.Join(t.TempDir(), "does-not-exist-dir")
-
-	second, ok := snap.ExportFile(modA)
-	if !ok || second != first {
-		t.Errorf("ExportFile(%s) second call = %q, %v; want the cached path %q reused instead of re-running recovery against a broken dir", modA, second, ok, first)
-	}
-}
-
-// TestSnapshot_ExportFile_CachesFailedRecovery verifies that a failed
-// reloadExportFile attempt is itself cached, not just a successful one (see
-// TestSnapshot_ExportFile_CachesRecoveredPath): a query-time caller must
-// never re-run the recovery subprocess on every call for a package whose
-// export data cannot be recovered. To prove the failure is actually cached
-// (rather than every call merely failing independently for its own
-// reasons), snap.dir is restored to a working directory after the first
-// (forced-to-fail) call: a fresh recovery attempt with that dir would now
-// succeed, so a second call that still reports ok=false can only mean the
-// cached failure was reused instead of retrying.
-func TestSnapshot_ExportFile_CachesFailedRecovery(t *testing.T) {
-	snap := loadTestdata(t)
-
-	stale := *snap.Packages[modA]
-	stale.ExportFile = filepath.Join(t.TempDir(), "does-not-exist-d")
-	snap.Packages[modA] = &stale
-
-	goodDir := snap.dir
-	snap.dir = filepath.Join(t.TempDir(), "does-not-exist-dir")
-
-	if _, ok := snap.ExportFile(modA); ok {
-		t.Fatalf("ExportFile(%s) with a broken dir = ok; want recovery to fail", modA)
-	}
-
-	snap.dir = goodDir
-
-	if _, ok := snap.ExportFile(modA); ok {
-		t.Errorf("ExportFile(%s) second call succeeded after the dir was fixed; want the cached failure reused instead of retrying recovery", modA)
 	}
 }
 

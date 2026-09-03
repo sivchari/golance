@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sivchari/golance/internal/depexport"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/index"
 	"github.com/sivchari/golance/internal/rpc"
@@ -122,6 +123,13 @@ func runIndexer(stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "golance: indexer mode requires %s, %s, and %s\n", server.EnvRoot, server.EnvDB, server.EnvCAS)
 		return 1
 	}
+	// depCASPath is optional, unlike the three above: an empty value
+	// degrades to index.Build resolving every dependency correctly without
+	// ever persisting the result (see index.Options.DepCAS's own doc) —
+	// server.EnvDepCAS is always set when this subprocess is launched by
+	// internal/server itself, but a directly-invoked indexer (a test, or a
+	// future standalone CLI use) should not be forced to know about it.
+	depCASPath := os.Getenv(server.EnvDepCAS)
 
 	stopProfiling, ok := setupProfiling(stderr)
 	defer stopProfiling()
@@ -129,7 +137,7 @@ func runIndexer(stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	return buildIndex(stdout, stderr, root, dbPath, casPath)
+	return buildIndex(stdout, stderr, root, dbPath, casPath, depCASPath)
 }
 
 // setupProfiling enables the runtime/pprof profiles requested via
@@ -190,7 +198,7 @@ func writeHeapProfile(stderr io.Writer, path string) {
 // buildIndex loads the import graph, opens the on-disk database and CAS,
 // and runs index.Build, reporting progress to stdout and errors to
 // stderr. It returns runIndexer's exit code.
-func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath string) int {
+func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath, depCASPath string) int {
 	loadStart := time.Now()
 	patterns := []string{"./..."}
 	loadOpts := graph.Options{Dir: root, Offline: envBool(server.EnvOffline, false)}
@@ -218,6 +226,19 @@ func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath string) int {
 		return 1
 	}
 
+	// depCAS is the machine-global dependency export-data cache (see
+	// index.Options.DepCAS's own doc); best-effort and optional, unlike cas
+	// above — a failure to open it here degrades to index.Build resolving
+	// every dependency correctly without ever persisting the result, never
+	// a fatal indexer error.
+	var depCAS *store.CAS
+	if depCASPath != "" {
+		depCAS, err = store.OpenCAS(depCASPath)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "golance: indexer: open dependency export cache: %v; dependency checks will not persist across runs\n", err)
+		}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if secs := envInt("GOLANCE_INDEX_DEADLINE_SECONDS"); secs > 0 {
@@ -229,6 +250,7 @@ func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath string) int {
 	stats, err := index.Build(ctx, snap, db, cas, index.Options{
 		Parallelism:   envInt(server.EnvIndexJobs),
 		RelativePaths: server.RelativeIndexPaths(root),
+		DepCAS:        depCAS,
 		Progress: func(done, total int) {
 			_, _ = fmt.Fprintf(stdout, "PROGRESS %d %d\n", done, total)
 		},
@@ -278,6 +300,22 @@ func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath string) int {
 	server.RunCASGC(func(format string, args ...any) {
 		_, _ = fmt.Fprintf(stderr, format+"\n", args...)
 	}, casPath, dbPath, db, schemaRebuild)
+
+	// Age-only sweep of the machine-global dependency export-data cache
+	// (see depexport.GCInterval/GCMaxAge's own doc for why this is age-only
+	// rather than internal/store's usual per-repo mark-and-sweep): the
+	// indexer is already doing bulk I/O, so this is a fine place to pay the
+	// (heavily throttled — GCInterval is a week) occasional directory walk.
+	// Best effort, exactly like RunCASGC above: a failed or skipped sweep
+	// only costs disk space, never correctness.
+	if depCAS != nil {
+		if stats, ran, err := depCAS.MaybeGCAged(time.Now(), depexport.GCMaxAge, depexport.GCInterval); err != nil {
+			_, _ = fmt.Fprintf(stderr, "golance: indexer: dependency export cache gc: %v\n", err)
+		} else if ran {
+			_, _ = fmt.Fprintf(stderr, "golance: indexer: dependency export cache gc: swept=%d swept_bytes=%d kept=%d kept_bytes=%d duration=%s\n",
+				stats.SweptCount, stats.SweptBytes, stats.KeptCount, stats.KeptBytes, stats.Duration)
+		}
+	}
 	return 0
 }
 

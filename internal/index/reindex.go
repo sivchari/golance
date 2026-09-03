@@ -7,6 +7,8 @@ import (
 	"go/token"
 	"time"
 
+	"github.com/sivchari/golance/internal/depcheck"
+	"github.com/sivchari/golance/internal/depexport"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/store"
 	"github.com/sivchari/golance/internal/typecheck"
@@ -38,7 +40,15 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 	fset := token.NewFileSet()
 	keys := newKeyTable(ctx, db)
 	exp := newCASExportSource(ctx, cas, keys)
-	imp := typecheck.NewImporter(fset, exp, snap, typecheck.NewCache())
+	// See Build's identical comments: depExp replaces the removed
+	// graph.Snapshot.ExportFile path for non-root dependency resolution,
+	// and depProvider's cap must be sized to the full non-root package
+	// count (depcheck.RecommendedCap) to avoid LRU thrashing across a
+	// closure walk that can touch many packages in one Reindex call.
+	depMeta := depcheck.NewGraphMetadataSource(snap)
+	depProvider := depcheck.NewProvider(depMeta, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootCount(snap))})
+	depExp := depexport.NewCache(opts.DepCAS, depMeta, depProvider, depexport.Options{BuildFlagsFingerprint: opts.BuildFlagsFingerprint})
+	imp := typecheck.NewImporter(fset, exp, depExp, typecheck.NewCache())
 
 	var stats Stats
 	// trustStat=false: reader may be an editor overlay whose content

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sivchari/golance/internal/depcheck"
+	"github.com/sivchari/golance/internal/depexport"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/overlay"
 	"github.com/sivchari/golance/internal/typecheck"
@@ -201,8 +203,10 @@ func TestEngine_DependencyDecodeCachedAcrossRechecks(t *testing.T) {
 	depCache := typecheck.NewCache()
 	ov := overlay.New()
 	src := NewGraphSource(snap, ov)
+	depMeta := depcheck.NewGraphMetadataSource(snap)
+	depExp := depexport.NewCache(nil, depMeta, depcheck.NewProvider(depMeta, depcheck.Options{}), depexport.Options{})
 	imp := func() types.ImporterFrom {
-		return typecheck.NewImporter(depFset, nil, snap, depCache)
+		return typecheck.NewImporter(depFset, nil, depExp, depCache)
 	}
 
 	e := New(src, ov, imp, Options{})

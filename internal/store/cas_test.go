@@ -254,3 +254,88 @@ func TestCASMaybeGCRespectsInterval(t *testing.T) {
 		t.Error("Has(1) = false after a MaybeGC call within GCInterval, want true (must not have re-walked)")
 	}
 }
+
+// TestCASGCAgedIgnoresMarksSweepsByAgeAlone verifies GCAged's contract for
+// a CAS directory with no mark set at all (internal/depexport's
+// machine-global cache, which no per-repo index database ever references):
+// a blob older than maxAge is swept regardless of any marks map passed in,
+// and a young one survives — marks is accepted only so GCAged can share
+// sweep's implementation with GC, never actually consulted meaningfully
+// here.
+func TestCASGCAgedIgnoresMarksSweepsByAgeAlone(t *testing.T) {
+	cas := openTestCAS(t)
+	const maxAge = 30 * 24 * time.Hour
+	for key, content := range map[uint64]string{
+		1: "old",
+		2: "young",
+	} {
+		if err := cas.Put(key, []byte(content)); err != nil {
+			t.Fatalf("Put(%d): %v", key, err)
+		}
+	}
+	old := time.Now().Add(-maxAge - time.Hour)
+	if err := os.Chtimes(cas.blobPath(1), old, old); err != nil {
+		t.Fatalf("Chtimes(1): %v", err)
+	}
+
+	stats, err := cas.GCAged(time.Now(), maxAge)
+	if err != nil {
+		t.Fatalf("GCAged() error = %v", err)
+	}
+	if stats.SweptCount != 1 {
+		t.Errorf("GCAged() SweptCount = %d, want 1", stats.SweptCount)
+	}
+	if stats.KeptCount != 1 {
+		t.Errorf("GCAged() KeptCount = %d, want 1", stats.KeptCount)
+	}
+	if cas.Has(1) {
+		t.Error("Has(1) = true after GCAged, want false (older than maxAge)")
+	}
+	if !cas.Has(2) {
+		t.Error("Has(2) = false after GCAged, want true (younger than maxAge)")
+	}
+}
+
+func TestCASMaybeGCAgedRespectsInterval(t *testing.T) {
+	cas := openTestCAS(t)
+	const maxAge = 30 * 24 * time.Hour
+	const interval = 7 * 24 * time.Hour
+	if err := cas.Put(1, []byte("old")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	old := time.Now().Add(-maxAge - time.Hour)
+	if err := os.Chtimes(cas.blobPath(1), old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	stats, ran, err := cas.MaybeGCAged(time.Now(), maxAge, interval)
+	if err != nil {
+		t.Fatalf("MaybeGCAged() error = %v", err)
+	}
+	if !ran {
+		t.Fatal("MaybeGCAged() ran = false on first call, want true")
+	}
+	if stats.SweptCount != 1 {
+		t.Errorf("MaybeGCAged() SweptCount = %d, want 1", stats.SweptCount)
+	}
+	if cas.Has(1) {
+		t.Fatal("Has(1) = true after first MaybeGCAged, want false")
+	}
+
+	if err := cas.Put(1, []byte("old-again")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := os.Chtimes(cas.blobPath(1), old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	_, ran, err = cas.MaybeGCAged(time.Now(), maxAge, interval)
+	if err != nil {
+		t.Fatalf("MaybeGCAged() second call error = %v", err)
+	}
+	if ran {
+		t.Error("MaybeGCAged() ran = true within interval, want false (must not have re-walked)")
+	}
+	if !cas.Has(1) {
+		t.Error("Has(1) = false after a MaybeGCAged call within interval, want true (must not have re-walked)")
+	}
+}

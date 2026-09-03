@@ -29,13 +29,19 @@ func TestEnsureDepProvider_ReusedWhenDepsUnchanged(t *testing.T) {
 	}}
 
 	s := &Server{}
-	p1 := s.ensureDepProvider(snap1)
+	p1, exp1 := s.ensureDepProvider(snap1)
 	if p1 == nil {
-		t.Fatal("ensureDepProvider returned nil")
+		t.Fatal("ensureDepProvider returned a nil Provider")
 	}
-	p2 := s.ensureDepProvider(snap2)
+	if exp1 == nil {
+		t.Fatal("ensureDepProvider returned a nil Cache")
+	}
+	p2, exp2 := s.ensureDepProvider(snap2)
 	if p1 != p2 {
 		t.Error("ensureDepProvider rebuilt the Provider even though the dependency set was unchanged")
+	}
+	if exp1 != exp2 {
+		t.Error("ensureDepProvider rebuilt the depexport.Cache even though the dependency set was unchanged")
 	}
 }
 
@@ -53,10 +59,13 @@ func TestEnsureDepProvider_RebuildsWhenDepsChanged(t *testing.T) {
 	}}
 
 	s := &Server{}
-	p1 := s.ensureDepProvider(snap1)
-	p2 := s.ensureDepProvider(snap2)
+	p1, exp1 := s.ensureDepProvider(snap1)
+	p2, exp2 := s.ensureDepProvider(snap2)
 	if p1 == p2 {
 		t.Error("ensureDepProvider reused the Provider even though the dependency set changed")
+	}
+	if exp1 == exp2 {
+		t.Error("ensureDepProvider reused the depexport.Cache even though the dependency set changed")
 	}
 }
 

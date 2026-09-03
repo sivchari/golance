@@ -12,6 +12,8 @@ import (
 
 	"golang.org/x/sync/semaphore"
 
+	"github.com/sivchari/golance/internal/depcheck"
+	"github.com/sivchari/golance/internal/depexport"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/store"
 	"github.com/sivchari/golance/internal/typecheck"
@@ -43,6 +45,17 @@ type Options struct {
 	// last written with, since two writers using different values into the
 	// same database would corrupt each other's path interpretation.
 	RelativePaths bool
+	// DepCAS is the machine-global, content-addressed store Build persists
+	// non-root (standard-library and module-cache) dependency export data
+	// into (see internal/depexport's package doc) — distinct from cas
+	// above, which holds THIS repository's own root-package facts and
+	// export data. nil disables persistence: Build still resolves every
+	// dependency correctly (declaration-only source-checking it fresh via
+	// internal/depcheck on every miss), just without ever reusing the
+	// result across processes or restarts — the same degraded-but-correct
+	// behavior a machine whose cache directory could not be opened falls
+	// back to (see internal/server's wiring).
+	DepCAS *store.CAS
 	// Progress, if non-nil, is called after each package finishes
 	// processing (built, skipped, or errored), with done counting up to
 	// total.
@@ -106,7 +119,23 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 	cache := typecheck.NewCache()
 	keys := newKeyTable(ctx, db)
 	exp := newCASExportSource(ctx, cas, keys)
-	imp := typecheck.NewImporter(fset, exp, snap, cache)
+	// depMeta/depProvider resolve every non-root (stdlib/module-cache)
+	// package this run's Importer needs, by declaration-only
+	// source-checking it via internal/depcheck (never invoking the Go
+	// toolchain's own compiler — see internal/depexport's package doc, the
+	// replacement for the removed `go list -export`/graph.Snapshot.ExportFile
+	// path). depExp persists each result in opts.DepCAS so a dependency
+	// already checked by THIS run, an earlier one, or even a different
+	// repository's indexer never needs rechecking on this machine again.
+	// depProvider's own LRU is sized to this run's WHOLE non-root package
+	// count (depcheck.RecommendedCap), not depcheck.DefaultCap — see that
+	// constant's own doc for the real, measured thrashing regression a
+	// batch run like this one hits at DefaultCap's small, navigation-sized
+	// capacity.
+	depMeta := depcheck.NewGraphMetadataSource(snap)
+	depProvider := depcheck.NewProvider(depMeta, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootCount(snap))})
+	depExp := depexport.NewCache(opts.DepCAS, depMeta, depProvider, depexport.Options{BuildFlagsFingerprint: opts.BuildFlagsFingerprint})
+	imp := typecheck.NewImporter(fset, exp, depExp, cache)
 	sem := semaphore.NewWeighted(int64(opts.Parallelism))
 
 	sched, total := newScheduler(snap, cache, opts.onEvicted)
@@ -145,6 +174,19 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 		}
 	}
 	return stats, err
+}
+
+// nonRootCount returns the number of non-root (stdlib/module-cache)
+// packages in snap — the sizing input for depcheck.RecommendedCap (see
+// Build's and Reindex's identical use).
+func nonRootCount(snap *graph.Snapshot) int {
+	n := 0
+	for _, pkg := range snap.Packages {
+		if !pkg.Root {
+			n++
+		}
+	}
+	return n
 }
 
 // runBuildJob acquires sem, processes one package via processUnit, releases

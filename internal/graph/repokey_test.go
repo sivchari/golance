@@ -121,12 +121,11 @@ func TestCache_SharedAcrossWorktrees(t *testing.T) {
 }
 
 // TestCache_DependencyPathsStayAbsoluteAcrossWorktrees verifies that a
-// dependency package's Dir/GoFiles/ExportFile — module-cache or GOROOT
-// paths, already stable across every worktree of a repository (see
-// toDiskPackages' doc) — come back byte-identical after a cross-worktree
-// LoadCache, unlike a workspace-local package's paths (see
-// TestCache_SharedAcrossWorktrees), which are rejoined onto the loading
-// root.
+// dependency package's Dir/GoFiles — module-cache or GOROOT paths, already
+// stable across every worktree of a repository (see toDiskPackages' doc) —
+// come back byte-identical after a cross-worktree LoadCache, unlike a
+// workspace-local package's paths (see TestCache_SharedAcrossWorktrees),
+// which are rejoined onto the loading root.
 func TestCache_DependencyPathsStayAbsoluteAcrossWorktrees(t *testing.T) {
 	// Captured BEFORE sandboxing $HOME below, so this resolves the real,
 	// already-populated module cache rather than one relative to the
@@ -148,8 +147,8 @@ func TestCache_DependencyPathsStayAbsoluteAcrossWorktrees(t *testing.T) {
 	}
 	// depfixture is not itself a git worktree; SaveCache/LoadCache's path
 	// treatment does not depend on Shared() being true for this particular
-	// assertion — it only depends on the dependency's Dir/GoFiles/ExportFile
-	// falling outside root, which relPath already leaves untouched (see
+	// assertion — it only depends on the dependency's Dir/GoFiles falling
+	// outside root, which relPath already leaves untouched (see
 	// toDiskPackages' doc) regardless of whether the cache file itself ends
 	// up shared or private.
 	snap := loadDepFixture(t)
@@ -173,17 +172,14 @@ func TestCache_DependencyPathsStayAbsoluteAcrossWorktrees(t *testing.T) {
 	if depGot.Dir != depWant.Dir {
 		t.Errorf("dependency Dir after round trip = %s, want unchanged %s", depGot.Dir, depWant.Dir)
 	}
-	if depGot.ExportFile != depWant.ExportFile {
-		t.Errorf("dependency ExportFile after round trip = %s, want unchanged %s", depGot.ExportFile, depWant.ExportFile)
-	}
 }
 
 // TestCache_VersionBumpDiscardsSharedSnapshot verifies that a cache written
 // under a previous cacheVersion — in particular a pre-v4 cache whose
-// Dir/GoFiles/ExportFile are plain absolute strings for whichever single
-// worktree wrote them (see cacheVersion's v4 doc) — is rejected outright
-// rather than being rejoined onto a different root as if it were already
-// relative, which would silently produce nonsense paths.
+// Dir/GoFiles are plain absolute strings for whichever single worktree
+// wrote them (see cacheVersion's v4 doc) — is rejected outright rather than
+// being rejoined onto a different root as if it were already relative,
+// which would silently produce nonsense paths.
 func TestCache_VersionBumpDiscardsSharedSnapshot(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
@@ -205,7 +201,7 @@ func TestCache_VersionBumpDiscardsSharedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read cache file: %v", err)
 	}
-	patched := strings.Replace(string(data), `"version":4`, `"version":3`, 1)
+	patched := strings.Replace(string(data), `"version":5`, `"version":4`, 1)
 	if patched == string(data) {
 		t.Fatal("version field not found in cache JSON; test needs updating")
 	}

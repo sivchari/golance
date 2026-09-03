@@ -10,10 +10,10 @@
 // every package a _test.go file can import — including stdlib packages no
 // production file in the workspace imports at all, such as "testing", and
 // module dependencies like testify — gets a real Package entry with
-// Dir/GoFiles/ExportFile, not just the packages production code reaches.
-// Without this, internal/typecheck's export-data importer has nothing to
-// resolve "testing" from, and every feature touching a _test.go file's use
-// of it (hover, definition, diagnostics) fails outright.
+// Dir/GoFiles, not just the packages production code reaches. Without this,
+// internal/depexport's dependency-export importer has nothing to resolve
+// "testing" from, and every feature touching a _test.go file's use of it
+// (hover, definition, diagnostics) fails outright.
 //
 // go list's own test-variant identifiers ("p", "p [q.test]", "q_test
 // [q.test]"; see Q1) never leak into this package's own Package.ImportPath
@@ -28,17 +28,9 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync"
 
 	"golang.org/x/tools/go/packages"
 )
-
-// exportFileMode is the minimal go/packages.Load mode that resolves export
-// data without also compiling anything Root (see loadMode's doc): used by
-// loadDepExportFiles' batched dependency-export load right after an
-// ordinary Load, and by reloadExportFile to recover a single package's
-// export data later (see Snapshot.ExportFile's doc for when that runs).
-const exportFileMode = packages.NeedName | packages.NeedExportFile
 
 // loadMode is the main go/packages.Load mode graph requests for the whole
 // workspace. NeedTypes and NeedSyntax must never be added here: loading
@@ -49,21 +41,16 @@ const exportFileMode = packages.NeedName | packages.NeedExportFile
 // though the underlying `go list -json` output does carry it — unless this
 // bit is requested (see golist.go's addFields, gated on cfg.Mode&NeedForTest).
 //
-// NeedExportFile is deliberately NOT included here, unlike through v0.5.0:
-// requesting it makes the underlying `go list` run with `-export=true`,
-// which COMPILES every matched package's export data rather than just
-// resolving metadata — for "./..." over a whole workspace, that means
-// compiling every one of possibly thousands of Root packages. golance never
-// reads a Root package's own ExportFile (Root packages are type-checked
-// straight from source — see internal/index/scheduler.go's doc and
-// internal/check); only a NON-root (stdlib/module-cache) dependency's
-// export data is ever consulted (internal/typecheck.ExportFileSource, wired
-// through workspace.depCache/depProvider). GOCACHE is keyed by absolute
-// path, so on a brand-new git worktree this -export compilation is a 100%
-// cache miss across the whole workspace — the dominant cost of a cold
-// worktree open (routinely minutes on a large monorepo), for data nothing
-// ever reads. Load instead resolves export data only for the packages that
-// can actually need it, via loadDepExportFiles.
+// NeedExportFile is deliberately never requested at all, by this mode or
+// any other go/packages.Load call anywhere in golance (see
+// internal/depexport's package doc for what replaced it): requesting it
+// makes the underlying `go list` run with `-export=true`, which COMPILES
+// the matched package's export data with the Go toolchain's own compiler
+// rather than just resolving metadata — for a large dependency closure on a
+// cold GOCACHE, that meant dozens of full-size `compile` processes running
+// at once (the field report internal/depexport exists to fix), all for
+// data golance now produces itself via declaration-only source-checking
+// (internal/depcheck), the same way gopls resolves a dependency's types.
 const loadMode = packages.NeedName | packages.NeedFiles | packages.NeedImports |
 	packages.NeedDeps | packages.NeedForTest
 
@@ -116,9 +103,8 @@ type Package struct {
 	// ordinary directory occupant would misroute a new file landing in
 	// that directory or offer an unimportable path as a completion
 	// candidate.
-	ForTest    string `json:"forTest,omitempty"`
-	ExportFile string `json:"exportFile,omitempty"`
-	Root       bool   `json:"root,omitempty"` // matched a Load pattern directly, as opposed to being pulled in only as a dependency
+	ForTest string `json:"forTest,omitempty"`
+	Root    bool   `json:"root,omitempty"` // matched a Load pattern directly, as opposed to being pulled in only as a dependency
 }
 
 // Snapshot is an immutable view of the import graph: every loaded package,
@@ -128,38 +114,9 @@ type Snapshot struct {
 	Packages map[string]*Package `json:"packages"`
 	Order    []string            `json:"order"`
 
-	dir        string              // working directory to re-run packages.Load from, for ExportFile's recovery path
-	buildFlags []string            // forwarded to packages.Config.BuildFlags on that same recovery path
-	revDeps    map[string][]string // import path -> direct importers present in the graph
-
-	// recovered caches, per import path, the outcome of ExportFile's
-	// reloadExportFile fallback: either a recovered export file path, or —
-	// stored as the recoveryFailed sentinel — that recovery was already
-	// attempted and failed. Either way, a later call for the same package
-	// after the same stat failure reuses the cached outcome instead of
-	// paying for another recovery subprocess; without caching the failure
-	// case too, a query touching a package whose export data can never be
-	// recovered (e.g. a genuinely broken dependency) would re-run the
-	// expensive go/packages.Load on every single call for it. A Snapshot is
-	// published once (via Load or LoadCache) and read concurrently by many
-	// request handlers from then on (see internal/server's
-	// atomic.Pointer[workspace]), so this cache — the one place ExportFile
-	// writes anything back — must be synchronized itself rather than a
-	// plain map; the Packages field above stays exactly as published, never
-	// mutated in place. The cache lives only as long as this Snapshot: a
-	// later revalidateGraph/setWorkspace publishes a fresh Snapshot with an
-	// empty recovered map, so a dependency's export data that becomes
-	// recoverable again (e.g. after `go build` repopulates GOCACHE) is
-	// retried on the next graph reload rather than staying permanently
-	// failed.
-	recovered sync.Map // string (import path) -> string (recovered export file path, or recoveryFailed)
+	dir     string              // working directory Load ran from, for Dir()/RelativePaths
+	revDeps map[string][]string // import path -> direct importers present in the graph
 }
-
-// recoveryFailed is the sentinel Snapshot.recovered stores for an import
-// path whose reloadExportFile fallback has already been tried and failed —
-// never a value reloadExportFile could itself return, since a real export
-// file path is never empty and never starts with NUL.
-const recoveryFailed = "\x00recovery-failed"
 
 // Options configures a Load call.
 type Options struct {
@@ -216,60 +173,7 @@ func Load(opts Options, patterns ...string) (*Snapshot, error) {
 	}, nil)
 
 	pkgs := fromPackages(all, rootSet)
-	loadDepExportFiles(opts, pkgs)
-	return newSnapshot(pkgs, opts.Dir, opts.BuildFlags)
-}
-
-// loadDepExportFiles resolves export data for every NON-root package in
-// pkgs (the stdlib/module-cache dependencies internal/typecheck.
-// ExportFileSource actually needs — see loadMode's doc for why Root
-// packages are excluded) via one batched go/packages.Load, populating each
-// Package.ExportFile in place. Root packages' own ExportFile is left "",
-// exactly as it is never read.
-//
-// This runs as a second `go list -export` limited to the dependency import
-// paths already known from pkgs, rather than the whole "./..." pattern:
-// module-cache and GOROOT paths are stable across every worktree of a
-// repository (unlike the workspace's own absolute path), so GOCACHE is
-// warm for them after the very first build on the machine — this is cheap,
-// not the cost loadMode's doc describes.
-//
-// Best-effort: if the batched load itself fails outright (e.g. a transient
-// build error unrelated to any specific package), pkgs simply keeps
-// whatever ExportFile values it already had (i.e. none), and
-// Snapshot.ExportFile's own per-package reloadExportFile fallback recovers
-// each one lazily on its first actual use instead of leaving the whole
-// Snapshot permanently degraded.
-func loadDepExportFiles(opts Options, pkgs map[string]*Package) {
-	var patterns []string
-	for path, pkg := range pkgs {
-		if !pkg.Root {
-			patterns = append(patterns, path)
-		}
-	}
-	if len(patterns) == 0 {
-		return
-	}
-	sort.Strings(patterns)
-
-	cfg := &packages.Config{
-		Mode:       exportFileMode,
-		Dir:        opts.Dir,
-		BuildFlags: opts.BuildFlags,
-		Env:        os.Environ(),
-	}
-	if opts.Offline {
-		cfg.Env = append(cfg.Env, "GOPROXY=off")
-	}
-	loaded, err := packages.Load(cfg, patterns...)
-	if err != nil {
-		return
-	}
-	for _, p := range loaded {
-		if pkg, ok := pkgs[p.PkgPath]; ok && p.ExportFile != "" {
-			pkg.ExportFile = p.ExportFile
-		}
-	}
+	return newSnapshot(pkgs, opts.Dir)
 }
 
 // fromPackages converts go/packages results into the graph's own
@@ -315,7 +219,6 @@ func fromPackages(pkgs []*packages.Package, rootSet map[string]bool) map[string]
 			Dir:        p.Dir,
 			GoFiles:    p.GoFiles,
 			Imports:    importPaths(p),
-			ExportFile: p.ExportFile,
 			Root:       rootSet[p.PkgPath],
 		}
 	}
@@ -349,9 +252,9 @@ func fromPackages(pkgs []*packages.Package, rootSet map[string]bool) map[string]
 		// anything that resolves it by that exact path, though nothing in
 		// golance does today. If the same PkgPath is reached from more
 		// than one q.test context, the first one visited wins — its
-		// Dir/GoFiles/ExportFile do not vary by context; only its build's
-		// internal type identity would, which this plain, non-ITV-aware
-		// graph does not model (see the ITV note above).
+		// Dir/GoFiles do not vary by context; only its build's internal
+		// type identity would, which this plain, non-ITV-aware graph does
+		// not model (see the ITV note above).
 		if _, exists := out[p.PkgPath]; exists {
 			continue
 		}
@@ -361,7 +264,6 @@ func fromPackages(pkgs []*packages.Package, rootSet map[string]bool) map[string]
 			Dir:        p.Dir,
 			GoFiles:    p.GoFiles,
 			Imports:    importPaths(p),
-			ExportFile: p.ExportFile,
 			Root:       false,
 			ForTest:    p.ForTest,
 		}
@@ -426,10 +328,9 @@ func isSyntheticTestBinary(p *packages.Package) bool {
 }
 
 // newSnapshot builds a Snapshot from a package map, computing the topo
-// order and reverse-dependency index. dir and buildFlags are remembered so
-// ExportFile can re-run packages.Load for a single package if the entry
-// already in pkgs turns out to be stale or was never populated.
-func newSnapshot(pkgs map[string]*Package, dir string, buildFlags []string) (*Snapshot, error) {
+// order and reverse-dependency index. dir is remembered for Dir()'s own use
+// (relative-path storage in a root-relative facts database).
+func newSnapshot(pkgs map[string]*Package, dir string) (*Snapshot, error) {
 	order, err := topoOrder(pkgs)
 	if err != nil {
 		return nil, err
@@ -446,7 +347,7 @@ func newSnapshot(pkgs map[string]*Package, dir string, buildFlags []string) (*Sn
 	for _, importers := range revDeps {
 		sort.Strings(importers)
 	}
-	return &Snapshot{Packages: pkgs, Order: order, dir: dir, buildFlags: buildFlags, revDeps: revDeps}, nil
+	return &Snapshot{Packages: pkgs, Order: order, dir: dir, revDeps: revDeps}, nil
 }
 
 // topoOrder returns the import paths of pkgs in Kahn topological order,
@@ -509,78 +410,6 @@ func (s *Snapshot) Package(path string) (*Package, bool) {
 // root-relative facts database (see internal/index.Options.RelativePaths
 // and internal/xref.New).
 func (s *Snapshot) Dir() string { return s.dir }
-
-// ExportFile returns the GOCACHE-generated export data file for path, if
-// the graph has one. Satisfies internal/typecheck.ExportFileSource.
-//
-// The path packages.Load reported at Load time can go stale (evicted by
-// GOCACHE trimming) or, rarely, never get populated in the first place (a
-// transient failure inside the `go list -export` the underlying build
-// system runs, unrelated to path's own source). Rather than surface that
-// as a permanent "no export data for path" to every caller for the rest of
-// this Snapshot's lifetime, ExportFile verifies the file still exists and,
-// if not, recovers with one scoped packages.Load for path alone — caching
-// the outcome, success or failure, in s.recovered so every later call for
-// path (this Snapshot's whole lifetime — see s.recovered's doc for how a
-// later Snapshot gets a fresh chance) reuses it instead of paying for
-// another recovery subprocess. This matters for a query-time caller in
-// particular: ExportFile must never become a place a request handler
-// synchronously re-runs go/packages.Load on every call for a package that
-// can never be recovered.
-func (s *Snapshot) ExportFile(path string) (string, bool) {
-	p, ok := s.Packages[path]
-	if !ok {
-		return "", false
-	}
-	if p.ExportFile != "" {
-		if _, err := os.Stat(p.ExportFile); err == nil {
-			return p.ExportFile, true
-		}
-	}
-	if v, ok := s.recovered.Load(path); ok {
-		recovered, _ := v.(string)
-		if recovered == recoveryFailed {
-			return "", false
-		}
-		if _, err := os.Stat(recovered); err == nil {
-			return recovered, true
-		}
-		s.recovered.Delete(path)
-	}
-	file, ok := reloadExportFile(s.dir, s.buildFlags, path)
-	if ok {
-		s.recovered.Store(path, file)
-		return file, true
-	}
-	s.recovered.Store(path, recoveryFailed)
-	return "", false
-}
-
-// reloadExportFile re-runs packages.Load for the single package pkgPath,
-// the recovery path ExportFile falls back to. It requests only
-// exportFileMode (no NeedDeps, NeedFiles, ...): pkgPath's dependencies are
-// already known from the Snapshot that called it, so this only needs
-// pkgPath's own (possibly freshly rebuilt) export data file.
-func reloadExportFile(dir string, buildFlags []string, pkgPath string) (string, bool) {
-	cfg := &packages.Config{
-		Mode:       exportFileMode,
-		Dir:        dir,
-		BuildFlags: buildFlags,
-		Env:        os.Environ(),
-	}
-	pkgs, err := packages.Load(cfg, pkgPath)
-	if err != nil || len(pkgs) != 1 {
-		return "", false
-	}
-	p := pkgs[0]
-	if len(p.Errors) > 0 || p.ExportFile == "" {
-		return "", false
-	}
-	if _, err := os.Stat(p.ExportFile); err != nil {
-		return "", false
-	}
-	return p.ExportFile, true
-}
 
 // ClosureUnits returns pkgPath plus the import path of every package in the
 // graph that (transitively) imports pkgPath — the set of packages whose

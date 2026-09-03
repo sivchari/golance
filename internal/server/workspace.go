@@ -16,6 +16,7 @@ import (
 
 	"github.com/sivchari/golance/internal/check"
 	"github.com/sivchari/golance/internal/depcheck"
+	"github.com/sivchari/golance/internal/depexport"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/typecheck"
 )
@@ -31,21 +32,25 @@ const maxDepCacheBytes = 512 * 1024 * 1024 // 512MiB
 // dependency importer decodes into across many rechecks, plus the single
 // *token.FileSet it is tied to (see typecheck.Cache's doc: a Cache and the
 // fset it was decoded into must be discarded together, never
-// independently). files resolves external-module and stdlib export data
-// (typecheck.ExportFileSource); those are treated as immutable for the
-// life of a workspace, since any change to them implies a go.mod/go.sum
-// change, which already triggers a full setWorkspace (and so a fresh
-// depCacheHolder) via revalidateGraph.
+// independently). exports resolves external-module and stdlib export data
+// by declaration-only source-checking it (internal/depexport.Cache — see
+// its package doc for what replaced typecheck.ExportFileSource/`go list
+// -export`), shared with this same workspace's own depProvider (see
+// ensureDepProvider) so dependency navigation and dependency compilation
+// resolve through the identical depcheck.Provider instance; those are
+// treated as immutable for the life of a workspace, since any change to
+// them implies a go.mod/go.sum change, which already triggers a full
+// setWorkspace (and so a fresh depCacheHolder) via revalidateGraph.
 type depCacheHolder struct {
-	files typecheck.ExportFileSource
+	exports typecheck.ExportSource
 
 	mu    sync.Mutex
 	fset  *token.FileSet
 	cache *typecheck.Cache
 }
 
-func newDepCacheHolder(files typecheck.ExportFileSource) *depCacheHolder {
-	return &depCacheHolder{files: files, fset: token.NewFileSet(), cache: typecheck.NewCache()}
+func newDepCacheHolder(exports typecheck.ExportSource) *depCacheHolder {
+	return &depCacheHolder{exports: exports, fset: token.NewFileSet(), cache: typecheck.NewCache()}
 }
 
 // importer returns a types.ImporterFrom decoding into d's current
@@ -58,7 +63,7 @@ func (d *depCacheHolder) importer() types.ImporterFrom {
 		d.fset = token.NewFileSet()
 		d.cache = typecheck.NewCache()
 	}
-	return typecheck.NewImporter(d.fset, nil, d.files, d.cache)
+	return typecheck.NewImporter(d.fset, nil, d.exports, d.cache)
 }
 
 // FileSet returns the *token.FileSet dependency export data is currently
@@ -162,11 +167,18 @@ func depsKey(snap *graph.Snapshot) string {
 	return string(h.Sum(nil))
 }
 
-// ensureDepProvider returns the depcheck.Provider setWorkspace should
-// install into the workspace it is building over snap: the server's current
-// one, retargeted at snap, if snap's dependency set (depsKey) matches the
-// one the current Provider was built for — otherwise a fresh Provider (and
-// a fresh depMetadataSource) replacing it.
+// ensureDepProvider returns the depcheck.Provider and depexport.Cache
+// setWorkspace should install into the workspace it is building over snap:
+// the server's current pair, retargeted at snap, if snap's dependency set
+// (depsKey) matches the one they were built for — otherwise a fresh
+// Provider (and a fresh depMetadataSource) replacing them, with a fresh
+// depexport.Cache built over that same Provider so navigation into a
+// dependency and compiling a workspace package against it always resolve
+// through one shared, identical depcheck.Provider instance (see
+// depCacheHolder's own doc) — s.depExportCAS itself is never rebuilt: it is
+// the machine-global, cross-repository persistent store (see
+// internal/depexport's package doc), opened once for this Server's whole
+// lifetime, independent of any one workspace's dependency set.
 //
 // This is the fix for a real production stall (see the caller's own doc):
 // setWorkspace runs on every graph revalidation, not only at initialize —
@@ -183,18 +195,40 @@ func depsKey(snap *graph.Snapshot) string {
 // removes that cost entirely for the common case (an ordinary edit inside
 // the workspace), while still rebuilding it — correctly, from scratch —
 // whenever the dependency set genuinely could have changed.
-func (s *Server) ensureDepProvider(snap *graph.Snapshot) *depcheck.Provider {
+func (s *Server) ensureDepProvider(snap *graph.Snapshot) (*depcheck.Provider, *depexport.Cache) {
 	key := depsKey(snap)
 
 	s.depProviderMu.Lock()
 	defer s.depProviderMu.Unlock()
 	if s.depProviderVal == nil || key != s.depProviderKey {
 		s.depProviderSrc = &depMetadataSource{}
-		s.depProviderVal = depcheck.NewProvider(s.depProviderSrc, depcheck.Options{})
+		// Cap sized to snap's own non-root package count
+		// (depcheck.RecommendedCap), not depcheck.DefaultCap: this same
+		// Provider also backs depExportsVal, which — unlike a pure
+		// navigation caller — can need to resolve a workspace package's
+		// ENTIRE dependency closure to compile it (see depCacheHolder's
+		// doc). DefaultCap's small, navigation-sized capacity thrashes
+		// badly at that scale; see depcheck.DefaultCap's own doc for the
+		// real, measured regression this avoids.
+		s.depProviderVal = depcheck.NewProvider(s.depProviderSrc, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootPackageCount(snap))})
+		s.depExportsVal = depexport.NewCache(s.depExportCAS, s.depProviderSrc, s.depProviderVal, depexport.Options{})
 		s.depProviderKey = key
 	}
 	s.depProviderSrc.retarget(snap)
-	return s.depProviderVal
+	return s.depProviderVal, s.depExportsVal
+}
+
+// nonRootPackageCount returns the number of non-root (stdlib/module-cache)
+// packages in snap — the sizing input for depcheck.RecommendedCap (see
+// ensureDepProvider's use).
+func nonRootPackageCount(snap *graph.Snapshot) int {
+	n := 0
+	for _, pkg := range snap.Packages {
+		if !pkg.Root {
+			n++
+		}
+	}
+	return n
 }
 
 // setWorkspace builds a fresh workspace bundle over snap and installs it,
@@ -204,10 +238,10 @@ func (s *Server) ensureDepProvider(snap *graph.Snapshot) *depcheck.Provider {
 // view a Resolver holds needs refreshing).
 func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	src := check.NewGraphSource(snap, s.overlay)
-	depCache := newDepCacheHolder(snap)
+	depProvider, depExports := s.ensureDepProvider(snap)
+	depCache := newDepCacheHolder(depExports)
 	imp := depCache.importer
 	engine := check.New(src, s.overlay, imp, check.Options{OnResult: s.publishDiagnostics})
-	depProvider := s.ensureDepProvider(snap)
 
 	fileToPkg := make(map[string]string)
 	dirToPkg := make(map[string]string, len(snap.Packages))

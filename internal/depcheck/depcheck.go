@@ -123,7 +123,42 @@ func (cp *CheckedPackage) Info() *types.Info { return cp.info }
 // by a few hops of jumping around one dependency" while bounding worst-case
 // resident *types.Package/*types.Info memory to a small, constant multiple
 // of one dependency's size, independent of workspace or GOPATH size.
+//
+// A caller using a Provider for BATCH export-data production instead — a
+// full run resolving every non-root package a workspace's root packages
+// import, transitively (see internal/depexport, and RecommendedCap below)
+// — must NOT use this default: check's own recursive import resolution
+// (ctxImporter.ImportFrom) walks the FULL transitive closure through this
+// same Provider, and a dependency closure larger than DefaultCap thrashes
+// the LRU badly — a widely-shared package (fmt, context, sync, ...) gets
+// evicted and re-checked from scratch every time a new importer reaches it
+// again, turning what should be "check every distinct package once" into
+// something close to "recheck a package once per importer," a real,
+// measured regression (single-digit seconds and hundreds of MB becoming
+// tens of seconds and multiple GB against a few hundred real
+// dependencies — see RecommendedCap's own doc).
 const DefaultCap = 64
+
+// RecommendedCap returns the LRU capacity a Provider dedicated to BATCH
+// export-data production (internal/depexport's use — not interactive
+// navigation, which should keep DefaultCap) should be constructed with,
+// given nonRootCount: the number of non-root (stdlib/module-cache)
+// packages the run may need to resolve, transitively. Sized to hold every
+// one of them live for the run's whole duration — never DefaultCap, which
+// exists for an entirely different, much smaller-locality workload (see
+// DefaultCap's own doc) and thrashes badly at this scale: a real
+// measurement against a synthetic ~370-package dependency closure went
+// from ~7s/~300MB (a correctly-sized cap) to ~72s/~7GB (DefaultCap) purely
+// from LRU eviction forcing the same widely-shared packages to be
+// rechecked from scratch over and over. DefaultCap is still used as a
+// floor for a tiny workspace's few dependencies, matching Provider's own
+// existing default for that case.
+func RecommendedCap(nonRootCount int) int {
+	if nonRootCount < DefaultCap {
+		return DefaultCap
+	}
+	return nonRootCount
+}
 
 // FullBodyDefaultCap is the full-body LRU's default entry capacity
 // (Options.FullBodyCap's zero value; see PackageWithBodies). Kept much
