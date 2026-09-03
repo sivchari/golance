@@ -105,82 +105,137 @@ func TestCASConcurrentPutSameKeySameContent(t *testing.T) {
 	}
 }
 
-func TestCASTrimRemovesOnlyStaleBlobs(t *testing.T) {
+// TestCASGCSweepsUnreferencedKeepsMarkedAndYoung verifies GC's core
+// mark-and-sweep property in one pass: a marked-but-old blob and an
+// unmarked-but-young blob both survive, while an unmarked, old blob is
+// swept.
+func TestCASGCSweepsUnreferencedKeepsMarkedAndYoung(t *testing.T) {
 	cas := openTestCAS(t)
-	if err := cas.Put(1, []byte("old")); err != nil {
-		t.Fatalf("Put(1): %v", err)
+	for key, content := range map[uint64]string{
+		1: "referenced-old",
+		2: "unreferenced-old",
+		3: "unreferenced-young",
+	} {
+		if err := cas.Put(key, []byte(content)); err != nil {
+			t.Fatalf("Put(%d): %v", key, err)
+		}
 	}
-	if err := cas.Put(2, []byte("fresh")); err != nil {
-		t.Fatalf("Put(2): %v", err)
+	old := time.Now().Add(-GraceWindow - time.Hour)
+	for _, key := range []uint64{1, 2} {
+		if err := os.Chtimes(cas.blobPath(key), old, old); err != nil {
+			t.Fatalf("Chtimes(%d): %v", key, err)
+		}
 	}
+	// key 3 keeps its just-written (young) mtime.
 
-	old := time.Now().Add(-TrimMaxAge - time.Hour)
-	if err := os.Chtimes(cas.blobPath(1), old, old); err != nil {
-		t.Fatalf("Chtimes: %v", err)
-	}
-
-	removed, err := cas.Trim(time.Now(), TrimMaxAge)
+	marks := map[uint64]struct{}{1: {}}
+	stats, err := cas.GC(time.Now(), marks)
 	if err != nil {
-		t.Fatalf("Trim() error = %v", err)
+		t.Fatalf("GC() error = %v", err)
 	}
-	if removed != 1 {
-		t.Errorf("Trim() removed = %d, want 1", removed)
+	if stats.SweptCount != 1 {
+		t.Errorf("GC() SweptCount = %d, want 1", stats.SweptCount)
 	}
-	if cas.Has(1) {
-		t.Error("Has(1) = true after Trim, want false (stale)")
-	}
-	if !cas.Has(2) {
-		t.Error("Has(2) = false after Trim, want true (fresh, must survive)")
-	}
-}
-
-// TestCASTrimSpareUsedBlob verifies that a blob whose only recent activity
-// is a Has (not a Get) still survives a Trim — presence-checking a blob
-// during revalidation counts as "in use" (see CAS.Has's doc), exactly as
-// important as a full Get for GC correctness.
-func TestCASTrimSpareUsedBlob(t *testing.T) {
-	cas := openTestCAS(t)
-	if err := cas.Put(1, []byte("data")); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	old := time.Now().Add(-TrimMaxAge - time.Hour)
-	if err := os.Chtimes(cas.blobPath(1), old, old); err != nil {
-		t.Fatalf("Chtimes: %v", err)
+	if stats.KeptCount != 2 {
+		t.Errorf("GC() KeptCount = %d, want 2", stats.KeptCount)
 	}
 
 	if !cas.Has(1) {
-		t.Fatal("Has(1) = false, want true")
+		t.Error("Has(1) = false after GC, want true (marked, must survive regardless of age)")
 	}
-	// Has must have refreshed the mtime past the cutoff.
-	removed, err := cas.Trim(time.Now(), TrimMaxAge)
-	if err != nil {
-		t.Fatalf("Trim() error = %v", err)
+	if cas.Has(2) {
+		t.Error("Has(2) = true after GC, want false (unmarked and past GraceWindow)")
 	}
-	if removed != 0 {
-		t.Errorf("Trim() removed = %d, want 0 (Has should have refreshed mtime)", removed)
+	if !cas.Has(3) {
+		t.Error("Has(3) = false after GC, want true (unmarked but within GraceWindow)")
 	}
 }
 
-func TestCASMaybeTrimRespectsInterval(t *testing.T) {
+// TestCASGCReportsByteCounts verifies GCStats' byte totals match the actual
+// blob sizes, not just counts — internal/server's log line reports both.
+func TestCASGCReportsByteCounts(t *testing.T) {
 	cas := openTestCAS(t)
-	if err := cas.Put(1, []byte("old")); err != nil {
+	kept := []byte("0123456789") // 10 bytes, marked
+	swept := []byte("abc")       // 3 bytes, unmarked and old
+	if err := cas.Put(1, kept); err != nil {
+		t.Fatalf("Put(1): %v", err)
+	}
+	if err := cas.Put(2, swept); err != nil {
+		t.Fatalf("Put(2): %v", err)
+	}
+	old := time.Now().Add(-GraceWindow - time.Hour)
+	if err := os.Chtimes(cas.blobPath(2), old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	stats, err := cas.GC(time.Now(), map[uint64]struct{}{1: {}})
+	if err != nil {
+		t.Fatalf("GC() error = %v", err)
+	}
+	if stats.KeptBytes != int64(len(kept)) {
+		t.Errorf("GC() KeptBytes = %d, want %d", stats.KeptBytes, len(kept))
+	}
+	if stats.SweptBytes != int64(len(swept)) {
+		t.Errorf("GC() SweptBytes = %d, want %d", stats.SweptBytes, len(swept))
+	}
+}
+
+// TestCASGCConcurrentGetOfSweptBlobIsAnOrdinaryMiss verifies the safety
+// argument (*CAS).GC's doc relies on: a blob removed by GC because it was
+// unmarked is indistinguishable, from a subsequent Get's point of view,
+// from a key that was simply never Put — an ordinary cache miss, never an
+// error — exactly the race a concurrent build racing a GC pass over the
+// same key would hit.
+func TestCASGCConcurrentGetOfSweptBlobIsAnOrdinaryMiss(t *testing.T) {
+	cas := openTestCAS(t)
+	if err := cas.Put(1, []byte("stale")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	old := time.Now().Add(-TrimMaxAge - time.Hour)
+	old := time.Now().Add(-GraceWindow - time.Hour)
 	if err := os.Chtimes(cas.blobPath(1), old, old); err != nil {
 		t.Fatalf("Chtimes: %v", err)
 	}
 
-	// First call: stamp file does not exist yet, so this actually trims.
-	if err := cas.MaybeTrim(time.Now()); err != nil {
-		t.Fatalf("MaybeTrim() error = %v", err)
+	if _, err := cas.GC(time.Now(), nil); err != nil {
+		t.Fatalf("GC() error = %v", err)
+	}
+
+	got, ok, err := cas.Get(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("Get() after GC swept key 1 error = %v, want a plain miss (ok=false, err=nil)", err)
+	}
+	if ok {
+		t.Fatalf("Get() after GC swept key 1 = (%q, true), want ok=false", got)
+	}
+}
+
+func TestCASMaybeGCRespectsInterval(t *testing.T) {
+	cas := openTestCAS(t)
+	if err := cas.Put(1, []byte("old")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	old := time.Now().Add(-GraceWindow - time.Hour)
+	if err := os.Chtimes(cas.blobPath(1), old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	// First call: stamp file does not exist yet, so this actually sweeps.
+	stats, ran, err := cas.MaybeGC(time.Now(), nil)
+	if err != nil {
+		t.Fatalf("MaybeGC() error = %v", err)
+	}
+	if !ran {
+		t.Fatal("MaybeGC() ran = false on first call, want true")
+	}
+	if stats.SweptCount != 1 {
+		t.Errorf("MaybeGC() SweptCount = %d, want 1", stats.SweptCount)
 	}
 	if cas.Has(1) {
-		t.Fatal("Has(1) = true after first MaybeTrim, want false")
+		t.Fatal("Has(1) = true after first MaybeGC, want false")
 	}
 
 	// Recreate the stale blob and re-stamp its old mtime, then call
-	// MaybeTrim again immediately: it must be a no-op (interval not
+	// MaybeGC again immediately: it must be a no-op (interval not
 	// elapsed), so the blob survives.
 	if err := cas.Put(1, []byte("old-again")); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -188,10 +243,14 @@ func TestCASMaybeTrimRespectsInterval(t *testing.T) {
 	if err := os.Chtimes(cas.blobPath(1), old, old); err != nil {
 		t.Fatalf("Chtimes: %v", err)
 	}
-	if err := cas.MaybeTrim(time.Now()); err != nil {
-		t.Fatalf("MaybeTrim() second call error = %v", err)
+	_, ran, err = cas.MaybeGC(time.Now(), nil)
+	if err != nil {
+		t.Fatalf("MaybeGC() second call error = %v", err)
+	}
+	if ran {
+		t.Error("MaybeGC() ran = true within GCInterval, want false (must not have re-walked)")
 	}
 	if !cas.Has(1) {
-		t.Error("Has(1) = false after a MaybeTrim call within TrimInterval, want true (must not have re-walked)")
+		t.Error("Has(1) = false after a MaybeGC call within GCInterval, want true (must not have re-walked)")
 	}
 }

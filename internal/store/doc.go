@@ -38,4 +38,23 @@
 // unlike DB's own small posting-list buckets — it carries no
 // transaction-lifetime restriction: callers may retain it as long as they
 // like.
+//
+// # CAS garbage collection
+//
+// A [CAS] directory never deletes anything on its own: every source edit or
+// factsSchemaVersion bump (internal/index) computes a new key and Puts a
+// new blob, orphaning whatever the old key pointed at. [CAS.GC] reclaims
+// those orphans via mark-and-sweep, not age alone: a blob survives if it is
+// in the caller-supplied mark set (the union of every UnitPointer.BlobKey
+// across every [DB] that shares this CAS directory — see internal/server's
+// RunCASGC, which builds that union across worktrees via each database's
+// [DB.CASDir] meta value) or was written within [GraceWindow]. The whole
+// design leans on one property everywhere else in this package already
+// assumes: a missing blob is never a correctness bug, only a cache miss —
+// [CAS.Get] reports ok=false exactly as it would for a key nothing ever
+// Put, and the caller retypechecks and re-Puts it, precisely like a GOCACHE
+// eviction. GC's mark set is therefore allowed to be a best-effort
+// under-approximation (see RunCASGC's own doc on why a currently-locked
+// database is skipped rather than waited for) without risking anything
+// worse than an occasional avoidable recompute.
 package store
