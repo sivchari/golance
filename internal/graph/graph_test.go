@@ -325,7 +325,7 @@ func TestLoadCache_RejectsOldVersion(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	patterns := []string{"./..."}
 
-	old := diskCache{Version: cacheVersion - 1, Root: root, Patterns: patterns, Packages: map[string]*Package{}}
+	old := diskCache{Version: cacheVersion - 1, Patterns: patterns, Packages: map[string]*Package{}}
 	b, err := json.Marshal(old)
 	if err != nil {
 		t.Fatalf("marshal old diskCache: %v", err)

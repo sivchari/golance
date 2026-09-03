@@ -263,14 +263,20 @@ func buildIndex(stdout, stderr io.Writer, root, dbPath, casPath string) int {
 // stale (see graph.Stale — go.mod/go.sum/go.work/go.work.sum unchanged
 // since the cache was written), instead of unconditionally re-running
 // `go list` on every indexer run. This mirrors internal/server's own
-// handleInitialize, except synchronously: the indexer is a one-shot batch
-// process with no interactive request to answer while a stale cache
-// revalidates, so there is nothing to gain from serving a possibly-stale
-// snapshot the way the server does.
+// handleInitialize, except synchronously and WITHOUT trusting a shared
+// cache (graph.Shared — see its own doc): the indexer is a one-shot batch
+// process building the authoritative facts index, with no interactive
+// request to answer while a stale or possibly-mismatched cache revalidates
+// in the background the way the server tolerates for fast readiness, so
+// there is nothing to gain from risking a snapshot that might reflect a
+// DIFFERENT worktree's file set (graph.Stale's own doc: mtime alone cannot
+// detect that for a cache shared across worktrees) — a `go list` here is
+// now cheap regardless, since graph.Load no longer pays the -export
+// compilation cost this cache was originally introduced to avoid.
 //
 // fromCache reports which path was taken, for the caller's own logging.
 func loadGraph(opts graph.Options, patterns []string, stderr io.Writer) (snap *graph.Snapshot, fromCache bool, err error) {
-	if !graph.Stale(opts.Dir) {
+	if !graph.Shared(opts.Dir) && !graph.Stale(opts.Dir) {
 		if cached, ok := graph.LoadCache(opts.Dir, patterns, opts.BuildFlags); ok {
 			return cached, true, nil
 		}

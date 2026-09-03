@@ -191,6 +191,33 @@ type Server struct {
 	// simply lost until some unrelated later change happened to touch the
 	// same package again.
 	dirtyPkgs map[string]bool
+
+	// wsReady is closed exactly once, by the first setWorkspace call to
+	// install a workspace (see waitWorkspace) — signaling any blocked
+	// caller that s.workspace() will now return non-nil. Relevant only
+	// during the async window between handleInitialize returning and its
+	// background loadWorkspaceAsync call finishing; an already-ready
+	// session never observes it closed, since waitWorkspace checks
+	// s.workspace() itself first.
+	wsReady     chan struct{}
+	wsReadyOnce sync.Once
+
+	// pendingOpensMu guards pendingOpens.
+	pendingOpensMu sync.Mutex
+	// pendingOpens records document paths handleDidOpen saw while
+	// s.workspace() was still nil (the async window right after
+	// handleInitialize, before loadWorkspaceAsync's first setWorkspace call
+	// completes), pending SetFocus/Invalidate once a workspace becomes
+	// available — see markPendingOpen/takePendingOpens/drainPendingOpens.
+	// Without this, a client's didOpen sent immediately after "initialized"
+	// — a normal sequence, and now a much wider window than before this
+	// window's load moved off the "initialize" response's own critical
+	// path — would never have its buffer focused (exempted from the check
+	// engine's LRU eviction) or its first diagnostics recheck scheduled,
+	// until some unrelated later edit happened to touch the same package.
+	// Mirrors dirtyPkgs' identical queue-until-available pattern for a
+	// didSave landing while s.idx is nil.
+	pendingOpens map[string]bool
 }
 
 // New constructs a Server and registers its LSP handlers on rpcServer.
@@ -208,6 +235,7 @@ func New(rpcServer *rpc.Server, opts Options) *Server {
 		overlay:   overlay.New(),
 		diagFiles: make(map[string]map[string]bool),
 		sessionID: newSessionID(),
+		wsReady:   make(chan struct{}),
 	}
 	s.watch = newWatchDebouncer(opts.WatchDebounce, s.revalidateWorkspace)
 	s.watchFP = newWatchFingerprints()
@@ -299,6 +327,73 @@ func (s *Server) Stop() {
 // workspace returns the current workspace bundle, or nil before the
 // "initialize" request has completed.
 func (s *Server) workspace() *workspace { return s.ws.Load() }
+
+// waitWorkspace returns the current workspace, blocking until one becomes
+// available or ctx is done, whichever comes first, if none is loaded yet.
+// checkedFile — the resolution chokepoint behind hover, completion,
+// signature help, and textDocument/definition's index-unavailable fallback
+// — uses this instead of workspace() so a request arriving during
+// golance's async initial graph load (see handleInitialize/
+// loadWorkspaceAsync) gets a real answer once that finishes, within
+// whatever the client's own ctx allows (its request timeout, or an
+// explicit $/cancelRequest), rather than an immediate empty result for the
+// window's whole duration — mirroring how gopls itself generally waits for
+// its own snapshot to become ready rather than answering empty.
+func (s *Server) waitWorkspace(ctx context.Context) *workspace {
+	if ws := s.workspace(); ws != nil {
+		return ws
+	}
+	select {
+	case <-s.wsReady:
+		return s.workspace()
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+// markPendingOpen records path as seen by handleDidOpen while s.workspace()
+// was still nil, pending SetFocus/Invalidate once one becomes available
+// (see drainPendingOpens).
+func (s *Server) markPendingOpen(path string) {
+	s.pendingOpensMu.Lock()
+	defer s.pendingOpensMu.Unlock()
+	if s.pendingOpens == nil {
+		s.pendingOpens = make(map[string]bool)
+	}
+	s.pendingOpens[path] = true
+}
+
+// takePendingOpens returns every document path markPendingOpen recorded
+// since the last takePendingOpens call, clearing the set.
+func (s *Server) takePendingOpens() []string {
+	s.pendingOpensMu.Lock()
+	defer s.pendingOpensMu.Unlock()
+	if len(s.pendingOpens) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(s.pendingOpens))
+	for p := range s.pendingOpens {
+		paths = append(paths, p)
+	}
+	s.pendingOpens = nil
+	return paths
+}
+
+// drainPendingOpens applies SetFocus/Invalidate — the same bookkeeping
+// handleDidOpen itself performs when the workspace is already ready — to
+// every document path markPendingOpen recorded while it was not, against
+// the just-installed ws. Called unconditionally from setWorkspace: a no-op
+// once the pending set has already been drained once (the ordinary case
+// for every setWorkspace call after the workspace's first ever install).
+func (s *Server) drainPendingOpens(ws *workspace) {
+	for _, path := range s.takePendingOpens() {
+		if _, ok := ws.nonWorkspacePackageForFile(path); ok {
+			continue
+		}
+		ws.engine.SetFocus(path)
+		ws.engine.Invalidate(filepath.Dir(path))
+	}
+}
 
 // nonWorkspacePackageForFile returns the real import path of the
 // graph-known, non-workspace package (GOROOT or a module-cache dependency —

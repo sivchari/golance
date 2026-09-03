@@ -236,10 +236,27 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	if old := s.ws.Load(); old != nil {
 		old.engine.Stop()
 	}
-	s.ws.Store(&workspace{
+	newWS := &workspace{
 		root: root, snap: snap, engine: engine, fileToPkg: fileToPkg, dirToPkg: dirToPkg,
 		depCache: depCache, depProvider: depProvider, pkgNameIndex: pkgNameIndex,
-	})
+	}
+	s.ws.Store(newWS)
+	// Unblocks any waitWorkspace caller (checkedFile) parked from before
+	// this, the workspace's first ever install — a no-op on every later
+	// setWorkspace call (revalidateGraph, a watched-files-triggered
+	// reload), since the channel is already closed by then. s.wsReady is
+	// nil for a Server built by test code as a bare &Server{...} literal
+	// rather than through New (a pattern several existing unit tests use
+	// for a minimal server with only the fields their own test needs) —
+	// harmless to skip there, since such a test never calls waitWorkspace
+	// concurrently with this.
+	if s.wsReady != nil {
+		s.wsReadyOnce.Do(func() { close(s.wsReady) })
+	}
+	// A no-op past the workspace's first install: handleDidOpen only ever
+	// queues a path via markPendingOpen while s.workspace() is nil, so
+	// nothing is pending here again once it is not.
+	s.drainPendingOpens(newWS)
 
 	if idx := s.idx.Load(); idx != nil {
 		s.idx.Store(&indexState{db: idx.db, cas: idx.cas, resolver: s.newResolver(idx.db, idx.cas, snap, RelativeIndexPaths(root))})
