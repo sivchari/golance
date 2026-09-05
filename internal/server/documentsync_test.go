@@ -19,6 +19,13 @@ import (
 	"go.lsp.dev/uri"
 )
 
+// reindexWait bounds how long tests wait for a didSave-triggered reindex
+// to finish. The reindex re-type-checks the saved package, which under
+// -race on shared CI runners has taken longer than the 5s this used to
+// be; the waits exit as soon as the reindex lands, so a generous bound
+// costs nothing when the run is fast.
+const reindexWait = 30 * time.Second
+
 // writeFrame writes v, marshaled as method's JSON-RPC notification params,
 // as a Content-Length-framed message to w — the same wire format
 // internal/rpc.Server.Serve reads.
@@ -159,7 +166,7 @@ func TestHandleDidSave_TestFileReindexesNewSymbol(t *testing.T) {
 		t.Fatalf("handleDidSave: %v", err)
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(reindexWait)
 	for {
 		resp, err := s.handleWorkspaceSymbol(context.Background(), mustMarshal(t, &protocol.WorkspaceSymbolParams{Query: newSymbol}))
 		if err != nil {
@@ -210,7 +217,7 @@ func TestHandleDidSave_ReindexNeverOrphanedByShutdown(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Serve() error = %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(reindexWait):
 		t.Fatal("Serve() did not return; the didSave-triggered reindex goroutine may be orphaned")
 	}
 	// Reaching here means Serve's own wg.Wait() drained the s.rpc.Go-tracked
@@ -286,7 +293,7 @@ func TestHandleDidSave_ReindexedOnceIndexBecomesAvailable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = idx.db.Close() })
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(reindexWait)
 	for {
 		resp, err := s.handleWorkspaceSymbol(context.Background(), mustMarshal(t, &protocol.WorkspaceSymbolParams{Query: newSymbol}))
 		if err != nil {
