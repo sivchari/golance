@@ -236,55 +236,7 @@ func Shout(name string, n int) string {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := t.TempDir()
-			writeModuleFile(t, dir, "go.mod", "module example.com/depcachetest\n\ngo 1.23\n")
-			writeModuleFile(t, dir, "leaf/leaf.go", "package leaf\n\n// Hello returns a greeting for name.\nfunc Hello(name string) string { return \"hello \" + name }\n")
-			midFile := writeModuleFile(t, dir, "mid/mid.go", `package mid
-
-import "example.com/depcachetest/leaf"
-
-// Shout returns a greeting for name.
-func Shout(name string) string {
-	return leaf.Hello(name)
-}
-`)
-			writeModuleFile(t, dir, "top/top.go", `package top
-
-import "example.com/depcachetest/mid"
-
-// Run calls mid.Shout.
-func Run(name string) string {
-	return mid.Shout(name)
-}
-`)
-
-			snap, err := graph.Load(graph.Options{Dir: dir}, "./...")
-			if err != nil {
-				t.Fatalf("graph.Load: %v", err)
-			}
-			db, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
-			if err != nil {
-				t.Fatalf("store.Open: %v", err)
-			}
-			t.Cleanup(func() {
-				if err := db.Close(); err != nil {
-					t.Errorf("db.Close: %v", err)
-				}
-			})
-			cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
-			if err != nil {
-				t.Fatalf("store.OpenCAS: %v", err)
-			}
-			if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
-				t.Fatalf("index.Build: %v", err)
-			}
-
-			rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
-			s := New(rpcServer, Options{Logger: newTestLogger(t)})
-			s.setWorkspace(dir, snap)
-			idx := &indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)}
-			s.idx.Store(idx)
-
+			s, idx, midFile := newDepCacheReindexServer(t)
 			ws := s.workspace()
 			// Warm depCache with a decoded entry for both mid and top,
 			// mirroring what a real recheck of some other package importing
@@ -311,6 +263,63 @@ func Run(name string) string {
 			}
 		})
 	}
+}
+
+// newDepCacheReindexServer builds the leaf/mid/top synthetic module,
+// indexes it, and returns a workspace-ready server over it plus its
+// installed index state and mid's file path — the fixture
+// TestReindex_NarrowsDepCacheInvalidationToActuallyChangedHops drives.
+func newDepCacheReindexServer(t *testing.T) (*Server, *indexState, string) {
+	t.Helper()
+	dir := t.TempDir()
+	writeModuleFile(t, dir, "go.mod", "module example.com/depcachetest\n\ngo 1.23\n")
+	writeModuleFile(t, dir, "leaf/leaf.go", "package leaf\n\n// Hello returns a greeting for name.\nfunc Hello(name string) string { return \"hello \" + name }\n")
+	midFile := writeModuleFile(t, dir, "mid/mid.go", `package mid
+
+import "example.com/depcachetest/leaf"
+
+// Shout returns a greeting for name.
+func Shout(name string) string {
+	return leaf.Hello(name)
+}
+`)
+	writeModuleFile(t, dir, "top/top.go", `package top
+
+import "example.com/depcachetest/mid"
+
+// Run calls mid.Shout.
+func Run(name string) string {
+	return mid.Shout(name)
+}
+`)
+
+	snap, err := graph.Load(graph.Options{Dir: dir}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("db.Close: %v", err)
+		}
+	})
+	cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+		t.Fatalf("index.Build: %v", err)
+	}
+
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	s.setWorkspace(dir, snap)
+	idx := &indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)}
+	s.idx.Store(idx)
+	return s, idx, midFile
 }
 
 // TestHandleDidSave_ReindexNeverOrphanedByShutdown covers Finding 7: the

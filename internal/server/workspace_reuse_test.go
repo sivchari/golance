@@ -198,7 +198,7 @@ func TestChangedExportSet(t *testing.T) {
 	}{
 		{
 			name:   "no changes",
-			mutate: func(t *testing.T, dir string) {},
+			mutate: func(*testing.T, string) {},
 			want:   nil,
 		},
 		{
