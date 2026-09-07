@@ -268,6 +268,12 @@ func (e *Engine) SetFocus(filePath string) {
 // ctx.Done() first always gets back the CheckedPackage its flight
 // computed, regardless of that guard.
 func (e *Engine) Get(ctx context.Context, filePath string) (*CheckedPackage, error) {
+	// Checked up front so an already-canceled request fails before any
+	// hashing work, and deterministically: the select below races
+	// ctx.Done() against fl.done, and with both ready it picks either.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	pkgPath, dir, goFiles, ok := e.snap.PackageForFile(filePath)
 	if !ok {
 		return nil, fmt.Errorf("check: %s is not part of a known package", filePath)
