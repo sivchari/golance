@@ -542,13 +542,9 @@ func (e *Engine) commitPublish(gen uint64, st *dirState, cp *CheckedPackage) {
 // progress (see runFlight, which runs on e.ctx) keeps running to completion
 // instead of failing every Get waiting on it with ctx.Err().
 //
-// This exists for the caller that discards this Engine for a fresh one over
-// a new import graph snapshot (e.g. Server.setWorkspace) but no longer wants
-// that to abort requests already in flight against it: the only reason that
-// site used to call Stop was to keep a stale debounce timer, or a background
-// recheck still running against the discarded import graph, from publishing
-// diagnostics via Options.OnResult after the swap — not to abort request
-// work. Retire prevents exactly that, and nothing more: canceling every
+// This is for a caller that discards e for a fresh Engine (e.g. over a new
+// import graph snapshot) but must stop e from publishing afterward without
+// aborting request work already in flight against it: canceling every
 // pending timer and background job stops any of them from reaching commit
 // after Retire returns, and setting e.retired makes commit itself suppress
 // the OnResult publish for the rare recheck already past that point when
@@ -572,15 +568,15 @@ func (e *Engine) Retire() {
 	}
 }
 
-// Stop cancels every directory's pending debounce timer and in-flight
-// background recheck (Invalidate/fireRecheck), and cancels e.ctx — which
-// every request-driven flight runs on (see runFlight) — canceling every
-// flight currently in progress too, so none of them can call
-// Options.OnResult after the caller discards this Engine — e.g. because a
-// fresh Engine over a new import graph snapshot is about to replace it. A
-// flight's detachment (see Get's doc) is only from any single requester's
-// ctx, not from the engine's own lifetime: Stop still reclaims it, exactly
-// as a server shutdown must be able to reclaim every goroutine it started.
+// Stop fully shuts e down: it cancels every directory's pending debounce
+// timer and in-flight background recheck (Invalidate/fireRecheck), and
+// cancels e.ctx — which every request-driven flight runs on (see
+// runFlight) — canceling every flight currently in progress too, so none
+// of them can call Options.OnResult once e is discarded. A flight's
+// detachment (see Get's doc) is only from any single requester's ctx, not
+// from the engine's own lifetime: Stop still reclaims it. See Retire for
+// the alternative that stops background publishing without aborting
+// in-flight request-driven work.
 // Safe to call more than once.
 func (e *Engine) Stop() {
 	e.mu.Lock()

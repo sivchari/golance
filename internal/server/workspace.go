@@ -180,21 +180,13 @@ func depsKey(snap *graph.Snapshot) string {
 // internal/depexport's package doc), opened once for this Server's whole
 // lifetime, independent of any one workspace's dependency set.
 //
-// This is the fix for a real production stall (see the caller's own doc):
-// setWorkspace runs on every graph revalidation, not only at initialize —
-// any go.mod/go.sum/go.work change, and any workspace/didChangeWatchedFiles
-// batch that adds or removes a file in an already-known package directory
-// (see needsGraphReload) — which, before this, discarded depProvider's
-// entire type-check cache every time. Since depProvider exists specifically
-// to answer navigation into the standard library and module dependencies —
-// content that does not change just because the user edited a workspace
-// file — that discard bought nothing but forced the next dependency-facing
-// query to re-type-check its whole import closure cold, sometimes tens of
-// seconds' worth of work for a large monorepo's shared dependencies.
-// Reusing the Provider whenever the dependency set itself is unchanged
-// removes that cost entirely for the common case (an ordinary edit inside
-// the workspace), while still rebuilding it — correctly, from scratch —
-// whenever the dependency set genuinely could have changed.
+// Reuse is sound whenever the dependency set is unchanged: depProvider
+// exists specifically to answer navigation into the standard library and
+// module dependencies, content that does not change just because the user
+// edited a workspace file, so keeping it — and its type-check cache — warm
+// across a setWorkspace call driven by nothing but such an edit costs
+// nothing in correctness. Rebuilding it — correctly, from scratch —
+// whenever depsKey differs is what keeps that safe.
 func (s *Server) ensureDepProvider(snap *graph.Snapshot) (*depcheck.Provider, *depexport.Cache) {
 	key := depsKey(snap)
 
@@ -304,11 +296,26 @@ func changedExportSet(old, snap *graph.Snapshot) []string {
 // sameGoFiles reports whether a and b list the same GoFiles, order
 // insensitive: go/packages makes no ordering guarantee across two separate
 // Load calls over unchanged on-disk content, so a naive index comparison
-// would report a spurious difference on every reload.
+// would report a spurious difference on every reload. In practice,
+// graph.Load produces deterministic ordering, so an unchanged package's two
+// listings compare equal elementwise without either allocating; the sorted
+// comparison below only runs as a fallback for the rare package whose order
+// did shift between loads.
 func sameGoFiles(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
+	ordered := true
+	for i := range a {
+		if a[i] != b[i] {
+			ordered = false
+			break
+		}
+	}
+	if ordered {
+		return true
+	}
+
 	as := append([]string(nil), a...)
 	bs := append([]string(nil), b...)
 	sort.Strings(as)
@@ -333,13 +340,10 @@ func sameGoFiles(a, b []string) bool {
 // place instead of rebuilt, because setWorkspace runs on every graph
 // revalidation, not only at initialize: any go.mod/go.sum/go.work change,
 // and any workspace/didChangeWatchedFiles batch that adds or removes a
-// file in an already-known package directory (see needsGraphReload). Before
-// this, every one of those calls rebuilt engine from scratch and stopped
-// the old one, which discarded ws.engine's whole per-unit check cache and
-// canceled every in-flight Get flight running against it — the source of a
-// real production stall ("server: checked package for ...: context
-// canceled") and of the next dependency-facing query having to re-check
-// its whole import closure cold.
+// file in an already-known package directory (see needsGraphReload).
+// Rebuilding engine from scratch on every such call would discard its
+// whole per-unit check cache and cancel every in-flight Get flight running
+// against it, so reuse is what keeps those warm across an ordinary edit.
 //
 // Reuse is sound for ws.engine's own cache without any extra bookkeeping:
 // every cache entry is validated against a live, current on-disk/overlay
@@ -370,6 +374,9 @@ func sameGoFiles(a, b []string) bool {
 // invalidate far more than changedExportSet's own GoFiles-diff heuristic
 // accounts for.
 func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
+	s.setWorkspaceMu.Lock()
+	defer s.setWorkspaceMu.Unlock()
+
 	old := s.ws.Load()
 	depProvider, depExports := s.ensureDepProvider(snap)
 	reuse := old != nil && old.root == root && old.depProvider == depProvider
@@ -396,14 +403,12 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 		// could otherwise still fire afterward and publish diagnostics via
 		// Options.OnResult computed against stale state — Retire's timer
 		// cancellation and OnResult suppression (see its own doc) prevent
-		// exactly that, which was Stop's only purpose at this call site.
-		// Unlike Stop, Retire does not cancel the engine's own lifecycle
-		// ctx, so a request-driven Get flight already in progress against
-		// the old engine (e.g. a hover the user triggered microseconds
-		// before this reload) keeps running to completion and its waiter
-		// gets the real result instead of ctx.Err() — the production
-		// stall this whole reuse/retire split exists to fix (see this
-		// function's own doc).
+		// exactly that. Unlike Stop, Retire does not cancel the engine's
+		// own lifecycle ctx, so a request-driven Get flight already in
+		// progress against the old engine (e.g. a hover the user
+		// triggered microseconds before this reload) keeps running to
+		// completion and its waiter gets the real result instead of
+		// ctx.Err().
 		if old != nil {
 			old.engine.Retire()
 		}

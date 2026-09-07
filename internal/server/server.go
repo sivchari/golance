@@ -117,6 +117,14 @@ type Server struct {
 	rpc     *rpc.Server
 	overlay *overlay.Overlay
 
+	// setWorkspaceMu serializes setWorkspace end to end: two concurrent
+	// calls (e.g. two overlapping handleDidChangeWatchedFiles-triggered
+	// revalidateGraph goroutines) must not both take the reuse branch and
+	// interleave their graphSrc.Retarget/depCache.invalidate/s.ws.Store
+	// calls, which could publish a workspace whose installed snap disagrees
+	// with what the shared graphSrc/depCache were last mutated to reflect.
+	setWorkspaceMu sync.Mutex
+
 	ws    atomic.Pointer[workspace]
 	idx   atomic.Pointer[indexState]
 	hints atomic.Pointer[map[langfeat.HintKind]bool] // enabled inlay hint kinds; nil until "initialize" or workspace/didChangeConfiguration sets it, meaning every kind enabled (see hintsEnabled)

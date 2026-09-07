@@ -60,6 +60,7 @@ func ReadExport(data []byte, fset *token.FileSet, pkgPath string, cache *Cache) 
 		return nil, wrapped
 	}
 	cache.bytes += int64(len(data))
+	cache.sizes[pkgPath] = int64(len(data))
 	cache.decodes++
 	return pkg, nil
 }

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/sivchari/golance/internal/graph"
@@ -176,6 +177,102 @@ func TestSetWorkspace_InFlightGetSurvivesReload(t *testing.T) {
 
 	if _, err := oldEngine.Get(context.Background(), greetGo); err != nil {
 		t.Errorf("Get on the retired engine after reload = %v, want nil: Retire must not cancel Engine.ctx the way the old Stop-based behavior did, or every flight against the discarded engine — in-flight or not — fails with ctx.Err() instead of completing", err)
+	}
+}
+
+// TestSetWorkspace_ConcurrentCallsStayConsistent guards against a logical
+// race between two overlapping setWorkspace calls that both take the reuse
+// path: without setWorkspaceMu serializing setWorkspace end to end, two
+// calls can interleave their ws.graphSrc.Retarget and s.ws.Store steps,
+// leaving the installed workspace's own snap (whatever s.ws.Store last
+// installed) disagreeing with the shared, reused graphSrc's last Retarget
+// target (whatever Retarget call happened to run last) — a genuine
+// correctness bug, e.g. a hover resolving a package's file set against the
+// wrong snapshot. This is a pure ordering race, not a data race in the
+// -race-detectable sense (both graphSrc's index and s.ws are swapped via
+// atomic.Pointer, each individual access is race-free); go test -race is
+// run here only for its usual blanket coverage, not because it is expected
+// to itself flag anything.
+//
+// Reproducing it needs genuine overlap right up to a call's own final
+// Retarget/Store pair, not just any overlap somewhere in a long run: a
+// free-running hammer of many goroutines looping thousands of times drifts
+// out of phase, so by the time they all finish only one is typically still
+// active and the tail is trivially self-consistent, without exercising the
+// actual bug even though many mid-run overlaps did occur. This instead runs
+// many independent rounds of exactly two goroutines released simultaneously
+// via a barrier (one setting snapA, one setting snapB), checking the
+// invariant after every round: synchronizing each round's start forces
+// genuine overlap at exactly the moment that matters, so the check below —
+// confirmed to fail within the first ~200 of 500 rounds before
+// setWorkspaceMu existed, and to pass reliably after — is what actually
+// exercises the race this test guards against.
+//
+// The invariant checked is that the installed workspace's own snap and its
+// graphSrc agree on greet's GoFiles, since PackageForFile returns
+// pkg.GoFiles straight from whichever *graphIndex Retarget last swapped in
+// (see GraphSource.Retarget and PackageForFile). This deliberately does not
+// use the added file itself as the probe: PackageForFile's directory
+// fallback would resolve it to greet's package under EITHER snapshot (a new
+// file landing in an already-known directory), masking the very
+// inconsistency this test needs to catch.
+func TestSetWorkspace_ConcurrentCallsStayConsistent(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	populateTempModule(t, root)
+	const greetPkgPath = "example.com/servermod/greet"
+	greetGo := filepath.Join(root, "greet", "greet.go")
+
+	snapA, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load (A): %v", err)
+	}
+	writeTempFile(t, filepath.Join(root, "greet"), "greet_extra.go", "package greet\n\n// Extra is an additional exported function.\nfunc Extra() string { return \"extra\" }\n")
+	snapB, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load (B): %v", err)
+	}
+	if pkg, ok := snapA.Packages[greetPkgPath]; !ok || len(pkg.GoFiles) != 1 {
+		t.Fatalf("snapA's greet package = %+v, want exactly greet.go; test setup is wrong", pkg)
+	}
+	if pkg, ok := snapB.Packages[greetPkgPath]; !ok || len(pkg.GoFiles) != 2 {
+		t.Fatalf("snapB's greet package = %+v, want greet.go and greet_extra.go; test setup is wrong", pkg)
+	}
+
+	s := newWorkspaceOnlyServerAt(t, root, snapA)
+
+	// See the barrier-per-round rationale in this test's own doc.
+	const rounds = 500
+	for round := range rounds {
+		var start, wg2 sync.WaitGroup
+		wg2.Add(2)
+		start.Add(1)
+		for i := range 2 {
+			go func(i int) {
+				defer wg2.Done()
+				start.Wait()
+				if (round+i)%2 == 0 {
+					s.setWorkspace(root, snapA)
+				} else {
+					s.setWorkspace(root, snapB)
+				}
+			}(i)
+		}
+		start.Done()
+		wg2.Wait()
+
+		ws := s.workspace()
+		wantPkg, ok := ws.snap.Packages[greetPkgPath]
+		if !ok {
+			t.Fatalf("round %d: greet package missing from the installed snapshot", round)
+		}
+		_, _, gotGoFiles, ok := ws.graphSrc.PackageForFile(greetGo)
+		if !ok {
+			t.Fatalf("round %d: ws.graphSrc.PackageForFile(greetGo) = ok false, want true", round)
+		}
+		if !sameGoFiles(wantPkg.GoFiles, gotGoFiles) {
+			t.Fatalf("round %d: workspace inconsistent after concurrent setWorkspace calls: installed snap's greet.GoFiles=%v but graphSrc.PackageForFile returned %v; the reused graphSrc's last Retarget disagreed with the last installed snapshot", round, wantPkg.GoFiles, gotGoFiles)
+		}
 	}
 }
 
