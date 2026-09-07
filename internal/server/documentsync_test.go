@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sivchari/golance/internal/graph"
@@ -19,11 +20,11 @@ import (
 	"go.lsp.dev/uri"
 )
 
-// reindexWait bounds how long tests wait for a didSave-triggered reindex
-// to finish. The reindex re-type-checks the saved package, which under
-// -race on shared CI runners has taken longer than the 5s this used to
-// be; the waits exit as soon as the reindex lands, so a generous bound
-// costs nothing when the run is fast.
+// reindexWait bounds TestHandleDidSave_ReindexNeverOrphanedByShutdown's
+// deadman select on Serve returning. The reindex re-type-checks the saved
+// package, which under -race on shared CI runners has taken longer than the
+// 5s this used to be; the select exits as soon as Serve returns, so a
+// generous bound costs nothing when the run is fast.
 const reindexWait = 30 * time.Second
 
 // writeFrame writes v, marshaled as method's JSON-RPC notification params,
@@ -120,66 +121,64 @@ func TestHandleDidOpen_QueuedBeforeWorkspaceReadyThenDrained(t *testing.T) {
 // perturb any other test's package/symbol-count assumptions against that
 // shared fixture.
 func TestHandleDidSave_TestFileReindexesNewSymbol(t *testing.T) {
-	dir := t.TempDir()
-	writeModuleFile(t, dir, "go.mod", "module example.com/didsavetest\n\ngo 1.23\n")
-	writeModuleFile(t, dir, "greet/greet.go", "package greet\n\n// Hello returns a greeting.\nfunc Hello() string { return \"hi\" }\n")
-	const testSrc = "package greet\n\nimport \"testing\"\n\nfunc TestHello(t *testing.T) {\n\tif Hello() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n"
-	testFile := writeModuleFile(t, dir, "greet/greet_test.go", testSrc)
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		writeModuleFile(t, dir, "go.mod", "module example.com/didsavetest\n\ngo 1.23\n")
+		writeModuleFile(t, dir, "greet/greet.go", "package greet\n\n// Hello returns a greeting.\nfunc Hello() string { return \"hi\" }\n")
+		const testSrc = "package greet\n\nimport \"testing\"\n\nfunc TestHello(t *testing.T) {\n\tif Hello() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n"
+		testFile := writeModuleFile(t, dir, "greet/greet_test.go", testSrc)
 
-	snap, err := graph.Load(graph.Options{Dir: dir}, "./...")
-	if err != nil {
-		t.Fatalf("graph.Load: %v", err)
-	}
-
-	db, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("db.Close: %v", err)
+		snap, err := graph.Load(graph.Options{Dir: dir}, "./...")
+		if err != nil {
+			t.Fatalf("graph.Load: %v", err)
 		}
-	})
-	cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
-	if err != nil {
-		t.Fatalf("store.OpenCAS: %v", err)
-	}
-	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
-		t.Fatalf("index.Build: %v", err)
-	}
 
-	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
-	s := New(rpcServer, Options{Logger: newTestLogger(t)})
-	s.setWorkspace(dir, snap)
-	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+		db, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(); err != nil {
+				t.Errorf("db.Close: %v", err)
+			}
+		})
+		cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
+		if err != nil {
+			t.Fatalf("store.OpenCAS: %v", err)
+		}
+		if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+			t.Fatalf("index.Build: %v", err)
+		}
 
-	openDoc(t, s, testFile, testSrc)
+		rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+		s := New(rpcServer, Options{Logger: newTestLogger(t)})
+		s.setWorkspace(dir, snap)
+		s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
 
-	const newSymbol = "TestOnlyHelperXYZ"
-	edited := testSrc + "\n// " + newSymbol + " is declared only in this in-package test file.\nfunc " + newSymbol + "() int { return 1 }\n"
+		openDoc(t, s, testFile, testSrc)
 
-	saveParams := mustMarshal(t, &protocol.DidSaveTextDocumentParams{
-		TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(testFile)},
-		Text:         &edited,
-	})
-	if err := s.handleDidSave(context.Background(), saveParams); err != nil {
-		t.Fatalf("handleDidSave: %v", err)
-	}
+		const newSymbol = "TestOnlyHelperXYZ"
+		edited := testSrc + "\n// " + newSymbol + " is declared only in this in-package test file.\nfunc " + newSymbol + "() int { return 1 }\n"
 
-	deadline := time.Now().Add(reindexWait)
-	for {
+		saveParams := mustMarshal(t, &protocol.DidSaveTextDocumentParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(testFile)},
+			Text:         &edited,
+		})
+		if err := s.handleDidSave(context.Background(), saveParams); err != nil {
+			t.Fatalf("handleDidSave: %v", err)
+		}
+
+		// Blocks until the s.rpc.Go-launched background reindex goroutine
+		// exits (real type-checking runs at real speed inside the bubble).
+		synctest.Wait()
 		resp, err := s.handleWorkspaceSymbol(context.Background(), mustMarshal(t, &protocol.WorkspaceSymbolParams{Query: newSymbol}))
 		if err != nil {
 			t.Fatalf("handleWorkspaceSymbol: %v", err)
 		}
-		if syms, ok := resp.(protocol.SymbolInformationSlice); ok && len(syms) > 0 {
-			return
+		if syms, ok := resp.(protocol.SymbolInformationSlice); !ok || len(syms) == 0 {
+			t.Fatalf("%s not visible via workspace/symbol after saving the in-package test file; the didSave-triggered reindex may not have fired for it", newSymbol)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s did not become visible via workspace/symbol after saving the in-package test file; the didSave-triggered reindex may not have fired for it", newSymbol)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	})
 }
 
 // TestReindex_NarrowsDepCacheInvalidationToActuallyChangedHops verifies
@@ -331,38 +330,40 @@ func Run(name string) string {
 // so the tracking/cancellation this relies on (s.rpc.Go, see
 // documentsync.go) is exercised the way production code actually uses it.
 func TestHandleDidSave_ReindexNeverOrphanedByShutdown(t *testing.T) {
-	s, snap, _ := newTestServer(t)
-	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
-	text, err := os.ReadFile(filepath.Clean(file))
-	if err != nil {
-		t.Fatalf("read %s: %v", file, err)
-	}
-
-	pr, pw := io.Pipe()
-	var out bytes.Buffer
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- s.rpc.Serve(context.Background(), pr, &out) }()
-
-	textStr := string(text)
-	go func() {
-		writeFrame(t, pw, protocol.MethodTextDocumentDidSave, &protocol.DidSaveTextDocumentParams{
-			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
-			Text:         &textStr,
-		})
-		_ = pw.Close() // EOF: Serve should wind down once the notification (and its tracked reindex) is drained
-	}()
-
-	select {
-	case err := <-serveDone:
+	synctest.Test(t, func(t *testing.T) {
+		s, snap, _ := newTestServer(t)
+		file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+		text, err := os.ReadFile(filepath.Clean(file))
 		if err != nil {
-			t.Fatalf("Serve() error = %v", err)
+			t.Fatalf("read %s: %v", file, err)
 		}
-	case <-time.After(reindexWait):
-		t.Fatal("Serve() did not return; the didSave-triggered reindex goroutine may be orphaned")
-	}
-	// Reaching here means Serve's own wg.Wait() drained the s.rpc.Go-tracked
-	// reindex goroutine before Serve returned — it neither outlived the
-	// session nor panicked.
+
+		pr, pw := io.Pipe()
+		var out bytes.Buffer
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- s.rpc.Serve(context.Background(), pr, &out) }()
+
+		textStr := string(text)
+		go func() {
+			writeFrame(t, pw, protocol.MethodTextDocumentDidSave, &protocol.DidSaveTextDocumentParams{
+				TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+				Text:         &textStr,
+			})
+			_ = pw.Close() // EOF: Serve should wind down once the notification (and its tracked reindex) is drained
+		}()
+
+		select {
+		case err := <-serveDone:
+			if err != nil {
+				t.Fatalf("Serve() error = %v", err)
+			}
+		case <-time.After(reindexWait):
+			t.Fatal("Serve() did not return; the didSave-triggered reindex goroutine may be orphaned")
+		}
+		// Reaching here means Serve's own wg.Wait() drained the s.rpc.Go-tracked
+		// reindex goroutine before Serve returned — it neither outlived the
+		// session nor panicked.
+	})
 }
 
 // TestHandleDidSave_ReindexedOnceIndexBecomesAvailable is a regression test
@@ -381,70 +382,68 @@ func TestHandleDidSave_ReindexNeverOrphanedByShutdown(t *testing.T) {
 // the dirty set and reindex greet, so the new symbol becomes visible via
 // workspace/symbol without any further save.
 func TestHandleDidSave_ReindexedOnceIndexBecomesAvailable(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	s, snap := newTestServerNoIndex(t)
-	root := s.workspace().root
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		s, snap := newTestServerNoIndex(t)
+		root := s.workspace().root
 
-	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
-	original, err := os.ReadFile(filepath.Clean(file))
-	if err != nil {
-		t.Fatalf("read %s: %v", file, err)
-	}
-	const newSymbol = "GoodbyeDirtySave"
-	edited := string(original) + "\n// " + newSymbol + " is added only via the overlay in this test.\nfunc " + newSymbol + "(name string) Greeting {\n\treturn Greeting{Text: \"goodbye, \" + name}\n}\n"
+		file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+		original, err := os.ReadFile(filepath.Clean(file))
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		const newSymbol = "GoodbyeDirtySave"
+		edited := string(original) + "\n// " + newSymbol + " is added only via the overlay in this test.\nfunc " + newSymbol + "(name string) Greeting {\n\treturn Greeting{Text: \"goodbye, \" + name}\n}\n"
 
-	openDoc(t, s, file, edited)
+		openDoc(t, s, file, edited)
 
-	saveParams := mustMarshal(t, &protocol.DidSaveTextDocumentParams{
-		TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
-	})
-	if err := s.handleDidSave(context.Background(), saveParams); err != nil {
-		t.Fatalf("handleDidSave (index unavailable): %v", err)
-	}
-	if idx := s.idx.Load(); idx != nil {
-		t.Fatal("s.idx installed during a test that never built one before the save; want nil")
-	}
-	s.dirtyMu.Lock()
-	dirty := s.dirtyPkgs["example.com/servermod/greet"]
-	s.dirtyMu.Unlock()
-	if !dirty {
-		t.Fatal("greet not recorded dirty after a save while the index was unavailable")
-	}
+		saveParams := mustMarshal(t, &protocol.DidSaveTextDocumentParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+		})
+		if err := s.handleDidSave(context.Background(), saveParams); err != nil {
+			t.Fatalf("handleDidSave (index unavailable): %v", err)
+		}
+		if idx := s.idx.Load(); idx != nil {
+			t.Fatal("s.idx installed during a test that never built one before the save; want nil")
+		}
+		s.dirtyMu.Lock()
+		dirty := s.dirtyPkgs["example.com/servermod/greet"]
+		s.dirtyMu.Unlock()
+		if !dirty {
+			t.Fatal("greet not recorded dirty after a save while the index was unavailable")
+		}
 
-	// Build and install an index from the unmodified on-disk content — the
-	// snapshot a build already running when the save above happened would
-	// have used. newSymbol must be absent from it.
-	dbPath := indexDBFile(root)
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
-		t.Fatalf("mkdir index dir: %v", err)
-	}
-	cas, err := store.OpenCAS(casDir(root))
-	if err != nil {
-		t.Fatalf("store.OpenCAS: %v", err)
-	}
-	buildTestIndexDB(t, snap, dbPath, cas)
+		// Build and install an index from the unmodified on-disk content — the
+		// snapshot a build already running when the save above happened would
+		// have used. newSymbol must be absent from it.
+		dbPath := indexDBFile(root)
+		if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+			t.Fatalf("mkdir index dir: %v", err)
+		}
+		cas, err := store.OpenCAS(casDir(root))
+		if err != nil {
+			t.Fatalf("store.OpenCAS: %v", err)
+		}
+		buildTestIndexDB(t, snap, dbPath, cas)
 
-	if s.openIndexAfterBuild(context.Background(), dbPath, nil, "") {
-		t.Fatal("openIndexAfterBuild locked = true, want false")
-	}
-	idx := s.idx.Load()
-	if idx == nil {
-		t.Fatal("s.idx is nil after openIndexAfterBuild")
-	}
-	t.Cleanup(func() { _ = idx.db.Close() })
+		if s.openIndexAfterBuild(context.Background(), dbPath, nil, "") {
+			t.Fatal("openIndexAfterBuild locked = true, want false")
+		}
+		idx := s.idx.Load()
+		if idx == nil {
+			t.Fatal("s.idx is nil after openIndexAfterBuild")
+		}
+		t.Cleanup(func() { _ = idx.db.Close() })
 
-	deadline := time.Now().Add(reindexWait)
-	for {
+		// openIndexAfterBuild's drainDirty call above already reindexed greet
+		// synchronously; Wait settles any background work regardless.
+		synctest.Wait()
 		resp, err := s.handleWorkspaceSymbol(context.Background(), mustMarshal(t, &protocol.WorkspaceSymbolParams{Query: newSymbol}))
 		if err != nil {
 			t.Fatalf("handleWorkspaceSymbol: %v", err)
 		}
-		if syms, ok := resp.(protocol.SymbolInformationSlice); ok && len(syms) > 0 {
-			return
+		if syms, ok := resp.(protocol.SymbolInformationSlice); !ok || len(syms) == 0 {
+			t.Fatalf("%s not visible via workspace/symbol after the index became available; the save made while the index was unavailable appears to have been lost", newSymbol)
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s did not become visible via workspace/symbol after the index became available; the save made while the index was unavailable appears to have been lost", newSymbol)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	})
 }

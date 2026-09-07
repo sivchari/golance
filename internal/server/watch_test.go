@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"go.lsp.dev/protocol"
@@ -22,31 +23,34 @@ import (
 // the behavior a `git pull` touching thousands of files in rapid
 // succession relies on.
 func TestWatchDebouncerCoalescesBurstIntoOneRun(t *testing.T) {
-	var mu sync.Mutex
-	var calls []bool
-	w := newWatchDebouncer(20*time.Millisecond, func(_ string, reload bool) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var calls []bool
+		w := newWatchDebouncer(20*time.Millisecond, func(_ string, reload bool) {
+			mu.Lock()
+			calls = append(calls, reload)
+			mu.Unlock()
+		})
+		t.Cleanup(w.Stop)
+
+		for i := range 5 {
+			w.onEvent("root", i == 2) // exactly one event in the burst needs reload
+			time.Sleep(2 * time.Millisecond)
+		}
+
+		synctest.Wait()
+		// Give any unwanted extra run a chance to also land before asserting.
+		time.Sleep(100 * time.Millisecond)
+
 		mu.Lock()
-		calls = append(calls, reload)
-		mu.Unlock()
+		defer mu.Unlock()
+		if len(calls) != 1 {
+			t.Fatalf("run called %d times, want exactly 1: %v", len(calls), calls)
+		}
+		if !calls[0] {
+			t.Fatal("run reload = false, want true (one event in the burst needed reload)")
+		}
 	})
-
-	for i := range 5 {
-		w.onEvent("root", i == 2) // exactly one event in the burst needs reload
-		time.Sleep(2 * time.Millisecond)
-	}
-
-	waitForCalls(t, &mu, &calls, 1)
-	// Give any unwanted extra run a chance to also land before asserting.
-	time.Sleep(100 * time.Millisecond)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(calls) != 1 {
-		t.Fatalf("run called %d times, want exactly 1: %v", len(calls), calls)
-	}
-	if !calls[0] {
-		t.Fatal("run reload = false, want true (one event in the burst needed reload)")
-	}
 }
 
 // TestWatchDebouncerRerunsExactlyOnceAfterInFlightPass verifies the
@@ -54,60 +58,63 @@ func TestWatchDebouncerCoalescesBurstIntoOneRun(t *testing.T) {
 // pass is already running are coalesced into exactly one more pass, run
 // immediately after the first finishes, and the two passes never overlap.
 func TestWatchDebouncerRerunsExactlyOnceAfterInFlightPass(t *testing.T) {
-	var mu sync.Mutex
-	var calls []bool
-	var running, maxRunning atomic.Int32
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var calls []bool
+		var running, maxRunning atomic.Int32
 
-	firstStarted := make(chan struct{})
-	release := make(chan struct{})
+		firstStarted := make(chan struct{})
+		release := make(chan struct{})
 
-	w := newWatchDebouncer(5*time.Millisecond, func(_ string, reload bool) {
-		n := running.Add(1)
-		for {
-			old := maxRunning.Load()
-			if n <= old || maxRunning.CompareAndSwap(old, n) {
-				break
+		w := newWatchDebouncer(5*time.Millisecond, func(_ string, reload bool) {
+			n := running.Add(1)
+			for {
+				old := maxRunning.Load()
+				if n <= old || maxRunning.CompareAndSwap(old, n) {
+					break
+				}
 			}
+
+			mu.Lock()
+			calls = append(calls, reload)
+			first := len(calls) == 1
+			mu.Unlock()
+			if first {
+				close(firstStarted)
+				<-release
+			}
+			running.Add(-1)
+		})
+		t.Cleanup(w.Stop)
+
+		w.onEvent("root", false)
+		select {
+		case <-firstStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("first run never started")
 		}
+
+		// Events arriving while the first pass is running: only their combined
+		// reload flag (true, from the last one) should reach the rerun.
+		w.onEvent("root", false)
+		w.onEvent("root", true)
+		close(release)
+
+		synctest.Wait()
+		time.Sleep(50 * time.Millisecond) // make sure no unwanted third run sneaks in
 
 		mu.Lock()
-		calls = append(calls, reload)
-		first := len(calls) == 1
-		mu.Unlock()
-		if first {
-			close(firstStarted)
-			<-release
+		defer mu.Unlock()
+		if len(calls) != 2 {
+			t.Fatalf("run called %d times, want exactly 2: %v", len(calls), calls)
 		}
-		running.Add(-1)
+		if calls[0] || !calls[1] {
+			t.Fatalf("calls = %v, want [false true]", calls)
+		}
+		if got := maxRunning.Load(); got > 1 {
+			t.Fatalf("max concurrent runs = %d, want at most 1 (singleflight)", got)
+		}
 	})
-
-	w.onEvent("root", false)
-	select {
-	case <-firstStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first run never started")
-	}
-
-	// Events arriving while the first pass is running: only their combined
-	// reload flag (true, from the last one) should reach the rerun.
-	w.onEvent("root", false)
-	w.onEvent("root", true)
-	close(release)
-
-	waitForCalls(t, &mu, &calls, 2)
-	time.Sleep(50 * time.Millisecond) // make sure no unwanted third run sneaks in
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(calls) != 2 {
-		t.Fatalf("run called %d times, want exactly 2: %v", len(calls), calls)
-	}
-	if calls[0] || !calls[1] {
-		t.Fatalf("calls = %v, want [false true]", calls)
-	}
-	if got := maxRunning.Load(); got > 1 {
-		t.Fatalf("max concurrent runs = %d, want at most 1 (singleflight)", got)
-	}
 }
 
 // TestWatchDebouncerStop_PendingTimerNeverFires covers half of Finding 6's
@@ -115,24 +122,26 @@ func TestWatchDebouncerRerunsExactlyOnceAfterInFlightPass(t *testing.T) {
 // Stop — otherwise a pending workspace/didChangeWatchedFiles-triggered
 // revalidation would still run past server shutdown.
 func TestWatchDebouncerStop_PendingTimerNeverFires(t *testing.T) {
-	var mu sync.Mutex
-	var calls int
-	w := newWatchDebouncer(20*time.Millisecond, func(_ string, _ bool) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var calls int
+		w := newWatchDebouncer(20*time.Millisecond, func(_ string, _ bool) {
+			mu.Lock()
+			calls++
+			mu.Unlock()
+		})
+
+		w.onEvent("root", false)
+		w.Stop()
+		time.Sleep(100 * time.Millisecond) // well past the debounce delay, if it were still armed
+
 		mu.Lock()
-		calls++
+		got := calls
 		mu.Unlock()
+		if got != 0 {
+			t.Fatalf("run called %d time(s) after Stop, want 0 (the pending timer must never fire)", got)
+		}
 	})
-
-	w.onEvent("root", false)
-	w.Stop()
-	time.Sleep(100 * time.Millisecond) // well past the debounce delay, if it were still armed
-
-	mu.Lock()
-	got := calls
-	mu.Unlock()
-	if got != 0 {
-		t.Fatalf("run called %d time(s) after Stop, want 0 (the pending timer must never fire)", got)
-	}
 }
 
 // TestWatchDebouncerStop_WaitsForInFlightRun covers the other half: Stop
@@ -140,62 +149,46 @@ func TestWatchDebouncerStop_PendingTimerNeverFires(t *testing.T) {
 // rather than returning while it is still outstanding — the property a
 // shutdown-time goroutine-leak check relies on.
 func TestWatchDebouncerStop_WaitsForInFlightRun(t *testing.T) {
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var finished atomic.Bool
+	synctest.Test(t, func(t *testing.T) {
+		started := make(chan struct{})
+		release := make(chan struct{})
+		var finished atomic.Bool
 
-	w := newWatchDebouncer(5*time.Millisecond, func(_ string, _ bool) {
-		close(started)
-		<-release
-		finished.Store(true)
-	})
+		w := newWatchDebouncer(5*time.Millisecond, func(_ string, _ bool) {
+			close(started)
+			<-release
+			finished.Store(true)
+		})
 
-	w.onEvent("root", false)
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("run never started")
-	}
-
-	stopDone := make(chan struct{})
-	go func() {
-		w.Stop()
-		close(stopDone)
-	}()
-
-	select {
-	case <-stopDone:
-		t.Fatal("Stop() returned before the in-flight run finished")
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	close(release)
-	select {
-	case <-stopDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Stop() never returned after the in-flight run finished")
-	}
-	if !finished.Load() {
-		t.Fatal("Stop() returned before run actually completed")
-	}
-}
-
-func waitForCalls(t *testing.T, mu *sync.Mutex, calls *[]bool, want int) {
-	t.Helper()
-	deadline := time.After(2 * time.Second)
-	for {
-		mu.Lock()
-		n := len(*calls)
-		mu.Unlock()
-		if n >= want {
-			return
-		}
+		w.onEvent("root", false)
 		select {
-		case <-deadline:
-			t.Fatalf("run called %d time(s) within 2s, want at least %d", n, want)
-		case <-time.After(time.Millisecond):
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("run never started")
 		}
-	}
+
+		stopDone := make(chan struct{})
+		go func() {
+			w.Stop()
+			close(stopDone)
+		}()
+
+		select {
+		case <-stopDone:
+			t.Fatal("Stop() returned before the in-flight run finished")
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		close(release)
+		select {
+		case <-stopDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Stop() never returned after the in-flight run finished")
+		}
+		if !finished.Load() {
+			t.Fatal("Stop() returned before run actually completed")
+		}
+	})
 }
 
 // TestNeedsGraphReload covers needsGraphReload's classification of a .go
@@ -236,71 +229,80 @@ func TestNeedsGraphReload(t *testing.T) {
 // to a file already part of the loaded workspace schedules a
 // revalidateWorkspace pass with reload=false.
 func TestHandleDidChangeWatchedFiles_KnownGoFileEditSchedulesRevalidate(t *testing.T) {
-	s := newWorkspaceOnlyServer(t)
-	root := s.workspace().root
-	knownFile := s.workspace().snap.Packages["example.com/servermod/greet"].GoFiles[0]
+	synctest.Test(t, func(t *testing.T) {
+		s := newWorkspaceOnlyServer(t)
+		root := s.workspace().root
+		knownFile := s.workspace().snap.Packages["example.com/servermod/greet"].GoFiles[0]
 
-	calls := installSpyWatch(s)
+		calls := installSpyWatch(s)
+		t.Cleanup(s.watch.Stop)
 
-	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
-		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
-	})); err != nil {
-		t.Fatalf("handleDidChangeWatchedFiles: %v", err)
-	}
-
-	select {
-	case c := <-calls:
-		if c.root != root || c.reload {
-			t.Fatalf("got %+v, want {root:%s reload:false}", c, root)
+		if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+			Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
+		})); err != nil {
+			t.Fatalf("handleDidChangeWatchedFiles: %v", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("watch was never scheduled for a known .go file edit")
-	}
+
+		select {
+		case c := <-calls:
+			if c.root != root || c.reload {
+				t.Fatalf("got %+v, want {root:%s reload:false}", c, root)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("watch was never scheduled for a known .go file edit")
+		}
+	})
 }
 
 // TestHandleDidChangeWatchedFiles_DeletedKnownFileNeedsReload verifies that
 // deleting a file the workspace already knows about schedules a
 // revalidateWorkspace pass with reload=true.
 func TestHandleDidChangeWatchedFiles_DeletedKnownFileNeedsReload(t *testing.T) {
-	s := newWorkspaceOnlyServer(t)
-	knownFile := s.workspace().snap.Packages["example.com/servermod/greet"].GoFiles[0]
+	synctest.Test(t, func(t *testing.T) {
+		s := newWorkspaceOnlyServer(t)
+		knownFile := s.workspace().snap.Packages["example.com/servermod/greet"].GoFiles[0]
 
-	calls := installSpyWatch(s)
+		calls := installSpyWatch(s)
+		t.Cleanup(s.watch.Stop)
 
-	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
-		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeDeleted}},
-	})); err != nil {
-		t.Fatalf("handleDidChangeWatchedFiles: %v", err)
-	}
-
-	select {
-	case c := <-calls:
-		if !c.reload {
-			t.Fatalf("got %+v, want reload:true", c)
+		if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+			Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeDeleted}},
+		})); err != nil {
+			t.Fatalf("handleDidChangeWatchedFiles: %v", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("watch was never scheduled for a deleted known .go file")
-	}
+
+		select {
+		case c := <-calls:
+			if !c.reload {
+				t.Fatalf("got %+v, want reload:true", c)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("watch was never scheduled for a deleted known .go file")
+		}
+	})
 }
 
 // TestHandleDidChangeWatchedFiles_NonGoFileIsIgnored verifies that a
 // non-.go file change (e.g. a README) never schedules a revalidation pass.
 func TestHandleDidChangeWatchedFiles_NonGoFileIsIgnored(t *testing.T) {
-	s := newWorkspaceOnlyServer(t)
-	root := s.workspace().root
-	calls := installSpyWatch(s)
+	synctest.Test(t, func(t *testing.T) {
+		s := newWorkspaceOnlyServer(t)
+		root := s.workspace().root
+		calls := installSpyWatch(s)
+		t.Cleanup(s.watch.Stop)
 
-	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
-		Changes: []protocol.FileEvent{{URI: uri.File(filepath.Join(root, "README.md")), Type: protocol.FileChangeTypeChanged}},
-	})); err != nil {
-		t.Fatalf("handleDidChangeWatchedFiles: %v", err)
-	}
+		if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+			Changes: []protocol.FileEvent{{URI: uri.File(filepath.Join(root, "README.md")), Type: protocol.FileChangeTypeChanged}},
+		})); err != nil {
+			t.Fatalf("handleDidChangeWatchedFiles: %v", err)
+		}
 
-	select {
-	case c := <-calls:
-		t.Fatalf("watch was scheduled for a non-.go file change: %+v", c)
-	case <-time.After(100 * time.Millisecond):
-	}
+		select {
+		case c := <-calls:
+			t.Fatalf("watch was scheduled for a non-.go file change: %+v", c)
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
 }
 
 // TestHandleDidChangeWatchedFiles_RepeatedNoOpEventIsSuppressed verifies the
@@ -313,68 +315,71 @@ func TestHandleDidChangeWatchedFiles_NonGoFileIsIgnored(t *testing.T) {
 // pass). A later event reporting a genuine on-disk change to the same path
 // must still schedule one.
 func TestHandleDidChangeWatchedFiles_RepeatedNoOpEventIsSuppressed(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	root := t.TempDir()
-	populateTempModule(t, root)
-	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
-	if err != nil {
-		t.Fatalf("graph.Load: %v", err)
-	}
-	s := newWorkspaceOnlyServerAt(t, root, snap)
-	knownFile := s.workspace().snap.Packages["example.com/servermod/greet"].GoFiles[0]
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		root := t.TempDir()
+		populateTempModule(t, root)
+		snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+		if err != nil {
+			t.Fatalf("graph.Load: %v", err)
+		}
+		s := newWorkspaceOnlyServerAt(t, root, snap)
+		knownFile := s.workspace().snap.Packages["example.com/servermod/greet"].GoFiles[0]
 
-	calls := installSpyWatch(s)
+		calls := installSpyWatch(s)
+		t.Cleanup(s.watch.Stop)
 
-	// First event: watchFingerprints remembers nothing yet for this path,
-	// so it is always treated as a real change.
-	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
-		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
-	})); err != nil {
-		t.Fatalf("handleDidChangeWatchedFiles: %v", err)
-	}
-	select {
-	case <-calls:
-	case <-time.After(2 * time.Second):
-		t.Fatal("watch was never scheduled for the first event")
-	}
+		// First event: watchFingerprints remembers nothing yet for this path,
+		// so it is always treated as a real change.
+		if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+			Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
+		})); err != nil {
+			t.Fatalf("handleDidChangeWatchedFiles: %v", err)
+		}
+		select {
+		case <-calls:
+		case <-time.After(2 * time.Second):
+			t.Fatal("watch was never scheduled for the first event")
+		}
 
-	// Second event for the same path, file untouched on disk in between: a
-	// no-op the editor re-reported, must not schedule another pass.
-	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
-		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
-	})); err != nil {
-		t.Fatalf("handleDidChangeWatchedFiles: %v", err)
-	}
-	select {
-	case c := <-calls:
-		t.Fatalf("watch was scheduled for a repeated no-op event: %+v", c)
-	case <-time.After(100 * time.Millisecond):
-	}
+		// Second event for the same path, file untouched on disk in between: a
+		// no-op the editor re-reported, must not schedule another pass.
+		if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+			Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
+		})); err != nil {
+			t.Fatalf("handleDidChangeWatchedFiles: %v", err)
+		}
+		select {
+		case c := <-calls:
+			t.Fatalf("watch was scheduled for a repeated no-op event: %+v", c)
+		case <-time.After(100 * time.Millisecond):
+		}
 
-	// Third event, after a genuine on-disk change (size changes, so this is
-	// immune to coarse mtime resolution): must schedule again.
-	// I/O goes through a literally-constructed path (static analysis
-	// rejects snapshot-derived ones); assert it names the same file the
-	// events report so the fingerprint check sees the change.
-	safePath := filepath.Join(root, "greet", "greet.go")
-	if safePath != knownFile {
-		t.Fatalf("fixture layout changed: snapshot file %s, expected %s", knownFile, safePath)
-	}
-	data, err := os.ReadFile(filepath.Clean(safePath))
-	if err != nil {
-		t.Fatalf("read %s: %v", safePath, err)
-	}
-	writeTempFile(t, filepath.Join(root, "greet"), "greet.go", string(data)+"\n")
-	if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
-		Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
-	})); err != nil {
-		t.Fatalf("handleDidChangeWatchedFiles: %v", err)
-	}
-	select {
-	case <-calls:
-	case <-time.After(2 * time.Second):
-		t.Fatal("watch was never scheduled after a genuine on-disk change")
-	}
+		// Third event, after a genuine on-disk change (size changes, so this is
+		// immune to coarse mtime resolution): must schedule again.
+		// I/O goes through a literally-constructed path (static analysis
+		// rejects snapshot-derived ones); assert it names the same file the
+		// events report so the fingerprint check sees the change.
+		safePath := filepath.Join(root, "greet", "greet.go")
+		if safePath != knownFile {
+			t.Fatalf("fixture layout changed: snapshot file %s, expected %s", knownFile, safePath)
+		}
+		data, err := os.ReadFile(filepath.Clean(safePath))
+		if err != nil {
+			t.Fatalf("read %s: %v", safePath, err)
+		}
+		writeTempFile(t, filepath.Join(root, "greet"), "greet.go", string(data)+"\n")
+		if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+			Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
+		})); err != nil {
+			t.Fatalf("handleDidChangeWatchedFiles: %v", err)
+		}
+		select {
+		case <-calls:
+		case <-time.After(2 * time.Second):
+			t.Fatal("watch was never scheduled after a genuine on-disk change")
+		}
+	})
 }
 
 // watchCall records one s.watch run invocation, for installSpyWatch.

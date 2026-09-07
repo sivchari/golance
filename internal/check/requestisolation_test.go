@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sivchari/golance/internal/overlay"
@@ -19,69 +20,71 @@ import (
 // where an editor request got "context canceled" for a request that was
 // still alive.
 func TestEngine_Get_NotCanceledByBackgroundRecheck(t *testing.T) {
-	gr := &gatingReader{
-		FileReader: overlay.New(),
-		started:    make(chan struct{}),
-		release:    make(chan struct{}),
-	}
-	var mu sync.Mutex
-	var bgResults int
+	synctest.Test(t, func(t *testing.T) {
+		gr := &gatingReader{
+			FileReader: overlay.New(),
+			started:    make(chan struct{}),
+			release:    make(chan struct{}),
+		}
+		var mu sync.Mutex
+		var bgResults int
 
-	e, root := newTestEngine(t, gr, Options{
-		DebounceDelay: 20 * time.Millisecond,
-		OnResult: func(*Result) {
-			mu.Lock()
-			bgResults++
-			mu.Unlock()
-		},
+		e, root := newTestEngine(t, gr, Options{
+			DebounceDelay: 20 * time.Millisecond,
+			OnResult: func(*Result) {
+				mu.Lock()
+				bgResults++
+				mu.Unlock()
+			},
+		})
+		dir := filepath.Join(root, "debounce")
+		path := filepath.Join(dir, "debounce.go")
+
+		type getOutcome struct {
+			cp  *CheckedPackage
+			err error
+		}
+		done := make(chan getOutcome, 1)
+		go func() {
+			cp, err := e.Get(context.Background(), path)
+			done <- getOutcome{cp, err}
+		}()
+
+		select {
+		case <-gr.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Get's recheck never started reading")
+		}
+
+		// Get is now blocked mid-read. Trigger a background recheck for the
+		// same directory and give its debounce time to fire and complete —
+		// under the old shared-cancellation design this would cancel Get.
+		e.Invalidate(dir)
+		time.Sleep(150 * time.Millisecond)
+
+		close(gr.release)
+
+		var outcome getOutcome
+		select {
+		case outcome = <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Get never completed after being unblocked")
+		}
+
+		if outcome.err != nil {
+			t.Fatalf("Get returned error %v, want nil (must not be canceled by a concurrent background recheck)", outcome.err)
+		}
+		if outcome.cp == nil {
+			t.Fatal("Get returned a nil CheckedPackage with a nil error")
+		}
+
+		mu.Lock()
+		got := bgResults
+		mu.Unlock()
+		if got == 0 {
+			t.Error("expected the background recheck to have completed and published a result")
+		}
 	})
-	dir := filepath.Join(root, "debounce")
-	path := filepath.Join(dir, "debounce.go")
-
-	type getOutcome struct {
-		cp  *CheckedPackage
-		err error
-	}
-	done := make(chan getOutcome, 1)
-	go func() {
-		cp, err := e.Get(context.Background(), path)
-		done <- getOutcome{cp, err}
-	}()
-
-	select {
-	case <-gr.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Get's recheck never started reading")
-	}
-
-	// Get is now blocked mid-read. Trigger a background recheck for the
-	// same directory and give its debounce time to fire and complete —
-	// under the old shared-cancellation design this would cancel Get.
-	e.Invalidate(dir)
-	time.Sleep(150 * time.Millisecond)
-
-	close(gr.release)
-
-	var outcome getOutcome
-	select {
-	case outcome = <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Get never completed after being unblocked")
-	}
-
-	if outcome.err != nil {
-		t.Fatalf("Get returned error %v, want nil (must not be canceled by a concurrent background recheck)", outcome.err)
-	}
-	if outcome.cp == nil {
-		t.Fatal("Get returned a nil CheckedPackage with a nil error")
-	}
-
-	mu.Lock()
-	got := bgResults
-	mu.Unlock()
-	if got == 0 {
-		t.Error("expected the background recheck to have completed and published a result")
-	}
 }
 
 // TestEngine_Commit_OlderGenerationDoesNotClobberNewer covers the ordering

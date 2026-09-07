@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sivchari/golance/internal/depcheck"
@@ -482,42 +483,44 @@ func TestEngine_Get_ExternalTestPackageCachedIndependently(t *testing.T) {
 // Invalidate(dir) — called for an edit to either file — reschedules both
 // variants, not just the base one.
 func TestEngine_Invalidate_InvalidatesBothVariants(t *testing.T) {
-	var mu sync.Mutex
-	seen := make(map[string]bool)
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		seen := make(map[string]bool)
 
-	e, root := newTestEngine(t, overlay.New(), Options{
-		DebounceDelay: 20 * time.Millisecond,
-		OnResult: func(r *Result) {
-			mu.Lock()
-			seen[r.PkgPath] = true
-			mu.Unlock()
-		},
+		e, root := newTestEngine(t, overlay.New(), Options{
+			DebounceDelay: 20 * time.Millisecond,
+			OnResult: func(r *Result) {
+				mu.Lock()
+				seen[r.PkgPath] = true
+				mu.Unlock()
+			},
+		})
+		dir := filepath.Join(root, "withtests")
+		baseFile := filepath.Join(dir, "withtests.go")
+		extFile := filepath.Join(dir, "withtests_ext_test.go")
+
+		ctx := context.Background()
+		baseCP, err := e.Get(ctx, baseFile)
+		if err != nil {
+			t.Fatalf("Get(withtests.go): %v", err)
+		}
+		extCP, err := e.Get(ctx, extFile)
+		if err != nil {
+			t.Fatalf("Get(withtests_ext_test.go): %v", err)
+		}
+
+		e.Invalidate(dir)
+		time.Sleep(300 * time.Millisecond)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if !seen[baseCP.PkgPath()] {
+			t.Errorf("Invalidate(dir) never republished the base unit (%q)", baseCP.PkgPath())
+		}
+		if !seen[extCP.PkgPath()] {
+			t.Errorf("Invalidate(dir) never republished the external test unit (%q)", extCP.PkgPath())
+		}
 	})
-	dir := filepath.Join(root, "withtests")
-	baseFile := filepath.Join(dir, "withtests.go")
-	extFile := filepath.Join(dir, "withtests_ext_test.go")
-
-	ctx := context.Background()
-	baseCP, err := e.Get(ctx, baseFile)
-	if err != nil {
-		t.Fatalf("Get(withtests.go): %v", err)
-	}
-	extCP, err := e.Get(ctx, extFile)
-	if err != nil {
-		t.Fatalf("Get(withtests_ext_test.go): %v", err)
-	}
-
-	e.Invalidate(dir)
-	time.Sleep(300 * time.Millisecond)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if !seen[baseCP.PkgPath()] {
-		t.Errorf("Invalidate(dir) never republished the base unit (%q)", baseCP.PkgPath())
-	}
-	if !seen[extCP.PkgPath()] {
-		t.Errorf("Invalidate(dir) never republished the external test unit (%q)", extCP.PkgPath())
-	}
 }
 
 // testEngineSnapshot returns the *graph.Snapshot newTestEngine loaded e's

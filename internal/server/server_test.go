@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"go.lsp.dev/protocol"
@@ -236,62 +237,64 @@ func TestHandleHover_Builtin(t *testing.T) {
 // (see handleInitialize/loadWorkspaceAsync) parks instead of answering
 // empty outright, and resolves correctly once setWorkspace installs one.
 func TestCheckedFile_WaitsForWorkspaceThenResolves(t *testing.T) {
-	root, err := filepath.Abs(filepath.Join("testdata", "module"))
-	if err != nil {
-		t.Fatalf("abs testdata root: %v", err)
-	}
-	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
-	if err != nil {
-		t.Fatalf("graph.Load: %v", err)
-	}
-	file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
-	pos := identPosition(t, file, 2) // call site in useHello
-
-	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
-	s := New(rpcServer, Options{Logger: newTestLogger(t)})
-
-	type hoverResult struct {
-		result any
-		err    error
-	}
-	done := make(chan hoverResult, 1)
-	go func() {
-		result, err := s.handleHover(context.Background(), mustMarshal(t, &protocol.HoverParams{
-			TextDocumentPositionParams: protocol.TextDocumentPositionParams{
-				TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
-				Position:     pos,
-			},
-		}))
-		done <- hoverResult{result, err}
-	}()
-
-	select {
-	case r := <-done:
-		t.Fatalf("handleHover returned before setWorkspace ran (result=%#v, err=%v); want it parked in waitWorkspace", r.result, r.err)
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	s.setWorkspace(root, snap)
-
-	select {
-	case r := <-done:
-		if r.err != nil {
-			t.Fatalf("handleHover: %v", r.err)
+	synctest.Test(t, func(t *testing.T) {
+		root, err := filepath.Abs(filepath.Join("testdata", "module"))
+		if err != nil {
+			t.Fatalf("abs testdata root: %v", err)
 		}
-		hover, ok := r.result.(*protocol.Hover)
-		if !ok || hover == nil {
-			t.Fatalf("handleHover result = %#v, want *protocol.Hover", r.result)
+		snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+		if err != nil {
+			t.Fatalf("graph.Load: %v", err)
 		}
-		md, ok := hover.Contents.(*protocol.MarkupContent)
-		if !ok {
-			t.Fatalf("hover.Contents = %#v, want *protocol.MarkupContent", hover.Contents)
+		file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+		pos := identPosition(t, file, 2) // call site in useHello
+
+		rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+		s := New(rpcServer, Options{Logger: newTestLogger(t)})
+
+		type hoverResult struct {
+			result any
+			err    error
 		}
-		if want := "func Hello"; !contains(md.Value, want) {
-			t.Fatalf("hover content = %q, want it to contain %q", md.Value, want)
+		done := make(chan hoverResult, 1)
+		go func() {
+			result, err := s.handleHover(context.Background(), mustMarshal(t, &protocol.HoverParams{
+				TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+					TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+					Position:     pos,
+				},
+			}))
+			done <- hoverResult{result, err}
+		}()
+
+		select {
+		case r := <-done:
+			t.Fatalf("handleHover returned before setWorkspace ran (result=%#v, err=%v); want it parked in waitWorkspace", r.result, r.err)
+		case <-time.After(200 * time.Millisecond):
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("handleHover never returned after setWorkspace ran")
-	}
+
+		s.setWorkspace(root, snap)
+
+		select {
+		case r := <-done:
+			if r.err != nil {
+				t.Fatalf("handleHover: %v", r.err)
+			}
+			hover, ok := r.result.(*protocol.Hover)
+			if !ok || hover == nil {
+				t.Fatalf("handleHover result = %#v, want *protocol.Hover", r.result)
+			}
+			md, ok := hover.Contents.(*protocol.MarkupContent)
+			if !ok {
+				t.Fatalf("hover.Contents = %#v, want *protocol.MarkupContent", hover.Contents)
+			}
+			if want := "func Hello"; !contains(md.Value, want) {
+				t.Fatalf("hover content = %q, want it to contain %q", md.Value, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("handleHover never returned after setWorkspace ran")
+		}
+	})
 }
 
 // TestCheckedFile_ContextDoneReturnsEmptyWithoutWorkspace verifies the other
@@ -300,35 +303,37 @@ func TestCheckedFile_WaitsForWorkspaceThenResolves(t *testing.T) {
 // result promptly, instead of blocking forever — "the client cancels via
 // its own timeout if it wants" (see waitWorkspace's doc).
 func TestCheckedFile_ContextDoneReturnsEmptyWithoutWorkspace(t *testing.T) {
-	root, err := filepath.Abs(filepath.Join("testdata", "module"))
-	if err != nil {
-		t.Fatalf("abs testdata root: %v", err)
-	}
-	file := filepath.Join(root, "greet", "greet.go")
+	synctest.Test(t, func(t *testing.T) {
+		root, err := filepath.Abs(filepath.Join("testdata", "module"))
+		if err != nil {
+			t.Fatalf("abs testdata root: %v", err)
+		}
+		file := filepath.Join(root, "greet", "greet.go")
 
-	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
-	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+		rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+		s := New(rpcServer, Options{Logger: newTestLogger(t)})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
 
-	start := time.Now()
-	result, err := s.handleHover(ctx, mustMarshal(t, &protocol.HoverParams{
-		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
-			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
-			Position:     protocol.Position{Line: 0, Character: 0},
-		},
-	}))
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("handleHover(ctx done, no workspace): error = %v, want nil (a null result, not a wire error)", err)
-	}
-	if result != nil {
-		t.Fatalf("handleHover(ctx done, no workspace) result = %#v, want nil", result)
-	}
-	if elapsed > 2*time.Second {
-		t.Fatalf("handleHover took %v after its own ctx expired; want it to return promptly once ctx is done", elapsed)
-	}
+		start := time.Now()
+		result, err := s.handleHover(ctx, mustMarshal(t, &protocol.HoverParams{
+			TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+				TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+				Position:     protocol.Position{Line: 0, Character: 0},
+			},
+		}))
+		elapsed := time.Since(start)
+		if err != nil {
+			t.Fatalf("handleHover(ctx done, no workspace): error = %v, want nil (a null result, not a wire error)", err)
+		}
+		if result != nil {
+			t.Fatalf("handleHover(ctx done, no workspace) result = %#v, want nil", result)
+		}
+		if elapsed != 100*time.Millisecond {
+			t.Fatalf("handleHover took %v after its own ctx expired; want it to return exactly at ctx's 100ms timeout", elapsed)
+		}
+	})
 }
 
 func TestHandleDefinition(t *testing.T) {
