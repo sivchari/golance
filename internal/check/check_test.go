@@ -532,5 +532,5 @@ func testEngineSnapshot(t *testing.T, e *Engine) (*graph.Snapshot, bool) {
 	if !ok {
 		return nil, false
 	}
-	return gs.snap, true
+	return gs.idx.Load().snap, true
 }

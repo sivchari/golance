@@ -57,8 +57,14 @@ type Options struct {
 // snapshot, so a workspace/didChangeWatchedFiles-triggered reload can swap
 // them in atomically without a lock on the read path.
 type workspace struct {
-	root     string
-	snap     *graph.Snapshot
+	root string
+	snap *graph.Snapshot
+	// graphSrc is the check.SnapshotSource ws.engine resolves
+	// PackageForFile against. It is retargeted in place (check.GraphSource
+	// .Retarget), rather than replaced, across every setWorkspace call that
+	// reuses engine — see setWorkspace's own doc for when that is and why
+	// it is sound.
+	graphSrc *check.GraphSource
 	engine   *check.Engine
 	depCache *depCacheHolder
 	// depProvider resolves non-workspace (standard library, module

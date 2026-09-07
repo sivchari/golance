@@ -102,6 +102,16 @@ type Stats struct {
 	// on wall-clock time, which a shared CI runner's load can make an
 	// unreliable proxy for the same fact.
 	TypeChecked int
+	// Changed is only populated by Reindex: the changed package plus every
+	// reverse-dependency-closure hop Reindex actually reprocessed (i.e. not
+	// skipped — see processUnit's unchangedOutcome path), in the order each
+	// was resolved. A skipped hop's combined blob key provably matched what
+	// db already had, so its ExportHash could not have changed either;
+	// Changed is therefore the exact subset of the walked closure whose
+	// export data may actually differ, for a caller to invalidate
+	// downstream caches (e.g. a decoded *types.Package cache) against
+	// instead of the whole closure Reindex walked to determine that.
+	Changed []string
 }
 
 // Build resolves every root (workspace) package in snap against db and cas,

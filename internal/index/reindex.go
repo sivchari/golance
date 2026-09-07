@@ -129,6 +129,7 @@ func reindexOne(ctx context.Context, fset *token.FileSet, imp *typecheck.Importe
 		stats.Skipped++
 	} else {
 		stats.Processed++
+		stats.Changed = append(stats.Changed, path)
 		if typeChecked {
 			stats.TypeChecked++
 		}
