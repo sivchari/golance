@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -292,43 +293,45 @@ func TestExitWithoutShutdownExitsWithCodeOne(t *testing.T) {
 }
 
 func TestCancelRequestCancelsHandlerContext(t *testing.T) {
-	s := newTestServer(t)
-	started := make(chan struct{})
-	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
-	s.Handle("slow", Background, func(ctx context.Context, _ json.RawMessage) (any, error) {
-		close(started)
-		<-ctx.Done()
-		return nil, ctx.Err()
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestServer(t)
+		started := make(chan struct{})
+		s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
+		s.Handle("slow", Background, func(ctx context.Context, _ json.RawMessage) (any, error) {
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+
+		in := strings.NewReader(
+			frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`) +
+				frame(t, `{"jsonrpc":"2.0","id":2,"method":"slow","params":{}}`) +
+				frame(t, `{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":2}}`),
+		)
+		var out bytes.Buffer
+		done := make(chan error, 1)
+		go func() { done <- s.Serve(context.Background(), in, &out) }()
+
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("handler never started")
+		}
+
+		if err := <-done; err != nil {
+			t.Fatalf("Serve() error = %v", err)
+		}
+		frames := readFrames(t, out.Bytes())
+		if len(frames) != 2 {
+			t.Fatalf("got %d frames, want 2: %v", len(frames), frames)
+		}
+		f := frameForID(t, frames, 2)
+		errObj, _ := f["error"].(map[string]any)
+		code, ok := errObj["code"].(float64)
+		if errObj == nil || !ok || int32(code) != requestCancelledCode {
+			t.Fatalf("frame = %v, want RequestCancelled", f)
+		}
 	})
-
-	in := strings.NewReader(
-		frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`) +
-			frame(t, `{"jsonrpc":"2.0","id":2,"method":"slow","params":{}}`) +
-			frame(t, `{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":2}}`),
-	)
-	var out bytes.Buffer
-	done := make(chan error, 1)
-	go func() { done <- s.Serve(context.Background(), in, &out) }()
-
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("handler never started")
-	}
-
-	if err := <-done; err != nil {
-		t.Fatalf("Serve() error = %v", err)
-	}
-	frames := readFrames(t, out.Bytes())
-	if len(frames) != 2 {
-		t.Fatalf("got %d frames, want 2: %v", len(frames), frames)
-	}
-	f := frameForID(t, frames, 2)
-	errObj, _ := f["error"].(map[string]any)
-	code, ok := errObj["code"].(float64)
-	if errObj == nil || !ok || int32(code) != requestCancelledCode {
-		t.Fatalf("frame = %v, want RequestCancelled", f)
-	}
 }
 
 func TestCancelRequestForUnknownIDIsNoop(t *testing.T) {
@@ -342,62 +345,54 @@ func TestCancelRequestForUnknownIDIsNoop(t *testing.T) {
 }
 
 func TestNotificationsForSameURIRunInOrder(t *testing.T) {
-	s := newTestServer(t)
-	var mu sync.Mutex
-	var order []int
-	release := make(chan struct{})
-	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
-	s.HandleNotification("first", func(context.Context, json.RawMessage) error {
-		<-release // force the second notification to queue behind this one
-		mu.Lock()
-		order = append(order, 1)
-		mu.Unlock()
-		return nil
-	})
-	s.HandleNotification("second", func(context.Context, json.RawMessage) error {
-		mu.Lock()
-		order = append(order, 2)
-		mu.Unlock()
-		return nil
-	})
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestServer(t)
+		var mu sync.Mutex
+		var order []int
+		release := make(chan struct{})
+		s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
+		s.HandleNotification("first", func(context.Context, json.RawMessage) error {
+			<-release // force the second notification to queue behind this one
+			mu.Lock()
+			order = append(order, 1)
+			mu.Unlock()
+			return nil
+		})
+		s.HandleNotification("second", func(context.Context, json.RawMessage) error {
+			mu.Lock()
+			order = append(order, 2)
+			mu.Unlock()
+			return nil
+		})
 
-	uri := `{"textDocument":{"uri":"file:///a.go"}}`
-	in := strings.NewReader(
-		frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`) +
-			frame(t, fmt.Sprintf(`{"jsonrpc":"2.0","method":"first","params":%s}`, uri)) +
-			frame(t, fmt.Sprintf(`{"jsonrpc":"2.0","method":"second","params":%s}`, uri)),
-	)
-	done := make(chan error, 1)
-	go func() { done <- s.Serve(context.Background(), in, &bytes.Buffer{}) }()
+		uri := `{"textDocument":{"uri":"file:///a.go"}}`
+		in := strings.NewReader(
+			frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`) +
+				frame(t, fmt.Sprintf(`{"jsonrpc":"2.0","method":"first","params":%s}`, uri)) +
+				frame(t, fmt.Sprintf(`{"jsonrpc":"2.0","method":"second","params":%s}`, uri)),
+		)
+		done := make(chan error, 1)
+		go func() { done <- s.Serve(context.Background(), in, &bytes.Buffer{}) }()
 
-	// Give the dispatcher time to enqueue both notifications behind "first"
-	// before releasing it, so the test actually exercises queuing rather
-	// than accidentally passing due to scheduling luck.
-	time.Sleep(50 * time.Millisecond)
-	close(release)
+		// Wait until the dispatcher has parked, i.e. both notifications are
+		// enqueued behind "first", so the test actually exercises queuing
+		// rather than accidentally passing due to scheduling luck.
+		synctest.Wait()
+		close(release)
 
-	if err := <-done; err != nil {
-		t.Fatalf("Serve() error = %v", err)
-	}
-	// Notification handlers run in a goroutine drained from the queue;
-	// wait for both to finish recording their order.
-	deadline := time.After(5 * time.Second)
-	for {
-		mu.Lock()
-		n := len(order)
-		mu.Unlock()
-		if n == 2 {
-			break
+		if err := <-done; err != nil {
+			t.Fatalf("Serve() error = %v", err)
 		}
-		select {
-		case <-deadline:
-			t.Fatalf("notifications did not both run, order = %v", order)
-		case <-time.After(time.Millisecond):
+		// Notification handlers run in a goroutine drained from the queue;
+		// wait for both to finish recording their order.
+		synctest.Wait()
+		mu.Lock()
+		got := append([]int(nil), order...)
+		mu.Unlock()
+		if len(got) != 2 || got[0] != 1 || got[1] != 2 {
+			t.Fatalf("order = %v, want [1 2]", got)
 		}
-	}
-	if order[0] != 1 || order[1] != 2 {
-		t.Fatalf("order = %v, want [1 2]", order)
-	}
+	})
 }
 
 func TestPlainErrorIsReportedAsInternalError(t *testing.T) {
@@ -472,33 +467,35 @@ func TestPanickingRequestHandlerReturnsInternalErrorAndServerKeepsServing(t *tes
 // response to send, so it must be logged and swallowed rather than crashing
 // the process or wedging that notification's per-document queue.
 func TestPanickingNotificationHandlerIsSwallowedAndServerKeepsServing(t *testing.T) {
-	s := newTestServer(t)
-	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
-	s.HandleNotification("boom", func(context.Context, json.RawMessage) error {
-		panic("deliberate notification panic")
-	})
-	ran := make(chan struct{}, 1)
-	s.HandleNotification("after", func(context.Context, json.RawMessage) error {
-		ran <- struct{}{}
-		return nil
-	})
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestServer(t)
+		s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
+		s.HandleNotification("boom", func(context.Context, json.RawMessage) error {
+			panic("deliberate notification panic")
+		})
+		ran := make(chan struct{}, 1)
+		s.HandleNotification("after", func(context.Context, json.RawMessage) error {
+			ran <- struct{}{}
+			return nil
+		})
 
-	uri := `{"textDocument":{"uri":"file:///a.go"}}`
-	in := strings.NewReader(
-		frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`) +
-			frame(t, fmt.Sprintf(`{"jsonrpc":"2.0","method":"boom","params":%s}`, uri)) +
-			frame(t, fmt.Sprintf(`{"jsonrpc":"2.0","method":"after","params":%s}`, uri)),
-	)
-	var out bytes.Buffer
-	if err := s.Serve(context.Background(), in, &out); err != nil {
-		t.Fatalf("Serve() error = %v", err)
-	}
+		uri := `{"textDocument":{"uri":"file:///a.go"}}`
+		in := strings.NewReader(
+			frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`) +
+				frame(t, fmt.Sprintf(`{"jsonrpc":"2.0","method":"boom","params":%s}`, uri)) +
+				frame(t, fmt.Sprintf(`{"jsonrpc":"2.0","method":"after","params":%s}`, uri)),
+		)
+		var out bytes.Buffer
+		if err := s.Serve(context.Background(), in, &out); err != nil {
+			t.Fatalf("Serve() error = %v", err)
+		}
 
-	select {
-	case <-ran:
-	case <-time.After(5 * time.Second):
-		t.Fatal("notification queued after the panicking one never ran; the queue is wedged")
-	}
+		select {
+		case <-ran:
+		case <-time.After(5 * time.Second):
+			t.Fatal("notification queued after the panicking one never ran; the queue is wedged")
+		}
+	})
 }
 
 func TestHandlerReturnedErrorPreservesCode(t *testing.T) {
@@ -575,79 +572,85 @@ func waitForFrame(t *testing.T, out *syncBuffer) json.RawMessage {
 }
 
 func TestRequestReturnsClientResponse(t *testing.T) {
-	s := newTestServer(t)
-	out := newSyncBuffer()
-	s.conn = newConn(out)
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestServer(t)
+		out := newSyncBuffer()
+		s.conn = newConn(out)
 
-	type outcome struct {
-		result json.RawMessage
-		err    error
-	}
-	done := make(chan outcome, 1)
-	go func() {
-		result, err := s.Request(context.Background(), "client/registerCapability", map[string]string{"id": "watch-go"})
-		done <- outcome{result, err}
-	}()
-
-	// Reply as the client would, echoing back the id Request assigned.
-	id := waitForFrame(t, out)
-	s.dispatchResponse(&message{ID: id, Result: json.RawMessage(`{"ok":true}`)})
-
-	select {
-	case got := <-done:
-		if got.err != nil {
-			t.Fatalf("Request() error = %v", got.err)
+		type outcome struct {
+			result json.RawMessage
+			err    error
 		}
-		if string(got.result) != `{"ok":true}` {
-			t.Fatalf("Request() result = %s, want {\"ok\":true}", got.result)
+		done := make(chan outcome, 1)
+		go func() {
+			result, err := s.Request(context.Background(), "client/registerCapability", map[string]string{"id": "watch-go"})
+			done <- outcome{result, err}
+		}()
+
+		// Reply as the client would, echoing back the id Request assigned.
+		id := waitForFrame(t, out)
+		s.dispatchResponse(&message{ID: id, Result: json.RawMessage(`{"ok":true}`)})
+
+		select {
+		case got := <-done:
+			if got.err != nil {
+				t.Fatalf("Request() error = %v", got.err)
+			}
+			if string(got.result) != `{"ok":true}` {
+				t.Fatalf("Request() result = %s, want {\"ok\":true}", got.result)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Request() did not return after its response was dispatched")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Request() did not return after its response was dispatched")
-	}
+	})
 }
 
 func TestRequestReturnsClientError(t *testing.T) {
-	s := newTestServer(t)
-	out := newSyncBuffer()
-	s.conn = newConn(out)
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestServer(t)
+		out := newSyncBuffer()
+		s.conn = newConn(out)
 
-	done := make(chan error, 1)
-	go func() {
-		_, err := s.Request(context.Background(), "client/registerCapability", map[string]string{})
-		done <- err
-	}()
+		done := make(chan error, 1)
+		go func() {
+			_, err := s.Request(context.Background(), "client/registerCapability", map[string]string{})
+			done <- err
+		}()
 
-	id := waitForFrame(t, out)
-	s.dispatchResponse(&message{ID: id, Error: &wireError{Code: internalErrorCode, Message: "not supported"}})
+		id := waitForFrame(t, out)
+		s.dispatchResponse(&message{ID: id, Error: &wireError{Code: internalErrorCode, Message: "not supported"}})
 
-	select {
-	case err := <-done:
-		var rpcErr *Error
-		if !errors.As(err, &rpcErr) || rpcErr.Message != "not supported" {
-			t.Fatalf("Request() error = %v, want an *Error wrapping %q", err, "not supported")
+		select {
+		case err := <-done:
+			var rpcErr *Error
+			if !errors.As(err, &rpcErr) || rpcErr.Message != "not supported" {
+				t.Fatalf("Request() error = %v, want an *Error wrapping %q", err, "not supported")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Request() did not return after its error response was dispatched")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Request() did not return after its error response was dispatched")
-	}
+	})
 }
 
 func TestRequestReturnsContextErrorOnTimeout(t *testing.T) {
-	s := newTestServer(t)
-	out := newSyncBuffer()
-	s.conn = newConn(out)
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestServer(t)
+		out := newSyncBuffer()
+		s.conn = newConn(out)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	_, err := s.Request(ctx, "client/registerCapability", map[string]string{})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Request() error = %v, want context.DeadlineExceeded", err)
-	}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		_, err := s.Request(ctx, "client/registerCapability", map[string]string{})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Request() error = %v, want context.DeadlineExceeded", err)
+		}
 
-	// The abandoned pending entry must not still be there, or a
-	// since-deregistered client response arriving late would leak: dispatch
-	// one and confirm it is silently dropped rather than panicking.
-	id := waitForFrame(t, out)
-	s.dispatchResponse(&message{ID: id, Result: json.RawMessage(`{}`)})
+		// The abandoned pending entry must not still be there, or a
+		// since-deregistered client response arriving late would leak: dispatch
+		// one and confirm it is silently dropped rather than panicking.
+		id := waitForFrame(t, out)
+		s.dispatchResponse(&message{ID: id, Result: json.RawMessage(`{}`)})
+	})
 }
 
 func TestNotifyWritesNotificationFrame(t *testing.T) {
@@ -679,28 +682,30 @@ func TestContext_BeforeServeReturnsBackground(t *testing.T) {
 // background work relies on to stop instead of outliving the session: once
 // Serve returns (here, on a clean EOF), Context is canceled.
 func TestContext_CanceledWhenServeReturns(t *testing.T) {
-	s := newTestServer(t)
-	pr, pw := io.Pipe()
-	var out bytes.Buffer
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestServer(t)
+		pr, pw := io.Pipe()
+		var out bytes.Buffer
 
-	done := make(chan error, 1)
-	go func() { done <- s.Serve(context.Background(), pr, &out) }()
+		done := make(chan error, 1)
+		go func() { done <- s.Serve(context.Background(), pr, &out) }()
 
-	if err := pw.Close(); err != nil {
-		t.Fatalf("close pipe writer: %v", err)
-	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Serve() error = %v, want nil (clean EOF)", err)
+		if err := pw.Close(); err != nil {
+			t.Fatalf("close pipe writer: %v", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Serve() did not return after EOF")
-	}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Serve() error = %v, want nil (clean EOF)", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Serve() did not return after EOF")
+		}
 
-	if err := s.Context().Err(); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Context().Err() after Serve returned = %v, want context.Canceled", err)
-	}
+		if err := s.Context().Err(); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Context().Err() after Serve returned = %v, want context.Canceled", err)
+		}
+	})
 }
 
 // TestGo_TrackedByServeShutdownDrain verifies both of Go's guarantees at
