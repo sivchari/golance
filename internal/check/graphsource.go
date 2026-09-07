@@ -5,6 +5,7 @@ import (
 	"go/token"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/overlay"
@@ -38,13 +39,22 @@ func externalTestVariant(pkgPath string) (basePkgPath string, ok bool) {
 	return strings.CutSuffix(pkgPath, externalTestPkgPathMarker)
 }
 
-// GraphSource adapts a *graph.Snapshot into a SnapshotSource by indexing
-// its packages' GoFiles once at construction time.
-type GraphSource struct {
+// graphIndex is the snapshot-derived state a GraphSource resolves
+// PackageForFile against: the snapshot itself plus the fileToPkg/dirToPkg
+// indexes built from it. It is immutable once built, so a *graphIndex can be
+// published via atomic.Pointer and read without locking — see GraphSource.idx
+// and Retarget.
+type graphIndex struct {
 	snap      *graph.Snapshot
-	reader    overlay.FileReader
 	fileToPkg map[string]string
 	dirToPkg  map[string]string
+}
+
+// GraphSource adapts a *graph.Snapshot into a SnapshotSource by indexing its
+// packages' GoFiles once at construction time (and again on every Retarget).
+type GraphSource struct {
+	reader overlay.FileReader
+	idx    atomic.Pointer[graphIndex]
 }
 
 // NewGraphSource returns a SnapshotSource backed by snap. reader is used
@@ -52,6 +62,22 @@ type GraphSource struct {
 // docs), to read the package clause of a file that snap does not itself
 // resolve.
 func NewGraphSource(snap *graph.Snapshot, reader overlay.FileReader) *GraphSource {
+	g := &GraphSource{reader: reader}
+	g.idx.Store(buildGraphIndex(snap))
+	return g
+}
+
+// Retarget rebuilds the index against snap and atomically swaps it in, so
+// PackageForFile resolves against snap from then on. Because the swap is a
+// single atomic pointer store, a PackageForFile call already in flight sees
+// either the old index or the new one in full — never a mix of the two —
+// regardless of how it interleaves with Retarget.
+func (g *GraphSource) Retarget(snap *graph.Snapshot) {
+	g.idx.Store(buildGraphIndex(snap))
+}
+
+// buildGraphIndex indexes snap's packages' GoFiles into a *graphIndex.
+func buildGraphIndex(snap *graph.Snapshot) *graphIndex {
 	fileToPkg := make(map[string]string)
 	dirToPkg := make(map[string]string, len(snap.Packages))
 	for pkgPath, pkg := range snap.Packages {
@@ -77,7 +103,7 @@ func NewGraphSource(snap *graph.Snapshot, reader overlay.FileReader) *GraphSourc
 		}
 		dirToPkg[pkg.Dir] = pkgPath
 	}
-	return &GraphSource{snap: snap, reader: reader, fileToPkg: fileToPkg, dirToPkg: dirToPkg}
+	return &graphIndex{snap: snap, fileToPkg: fileToPkg, dirToPkg: dirToPkg}
 }
 
 // PackageForFile implements SnapshotSource. If path is not itself a known
@@ -102,18 +128,19 @@ func NewGraphSource(snap *graph.Snapshot, reader overlay.FileReader) *GraphSourc
 // ok=false if path has no readable or parseable package clause, so an
 // empty buffer or a non-Go file continues to get no language features.
 func (g *GraphSource) PackageForFile(path string) (pkgPath, dir string, goFiles []string, ok bool) {
-	if pp, hit := g.fileToPkg[path]; hit {
-		pkg, pkgOK := g.snap.Package(pp)
+	idx := g.idx.Load()
+	if pp, hit := idx.fileToPkg[path]; hit {
+		pkg, pkgOK := idx.snap.Package(pp)
 		if !pkgOK {
 			return "", "", nil, false
 		}
 		return pp, pkg.Dir, pkg.GoFiles, true
 	}
-	pp, hit := g.dirToPkg[filepath.Dir(path)]
+	pp, hit := idx.dirToPkg[filepath.Dir(path)]
 	if !hit {
 		return g.adhocPackageForFile(path)
 	}
-	pkg, pkgOK := g.snap.Package(pp)
+	pkg, pkgOK := idx.snap.Package(pp)
 	if !pkgOK {
 		return "", "", nil, false
 	}

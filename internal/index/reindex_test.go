@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -106,6 +107,84 @@ func Shout(name string, n int) string {
 	}
 	if stats.Processed != 2 {
 		t.Errorf("Processed = %d, want 2 (mid and top, since mid's export data changed)", stats.Processed)
+	}
+}
+
+// TestReindex_Stats_ChangedTracksActuallyReprocessedHops verifies
+// Stats.Changed reflects exactly the hops Reindex actually reprocessed
+// (skipped == false), not the whole reverse-dependency closure it walked:
+// a body-only edit to mid (imported by top) must list mid alone, while a
+// signature-changing edit must list both mid and top.
+func TestReindex_Stats_ChangedTracksActuallyReprocessedHops(t *testing.T) {
+	tests := []struct {
+		name   string
+		edited []byte
+		want   []string
+	}{
+		{
+			name: "body only edit",
+			edited: []byte(`// Package mid depends on leaf.
+package mid
+
+import (
+	"strings"
+
+	"example.com/idxmod/leaf"
+)
+
+// Shout returns an uppercase greeting for name.
+func Shout(name string) string {
+	greeting := leaf.Hello(name)
+	return strings.ToUpper(greeting.Message + "!")
+}
+`),
+			want: []string{pkgMid},
+		},
+		{
+			name: "signature changing edit",
+			edited: []byte(`// Package mid depends on leaf.
+package mid
+
+import (
+	"strings"
+
+	"example.com/idxmod/leaf"
+)
+
+// Shout returns an uppercase greeting for name, repeated n times.
+func Shout(name string, n int) string {
+	g := leaf.Hello(name)
+	out := strings.ToUpper(g.Message)
+	for i := 1; i < n; i++ {
+		out += out
+	}
+	return out
+}
+`),
+			want: []string{pkgMid, pkgTop},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snap := loadTestSnapshot(t)
+			db := openTestDB(t)
+			cas := openTestCAS(t)
+			ctx := context.Background()
+
+			if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
+				t.Fatalf("initial Build: %v", err)
+			}
+
+			reader := overlayReader(t, midSrcPath, tt.edited)
+			stats, err := Reindex(ctx, snap, db, cas, pkgMid, reader, &Options{})
+			if err != nil {
+				t.Logf("Reindex returned error (may be expected: top.go's call site can be stale): %v", err)
+			}
+			if !slices.Equal(stats.Changed, tt.want) {
+				t.Errorf("stats.Changed = %v, want %v", stats.Changed, tt.want)
+			}
+		})
 	}
 }
 

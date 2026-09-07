@@ -57,8 +57,14 @@ type Options struct {
 // snapshot, so a workspace/didChangeWatchedFiles-triggered reload can swap
 // them in atomically without a lock on the read path.
 type workspace struct {
-	root     string
-	snap     *graph.Snapshot
+	root string
+	snap *graph.Snapshot
+	// graphSrc is the check.SnapshotSource ws.engine resolves
+	// PackageForFile against. It is retargeted in place (check.GraphSource
+	// .Retarget), rather than replaced, across every setWorkspace call that
+	// reuses engine — see setWorkspace's own doc for when that is and why
+	// it is sound.
+	graphSrc *check.GraphSource
 	engine   *check.Engine
 	depCache *depCacheHolder
 	// depProvider resolves non-workspace (standard library, module
@@ -110,6 +116,14 @@ type Server struct {
 	logger  *log.Logger
 	rpc     *rpc.Server
 	overlay *overlay.Overlay
+
+	// setWorkspaceMu serializes setWorkspace end to end: two concurrent
+	// calls (e.g. two overlapping handleDidChangeWatchedFiles-triggered
+	// revalidateGraph goroutines) must not both take the reuse branch and
+	// interleave their graphSrc.Retarget/depCache.invalidate/s.ws.Store
+	// calls, which could publish a workspace whose installed snap disagrees
+	// with what the shared graphSrc/depCache were last mutated to reflect.
+	setWorkspaceMu sync.Mutex
 
 	ws    atomic.Pointer[workspace]
 	idx   atomic.Pointer[indexState]

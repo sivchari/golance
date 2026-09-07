@@ -206,23 +206,32 @@ func (s *Server) handleDidClose(_ context.Context, params json.RawMessage) error
 
 // reindex re-type-checks pkgPath (and, if its export data changed, its
 // reverse-dependency closure) and persists the result to idx.db. On
-// success, it also drops pkgPath and every package that (transitively)
-// imports it from the check engine's persistent dependency cache and from
-// idx.resolver's own export-data cache, so a later recheck of an open file
-// — or a later cross-reference query, e.g. Go to Implementation — re-decodes
-// pkgPath's freshly written export data instead of reusing the
-// *types.Package decoded from what was on disk before this save (see
-// xref.Resolver.Invalidate's doc for why that reuse would otherwise happen
-// silently). This is deliberately coarser than Reindex's own change-
-// propagation (which stops at the first hop whose export data didn't
-// actually change): it is sound either way, and avoids needing Reindex to
-// report exactly which hops in the closure changed.
+// success, it also drops pkgPath and every reverse-dependency-closure hop
+// Reindex actually reprocessed (Stats.Changed) from the check engine's
+// persistent dependency cache and from idx.resolver's own export-data
+// cache, so a later recheck of an open file — or a later cross-reference
+// query, e.g. Go to Implementation — re-decodes freshly written export data
+// instead of reusing a *types.Package decoded from what was on disk before
+// this save (see xref.Resolver.Invalidate's doc for why that reuse would
+// otherwise happen silently). Narrowing to Stats.Changed instead of the
+// whole closure Reindex walked is sound: a hop Reindex skipped had a
+// combined blob key that provably matched what db already had, so its
+// export data provably did not change either — the same guarantee
+// unchangedOutcome already relies on inside Reindex itself. If Stats.Changed
+// comes back empty (Reindex found pkgPath itself byte-identical too), fall
+// back to invalidating pkgPath alone: the overlay content this save just
+// wrote may still differ from what was on disk when Reindex's own trustStat
+// check ran.
 func (s *Server) reindex(ctx context.Context, ws *workspace, idx *indexState, pkgPath string) {
-	if _, err := index.Reindex(ctx, ws.snap, idx.db, idx.cas, pkgPath, s.overlay.ReadFile, &index.Options{RelativePaths: RelativeIndexPaths(ws.root)}); err != nil {
+	stats, err := index.Reindex(ctx, ws.snap, idx.db, idx.cas, pkgPath, s.overlay.ReadFile, &index.Options{RelativePaths: RelativeIndexPaths(ws.root)})
+	if err != nil {
 		s.logger.Printf("server: reindex %s: %v", pkgPath, err)
 		return
 	}
-	changed := append([]string{pkgPath}, ws.snap.ClosureUnits(pkgPath)...)
+	changed := stats.Changed
+	if len(changed) == 0 {
+		changed = []string{pkgPath}
+	}
 	ws.depCache.invalidate(changed)
 	idx.resolver.Invalidate(changed)
 }

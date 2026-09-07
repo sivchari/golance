@@ -250,6 +250,57 @@ func TestCache_DeleteClearsFailure(t *testing.T) {
 	}
 }
 
+// TestCache_DeleteDecrementsBytes confirms Delete subtracts the deleted
+// entry's own decoded size from Bytes(), rather than leaving it in the
+// running total forever: a Cache that outlives many Delete calls (e.g.
+// depCacheHolder's long-lived cache across setWorkspace reuses) must not
+// have Bytes() grow monotonically from entries no longer even cached, or it
+// eventually forces a spurious full-cache discard past maxDepCacheBytes.
+func TestCache_DeleteDecrementsBytes(t *testing.T) {
+	fset := token.NewFileSet()
+	depFile := parseTestdata(t, fset, "dep/dep.go")
+	userFile := parseTestdata(t, fset, "user/user.go")
+	cache := NewCache()
+	stdlib := newStdlibExportSource(t)
+
+	depImp := NewImporter(fset, nil, stdlib, cache)
+	depPkg, _, errs := CheckPackage(fset, []*ast.File{depFile}, "example.com/tcmod/dep", depImp)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected type errors checking dep: %v", errs)
+	}
+	depBlob, err := WriteExport(depPkg, fset)
+	if err != nil {
+		t.Fatalf("WriteExport: %v", err)
+	}
+	depSrc := blobSource{blobs: map[string][]byte{"example.com/tcmod/dep": depBlob}}
+
+	userImp := NewImporter(fset, depSrc, stdlib, cache)
+	_, _, errs = CheckPackage(fset, []*ast.File{userFile}, "example.com/tcmod/user", userImp)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected type errors checking user: %v", errs)
+	}
+
+	afterBothDecoded := cache.Bytes()
+	if afterBothDecoded <= int64(len(depBlob)) {
+		t.Fatalf("Bytes() after decoding dep and stdlib fmt = %d, want more than dep's own blob size %d", afterBothDecoded, len(depBlob))
+	}
+
+	cache.Delete("example.com/tcmod/dep")
+
+	if got, want := cache.Bytes(), afterBothDecoded-int64(len(depBlob)); got != want {
+		t.Errorf("Bytes() after Delete(dep) = %d, want %d (previous total minus dep's own decoded size)", got, want)
+	}
+
+	decodesBefore := cache.Decodes()
+	depImp2 := NewImporter(fset, depSrc, nil, cache)
+	if _, err := depImp2.ImportFrom("example.com/tcmod/dep", "", 0); err != nil {
+		t.Fatalf("re-import dep after Delete: %v", err)
+	}
+	if got := cache.Decodes(); got != decodesBefore+1 {
+		t.Errorf("Decodes() after re-importing deleted dep = %d, want %d (a fresh decode)", got, decodesBefore+1)
+	}
+}
+
 // TestCheckPackage_CollectsErrors verifies every type error is collected,
 // not just the first.
 func TestCheckPackage_CollectsErrors(t *testing.T) {

@@ -182,6 +182,146 @@ func TestHandleDidSave_TestFileReindexesNewSymbol(t *testing.T) {
 	}
 }
 
+// TestReindex_NarrowsDepCacheInvalidationToActuallyChangedHops verifies
+// Server.reindex evicts ws.depCache only for the hops index.Reindex reports
+// via Stats.Changed, not the whole reverse-dependency closure: mid is
+// imported by top, and a body-only edit to mid must leave top's decoded
+// dependency entry alone, while a signature-changing edit must evict it
+// too. Presence in depCache is observed indirectly through
+// typecheck.Cache.Decodes(): re-importing a path that is still cached is a
+// hit (no new decode), while re-importing an evicted path forces a fresh
+// one.
+func TestReindex_NarrowsDepCacheInvalidationToActuallyChangedHops(t *testing.T) {
+	const (
+		pkgMid = "example.com/depcachetest/mid"
+		pkgTop = "example.com/depcachetest/top"
+	)
+
+	tests := []struct {
+		name        string
+		edited      string
+		wantEvicted map[string]bool
+	}{
+		{
+			name: "body only edit",
+			edited: `package mid
+
+import "example.com/depcachetest/leaf"
+
+// Shout returns a greeting for name.
+func Shout(name string) string {
+	return leaf.Hello(name) + "!"
+}
+`,
+			wantEvicted: map[string]bool{pkgMid: true, pkgTop: false},
+		},
+		{
+			name: "signature changing edit",
+			edited: `package mid
+
+import "example.com/depcachetest/leaf"
+
+// Shout returns a greeting for name, repeated n times.
+func Shout(name string, n int) string {
+	out := leaf.Hello(name)
+	for i := 1; i < n; i++ {
+		out += out
+	}
+	return out
+}
+`,
+			wantEvicted: map[string]bool{pkgMid: true, pkgTop: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, idx, midFile := newDepCacheReindexServer(t)
+			ws := s.workspace()
+			// Warm depCache with a decoded entry for both mid and top,
+			// mirroring what a real recheck of some other package importing
+			// top (and so transitively mid) would leave behind.
+			imp := ws.depCache.importer()
+			for _, p := range []string{pkgMid, pkgTop} {
+				if _, err := imp.ImportFrom(p, "", 0); err != nil {
+					t.Fatalf("warm depCache for %s: %v", p, err)
+				}
+			}
+
+			openDoc(t, s, midFile, tt.edited)
+			s.reindex(context.Background(), ws, idx, pkgMid)
+
+			for _, p := range []string{pkgMid, pkgTop} {
+				before := ws.depCache.cache.Decodes()
+				if _, err := imp.ImportFrom(p, "", 0); err != nil {
+					t.Fatalf("re-import %s after reindex: %v", p, err)
+				}
+				evicted := ws.depCache.cache.Decodes() > before
+				if evicted != tt.wantEvicted[p] {
+					t.Errorf("%s evicted from depCache = %v, want %v", p, evicted, tt.wantEvicted[p])
+				}
+			}
+		})
+	}
+}
+
+// newDepCacheReindexServer builds the leaf/mid/top synthetic module,
+// indexes it, and returns a workspace-ready server over it plus its
+// installed index state and mid's file path — the fixture
+// TestReindex_NarrowsDepCacheInvalidationToActuallyChangedHops drives.
+func newDepCacheReindexServer(t *testing.T) (*Server, *indexState, string) {
+	t.Helper()
+	dir := t.TempDir()
+	writeModuleFile(t, dir, "go.mod", "module example.com/depcachetest\n\ngo 1.23\n")
+	writeModuleFile(t, dir, "leaf/leaf.go", "package leaf\n\n// Hello returns a greeting for name.\nfunc Hello(name string) string { return \"hello \" + name }\n")
+	midFile := writeModuleFile(t, dir, "mid/mid.go", `package mid
+
+import "example.com/depcachetest/leaf"
+
+// Shout returns a greeting for name.
+func Shout(name string) string {
+	return leaf.Hello(name)
+}
+`)
+	writeModuleFile(t, dir, "top/top.go", `package top
+
+import "example.com/depcachetest/mid"
+
+// Run calls mid.Shout.
+func Run(name string) string {
+	return mid.Shout(name)
+}
+`)
+
+	snap, err := graph.Load(graph.Options{Dir: dir}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("db.Close: %v", err)
+		}
+	})
+	cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+		t.Fatalf("index.Build: %v", err)
+	}
+
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	s.setWorkspace(dir, snap)
+	idx := &indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)}
+	s.idx.Store(idx)
+	return s, idx, midFile
+}
+
 // TestHandleDidSave_ReindexNeverOrphanedByShutdown covers Finding 7: the
 // background reindex handleDidSave starts must be tracked and bound to the
 // session's own lifetime, so that even if a save happens immediately before

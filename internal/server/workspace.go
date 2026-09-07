@@ -180,21 +180,13 @@ func depsKey(snap *graph.Snapshot) string {
 // internal/depexport's package doc), opened once for this Server's whole
 // lifetime, independent of any one workspace's dependency set.
 //
-// This is the fix for a real production stall (see the caller's own doc):
-// setWorkspace runs on every graph revalidation, not only at initialize —
-// any go.mod/go.sum/go.work change, and any workspace/didChangeWatchedFiles
-// batch that adds or removes a file in an already-known package directory
-// (see needsGraphReload) — which, before this, discarded depProvider's
-// entire type-check cache every time. Since depProvider exists specifically
-// to answer navigation into the standard library and module dependencies —
-// content that does not change just because the user edited a workspace
-// file — that discard bought nothing but forced the next dependency-facing
-// query to re-type-check its whole import closure cold, sometimes tens of
-// seconds' worth of work for a large monorepo's shared dependencies.
-// Reusing the Provider whenever the dependency set itself is unchanged
-// removes that cost entirely for the common case (an ordinary edit inside
-// the workspace), while still rebuilding it — correctly, from scratch —
-// whenever the dependency set genuinely could have changed.
+// Reuse is sound whenever the dependency set is unchanged: depProvider
+// exists specifically to answer navigation into the standard library and
+// module dependencies, content that does not change just because the user
+// edited a workspace file, so keeping it — and its type-check cache — warm
+// across a setWorkspace call driven by nothing but such an edit costs
+// nothing in correctness. Rebuilding it — correctly, from scratch —
+// whenever depsKey differs is what keeps that safe.
 func (s *Server) ensureDepProvider(snap *graph.Snapshot) (*depcheck.Provider, *depexport.Cache) {
 	key := depsKey(snap)
 
@@ -231,17 +223,196 @@ func nonRootPackageCount(snap *graph.Snapshot) int {
 	return n
 }
 
-// setWorkspace builds a fresh workspace bundle over snap and installs it,
+// changedExportSet returns every package path in snap whose cached
+// dependency export data (ws.depCache, keyed by import path) setWorkspace's
+// reuse path can no longer trust, for depCache.invalidate to drop before
+// the reused engine's next recheck of anything importing them. A package
+// qualifies by having a different GoFiles set between old and snap — a file
+// created or deleted in its directory, the only way needsGraphReload
+// triggers a setWorkspace call without a go.mod/go.sum change (see
+// setWorkspace's own doc for why a content-only edit is excluded) — or by
+// having disappeared from snap entirely (removed from the workspace, e.g.
+// its directory deleted). Each such package is expanded through the
+// reverse-dependency closure of BOTH snap and old (Snapshot.ClosureUnits),
+// each guarded by an existence check in that snapshot before the call:
+// snap's closure catches every current importer of the change, and old's
+// catches an importer snap no longer even has a node for (itself removed
+// in the same reload, e.g. a package's only importer deleted alongside
+// it) — either alone can miss an importer the other still knows about.
+// Mirrors index.Reindex's own reverse-closure invalidation
+// (internal/index/reindex.go's orderedReverseClosure), driven here off a
+// GoFiles diff across two snapshots rather than off one caller-supplied
+// changed package.
+//
+// A ForTest-tagged entry (graph.Package.ForTest != "") is skipped in both
+// snapshots, the same exclusion setWorkspace's own fileToPkg/dirToPkg build
+// and check.GraphSource.buildGraphIndex apply: it is a synthesized
+// test-only node — most commonly an external "_test" package — that no
+// real import path ever imports (see externalTestPkgPathMarker), so its
+// own GoFiles changing implies nothing about any dependency importer's
+// cached export data; the on-disk file change it reflects is already
+// covered by the base package sharing its directory.
+func changedExportSet(old, snap *graph.Snapshot) []string {
+	changed := make(map[string]bool)
+	for path, pkg := range snap.Packages {
+		if pkg.ForTest != "" {
+			continue
+		}
+		oldPkg, ok := old.Package(path)
+		if !ok || !sameGoFiles(oldPkg.GoFiles, pkg.GoFiles) {
+			changed[path] = true
+		}
+	}
+	for path, pkg := range old.Packages {
+		if pkg.ForTest != "" {
+			continue
+		}
+		if _, ok := snap.Package(path); !ok {
+			changed[path] = true
+		}
+	}
+
+	set := make(map[string]bool, len(changed))
+	for path := range changed {
+		if _, ok := snap.Package(path); ok {
+			for _, dep := range snap.ClosureUnits(path) {
+				set[dep] = true
+			}
+		}
+		if _, ok := old.Package(path); ok {
+			for _, dep := range old.ClosureUnits(path) {
+				set[dep] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for path := range set {
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sameGoFiles reports whether a and b list the same GoFiles, order
+// insensitive: go/packages makes no ordering guarantee across two separate
+// Load calls over unchanged on-disk content, so a naive index comparison
+// would report a spurious difference on every reload. In practice,
+// graph.Load produces deterministic ordering, so an unchanged package's two
+// listings compare equal elementwise without either allocating; the sorted
+// comparison below only runs as a fallback for the rare package whose order
+// did shift between loads.
+func sameGoFiles(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ordered := true
+	for i := range a {
+		if a[i] != b[i] {
+			ordered = false
+			break
+		}
+	}
+	if ordered {
+		return true
+	}
+
+	as := append([]string(nil), a...)
+	bs := append([]string(nil), b...)
+	sort.Strings(as)
+	sort.Strings(bs)
+	for i := range as {
+		if as[i] != bs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// setWorkspace builds a workspace bundle over snap and installs it,
 // replacing whatever workspace (if any) was loaded before. If a facts
 // index is already open, its Resolver is rebuilt over the new snapshot too
 // (the *store.DB itself is untouched — only the in-memory import-graph
 // view a Resolver holds needs refreshing).
+//
+// When the outgoing workspace is being reloaded rather than replaced —
+// same root, same dependency set (ensureDepProvider's own reuse decision,
+// see reuse below) — ws.graphSrc, ws.engine, and ws.depCache are reused in
+// place instead of rebuilt, because setWorkspace runs on every graph
+// revalidation, not only at initialize: any go.mod/go.sum/go.work change,
+// and any workspace/didChangeWatchedFiles batch that adds or removes a
+// file in an already-known package directory (see needsGraphReload).
+// Rebuilding engine from scratch on every such call would discard its
+// whole per-unit check cache and cancel every in-flight Get flight running
+// against it, so reuse is what keeps those warm across an ordinary edit.
+//
+// Reuse is sound for ws.engine's own cache without any extra bookkeeping:
+// every cache entry is validated against a live, current on-disk/overlay
+// content hash on every Get (see Engine.runRecheck's contentHash check),
+// so an edit to a workspace package's own files always self-heals on its
+// next check regardless of whether the graph snapshot backing the engine
+// was ever refreshed. The one thing that check alone cannot catch is a
+// workspace package's DEPENDENCY export data going stale in ws.depCache:
+// the dependency importer decodes and caches a *types.Package by import
+// path, with nothing in that path noticing that its own real content
+// changed underneath it (the specific case: a file created or deleted in
+// its directory — the only way needsGraphReload fires without a
+// go.mod/go.sum change, since a content-only edit does not change GoFiles
+// and is already covered by the per-save reindex invalidation instead, see
+// Server.reindex). changedExportSet computes exactly that set of import
+// paths, expanded through the reverse-dependency closure of both the
+// outgoing and incoming snapshot so every importer that could have
+// observed the change is covered too, and depCache.invalidate drops them
+// before the reused engine's next recheck of anything importing them.
+//
+// The reuse condition — pointer identity with ensureDepProvider's own
+// reuse decision (old.depProvider == depProvider) — piggybacks on
+// ensureDepProvider's depsKey check on purpose: any change to the
+// non-workspace (standard library/module-cache) package set already forces
+// ensureDepProvider to rebuild depProvider, and that is exactly the signal
+// that also forces engine/graphSrc/depCache to rebuild from scratch here,
+// since a genuine dependency-set change (a go.mod/go.sum/go.work edit) can
+// invalidate far more than changedExportSet's own GoFiles-diff heuristic
+// accounts for.
 func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
-	src := check.NewGraphSource(snap, s.overlay)
+	s.setWorkspaceMu.Lock()
+	defer s.setWorkspaceMu.Unlock()
+
+	old := s.ws.Load()
 	depProvider, depExports := s.ensureDepProvider(snap)
-	depCache := newDepCacheHolder(depExports)
-	imp := depCache.importer
-	engine := check.New(src, s.overlay, imp, check.Options{OnResult: s.publishDiagnostics})
+	reuse := old != nil && old.root == root && old.depProvider == depProvider
+
+	var (
+		graphSrc *check.GraphSource
+		depCache *depCacheHolder
+		engine   *check.Engine
+	)
+	if reuse {
+		graphSrc = old.graphSrc
+		graphSrc.Retarget(snap)
+		depCache = old.depCache
+		depCache.invalidate(changedExportSet(old.snap, snap))
+		engine = old.engine
+	} else {
+		graphSrc = check.NewGraphSource(snap, s.overlay)
+		depCache = newDepCacheHolder(depExports)
+		engine = check.New(graphSrc, s.overlay, depCache.importer, check.Options{OnResult: s.publishDiagnostics})
+		// Retire, not Stop, the outgoing engine: a debounce timer already
+		// scheduled on it (e.g. by a handleDidChange that captured the old
+		// workspace microseconds before this swap), or a background
+		// recheck still running against the now-discarded import graph,
+		// could otherwise still fire afterward and publish diagnostics via
+		// Options.OnResult computed against stale state — Retire's timer
+		// cancellation and OnResult suppression (see its own doc) prevent
+		// exactly that. Unlike Stop, Retire does not cancel the engine's
+		// own lifecycle ctx, so a request-driven Get flight already in
+		// progress against the old engine (e.g. a hover the user
+		// triggered microseconds before this reload) keeps running to
+		// completion and its waiter gets the real result instead of
+		// ctx.Err().
+		if old != nil {
+			old.engine.Retire()
+		}
+	}
 
 	fileToPkg := make(map[string]string)
 	dirToPkg := make(map[string]string, len(snap.Packages))
@@ -262,16 +433,8 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	}
 	pkgNameIndex := buildPkgNameIndex(snap)
 
-	// Stop the outgoing workspace's engine before installing the new one:
-	// otherwise a debounce timer already scheduled on it (e.g. by a
-	// handleDidChange that captured the old workspace microseconds before
-	// this swap) could still fire afterward and publish diagnostics
-	// computed against the now-discarded import graph.
-	if old := s.ws.Load(); old != nil {
-		old.engine.Stop()
-	}
 	newWS := &workspace{
-		root: root, snap: snap, engine: engine, fileToPkg: fileToPkg, dirToPkg: dirToPkg,
+		root: root, snap: snap, graphSrc: graphSrc, engine: engine, fileToPkg: fileToPkg, dirToPkg: dirToPkg,
 		depCache: depCache, depProvider: depProvider, pkgNameIndex: pkgNameIndex,
 	}
 	s.ws.Store(newWS)

@@ -345,12 +345,16 @@ func (r *Resolver) logDecodeFailureOnce(pkgPath string, err error) {
 // earlier query is invisible to the caller, so the same query can look
 // flaky depending only on session history.
 //
-// Callers pass pkgPath plus its reverse-dependency closure ([graph.
-// Snapshot.ClosureUnits]), mirroring depCacheHolder.invalidate: an
-// importer's own decoded *types.Package can embed direct references to
-// pkgPath's now-superseded one (e.g. an embedded interface or struct
-// field), so it must be dropped and re-decoded too, even though its own
-// source content did not change.
+// pkgPaths is the set of packages whose export data may have changed and so
+// must be re-decoded on next use — not necessarily an exhaustive
+// reverse-dependency closure: Server.reindex, this method's production
+// caller, passes only the hops index.Reindex actually reprocessed
+// ([index.Stats.Changed]), on the grounds that a hop it skipped had export
+// data provably unchanged (see reindex's own doc). A dropped entry's own
+// decoded *types.Package can still be embedded inside another cached
+// entry's types (e.g. via an embedded interface or struct field), so a
+// caller that wants those covered too must include them in pkgPaths
+// itself, the same way depCacheHolder.invalidate's caller does.
 //
 // r.units needs no equivalent treatment here: it is keyed by BlobKey, the
 // CAS content address a reindex necessarily changes (see unitCache's doc),

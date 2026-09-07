@@ -45,28 +45,33 @@ type ExportSource interface {
 type Cache struct {
 	mu      sync.Mutex
 	pkgs    map[string]*types.Package
+	sizes   map[string]int64 // pkgPath -> its decode's size, the same value summed into bytes below
 	failed  map[string]error // pkgPath -> ReadExport's error, see ReadExport's doc
-	bytes   int64            // sum of decoded export-data blob sizes, a naive proxy for memory held
+	bytes   int64            // sum of sizes for entries currently in pkgs, a naive proxy for memory held
 	decodes int64            // number of gcexportdata.Read calls this Cache has performed (cache misses)
 }
 
 // NewCache returns an empty Cache.
 func NewCache() *Cache {
-	return &Cache{pkgs: make(map[string]*types.Package), failed: make(map[string]error)}
+	return &Cache{pkgs: make(map[string]*types.Package), sizes: make(map[string]int64), failed: make(map[string]error)}
 }
 
 // Delete removes pkgPath's cached *types.Package and any cached ReadExport
-// failure for it, if either exists. A later ImportFrom/ReadExport call for
-// pkgPath re-decodes it from export data instead of serving a stale
-// success or a stale failure. Callers use this to evict dependencies once
-// every importer that needed them has finished, bounding cache growth
-// independent of workspace size, and to invalidate a reindexed package's
-// entry (see internal/xref.Resolver.Invalidate, ReadExport's only caller
-// that also calls this).
+// failure for it, if either exists, subtracting its recorded size from
+// bytes so bytes reflects only entries still cached rather than growing
+// monotonically forever. A later ImportFrom/ReadExport call for pkgPath
+// re-decodes it from export data instead of serving a stale success or a
+// stale failure. Callers use this to evict dependencies once every importer
+// that needed them has finished, bounding cache growth independent of
+// workspace size, and to invalidate a reindexed package's entry (see
+// internal/xref.Resolver.Invalidate, ReadExport's only caller that also
+// calls this).
 func (c *Cache) Delete(pkgPath string) {
 	c.mu.Lock()
 	delete(c.pkgs, pkgPath)
 	delete(c.failed, pkgPath)
+	c.bytes -= c.sizes[pkgPath]
+	delete(c.sizes, pkgPath)
 	c.mu.Unlock()
 }
 
@@ -77,10 +82,11 @@ func (c *Cache) Len() int {
 	return len(c.pkgs)
 }
 
-// Bytes returns the running total of decoded export-data blob sizes: a
-// cheap, approximate estimate of the memory c is holding onto, for callers
-// that want to bound cache growth (e.g. discard c and start a fresh one
-// past some threshold) without a precise heap accounting.
+// Bytes returns the sum of decoded export-data blob sizes for entries
+// currently cached (Delete subtracts an evicted entry's size): a cheap,
+// approximate estimate of the memory c is holding onto, for callers that
+// want to bound cache growth (e.g. discard c and start a fresh one past
+// some threshold) without a precise heap accounting.
 func (c *Cache) Bytes() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -220,6 +226,7 @@ func (imp *Importer) decode(r io.Reader, path string, size int64) (*types.Packag
 		return nil, fmt.Errorf("typecheck: decode export data for %s: %w", path, err)
 	}
 	imp.cache.bytes += size
+	imp.cache.sizes[path] = size
 	imp.cache.decodes++
 	return pkg, nil
 }

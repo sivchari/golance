@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"go/types"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sivchari/golance/internal/overlay"
@@ -183,6 +184,12 @@ type Engine struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// retired is set by Retire. commit consults it to suppress
+	// Options.OnResult for a recheck that completes after Retire — see
+	// Retire's doc for why this, and not e.ctx cancellation, is how it stops
+	// a retired Engine from publishing.
+	retired atomic.Bool
+
 	mu      sync.Mutex
 	focus   string // directory of the focused package, "" if none — protects every variant of that directory from eviction, see evictLocked
 	dirs    map[unitKey]pkgInfo
@@ -261,6 +268,12 @@ func (e *Engine) SetFocus(filePath string) {
 // ctx.Done() first always gets back the CheckedPackage its flight
 // computed, regardless of that guard.
 func (e *Engine) Get(ctx context.Context, filePath string) (*CheckedPackage, error) {
+	// Checked up front so an already-canceled request fails before any
+	// hashing work, and deterministically: the select below races
+	// ctx.Done() against fl.done, and with both ready it picks either.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	pkgPath, dir, goFiles, ok := e.snap.PackageForFile(filePath)
 	if !ok {
 		return nil, fmt.Errorf("check: %s is not part of a known package", filePath)
@@ -471,9 +484,15 @@ func (e *Engine) nextGen(key unitKey) uint64 {
 // (commitCache) nor, independently, in what gets published (commitPublish;
 // gating only the cache write is not enough, since computing and
 // publishing a Result run outside Engine.mu and can take unbounded time).
+//
+// The cache write always happens, even after Retire: it is harmless on an
+// engine about to be discarded, and a Get waiter joined to this recheck's
+// flight reads fl.cp directly rather than going back through the cache (see
+// Get's doc), so skipping it would save nothing. Only the OnResult publish
+// is suppressed once e.retired is set — see Retire's doc.
 func (e *Engine) commit(key unitKey, gen uint64, cp *CheckedPackage) {
 	st, ok := e.commitCache(key, gen, cp)
-	if !ok || e.opts.OnResult == nil {
+	if !ok || e.opts.OnResult == nil || e.retired.Load() {
 		return
 	}
 	e.commitPublish(gen, st, cp)
@@ -523,15 +542,47 @@ func (e *Engine) commitPublish(gen uint64, st *dirState, cp *CheckedPackage) {
 	e.opts.OnResult(result)
 }
 
-// Stop cancels every directory's pending debounce timer and in-flight
-// background recheck (Invalidate/fireRecheck), and cancels e.ctx — which
-// every request-driven flight runs on (see runFlight) — canceling every
-// flight currently in progress too, so none of them can call
-// Options.OnResult after the caller discards this Engine — e.g. because a
-// fresh Engine over a new import graph snapshot is about to replace it. A
-// flight's detachment (see Get's doc) is only from any single requester's
-// ctx, not from the engine's own lifetime: Stop still reclaims it, exactly
-// as a server shutdown must be able to reclaim every goroutine it started.
+// Retire cancels every directory's pending debounce timer and in-flight
+// background recheck (Invalidate/fireRecheck), same as Stop, but — unlike
+// Stop — does not cancel e.ctx, so a request-driven flight already in
+// progress (see runFlight, which runs on e.ctx) keeps running to completion
+// instead of failing every Get waiting on it with ctx.Err().
+//
+// This is for a caller that discards e for a fresh Engine (e.g. over a new
+// import graph snapshot) but must stop e from publishing afterward without
+// aborting request work already in flight against it: canceling every
+// pending timer and background job stops any of them from reaching commit
+// after Retire returns, and setting e.retired makes commit itself suppress
+// the OnResult publish for the rare recheck already past that point when
+// Retire is called (see commit's doc) — while every in-flight flight is left
+// to run to completion, so its waiters still get a real result instead of a
+// spurious cancellation.
+//
+// Safe to call more than once.
+func (e *Engine) Retire() {
+	e.retired.Store(true)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, st := range e.jobs {
+		if st.timer != nil {
+			st.timer.Stop()
+			st.timer = nil
+		}
+		if st.cancel != nil {
+			st.cancel()
+		}
+	}
+}
+
+// Stop fully shuts e down: it cancels every directory's pending debounce
+// timer and in-flight background recheck (Invalidate/fireRecheck), and
+// cancels e.ctx — which every request-driven flight runs on (see
+// runFlight) — canceling every flight currently in progress too, so none
+// of them can call Options.OnResult once e is discarded. A flight's
+// detachment (see Get's doc) is only from any single requester's ctx, not
+// from the engine's own lifetime: Stop still reclaims it. See Retire for
+// the alternative that stops background publishing without aborting
+// in-flight request-driven work.
 // Safe to call more than once.
 func (e *Engine) Stop() {
 	e.mu.Lock()
