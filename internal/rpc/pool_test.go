@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -24,57 +25,59 @@ import (
 // would make the fast response wait for the slow one and this test would
 // time out.
 func TestBackgroundPool_SlowRequestDoesNotSerializeFastOne(t *testing.T) {
-	s := newTestServer(t)
-	release := make(chan struct{})
-	slowStarted := make(chan struct{})
-	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
-	s.Handle("slow", Background, func(_ context.Context, _ json.RawMessage) (any, error) {
-		close(slowStarted)
-		<-release
-		return "slow-done", nil
-	})
-	s.Handle("fast", Background, func(context.Context, json.RawMessage) (any, error) {
-		return "fast-done", nil
-	})
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestServer(t)
+		release := make(chan struct{})
+		slowStarted := make(chan struct{})
+		s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
+		s.Handle("slow", Background, func(_ context.Context, _ json.RawMessage) (any, error) {
+			close(slowStarted)
+			<-release
+			return "slow-done", nil
+		})
+		s.Handle("fast", Background, func(context.Context, json.RawMessage) (any, error) {
+			return "fast-done", nil
+		})
 
-	pr, pw := io.Pipe()
-	out := newSyncBuffer()
-	done := make(chan error, 1)
-	go func() { done <- s.Serve(context.Background(), pr, out) }()
+		pr, pw := io.Pipe()
+		out := newSyncBuffer()
+		done := make(chan error, 1)
+		go func() { done <- s.Serve(context.Background(), pr, out) }()
 
-	writeFrame(t, pw, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
-	writeFrame(t, pw, `{"jsonrpc":"2.0","id":2,"method":"slow","params":{}}`)
+		writeFrame(t, pw, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+		writeFrame(t, pw, `{"jsonrpc":"2.0","id":2,"method":"slow","params":{}}`)
 
-	select {
-	case <-slowStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("slow handler never started")
-	}
-
-	// slow now provably holds a Background pool slot; only now send fast.
-	writeFrame(t, pw, `{"jsonrpc":"2.0","id":3,"method":"fast","params":{}}`)
-	writeFrame(t, pw, `{"jsonrpc":"2.0","method":"exit"}`)
-	_ = pw.Close()
-
-	// The fast response must arrive WHILE slow is still blocked on release —
-	// proving it was never queued behind slow.
-	deadline := time.After(2 * time.Second)
-	fastSeen := false
-	for !fastSeen {
 		select {
-		case <-out.wait:
-		case <-deadline:
-			t.Fatal("fast response did not arrive within 2s while the slow request was still in flight")
+		case <-slowStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("slow handler never started")
 		}
-		for _, f := range readFrames(t, out.Bytes()) {
-			if id, ok := f["id"].(float64); ok && id == 3 {
-				fastSeen = true
+
+		// slow now provably holds a Background pool slot; only now send fast.
+		writeFrame(t, pw, `{"jsonrpc":"2.0","id":3,"method":"fast","params":{}}`)
+		writeFrame(t, pw, `{"jsonrpc":"2.0","method":"exit"}`)
+		_ = pw.Close()
+
+		// The fast response must arrive WHILE slow is still blocked on release —
+		// proving it was never queued behind slow.
+		deadline := time.After(2 * time.Second)
+		fastSeen := false
+		for !fastSeen {
+			select {
+			case <-out.wait:
+			case <-deadline:
+				t.Fatal("fast response did not arrive within 2s while the slow request was still in flight")
+			}
+			for _, f := range readFrames(t, out.Bytes()) {
+				if id, ok := f["id"].(float64); ok && id == 3 {
+					fastSeen = true
+				}
 			}
 		}
-	}
 
-	close(release)
-	<-done // exit notification already queued; Serve returns *ExitError, ignored here
+		close(release)
+		<-done // exit notification already queued; Serve returns *ExitError, ignored here
+	})
 }
 
 // TestBackgroundPool_BoundedSizeSerializesExcessRequests documents the pool
@@ -87,52 +90,54 @@ func TestBackgroundPool_SlowRequestDoesNotSerializeFastOne(t *testing.T) {
 // sole slot, so which request's goroutine happens to win the race to
 // acquire it is not left to chance.
 func TestBackgroundPool_BoundedSizeSerializesExcessRequests(t *testing.T) {
-	s := NewServer(WithLogger(log.New(&testWriter{t}, "", 0)), WithBackgroundWorkers(1))
-	release := make(chan struct{})
-	slowStarted := make(chan struct{})
-	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
-	s.Handle("slow", Background, func(_ context.Context, _ json.RawMessage) (any, error) {
-		close(slowStarted)
-		<-release
-		return "slow-done", nil
+	synctest.Test(t, func(t *testing.T) {
+		s := NewServer(WithLogger(log.New(&testWriter{t}, "", 0)), WithBackgroundWorkers(1))
+		release := make(chan struct{})
+		slowStarted := make(chan struct{})
+		s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
+		s.Handle("slow", Background, func(_ context.Context, _ json.RawMessage) (any, error) {
+			close(slowStarted)
+			<-release
+			return "slow-done", nil
+		})
+		fastRan := make(chan struct{})
+		s.Handle("fast", Background, func(context.Context, json.RawMessage) (any, error) {
+			close(fastRan)
+			return "fast-done", nil
+		})
+
+		pr, pw := io.Pipe()
+		var out bytes.Buffer
+		done := make(chan error, 1)
+		go func() { done <- s.Serve(context.Background(), pr, &out) }()
+
+		writeFrame(t, pw, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+		writeFrame(t, pw, `{"jsonrpc":"2.0","id":2,"method":"slow","params":{}}`)
+
+		select {
+		case <-slowStarted:
+		case <-time.After(5 * time.Second):
+			t.Fatal("slow handler never started")
+		}
+
+		writeFrame(t, pw, `{"jsonrpc":"2.0","id":3,"method":"fast","params":{}}`)
+		writeFrame(t, pw, `{"jsonrpc":"2.0","method":"exit"}`)
+		_ = pw.Close()
+
+		select {
+		case <-fastRan:
+			t.Fatal("fast handler ran before slow released its slot, with Background bounded to 1")
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		close(release)
+		select {
+		case <-fastRan:
+		case <-time.After(5 * time.Second):
+			t.Fatal("fast handler never ran after slow released its slot")
+		}
+		<-done
 	})
-	fastRan := make(chan struct{})
-	s.Handle("fast", Background, func(context.Context, json.RawMessage) (any, error) {
-		close(fastRan)
-		return "fast-done", nil
-	})
-
-	pr, pw := io.Pipe()
-	var out bytes.Buffer
-	done := make(chan error, 1)
-	go func() { done <- s.Serve(context.Background(), pr, &out) }()
-
-	writeFrame(t, pw, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
-	writeFrame(t, pw, `{"jsonrpc":"2.0","id":2,"method":"slow","params":{}}`)
-
-	select {
-	case <-slowStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("slow handler never started")
-	}
-
-	writeFrame(t, pw, `{"jsonrpc":"2.0","id":3,"method":"fast","params":{}}`)
-	writeFrame(t, pw, `{"jsonrpc":"2.0","method":"exit"}`)
-	_ = pw.Close()
-
-	select {
-	case <-fastRan:
-		t.Fatal("fast handler ran before slow released its slot, with Background bounded to 1")
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	close(release)
-	select {
-	case <-fastRan:
-	case <-time.After(5 * time.Second):
-		t.Fatal("fast handler never ran after slow released its slot")
-	}
-	<-done
 }
 
 // writeFrame writes body as one Content-Length-framed message to w, failing

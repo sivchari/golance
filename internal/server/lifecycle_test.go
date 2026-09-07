@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"go.lsp.dev/protocol"
@@ -32,84 +33,84 @@ import (
 // a subprocess (os.Executable() resolves to it under `go test`), the same
 // hazard TestRevalidateIndex_UnchangedKeepsWarmOpenHandle guards against.
 func TestHandleInitialize_ReturnsBeforeGraphLoadCompletes(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	root, err := filepath.Abs(filepath.Join("testdata", "module"))
-	if err != nil {
-		t.Fatalf("abs testdata root: %v", err)
-	}
-
-	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
-	if err != nil {
-		t.Fatalf("graph.Load: %v", err)
-	}
-	dbPath := indexDBFile(root)
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
-		t.Fatalf("mkdir index dir: %v", err)
-	}
-	cas, err := store.OpenCAS(casDir(root))
-	if err != nil {
-		t.Fatalf("store.OpenCAS: %v", err)
-	}
-	buildTestIndexDB(t, snap, dbPath, cas)
-
-	unblock := make(chan struct{})
-	started := make(chan struct{})
-	var once sync.Once
-	orig := graphLoad
-	t.Cleanup(func() { graphLoad = orig })
-	graphLoad = func(opts graph.Options, patterns ...string) (*graph.Snapshot, error) {
-		once.Do(func() { close(started) })
-		<-unblock
-		return orig(opts, patterns...)
-	}
-
-	s := New(rpc.NewServer(rpc.WithLogger(newTestLogger(t))), Options{Logger: newTestLogger(t)})
-	t.Cleanup(func() {
-		if idx := s.idx.Load(); idx != nil {
-			_ = idx.db.Close()
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		root, err := filepath.Abs(filepath.Join("testdata", "module"))
+		if err != nil {
+			t.Fatalf("abs testdata root: %v", err)
 		}
-	})
 
-	params, err := protocol.Marshal(&protocol.InitializeParams{
-		WorkspaceFoldersInitializeParams: protocol.WorkspaceFoldersInitializeParams{
-			WorkspaceFolders: protocol.NewNullable([]protocol.WorkspaceFolder{{URI: uri.File(root), Name: "module"}}),
-		},
-	})
-	if err != nil {
-		t.Fatalf("marshal InitializeParams: %v", err)
-	}
+		snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+		if err != nil {
+			t.Fatalf("graph.Load: %v", err)
+		}
+		dbPath := indexDBFile(root)
+		if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+			t.Fatalf("mkdir index dir: %v", err)
+		}
+		cas, err := store.OpenCAS(casDir(root))
+		if err != nil {
+			t.Fatalf("store.OpenCAS: %v", err)
+		}
+		buildTestIndexDB(t, snap, dbPath, cas)
 
-	start := time.Now()
-	res, err := s.handleInitialize(context.Background(), params)
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("handleInitialize: %v", err)
-	}
-	if _, ok := res.(*protocol.InitializeResult); !ok {
-		t.Fatalf("handleInitialize result type = %T, want *protocol.InitializeResult", res)
-	}
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("handleInitialize took %v while graph load was blocked; want it to return before the load completes", elapsed)
-	}
+		unblock := make(chan struct{})
+		started := make(chan struct{})
+		var once sync.Once
+		orig := graphLoad
+		t.Cleanup(func() { graphLoad = orig })
+		graphLoad = func(opts graph.Options, patterns ...string) (*graph.Snapshot, error) {
+			once.Do(func() { close(started) })
+			<-unblock
+			return orig(opts, patterns...)
+		}
 
-	select {
-	case <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("loadWorkspaceAsync never called graphLoad")
-	}
-	if ws := s.workspace(); ws != nil {
-		t.Fatal("workspace already populated while graph load is still blocked")
-	}
+		s := New(rpc.NewServer(rpc.WithLogger(newTestLogger(t))), Options{Logger: newTestLogger(t)})
+		t.Cleanup(func() {
+			if idx := s.idx.Load(); idx != nil {
+				_ = idx.db.Close()
+			}
+		})
 
-	close(unblock)
+		params, err := protocol.Marshal(&protocol.InitializeParams{
+			WorkspaceFoldersInitializeParams: protocol.WorkspaceFoldersInitializeParams{
+				WorkspaceFolders: protocol.NewNullable([]protocol.WorkspaceFolder{{URI: uri.File(root), Name: "module"}}),
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal InitializeParams: %v", err)
+		}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for s.workspace() == nil {
-		if time.Now().After(deadline) {
+		res, err := s.handleInitialize(context.Background(), params)
+		if err != nil {
+			t.Fatalf("handleInitialize: %v", err)
+		}
+		if _, ok := res.(*protocol.InitializeResult); !ok {
+			t.Fatalf("handleInitialize result type = %T, want *protocol.InitializeResult", res)
+		}
+		// The real proof handleInitialize returned before the graph load
+		// finished, rather than a wall-clock bound (meaningless under the fake
+		// clock): the workspace must still be unset right after it returns.
+		if ws := s.workspace(); ws != nil {
+			t.Fatal("workspace already populated by the time handleInitialize returned; want it to return before the load completes")
+		}
+
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("loadWorkspaceAsync never called graphLoad")
+		}
+		if ws := s.workspace(); ws != nil {
+			t.Fatal("workspace already populated while graph load is still blocked")
+		}
+
+		close(unblock)
+
+		synctest.Wait()
+		if s.workspace() == nil {
 			t.Fatal("workspace never became ready after graph load was unblocked")
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	})
 }
 
 // TestHandleInitialized_SetsClientInitialized covers the ordering guarantee

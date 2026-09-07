@@ -47,5 +47,8 @@ func newTestEngineWithImporterHook(t *testing.T, reader overlay.FileReader, opts
 	if hook != nil {
 		imp = hook(imp)
 	}
-	return New(src, reader, imp, opts), root
+	e := New(src, reader, imp, opts)
+	t.Cleanup(func() { e.Stop() })
+
+	return e, root
 }
