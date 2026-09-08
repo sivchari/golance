@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"runtime"
 
 	"go.lsp.dev/protocol"
 
@@ -33,7 +34,7 @@ import (
 // complete entirely in the window between this handler's own workspace()
 // read and its markPendingOpen call, in which case that drain already ran
 // over an empty pending set and would otherwise never see this path again.
-func (s *Server) handleDidOpen(_ context.Context, params json.RawMessage) error {
+func (s *Server) handleDidOpen(ctx context.Context, params json.RawMessage) error {
 	var p protocol.DidOpenTextDocumentParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return err
@@ -58,7 +59,44 @@ func (s *Server) handleDidOpen(_ context.Context, params json.RawMessage) error 
 	}
 	ws.engine.SetFocus(path)
 	ws.engine.Invalidate(filepath.Dir(path))
+	s.selfHealFactsIfStale(ctx, ws, path)
 	return nil
+}
+
+// selfHealFactsIfStale checks path's package against the facts index and
+// schedules a background reindex if it disagrees with what is now on disk
+// — closing the gap left by reindexing only ever being triggered by
+// handleDidSave: a package changed outside the editor (git checkout, pull,
+// branch switch) otherwise never gets its facts refreshed until one of its
+// files happens to be saved through the editor, which may never happen for
+// a file the user only ever reads. idx==nil is a no-op: the very first
+// successful build writes every package's facts from scratch, so there is
+// nothing to repair yet, and s.reindex would have no *indexState to write
+// through regardless.
+//
+// The check itself (index.PackageChanged) is cheap enough to run inline —
+// one bbolt read plus stat-based hashing of path's own package files, no
+// type-checking — but the reindex it can trigger is not, so that part is
+// detached via s.rpc.Go exactly like handleDidSave's own reindex, rather
+// than blocking this notification handler's return.
+func (s *Server) selfHealFactsIfStale(ctx context.Context, ws *workspace, path string) {
+	idx := s.idx.Load()
+	if idx == nil {
+		return
+	}
+	pkgPath, ok := s.pkgPathForFile(path)
+	if !ok {
+		return
+	}
+	changed, err := index.PackageChanged(ctx, ws.snap, idx.db, pkgPath, runtime.Version(), "", RelativeIndexPaths(ws.root))
+	if err != nil {
+		s.logger.Printf("golance: check facts for %s: %v", pkgPath, err)
+		return
+	}
+	if !changed {
+		return
+	}
+	s.rpc.Go(func(ctx context.Context) { s.reindex(ctx, ws, idx, pkgPath) })
 }
 
 // handleDidChange applies the content change to the document's overlay and

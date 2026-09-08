@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -444,6 +445,168 @@ func TestHandleDidSave_ReindexedOnceIndexBecomesAvailable(t *testing.T) {
 		}
 		if syms, ok := resp.(protocol.SymbolInformationSlice); !ok || len(syms) == 0 {
 			t.Fatalf("%s not visible via workspace/symbol after the index became available; the save made while the index was unavailable appears to have been lost", newSymbol)
+		}
+	})
+}
+
+// TestHandleDidOpen_SelfHealsMissingFacts is a regression test for GAP 2's
+// didOpen path: opening a file whose package the facts index has never
+// recorded a store.UnitPointer for at all (the same state GAP 1's
+// stale-snapshot bug leaves behind, or simply a package that was never
+// saved through the editor after a git checkout/pull) triggers a
+// background reindex without requiring a save first.
+func TestHandleDidOpen_SelfHealsMissingFacts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		writeModuleFile(t, dir, "go.mod", "module example.com/didopenheal\n\ngo 1.23\n")
+		writeModuleFile(t, dir, "pkga/pkga.go", "package pkga\n\n// V returns 1.\nfunc V() int { return 1 }\n")
+
+		snapBeforeB, err := graph.Load(graph.Options{Dir: dir}, "./...")
+		if err != nil {
+			t.Fatalf("graph.Load: %v", err)
+		}
+
+		dbPath := filepath.Join(t.TempDir(), "index.db")
+		cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
+		if err != nil {
+			t.Fatalf("store.OpenCAS: %v", err)
+		}
+		db, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		if _, err := index.Build(context.Background(), snapBeforeB, db, cas, &index.Options{}); err != nil {
+			t.Fatalf("index.Build: %v", err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("db.Close: %v", err)
+		}
+
+		const pkgbSrc = "package pkgb\n\n// W returns 2.\nfunc W() int { return 2 }\n"
+		pkgbFile := writeModuleFile(t, dir, "pkgb/pkgb.go", pkgbSrc)
+		fullSnap, err := graph.Load(graph.Options{Dir: dir}, "./...")
+		if err != nil {
+			t.Fatalf("graph.Load: %v", err)
+		}
+
+		db2, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open (reopen): %v", err)
+		}
+		t.Cleanup(func() { _ = db2.Close() })
+
+		rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+		s := New(rpcServer, Options{Logger: newTestLogger(t)})
+		s.setWorkspace(dir, fullSnap)
+		s.idx.Store(&indexState{db: db2, cas: cas, resolver: xref.New(db2, cas, fullSnap, false)})
+
+		openParams := mustMarshal(t, &protocol.DidOpenTextDocumentParams{
+			TextDocument: protocol.TextDocumentItem{URI: uri.File(pkgbFile), Version: 1, Text: pkgbSrc},
+		})
+		if err := s.handleDidOpen(context.Background(), openParams); err != nil {
+			t.Fatalf("handleDidOpen: %v", err)
+		}
+		synctest.Wait()
+
+		if _, err := db2.GetUnit(context.Background(), store.Hash("example.com/didopenheal/pkgb")); err != nil {
+			t.Fatalf("GetUnit(pkgb) after didOpen: %v (want its facts self-healed without a save)", err)
+		}
+	})
+}
+
+// TestHandleDidOpen_NoSelfHealWhenIndexNil verifies that selfHealFactsIfStale
+// is a plain no-op — no panic, nothing scheduled — while s.idx is nil (the
+// same window handleDidSave's own markDirty/drainDirty exists for): the very
+// first successful build writes every package's facts from scratch, so
+// there is nothing to repair yet, and there is no *indexState to reindex
+// through even if there were.
+func TestHandleDidOpen_NoSelfHealWhenIndexNil(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, snap := newTestServerNoIndex(t)
+		file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+		text, err := os.ReadFile(filepath.Clean(file))
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+
+		openParams := mustMarshal(t, &protocol.DidOpenTextDocumentParams{
+			TextDocument: protocol.TextDocumentItem{URI: uri.File(file), Version: 1, Text: string(text)},
+		})
+		if err := s.handleDidOpen(context.Background(), openParams); err != nil {
+			t.Fatalf("handleDidOpen (index nil): %v", err)
+		}
+		synctest.Wait()
+
+		if idx := s.idx.Load(); idx != nil {
+			t.Fatal("s.idx installed during a test that never built one before the open; selfHealFactsIfStale must not install anything")
+		}
+	})
+}
+
+// TestHandleDidOpen_NoSelfHealWhenFresh verifies that opening a file whose
+// package facts are already up to date leaves its store.UnitPointer
+// byte-for-byte unchanged: selfHealFactsIfStale must not trigger a reindex
+// (and so not rewrite anything) for a package index.PackageChanged reports
+// unchanged. Uses its own temp module — not testdata/module, which lives
+// inside this repository's own git checkout and so would make
+// RelativeIndexPaths(root) true, while newTestServer's index.Build call
+// always stores absolute paths (Options{} default); a temp dir outside any
+// git repository keeps both consistent with each other, matching what
+// index.Build and selfHealFactsIfStale would each independently resolve
+// RelativeIndexPaths(root) to in production.
+func TestHandleDidOpen_NoSelfHealWhenFresh(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		writeModuleFile(t, dir, "go.mod", "module example.com/didopenfresh\n\ngo 1.23\n")
+		const greetSrc = "package greet\n\n// Hello returns a greeting.\nfunc Hello() string { return \"hi\" }\n"
+		greetFile := writeModuleFile(t, dir, "greet/greet.go", greetSrc)
+
+		snap, err := graph.Load(graph.Options{Dir: dir}, "./...")
+		if err != nil {
+			t.Fatalf("graph.Load: %v", err)
+		}
+		db, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := db.Close(); err != nil {
+				t.Errorf("db.Close: %v", err)
+			}
+		})
+		cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
+		if err != nil {
+			t.Fatalf("store.OpenCAS: %v", err)
+		}
+		if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+			t.Fatalf("index.Build: %v", err)
+		}
+
+		rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+		s := New(rpcServer, Options{Logger: newTestLogger(t)})
+		s.setWorkspace(dir, snap)
+		s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+
+		const pkgGreet = "example.com/didopenfresh/greet"
+		before, err := db.GetUnit(context.Background(), store.Hash(pkgGreet))
+		if err != nil {
+			t.Fatalf("GetUnit(greet) before didOpen: %v", err)
+		}
+
+		openParams := mustMarshal(t, &protocol.DidOpenTextDocumentParams{
+			TextDocument: protocol.TextDocumentItem{URI: uri.File(greetFile), Version: 1, Text: greetSrc},
+		})
+		if err := s.handleDidOpen(context.Background(), openParams); err != nil {
+			t.Fatalf("handleDidOpen: %v", err)
+		}
+		synctest.Wait()
+
+		after, err := db.GetUnit(context.Background(), store.Hash(pkgGreet))
+		if err != nil {
+			t.Fatalf("GetUnit(greet) after didOpen: %v", err)
+		}
+		if !reflect.DeepEqual(before, after) {
+			t.Errorf("UnitPointer changed after opening an unmodified file: before=%+v after=%+v (selfHealFactsIfStale must not reindex an up-to-date package)", before, after)
 		}
 	})
 }

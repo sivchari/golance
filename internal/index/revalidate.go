@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sort"
 	"sync"
-	"sync/atomic"
 
 	"golang.org/x/sync/semaphore"
 
@@ -34,6 +34,82 @@ import (
 // anything, so its work is I/O-bound (a stat per file, and occasionally a
 // source read for the content-hash fallback) rather than CPU-bound.
 func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolchainFP, buildFlagsFP string, relative bool) (bool, error) {
+	stale, wholeDBStale, err := revalidateImpl(ctx, snap, db, toolchainFP, buildFlagsFP, relative)
+	if err != nil {
+		return false, err
+	}
+	return wholeDBStale || len(stale) > 0, nil
+}
+
+// RevalidateStale is Revalidate's per-package variant: instead of a single
+// bool, it returns the sorted import paths of every stale root package, for
+// a caller that wants to repair only what changed — one [Reindex] call per
+// entry — rather than forcing a full [Build] rebuild whenever anything at
+// all is stale.
+//
+// wholeDBStale mirrors Revalidate's own whole-database short-circuit: db's
+// build fingerprint (see [store.DB.BuildFingerprint]) is missing or does
+// not match toolchainFP, so nothing recorded in db is trustworthy enough to
+// compare packages against. Reindex never writes a build fingerprint (only
+// [Build] calls [store.DB.PutBuildFingerprint]), so a caller must not route
+// a wholeDBStale=true result through per-package Reindex — that would leave
+// the fingerprint missing/mismatched forever, and every future Revalidate
+// or RevalidateStale call would keep reporting the whole database stale
+// regardless of how many individual packages get reindexed. When
+// wholeDBStale is true, pkgs is always nil; only a full Build resolves it.
+//
+// Unlike a boolean short-circuit, this always scans every root package in
+// snap: the caller needs the complete stale set, not merely proof that one
+// exists, so there is no early exit once the first stale package is found.
+func RevalidateStale(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolchainFP, buildFlagsFP string, relative bool) ([]string, bool, error) {
+	return revalidateImpl(ctx, snap, db, toolchainFP, buildFlagsFP, relative)
+}
+
+// PackageChanged is Revalidate's single-package variant, for a caller that
+// only needs a cheap answer for one specific root package — e.g.
+// internal/server's didOpen-time self-heal — rather than fanning out over
+// the whole workspace. It costs one [store.DB.BuildFingerprint] read, one
+// [store.DB.GetUnit] read, and stat-based hashing of path's own files only;
+// it never touches any other package's files.
+//
+// The whole-database build-fingerprint check runs first, exactly as in
+// Revalidate: if it is missing or does not match toolchainFP, PackageChanged
+// reports true without even looking path up in snap, since nothing recorded
+// in db could be trusted regardless of what path's own state turns out to
+// be.
+//
+// path must name a root package known to snap (see
+// [graph.Snapshot.Package]); an unknown path is a caller bug — asking about
+// a package that does not exist in the current workspace graph — and is
+// reported as an error rather than as "changed". A path that snap does know
+// about but db has never recorded a [store.UnitPointer] for (e.g. a
+// newly-added package) does report true, via the same path packageChanged
+// already takes for that case.
+func PackageChanged(ctx context.Context, snap *graph.Snapshot, db *store.DB, path, toolchainFP, buildFlagsFP string, relative bool) (bool, error) {
+	fp, err := db.BuildFingerprint()
+	notFound := errors.Is(err, store.ErrNotFound)
+	if err != nil && !notFound {
+		return false, fmt.Errorf("index: packagechanged: read build fingerprint: %w", err)
+	}
+	if notFound || fp != toolchainFP {
+		return true, nil
+	}
+
+	pkg, ok := snap.Package(path)
+	if !ok {
+		return false, fmt.Errorf("index: packagechanged: unknown package %s", path)
+	}
+
+	keys := newKeyTable(ctx, db)
+	return packageChanged(ctx, db, keys, snap, pkg, path, toolchainFP, buildFlagsFP, snap.Dir(), relative)
+}
+
+// revalidateImpl is the shared implementation behind Revalidate and
+// RevalidateStale: it scans every root package in snap concurrently and
+// reports which ones are stale (see packageChanged), short-circuiting only
+// on the cheap whole-database build-fingerprint check both public entry
+// points document.
+func revalidateImpl(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolchainFP, buildFlagsFP string, relative bool) (stale []string, wholeDBStale bool, err error) {
 	// Cheap whole-database short-circuit: if db was never fully built under
 	// the running toolchain at all (see index.Build's PutBuildFingerprint),
 	// every package needs rechecking, so there is no point fanning out a
@@ -47,19 +123,20 @@ func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolcha
 	fp, err := db.BuildFingerprint()
 	notFound := errors.Is(err, store.ErrNotFound)
 	if err != nil && !notFound {
-		return false, fmt.Errorf("index: revalidate: read build fingerprint: %w", err)
+		return nil, false, fmt.Errorf("index: revalidate: read build fingerprint: %w", err)
 	}
 	// notFound and a genuine fingerprint mismatch both mean the same thing
-	// here: nothing trustworthy to compare packages against, so report
-	// changed without a per-package fan-out.
+	// here: nothing trustworthy to compare packages against, so report the
+	// whole database stale without a per-package fan-out.
 	if notFound || fp != toolchainFP {
-		return true, nil
+		return nil, true, nil
 	}
 
 	root := snap.Dir()
 	keys := newKeyTable(ctx, db)
 	sem := semaphore.NewWeighted(int64(max(1, runtime.NumCPU()*2)))
-	var changed atomic.Bool
+	var mu sync.Mutex
+	var staleList []string
 	var firstErr firstErrRecorder
 	var wg sync.WaitGroup
 	for path, pkg := range snap.Packages {
@@ -81,15 +158,18 @@ func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolcha
 				return
 			}
 			if pkgChanged {
-				changed.Store(true)
+				mu.Lock()
+				staleList = append(staleList, path)
+				mu.Unlock()
 			}
 		}(path, pkg)
 	}
 	wg.Wait()
 	if err := firstErr.get(); err != nil {
-		return false, err
+		return nil, false, err
 	}
-	return changed.Load(), nil
+	sort.Strings(staleList)
+	return staleList, false, nil
 }
 
 // packageChanged reports whether pkg differs from what db last recorded for
