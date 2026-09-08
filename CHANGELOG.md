@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.2](https://github.com/sivchari/golance/compare/v0.7.1...v0.7.2) - 2026-09-08
+- fix: self-heal missing facts index entries across worktree reloads by @sivchari in https://github.com/sivchari/golance/pull/102
+
 ## [v0.7.1](https://github.com/sivchari/golance/compare/v0.7.0...v0.7.1) - 2026-09-07
 - fix: extend flaky didSave reindex waits in server tests by @sivchari in https://github.com/sivchari/golance/pull/97
 - fix: reuse check engine and dep caches across workspace reloads by @sivchari in https://github.com/sivchari/golance/pull/99
