@@ -254,81 +254,245 @@ func TestE2E_WorktreeSimultaneousStartup(t *testing.T) {
 	}
 }
 
-// TestE2E_BranchSwitchNoRetypecheck verifies that switching a single
-// worktree's content back to a version already seen (a stand-in for `git
-// checkout` between two branches) does not re-type-check anything the
-// second time around: the shared CAS already holds every package's blob
-// for that exact content from the first time this worktree built it, so
-// the third session's build (content reverted to the original) resolves
-// entirely via CAS hits.
+// TestE2E_BranchSwitchSelfHealsWithoutFullRebuild verifies that switching a
+// single worktree's content back and forth (a stand-in for `git checkout`
+// between two branches, without needing a real git history for this
+// specific property) is picked up correctly by a warm-reopened session —
+// self-healed in place rather than left stale until an editor save.
 //
 // This drives three sequential sessions against the same root, rewriting
 // one file of a synthetic "heavy" package (writeHeavyPackage — many files,
 // so a real recheck of the whole package is representative of the
 // real-world case that motivated this design: a large generated-model
 // package where any single file's edit forces the whole package to be
-// reprocessed) directly between them, equivalent to the on-disk effect of
-// a branch checkout without needing a real git history for this specific
-// property: A (original content, a real build) -> B (a genuine edit,
-// forcing a real re-type-check of the heavy package) -> A again (revert, a
-// CAS-hit-only build).
+// reprocessed) directly between them: A (original content, a real cold
+// build) -> B (a genuine edit, self-healed by revalidateIndex's targeted
+// repair, see internal/server/indexer.go) -> A again (revert, self-healed
+// the same way).
 //
-// What matters is asserted directly on each build's own reported stats
-// (see startAndAwaitIndex/indexStats), not inferred from wall-clock time:
-// a shared CI runner's load makes elapsed-time comparisons an unreliable
-// proxy for "did this build actually type-check the heavy package again."
-// heavy is otherwise unimported by anything else in the workspace (see
-// writeE2EModule's doc), so it is the only package whose own recheck could
-// ever show up in these stats.
-func TestE2E_BranchSwitchNoRetypecheck(t *testing.T) {
+// Sessions B and C are deliberately not awaited via startAndAwaitIndex's
+// $/progress-based waitForIndexReady: each is a warm reopen of the same
+// per-root facts index session A already built (tryWarmOpen succeeds), and
+// heavy alone changing is a single-package stale set — small enough that
+// revalidateIndex's targeted repair (repairIndexPackagesLocked) now fixes it
+// in-process rather than falling back to a full indexer-subprocess rebuild
+// (see indexRepairThreshold's own doc), so no $/progress notification is
+// ever sent for either session. Correctness is instead observed directly
+// through workspace/symbol on an exported marker function the edit adds
+// (HeavyEdited): its presence/absence reflects whether the facts index's
+// own view of heavy actually caught up with what changed on disk. This
+// intentionally no longer distinguishes a CAS hit from a genuine
+// retypecheck the way the original version of this test (subprocess STATS)
+// did — internal/index's own Build/Reindex tests already cover that
+// invariant directly; what matters here is that a warm session's facts
+// self-heal without a save, exactly like TestE2E_WorktreeSelfHealsMissingPackageFacts
+// verifies for the worktree-specific shared-cache variant of the same gap.
+func TestE2E_BranchSwitchSelfHealsWithoutFullRebuild(t *testing.T) {
 	skipUnlessE2E(t)
 
 	root, locs := writeE2EModule(t)
 	heavyFile, originalHeavySrc := writeHeavyPackage(t, root, "heavy", 500)
 	fakeHome := t.TempDir()
 
-	editedHeavySrc := strings.Replace(originalHeavySrc, "package heavy", "package heavy\n\n// edited marks a real content change.\nvar edited = true", 1)
+	const heavyEditedMarker = "HeavyEdited"
+	editedHeavySrc := strings.Replace(originalHeavySrc, "package heavy",
+		"package heavy\n\n// HeavyEdited marks a real content change, added only by this test.\nfunc HeavyEdited() bool { return true }", 1)
 
-	// Session A: original content, a genuine first-ever build. This also
-	// primes the graph cache (go.mod/go.sum unchanged for the rest of this
-	// test), so sessions B and C below pay the same fixed `go list`-free
-	// startup cost.
+	// Session A: original content, a genuine first-ever cold build (no
+	// per-root facts index exists yet, so tryWarmOpen cannot succeed and
+	// buildIndex always runs a real indexer subprocess regardless of
+	// indexRepairThreshold). This also primes the graph cache (go.mod/go.sum
+	// unchanged for the rest of this test), so sessions B and C below pay
+	// the same fixed `go list`-free startup cost.
 	a, aStats, firstElapsed := startAndAwaitIndex(t, root, fakeHome, locs.appFile)
 	t.Logf("session A: first build finished in %s (%+v)", firstElapsed, aStats)
 	if got := definitionAt(t, a, locs.appFile, locs.sumCallInApp); len(got) != 1 {
 		t.Fatalf("session A: want exactly 1 definition location, got %d: %+v", len(got), got)
 	}
+	waitForWorkspaceSymbolCount(t, a, heavyEditedMarker, 0, e2eRequestBudget)
 	a.stop(t)
 
-	// Session B: a genuine edit to the heavy package — new content this
-	// CAS has never seen, forcing a real re-type-check of the whole
-	// package.
+	// Session B: a genuine edit to the heavy package, then a warm reopen of
+	// the same per-root facts index session A already built — self-healed by
+	// revalidateIndex's targeted repair without ever saving through the
+	// editor.
 	if err := os.WriteFile(heavyFile, []byte(editedHeavySrc), 0o600); err != nil {
 		t.Fatalf("edit %s: %v", heavyFile, err)
 	}
-	b, bStats, editElapsed := startAndAwaitIndex(t, root, fakeHome, locs.appFile)
-	t.Logf("session B: build finished in %s (%+v)", editElapsed, bStats)
-	if bStats.typeChecked != 1 {
-		t.Errorf("session B: type-checked %d package(s), want exactly 1 (heavy, the only package whose content changed)", bStats.typeChecked)
-	}
+	b := startClientIn(t, root, fakeHome)
+	b.initialize(t, root)
+	b.openFile(t, locs.appFile)
 	if got := definitionAt(t, b, locs.appFile, locs.sumCallInApp); len(got) != 1 {
 		t.Fatalf("session B: want exactly 1 definition location, got %d: %+v", len(got), got)
 	}
+	waitForWorkspaceSymbolCount(t, b, heavyEditedMarker, 1, e2eRequestBudget)
 	b.stop(t)
 
 	// Session A again: revert the heavy package to the exact original
-	// content. Its (content, dependency-API) combination now matches
-	// exactly what session A already built, so this must resolve via a
-	// CAS hit alone — no type-check.
+	// content, then another warm reopen — the marker function must
+	// disappear from the facts index again, proving the repair genuinely
+	// reflects heavy's current on-disk content each time, not merely a
+	// one-way "something changed" flag.
 	if err := os.WriteFile(heavyFile, []byte(originalHeavySrc), 0o600); err != nil {
 		t.Fatalf("revert %s: %v", heavyFile, err)
 	}
-	c, cStats, revertElapsed := startAndAwaitIndex(t, root, fakeHome, locs.appFile)
-	t.Logf("session A (reverted): build finished in %s (%+v)", revertElapsed, cStats)
-	if cStats.typeChecked != 0 {
-		t.Errorf("session A (reverted): type-checked %d package(s), want 0 (heavy's reverted content was already built by session A, so this must resolve via a CAS hit alone)", cStats.typeChecked)
-	}
+	c := startClientIn(t, root, fakeHome)
+	c.initialize(t, root)
+	c.openFile(t, locs.appFile)
 	if got := definitionAt(t, c, locs.appFile, locs.sumCallInApp); len(got) != 1 {
 		t.Fatalf("session A (reverted): want exactly 1 definition location, got %d: %+v", len(got), got)
+	}
+	waitForWorkspaceSymbolCount(t, c, heavyEditedMarker, 0, e2eRequestBudget)
+	c.stop(t)
+}
+
+// waitForWorkspaceSymbolCount polls workspace/symbol for query until it
+// returns exactly wantCount results, or timeout elapses — for asserting a
+// symbol has become visible (wantCount > 0) or, symmetrically, has
+// disappeared again (wantCount == 0) once a background self-heal is
+// expected to have settled.
+func waitForWorkspaceSymbolCount(t *testing.T, c *lspClient, query string, wantCount int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		resp := c.callRetryIndexUnavailable(t, protocol.MethodWorkspaceSymbol, &protocol.WorkspaceSymbolParams{Query: query}, timeout)
+		if len(resp.Error) > 0 {
+			t.Fatalf("workspace/symbol(%q) failed: %s", query, resp.Error)
+		}
+		var syms protocol.SymbolInformationSlice
+		if err := protocol.Unmarshal(resp.Result, &syms); err != nil {
+			t.Fatalf("unmarshal workspace/symbol(%q) result: %v", query, err)
+		}
+		if len(syms) == wantCount {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("workspace/symbol(%q) returned %d result(s) after %s, want %d", query, len(syms), timeout, wantCount)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestE2E_WorktreeSelfHealsMissingPackageFacts is a regression test for the
+// worktree bug this package's own commit fixed: a session that warm-opens
+// its own already-built per-root facts index trusts the repository-shared
+// graph cache (graph.Shared) immediately at startup, which can list a
+// different package set than what is actually on disk for this worktree
+// right now — reproduced here simply by adding a package to worktree B
+// alone, after both the shared graph cache and worktree B's own facts index
+// were last saved. Before the fix, the background revalidateGraph pass that
+// self-heals the snapshot (kicked unconditionally for a shared cache, see
+// loadWorkspaceAsync) never re-checked the facts index against the fresher
+// snapshot it installs, so the new package's facts were never computed
+// until something else (a save) happened to trigger a reindex — jumping
+// into it, or finding references to it, stayed broken (an empty result,
+// forever) rather than self-healing within any bounded time: handleReferences
+// never surfaces a facts-read failure as a client-facing RPC error (it logs
+// "xref: read facts for ...: store: not found" server-side and answers with
+// an empty result instead), so definitionAt/waitForNonEmptyLocations'
+// bounded retry-until-non-empty below is what actually distinguishes "self-
+// healed" from "still broken," not any client-visible error.
+//
+// Deliberately never opens the new files (textDocument/didOpen) before
+// querying: that would additionally exercise handleDidOpen's own
+// self-heal (already covered by internal/server's own unit tests), muddying
+// this test's specific coverage of the background revalidateGraph path —
+// the actual trigger behind the original bug report.
+func TestE2E_WorktreeSelfHealsMissingPackageFacts(t *testing.T) {
+	skipUnlessE2E(t)
+
+	mainRoot, otherRoot, locs := gitWorktreeModule(t)
+	fakeHome := t.TempDir()
+
+	// Worktree A: an ordinary cold-start session. Its build populates the
+	// shared CAS and the repository-shared graph cache (graph.Shared),
+	// neither of which yet knows about the package added to worktree B
+	// below.
+	a, _, _ := startAndAwaitIndex(t, mainRoot, fakeHome, locs.appFile)
+	if got := definitionAt(t, a, locs.appFile, locs.sumCallInApp); len(got) != 1 {
+		t.Fatalf("worktree A: want exactly 1 definition location, got %d: %+v", len(got), got)
+	}
+	a.stop(t)
+
+	// Worktree B's own first session: also a genuine cold start (its
+	// per-root facts index does not exist yet), which builds and installs
+	// it. This is the shared graph cache's first save from worktree B's own
+	// perspective, so it now reflects worktree B's current (still
+	// incomplete) package set.
+	otherAppFile := strings.Replace(locs.appFile, mainRoot, otherRoot, 1)
+	b, _, _ := startAndAwaitIndex(t, otherRoot, fakeHome, otherAppFile)
+	if got := definitionAt(t, b, otherAppFile, locs.sumCallInApp); len(got) != 1 {
+		t.Fatalf("worktree B: want exactly 1 definition location, got %d: %+v", len(got), got)
+	}
+	b.stop(t)
+
+	// Add two brand-new packages to worktree B alone, after both the
+	// shared graph cache and worktree B's own per-root facts index were
+	// last saved: neither knows about them yet.
+	const newPkgSrc = `package newpkg
+
+// Greet returns a greeting.
+func Greet() string {
+	return "hi"
+}
+`
+	newPkgFile := writeE2EFile(t, otherRoot, "newpkg/newpkg.go", newPkgSrc)
+	greetDecl := mustPos(t, newPkgSrc, "func Greet", "Greet")
+
+	const usenewSrc = `package usenew
+
+import "example.com/e2e/newpkg"
+
+// Call invokes newpkg.Greet.
+func Call() string {
+	return newpkg.Greet()
+}
+`
+	usenewFile := writeE2EFile(t, otherRoot, "usenew/usenew.go", usenewSrc)
+	greetCall := mustPos(t, usenewSrc, "newpkg.Greet()", "Greet")
+
+	// Worktree B, second session: warm-opens the same per-root facts index
+	// built above (still missing newpkg/usenew entirely) over a graph
+	// snapshot the shared cache also does not list them in yet — the exact
+	// state a wrong/stale snapshot leaves behind. graph.Shared(otherRoot)
+	// unconditionally kicks a background revalidateGraph pass on every such
+	// start; the fix under test is that pass now also revalidating the
+	// facts index against the fresh snapshot it installs, repairing the two
+	// new packages in place without any save.
+	//
+	// Unlike startAndAwaitIndex's cold-start sessions above, this does not
+	// wait for a $/progress "golance/index" end notification: tryWarmOpen
+	// succeeds immediately here (worktree B's own per-root database already
+	// exists), so no indexer subprocess ever runs and no such notification
+	// is ever sent — neither for the (old, buggy) no-op revalidateIndex
+	// outcome nor for the new in-process targeted repair, both of which
+	// stay entirely within this process. definitionAt/waitForNonEmptyLocations's
+	// own retry loop (up to e2eRequestBudget) is what actually waits out the
+	// self-heal below.
+	c := startClientIn(t, otherRoot, fakeHome)
+	c.initialize(t, otherRoot)
+	c.openFile(t, otherAppFile)
+	defer c.stop(t)
+
+	got := definitionAt(t, c, usenewFile, greetCall)
+	if len(got) != 1 || got[0].URI.FsPath() != newPkgFile {
+		t.Fatalf("worktree B: definition on newpkg.Greet() = %+v, want exactly 1 location in %s", got, newPkgFile)
+	}
+
+	refs := c.waitForNonEmptyLocations(t, protocol.MethodTextDocumentReferences, &protocol.ReferenceParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(newPkgFile)},
+			Position:     greetDecl,
+		},
+		Context: protocol.ReferenceContext{IncludeDeclaration: false},
+	}, e2eRequestBudget)
+	var foundCallSite bool
+	for _, l := range refs {
+		if l.URI.FsPath() == usenewFile {
+			foundCallSite = true
+		}
+	}
+	if !foundCallSite {
+		t.Fatalf("worktree B: references on Greet's declaration missing the call site in %s; got %+v", usenewFile, refs)
 	}
 }

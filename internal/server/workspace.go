@@ -533,6 +533,22 @@ func (s *Server) workspaceReadyRefreshes() []func(context.Context) {
 // the current workspace, refreshing the on-disk cache. Used both for a
 // stale-cache background revalidation right after initialize and for a
 // workspace/didChangeWatchedFiles-triggered reload.
+//
+// It also revalidates the facts index (s.revalidateIndex) against the
+// snapshot it just installed. This is the single choke point closing a gap
+// every revalidateGraph caller shared: an earlier revalidateIndex pass —
+// notably loadWorkspaceAsync's once-per-session check right after
+// initialize — may have run against a since-superseded snapshot, most
+// notably the shared graph cache's possibly-wrong one (every worktree of a
+// repository reads and writes the same cache file; see graph.Shared and
+// loadWorkspaceAsync's own doc for why it is trusted immediately rather
+// than waited on), and so could never have scanned a package that
+// snapshot did not even list. Revalidating here means neither this
+// function's own callers nor any future one needs to separately remember
+// to do so; it is cheap whenever nothing is actually stale (see
+// index.RevalidateStale's own doc), so paying for it on every reload —
+// not only the one that might have mattered — costs nothing worth
+// special-casing around.
 func (s *Server) revalidateGraph(opts graph.Options, patterns []string) {
 	snap, err := graph.Load(opts, patterns...)
 	if err != nil {
@@ -543,6 +559,7 @@ func (s *Server) revalidateGraph(opts graph.Options, patterns []string) {
 		s.logger.Printf("server: save graph cache: %v", err)
 	}
 	s.setWorkspace(opts.Dir, snap)
+	s.revalidateIndex(s.rpc.Context(), opts.Dir)
 }
 
 // handleDidChangeWatchedFiles keeps the workspace current when files change
@@ -670,14 +687,18 @@ func packageDirs(snap *graph.Snapshot) map[string]bool {
 // graph is reloaded from scratch first (see revalidateGraph) — a
 // new/removed file in an already-known package can only be discovered that
 // way (see needsGraphReload); a brand-new package is not discovered here at
-// all, deferred to the next restart (see needsGraphReload's doc). Either
-// way, the facts index is then revalidated exactly like the once-at-startup
-// check (see revalidateIndex): if it disagrees with what is now on disk,
-// the indexer subprocess rebuilds it in the background exactly as it does
-// on a cold start.
+// all, deferred to the next restart (see needsGraphReload's doc) — and
+// revalidateGraph itself already revalidates the facts index against the
+// snapshot it installs, so there is nothing further to do here in that
+// case. Otherwise, the facts index is revalidated directly against the
+// already-loaded snapshot exactly like the once-at-startup check (see
+// revalidateIndex): if it disagrees with what is now on disk, the indexer
+// subprocess rebuilds it (or a targeted repair fixes it in place) in the
+// background exactly as it does on a cold start.
 func (s *Server) revalidateWorkspace(root string, reload bool) {
 	if reload {
 		s.revalidateGraph(graph.Options{Dir: root, Offline: s.opts.Offline}, []string{allPackagesPattern})
+		return
 	}
 	// s.watch (see watch.go) calls this from its own debounce-timer
 	// goroutine, not from a request/notification handler, so there is no

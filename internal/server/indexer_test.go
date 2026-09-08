@@ -358,14 +358,15 @@ func TestIndexStatsMessage(t *testing.T) {
 	}
 }
 
-// TestIndexNeedsRebuild_MismatchedFingerprint verifies that a stale
-// database (here, a mismatched toolchain fingerprint, which forces every
-// package to be treated as changed) is flagged for a rebuild by
-// indexNeedsRebuild — the check revalidateIndex uses before closing the
-// warm-opened handle and delegating to buildIndex (not exercised directly
-// here: buildIndex launches a real subprocess, which is out of scope for a
-// unit test — see the e2e suite for full-process coverage).
-func TestIndexNeedsRebuild_MismatchedFingerprint(t *testing.T) {
+// TestStaleIndexPackages_MismatchedFingerprint verifies that a stale
+// database (here, a mismatched toolchain fingerprint) is reported via
+// staleIndexPackages' wholeDBStale return — the whole-database short
+// circuit revalidateIndex uses to route straight to a full rebuild (not
+// exercised directly here: buildIndex launches a real subprocess, which is
+// out of scope for a unit test — see the e2e suite for full-process
+// coverage) rather than a per-package targeted repair, since Reindex never
+// writes a build fingerprint (see index.RevalidateStale's own doc).
+func TestStaleIndexPackages_MismatchedFingerprint(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	s := newWorkspaceOnlyServer(t)
 	root := s.workspace().root
@@ -398,8 +399,115 @@ func TestIndexNeedsRebuild_MismatchedFingerprint(t *testing.T) {
 	s.idx.Store(idx)
 	t.Cleanup(func() { _ = idx.db.Close() })
 
-	if !s.indexNeedsRebuild() {
-		t.Error("indexNeedsRebuild() = false, want true for a mismatched toolchain fingerprint")
+	pkgs, wholeDBStale := s.staleIndexPackages(context.Background())
+	if !wholeDBStale {
+		t.Error("staleIndexPackages() wholeDBStale = false, want true for a mismatched toolchain fingerprint")
+	}
+	if len(pkgs) != 0 {
+		t.Errorf("staleIndexPackages() pkgs = %v, want empty when wholeDBStale", pkgs)
+	}
+}
+
+// TestRevalidateIndex_TargetedRepairFixesMissingPackageWithoutFullRebuild
+// verifies GAP 1/D3's repair path end to end: a package that was never
+// built into the warm-opened database (its UnitPointer missing entirely —
+// the same state a worktree's self-healed snapshot exposes for a package
+// its earlier, wrong snapshot never even listed) is fixed in place, and
+// s.idx's own pointer identity is left unchanged — proof this went through
+// repairIndexPackagesLocked, not a close-and-rebuild.
+func TestRevalidateIndex_TargetedRepairFixesMissingPackageWithoutFullRebuild(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	writeTempFile(t, dir, "go.mod", "module example.com/repairtest\n\ngo 1.26\n")
+	aDir := filepath.Join(dir, "pkga")
+	if err := os.MkdirAll(aDir, 0o750); err != nil {
+		t.Fatalf("mkdir pkga: %v", err)
+	}
+	writeTempFile(t, aDir, "pkga.go", "package pkga\n\n// V returns 1.\nfunc V() int { return 1 }\n")
+
+	snapBeforeB, err := graph.Load(graph.Options{Dir: dir}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load (before pkgb exists): %v", err)
+	}
+
+	dbPath := indexDBFile(dir)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+	cas, err := store.OpenCAS(casDir(dir))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	// Builds a database that has never even heard of pkgb — the same state
+	// a stale/superseded snapshot (GAP 1) leaves behind, distinct from a
+	// package whose content merely changed.
+	buildTestIndexDB(t, snapBeforeB, dbPath, cas)
+
+	bDir := filepath.Join(dir, "pkgb")
+	if err := os.MkdirAll(bDir, 0o750); err != nil {
+		t.Fatalf("mkdir pkgb: %v", err)
+	}
+	writeTempFile(t, bDir, "pkgb.go", "package pkgb\n\n// W returns 2.\nfunc W() int { return 2 }\n")
+	fullSnap, err := graph.Load(graph.Options{Dir: dir}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load (with pkgb): %v", err)
+	}
+	if _, ok := fullSnap.Packages["example.com/repairtest/pkgb"]; !ok {
+		t.Fatal("pkgb missing from fullSnap; test setup is wrong")
+	}
+
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	s.setWorkspace(dir, fullSnap)
+
+	idx, ok := s.tryWarmOpen(dir)
+	if !ok {
+		t.Fatal("tryWarmOpen() = not ok, want ok")
+	}
+	s.idx.Store(idx)
+	t.Cleanup(func() { _ = idx.db.Close() })
+
+	s.revalidateIndex(context.Background(), dir)
+
+	got := s.idx.Load()
+	if got != idx {
+		t.Errorf("s.idx after revalidateIndex = %p, want the original warm-opened %p (a targeted repair must not close-and-rebuild)", got, idx)
+	}
+	if _, err := got.db.GetUnit(context.Background(), store.Hash("example.com/repairtest/pkgb")); err != nil {
+		t.Fatalf("GetUnit(pkgb) after revalidateIndex: %v (want its facts repaired in place)", err)
+	}
+	infos, err := idx.resolver.WorkspaceSymbol(context.Background(), "W")
+	if err != nil {
+		t.Fatalf("WorkspaceSymbol(W): %v", err)
+	}
+	if len(infos) == 0 {
+		t.Fatal(`WorkspaceSymbol("W") returned nothing for pkgb after the repair, want its facts queryable exactly like a normally-built package`)
+	}
+}
+
+// TestRevalidateIndex_LargeStaleSetFallsBackToFullRebuild verifies
+// chooseIndexRevalidateAction's threshold gate: once the stale set exceeds
+// indexRepairThreshold, revalidateIndex must choose a full rebuild rather
+// than a targeted repair, even though the whole database is not stale.
+// Asserted at the decision level (chooseIndexRevalidateAction), not by
+// driving revalidateIndex's actual rebuild branch end to end: that
+// launches a real indexer subprocess via os.Executable(), which in a `go
+// test` binary is the test binary itself — not cmd/golance's indexer mode
+// — so letting it run here would at best hang and at worst recursively
+// re-execute this very test suite. workspace.go's workspaceReadyRefreshes
+// documents the same "test the decision, not the dispatch" split for an
+// analogous reason.
+func TestRevalidateIndex_LargeStaleSetFallsBackToFullRebuild(t *testing.T) {
+	old := indexRepairThreshold
+	indexRepairThreshold = 1
+	t.Cleanup(func() { indexRepairThreshold = old })
+
+	pkgs := []string{"a", "b"}
+	if got := chooseIndexRevalidateAction(pkgs, false); got != indexRevalidateRebuild {
+		t.Errorf("chooseIndexRevalidateAction(%d stale, wholeDBStale=false) = %v, want indexRevalidateRebuild once the stale count exceeds indexRepairThreshold=%d", len(pkgs), got, indexRepairThreshold)
+	}
+	if got := chooseIndexRevalidateAction(pkgs[:1], false); got != indexRevalidateRepair {
+		t.Errorf("chooseIndexRevalidateAction(%d stale, wholeDBStale=false) = %v, want indexRevalidateRepair at exactly indexRepairThreshold=%d", 1, got, indexRepairThreshold)
 	}
 }
 

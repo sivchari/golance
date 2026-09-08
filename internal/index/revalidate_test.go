@@ -176,3 +176,133 @@ func TestRevalidate_NewPackageNotYetInDB(t *testing.T) {
 		t.Error("Revalidate() = false, want true for a database with nothing built yet")
 	}
 }
+
+// TestRevalidateStale_ListsOnlyStalePackages verifies that RevalidateStale
+// returns exactly the stale root packages' import paths, leaving both an
+// unaffected sibling (leaf) and an unaffected dependent (top, which imports
+// the corrupted package but not any of its changed fields) out of the
+// result.
+func TestRevalidateStale_ListsOnlyStalePackages(t *testing.T) {
+	snap := loadTestSnapshot(t)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+	ctx := context.Background()
+
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	old, err := db.GetUnit(ctx, store.Hash(pkgMid))
+	if err != nil {
+		t.Fatalf("GetUnit(mid): %v", err)
+	}
+	corrupted := old
+	corrupted.ToolchainFingerprint = "corrupted-fingerprint"
+	if err := db.PutUnitPointersBatch(map[uint64]store.UnitPointer{store.Hash(pkgMid): corrupted}); err != nil {
+		t.Fatalf("PutUnitPointersBatch: %v", err)
+	}
+
+	pkgs, wholeDBStale, err := RevalidateStale(ctx, snap, db, runtime.Version(), "", false)
+	if err != nil {
+		t.Fatalf("RevalidateStale: %v", err)
+	}
+	if wholeDBStale {
+		t.Error("RevalidateStale() wholeDBStale = true, want false")
+	}
+	if want := []string{pkgMid}; !reflect.DeepEqual(pkgs, want) {
+		t.Errorf("RevalidateStale() pkgs = %v, want %v", pkgs, want)
+	}
+}
+
+// TestRevalidateStale_MismatchedFingerprintReportsWholeDBStale verifies that
+// RevalidateStale reports wholeDBStale via the same whole-database
+// short-circuit Revalidate uses, without a per-package fan-out.
+func TestRevalidateStale_MismatchedFingerprintReportsWholeDBStale(t *testing.T) {
+	snap := loadTestSnapshot(t)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+	ctx := context.Background()
+
+	if _, err := Build(ctx, snap, db, cas, &Options{ToolchainFingerprint: "go1.0-fake"}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	pkgs, wholeDBStale, err := RevalidateStale(ctx, snap, db, runtime.Version(), "", false)
+	if err != nil {
+		t.Fatalf("RevalidateStale: %v", err)
+	}
+	if !wholeDBStale {
+		t.Error("RevalidateStale() wholeDBStale = false, want true for a mismatched toolchain fingerprint")
+	}
+	if len(pkgs) != 0 {
+		t.Errorf("RevalidateStale() pkgs = %v, want empty when wholeDBStale", pkgs)
+	}
+}
+
+// TestPackageChanged_MissingUnitPointer verifies that PackageChanged reports
+// true for a package snap knows about but db has never recorded a
+// store.UnitPointer for, without that alone making the whole database look
+// stale (db's build fingerprint still matches).
+func TestPackageChanged_MissingUnitPointer(t *testing.T) {
+	dir := mutableTestModule(t)
+	snap := loadSnapshot(t, dir)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+	ctx := context.Background()
+
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	writeFile(t, dir, "extra/extra.go", "package extra\n\n// V returns 1.\nfunc V() int { return 1 }\n")
+	snap = loadSnapshot(t, dir)
+
+	const pkgExtra = "example.com/idxmod/extra"
+	changed, err := PackageChanged(ctx, snap, db, pkgExtra, runtime.Version(), "", false)
+	if err != nil {
+		t.Fatalf("PackageChanged: %v", err)
+	}
+	if !changed {
+		t.Error("PackageChanged() = false, want true for a package with no recorded UnitPointer")
+	}
+}
+
+// TestPackageChanged_Unchanged verifies that PackageChanged reports false
+// for a package right after Build, matching Revalidate's own
+// TestRevalidate_NothingChanged.
+func TestPackageChanged_Unchanged(t *testing.T) {
+	snap := loadTestSnapshot(t)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+	ctx := context.Background()
+
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	changed, err := PackageChanged(ctx, snap, db, pkgLeaf, runtime.Version(), "", false)
+	if err != nil {
+		t.Fatalf("PackageChanged: %v", err)
+	}
+	if changed {
+		t.Error("PackageChanged() = true, want false for an untouched package")
+	}
+}
+
+// TestPackageChanged_UnknownPackage verifies that PackageChanged reports an
+// error, not a boolean, for a path snap does not know about at all — a
+// caller bug, not a "changed" condition.
+func TestPackageChanged_UnknownPackage(t *testing.T) {
+	snap := loadTestSnapshot(t)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+	ctx := context.Background()
+
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if _, err := PackageChanged(ctx, snap, db, "example.com/idxmod/nonexistent", runtime.Version(), "", false); err == nil {
+		t.Error("PackageChanged() error = nil, want an error for an unknown package path")
+	}
+}

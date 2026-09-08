@@ -296,43 +296,105 @@ func (s *Server) tryWarmOpen(root string) (*indexState, bool) {
 	return &indexState{db: db, cas: cas, resolver: s.newResolver(db, cas, ws.snap, RelativeIndexPaths(root))}, true
 }
 
+// indexRepairThreshold bounds how many stale root packages revalidateIndex
+// repairs in place (repairIndexPackagesLocked) rather than falling back to
+// a full close-and-rebuild (buildIndexLocked). A targeted repair walks each
+// stale package's reverse-dependency closure sequentially, in-process,
+// while a full rebuild parallelizes every package across the indexer
+// subprocess's own worker pool (see index.Build's Options.Parallelism) —
+// worthwhile once the stale set is large enough that a sequential walk
+// would cost more than the parallelized alternative, or is simply close to
+// the whole workspace anyway. A var, not a const, so a test can lower it to
+// exercise the full-rebuild fallback without needing a fixture with 64+
+// stale packages.
+var indexRepairThreshold = 64
+
+// indexRevalidateAction is revalidateIndex's decision for what to do with a
+// staleIndexPackages result, split out via chooseIndexRevalidateAction so
+// the decision itself can be unit-tested without triggering either a real
+// reindex or an indexer subprocess launch — the same "test the decision,
+// not the dispatch" split workspace.go's workspaceReadyRefreshes uses for
+// an analogous reason.
+type indexRevalidateAction int
+
+const (
+	indexRevalidateNone indexRevalidateAction = iota
+	indexRevalidateRepair
+	indexRevalidateRebuild
+)
+
+// chooseIndexRevalidateAction decides revalidateIndex's branch from a
+// staleIndexPackages result: no-op when nothing is stale, a targeted
+// in-place repair when the stale set is small enough (indexRepairThreshold)
+// and the whole database is still trustworthy, or a full rebuild otherwise —
+// including whenever wholeDBStale is true, since Reindex never writes a
+// build fingerprint (see index.RevalidateStale's own doc) and so cannot
+// resolve that case no matter how few packages came back stale.
+func chooseIndexRevalidateAction(pkgs []string, wholeDBStale bool) indexRevalidateAction {
+	if !wholeDBStale && len(pkgs) == 0 {
+		return indexRevalidateNone
+	}
+	if !wholeDBStale && len(pkgs) <= indexRepairThreshold {
+		return indexRevalidateRepair
+	}
+	return indexRevalidateRebuild
+}
+
 // revalidateIndex checks, cheaply and in-process, whether root's
 // warm-opened facts index (installed by a prior tryWarmOpen) is still up
 // to date — the same skip logic [index.Build] uses to decide whether a
 // package needs rechecking, minus any type-checking itself (see
-// index.Revalidate). This runs concurrently with query handling and any
-// in-session Reindex against the same *store.DB (bbolt supports any number
-// of concurrent readers alongside one writer on one open handle), so
-// nothing needs to pause while it runs.
+// index.RevalidateStale). This runs concurrently with query handling and
+// any in-session Reindex against the same *store.DB (bbolt supports any
+// number of concurrent readers alongside one writer on one open handle),
+// so nothing needs to pause while it runs.
 //
 // If nothing is stale, this is a no-op: the warm-opened index keeps
-// serving as-is. Otherwise — a toolchain change, or a file changed outside
-// this session since it was last built — it closes the warm-opened db
-// handle (releasing it; bbolt's Close blocks until any in-flight read
+// serving as-is. If the stale set is small (chooseIndexRevalidateAction),
+// each stale package is repaired in place (repairIndexPackagesLocked) —
+// the same in-process s.reindex call handleDidSave makes — without ever
+// nil-ing out s.idx, so cross-reference queries keep answering throughout.
+// Otherwise — a toolchain change, or a stale set large enough that a
+// sequential repair no longer pays for itself — it closes the warm-opened
+// db handle (releasing it; bbolt's Close blocks until any in-flight read
 // finishes, so this does not race a concurrent query) and falls back to
 // buildIndex, the same full-rebuild path a cold start (no warm-open at
 // all) uses.
 //
-// v0.1 scope: this check runs once, shortly after initialize. A pull that
-// lands after it has already run is not picked up until the next restart
-// (or a go.mod/go.sum/go.work change, which handleDidChangeWatchedFiles
-// separately reloads the import graph for) — there is no ongoing poll for
-// external file changes during the rest of the session.
+// v0.1 scope: this check runs once per caller (see below), not on an
+// ongoing poll for external file changes during the rest of the session.
 //
-// revalidateIndex has two independent callers — the once-per-session
-// background check right after initialize (lifecycle.go) and a watched-
-// files-triggered revalidateWorkspace pass (workspace.go) — that can fire
-// close enough together to both observe the same warm-opened index as
-// stale at once. s.idxMu (held for this call's entire body, including any
-// buildIndex it triggers) serializes them: the second caller through the
-// lock re-checks indexNeedsRebuild against whatever the first one just
-// installed, so it only rebuilds again if still actually necessary, never
-// races the first's own Store(nil)/Close, and never runs a second indexer
-// subprocess concurrently with the first's.
+// revalidateIndex has several independent callers that can fire close
+// enough together to both observe the same warm-opened index as stale at
+// once: the once-per-session background check right after initialize
+// (lifecycle.go), a watched-files-triggered revalidateWorkspace pass
+// (workspace.go), and revalidateGraph itself, which every reload — of
+// either kind — ultimately runs through. s.idxMu (held for this call's
+// entire body, including any repair or rebuild it triggers) serializes all
+// of them: the second caller through the lock re-checks
+// staleIndexPackages against whatever the first one just installed, so it
+// only acts again if still actually necessary, never races the first's own
+// Store(nil)/Close, and never runs a second indexer subprocess
+// concurrently with the first's.
 func (s *Server) revalidateIndex(ctx context.Context, root string) {
 	s.idxMu.Lock()
 	defer s.idxMu.Unlock()
-	if !s.indexNeedsRebuild() {
+	pkgs, wholeDBStale := s.staleIndexPackages(ctx)
+	action := chooseIndexRevalidateAction(pkgs, wholeDBStale)
+	if action == indexRevalidateRepair {
+		idx := s.idx.Load()
+		ws := s.workspace()
+		if idx != nil && ws != nil {
+			s.repairIndexPackagesLocked(ctx, ws, idx, pkgs)
+			return
+		}
+		// idx or ws vanished under us since staleIndexPackages read them
+		// (e.g. a concurrent Stop): a full rebuild's own workspace()/idx
+		// re-checks handle that safely, whereas silently doing nothing
+		// would leave the stale packages unrepaired.
+		action = indexRevalidateRebuild
+	}
+	if action == indexRevalidateNone {
 		return
 	}
 	if idx := s.idx.Load(); idx != nil {
@@ -344,26 +406,43 @@ func (s *Server) revalidateIndex(ctx context.Context, root string) {
 	s.buildIndexLocked(ctx, root)
 }
 
-// indexNeedsRebuild reports whether the currently warm-opened index (if
-// any) is stale, per index.Revalidate. False whenever there is nothing
-// warm-opened to check, or the check itself fails (conservatively: keep
-// serving what is already open rather than force a rebuild on every
+// repairIndexPackagesLocked reindexes each of pkgs in place, via the same
+// s.reindex call handleDidSave makes for a saved package — including its
+// reverse-dependency-closure fan-out and depCache/resolver invalidation.
+// Unlike buildIndexLocked's close-and-rebuild path, s.idx is never touched:
+// cross-reference queries keep answering throughout, from increasingly
+// fresh state as each package is repaired, rather than returning
+// index-unavailable for however long a full subprocess rebuild would take.
+// Called only from revalidateIndex, which already holds s.idxMu.
+func (s *Server) repairIndexPackagesLocked(ctx context.Context, ws *workspace, idx *indexState, pkgs []string) {
+	for _, pkgPath := range pkgs {
+		s.reindex(ctx, ws, idx, pkgPath)
+	}
+}
+
+// staleIndexPackages reports which of the currently warm-opened index's
+// (if any) root packages are stale, per index.RevalidateStale — the
+// per-package detail revalidateIndex needs to decide between a targeted
+// repair and a full rebuild, rather than index.Revalidate's single
+// whole-database bool. Reports nothing stale (nil, false) whenever there is
+// nothing warm-opened to check, or the check itself fails (conservatively:
+// keep serving what is already open rather than force a rebuild on every
 // transient error).
-func (s *Server) indexNeedsRebuild() bool {
+func (s *Server) staleIndexPackages(ctx context.Context) (pkgs []string, wholeDBStale bool) {
 	idx := s.idx.Load()
 	if idx == nil {
-		return false
+		return nil, false
 	}
 	ws := s.workspace()
 	if ws == nil {
-		return false
+		return nil, false
 	}
-	changed, err := index.Revalidate(context.Background(), ws.snap, idx.db, runtime.Version(), "", RelativeIndexPaths(ws.root))
+	pkgs, wholeDBStale, err := index.RevalidateStale(ctx, ws.snap, idx.db, runtime.Version(), "", RelativeIndexPaths(ws.root))
 	if err != nil {
 		s.logger.Printf("golance: revalidate index: %v", err)
-		return false
+		return nil, false
 	}
-	return changed
+	return pkgs, wholeDBStale
 }
 
 // buildIndex launches the indexer subprocess for root, relays its build
