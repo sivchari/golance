@@ -426,9 +426,13 @@ func (g *goplsLSP) close(t *testing.T) {
 
 func (g *goplsLSP) initialize(t *testing.T) {
 	t.Helper()
-	rootURI := uri.File(g.root)
 	params := &protocol.InitializeParams{
-		RootURI: &rootURI,
+		WorkspaceFoldersInitializeParams: protocol.WorkspaceFoldersInitializeParams{
+			WorkspaceFolders: protocol.NewNullable([]protocol.WorkspaceFolder{{
+				URI:  uri.File(g.root),
+				Name: filepath.Base(g.root),
+			}}),
+		},
 		Capabilities: protocol.ClientCapabilities{
 			TextDocument: &protocol.TextDocumentClientCapabilities{
 				TypeHierarchy:  &protocol.TypeHierarchyClientCapabilities{},
