@@ -745,3 +745,45 @@ func TestGo_TrackedByServeShutdownDrain(t *testing.T) {
 		t.Fatal("Serve() returned before its own wg.Wait() drained the Go-launched goroutine")
 	}
 }
+
+// TestGo_PanicRecoveredLoggedAndDrainsOnShutdown covers Go's own panic
+// recovery: a panic in a Go-launched detached goroutine has no
+// request/notification dispatch caller left to fail gracefully by the time
+// it runs, so it must be recovered and logged with a stack trace instead of
+// crashing the whole process, and wg.Done must still run so Serve's
+// shutdown-time drain (see TestGo_TrackedByServeShutdownDrain) never hangs
+// on a goroutine that panicked.
+func TestGo_PanicRecoveredLoggedAndDrainsOnShutdown(t *testing.T) {
+	var logBuf bytes.Buffer
+	s := NewServer(WithLogger(log.New(&logBuf, "", 0)))
+	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) {
+		s.Go(func(context.Context) {
+			panic("deliberate background panic")
+		})
+		return nil, nil
+	})
+
+	pr, pw := io.Pipe()
+	var out bytes.Buffer
+	go func() {
+		_, _ = pw.Write([]byte(frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)))
+		_ = pw.Close()
+	}()
+
+	// Serve returning at all (rather than the test process crashing) is
+	// itself part of what this test verifies; its own defer s.wg.Wait()
+	// additionally guarantees the panic was already recovered and logged by
+	// the time it returns, exactly as TestGo_TrackedByServeShutdownDrain
+	// relies on for a non-panicking fn.
+	if err := s.Serve(context.Background(), pr, &out); err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+
+	got := logBuf.String()
+	if !strings.Contains(got, "deliberate background panic") {
+		t.Fatalf("log output = %q, want it to contain the panic value", got)
+	}
+	if !strings.Contains(got, "goroutine") {
+		t.Fatalf("log output = %q, want a stack trace", got)
+	}
+}

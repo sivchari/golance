@@ -121,24 +121,36 @@ func Shared(root string) bool {
 	return shared
 }
 
+// cacheBaseDir resolves the directory CacheFile builds golance's own cache
+// path under. A package-level var, not a plain function call, so a test can
+// replace it directly (see graph_test.go's withTestCacheDir) instead of
+// going through an environment variable: os.UserCacheDir() ignores
+// XDG_CACHE_HOME on darwin (it always returns $HOME/Library/Caches there),
+// so an env-var-only seam would silently fail to isolate CacheFile on that
+// platform, leaving a test reading and writing the developer's real
+// ~/Library/Caches/golance directory instead of its own t.TempDir().
+var cacheBaseDir = defaultCacheBaseDir
+
+func defaultCacheBaseDir() string {
+	if base, err := os.UserCacheDir(); err == nil {
+		return base
+	}
+	return filepath.Join(os.Getenv("HOME"), ".cache")
+}
+
 // CacheFile returns the on-disk cache path for a workspace root, under
-// $XDG_CACHE_HOME (or the platform default via os.UserCacheDir). Keyed by
-// RepoKey(root), not root itself: every worktree of the same git repository
-// resolves to the same path, so a graph cache one worktree already paid to
-// build (see loadMode's doc for that cost on a large monorepo) is directly
-// available to a brand-new sibling worktree instead of that worktree
-// needing its own cold `go list`. A non-git root's RepoKey is root itself
-// (shared=false), so this collapses back to golance's pre-sharing,
-// private-per-root behavior for that case — the same function, no special
-// casing needed.
+// cacheBaseDir(). Keyed by RepoKey(root), not root itself: every worktree of
+// the same git repository resolves to the same path, so a graph cache one
+// worktree already paid to build (see loadMode's doc for that cost on a
+// large monorepo) is directly available to a brand-new sibling worktree
+// instead of that worktree needing its own cold `go list`. A non-git root's
+// RepoKey is root itself (shared=false), so this collapses back to
+// golance's pre-sharing, private-per-root behavior for that case — the same
+// function, no special casing needed.
 func CacheFile(root string) string {
 	key, _ := RepoKey(root)
 	h := sha256.Sum256([]byte(key))
-	base, err := os.UserCacheDir()
-	if err != nil {
-		base = filepath.Join(os.Getenv("HOME"), ".cache")
-	}
-	return filepath.Join(base, "golance", fmt.Sprintf("graph-%x.json", h[:8]))
+	return filepath.Join(cacheBaseDir(), "golance", fmt.Sprintf("graph-%x.json", h[:8]))
 }
 
 // LoadCache reads a Snapshot previously persisted by SaveCache, rejoined

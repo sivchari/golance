@@ -389,6 +389,44 @@ func (e *Engine) Invalidate(dir string) {
 	}
 }
 
+// InvalidateDependency drops the cached CheckedPackage for each of dirs (both
+// variants, see unitKey) that Engine already knows about (see
+// unitKnownLocked), and arms the same debounce-triggered recheck+publish
+// Invalidate does for those. A dir Engine has never resolved — never Get's
+// or SetFocus'd, i.e. never opened — is left alone entirely: it has nothing
+// cached that a stale dependency could have left stale in the first place
+// (a content-hash cache hit can only ever return a previously committed
+// entry), so there is nothing to drop and nothing worth scheduling a
+// recheck for.
+//
+// This exists for Server.reindex's reverse-dependency closure of a saved
+// package: unlike Invalidate's own callers (didOpen/didChange/didSave, each
+// scoped to the one file its own notification is about, always already
+// known by the time it calls Invalidate — see Invalidate's doc), dirs here
+// can span an arbitrary number of OTHER packages nothing in that
+// notification touched directly, most of which — in a large workspace — the
+// engine may never have resolved at all. Arming Invalidate's own
+// unconditional debounce for every one of them would schedule a full
+// recheck, and publish diagnostics, for a file the user never opened, on
+// every save of a widely-imported package; gating on unitKnownLocked instead
+// bounds the work (and the diagnostics traffic) to units the engine already
+// has live, which is exactly the set whose cached type information this
+// dependency change could have made wrong.
+func (e *Engine) InvalidateDependency(dirs []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, dir := range dirs {
+		for _, v := range [...]variant{variantBase, variantExternalTest} {
+			key := unitKey{dir: dir, variant: v}
+			if !e.unitKnownLocked(key) {
+				continue
+			}
+			delete(e.cache, key)
+			e.armDebounceLocked(key)
+		}
+	}
+}
+
 // unitKnownLocked reports whether Engine has ever resolved or cached key.
 // Callers must hold e.mu.
 func (e *Engine) unitKnownLocked(key unitKey) bool {
@@ -432,8 +470,30 @@ func (e *Engine) jobStateLocked(key unitKey) *dirState {
 // no-op if a newer background job has since superseded this one. This is
 // used only for debounce-triggered background rechecks (fireRecheck); Get
 // does not call it.
+//
+// If e.ctx is already canceled — Stop has already run, or is running
+// concurrently and reaches its own e.mu section either before or after this
+// one — the returned context is pre-canceled and never registered as key's
+// dirState.cancel. This is what makes Stop's contract airtight against a
+// debounce timer that fires concurrently with Stop itself (see
+// armDebounceLocked's time.AfterFunc: Stop cannot prevent an already-fired
+// timer's callback from running, only from doing anything once it does):
+// whichever of the two goroutines reaches e.mu first, the other observes a
+// fully consistent outcome — either this job registers before Stop's own
+// pass, and Stop's loop below cancels it like any other, or Stop's
+// e.cancel() has already run, and this call sees e.ctx.Err() != nil and
+// bails before registering anything Stop could otherwise miss. Either way,
+// fireRecheck's caller ends up with a context runRecheck rejects at its very
+// first check (before any file I/O or type-checking), so it can never reach
+// commit/Options.OnResult once Stop has returned.
 func (e *Engine) startJob(parent context.Context, key unitKey) (context.Context, func()) {
 	e.mu.Lock()
+	if e.ctx.Err() != nil {
+		e.mu.Unlock()
+		ctx, cancel := context.WithCancel(parent)
+		cancel()
+		return ctx, func() {}
+	}
 	st := e.jobStateLocked(key)
 	if st.timer != nil {
 		st.timer.Stop()
@@ -583,6 +643,16 @@ func (e *Engine) Retire() {
 // from the engine's own lifetime: Stop still reclaims it. See Retire for
 // the alternative that stops background publishing without aborting
 // in-flight request-driven work.
+//
+// This contract holds even for a debounce timer that fires concurrently
+// with Stop itself: time.Timer.Stop cannot prevent an already-fired
+// timer's callback from running, so this loop alone cannot guarantee such a
+// callback never calls Options.OnResult — the guarantee instead comes from
+// startJob observing e.ctx (canceled above, under the same e.mu this loop
+// holds) before registering any job Stop could otherwise race past. See
+// startJob's doc for the full argument. No debounce-triggered background
+// recheck can reach commit/Options.OnResult once Stop has returned,
+// regardless of how its timer's fire raced this call.
 // Safe to call more than once.
 func (e *Engine) Stop() {
 	e.mu.Lock()

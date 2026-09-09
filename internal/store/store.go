@@ -125,13 +125,31 @@ type DB struct {
 // reports every package as not-yet-in-db, triggering a full rebuild — see
 // internal/server.indexNeedsRebuild) already handles an empty database
 // correctly.
+//
+// A path whose bytes bbolt cannot even parse as a database at all — its two
+// meta pages both invalid, e.g. because something outside golance truncated
+// or overwrote the file, or a write was torn by a full disk — gets the exact
+// same discard-and-recreate treatment (see isCorrupt), just one step
+// earlier: discardStale needs a transaction to run at all to read the meta
+// bucket, which bbolt.Open itself never reaches for a file this broken.
+// Without this, such a file would fail every future Open attempt forever —
+// unlike every other Open failure this package recognizes (a lock held by
+// another live session; a missing parent directory), there is no future
+// event that could ever make it openable again.
 func Open(path string) (*DB, error) {
 	bdb, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: openTimeout})
+	recreated := false
+	if err != nil && isCorrupt(err) {
+		recreated = true
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			return nil, fmt.Errorf("store: remove corrupt %s: %w", path, rmErr)
+		}
+		bdb, err = bbolt.Open(path, 0o600, &bbolt.Options{Timeout: openTimeout})
+	}
 	if err != nil {
 		return nil, wrapOpenErr(path, err)
 	}
-	var recreated bool
-	if discardStale(bdb) {
+	if !recreated && discardStale(bdb) {
 		recreated = true
 		if err := bdb.Close(); err != nil {
 			return nil, fmt.Errorf("store: close stale %s: %w", path, err)
@@ -157,6 +175,19 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("store: init buckets: %w", err)
 	}
 	return &DB{bolt: bdb, path: path, recreated: recreated}, nil
+}
+
+// isCorrupt reports whether err — a bbolt.Open failure — means path exists
+// but its content is not (or no longer) a readable bbolt database, as
+// opposed to being held open by another process (ErrTimeout, handled
+// separately by IsLocked) or some other environmental failure (e.g. a
+// missing parent directory). bbolt returns one of these four errors when
+// neither of a database's two meta pages passes validation.
+func isCorrupt(err error) bool {
+	return errors.Is(err, bolterrors.ErrInvalid) ||
+		errors.Is(err, bolterrors.ErrInvalidMapping) ||
+		errors.Is(err, bolterrors.ErrVersionMismatch) ||
+		errors.Is(err, bolterrors.ErrChecksum)
 }
 
 // OpenReadOnly opens an already-initialized index database at path without

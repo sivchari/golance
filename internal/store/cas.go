@@ -220,6 +220,9 @@ func (c *CAS) sweep(now time.Time, marks map[uint64]struct{}, grace time.Duratio
 			}
 			key, ok := blobKeyFromFilename(shard.Name(), e.Name())
 			if !ok {
+				if isOrphanedPutTempFile(e.Name()) {
+					sweepOrphanedTempFile(shardPath, e, cutoff, &stats)
+				}
 				continue
 			}
 			fi, err := e.Info()
@@ -240,6 +243,37 @@ func (c *CAS) sweep(now time.Time, marks map[uint64]struct{}, grace time.Duratio
 	}
 	stats.Duration = time.Since(start)
 	return stats, nil
+}
+
+// isOrphanedPutTempFile reports whether name matches the "tmp-*.blob"
+// pattern (*CAS).Put stages a write under, in the same shard directory,
+// before renaming it into its final blobPath. blobKeyFromFilename never
+// matches this shape (its 16 hex digits can never start with "tmp-"), so
+// without this check a temp file left behind by a process that crashed
+// between CreateTemp and Rename would never be swept at all, no matter how
+// old — silently accumulating one leftover file per interrupted Put across
+// the lifetime of a shared CAS directory.
+func isOrphanedPutTempFile(name string) bool {
+	return strings.HasPrefix(name, "tmp-") && strings.HasSuffix(name, ".blob")
+}
+
+// sweepOrphanedTempFile removes e — already known to match
+// isOrphanedPutTempFile — if it was last written before cutoff, folding the
+// reclaimed size into stats' swept counters exactly as an ordinary
+// unreferenced blob would be. The same cutoff already governing every other
+// removal in sweep applies here for the same reason: a temp file younger
+// than the grace window may belong to a Put that is still in flight
+// (CreateTemp has run; Rename has not yet), not one that crashed.
+func sweepOrphanedTempFile(shardPath string, e os.DirEntry, cutoff time.Time, stats *GCStats) {
+	fi, err := e.Info()
+	if err != nil || fi.ModTime().After(cutoff) {
+		return
+	}
+	size := fi.Size()
+	if os.Remove(filepath.Join(shardPath, e.Name())) == nil {
+		stats.SweptCount++
+		stats.SweptBytes += size
+	}
 }
 
 // MaybeGC runs GC(now, marks) only if at least GCInterval has passed since

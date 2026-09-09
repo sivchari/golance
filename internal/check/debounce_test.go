@@ -1,6 +1,7 @@
 package check
 
 import (
+	"context"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -195,4 +196,86 @@ func TestEngine_Stop_CancelsPendingDebounceTimer(t *testing.T) {
 			t.Fatalf("OnResult called %d times after Stop, want 0 (the pending debounce timer must never fire)", got)
 		}
 	})
+}
+
+// TestEngine_Invalidate_AfterStopNeverPublishes is a regression test for a
+// gap TestEngine_Stop_CancelsPendingDebounceTimer and
+// TestEngine_Stop_CancelsInFlightBackgroundRecheck do not cover: a debounce
+// timer armed (or already fired) so close to Stop that Stop's own
+// disarm/cancel loop races it rather than observing it. Invalidate here runs
+// entirely after Stop has already returned, so its timer is armed with
+// e.ctx already canceled — reproducing, deterministically, the same state a
+// timer that fires concurrently with Stop ends up in once its callback
+// reaches startJob (see startJob's doc): without startJob's e.ctx check,
+// this would still fire after the debounce delay and reach
+// commit/Options.OnResult despite Stop having already returned.
+func TestEngine_Invalidate_AfterStopNeverPublishes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var count int
+
+		e, root := newTestEngine(t, overlay.New(), Options{
+			DebounceDelay: 20 * time.Millisecond,
+			OnResult: func(*Result) {
+				mu.Lock()
+				count++
+				mu.Unlock()
+			},
+		})
+		dir := filepath.Join(root, "debounce")
+
+		e.Stop()
+		e.Invalidate(dir)
+		time.Sleep(150 * time.Millisecond) // long enough for the debounce delay to elapse
+
+		mu.Lock()
+		got := count
+		mu.Unlock()
+		if got != 0 {
+			t.Fatalf("OnResult called %d times for a debounce armed after Stop, want 0", got)
+		}
+	})
+}
+
+// TestEngine_StartJob_RacesStopAlreadyCanceled directly exercises the race
+// startJob's doc describes: a debounce timer's callback reaching startJob
+// after Stop has already canceled e.ctx, but before (or without) ever having
+// registered a dirState.cancel Stop's own loop could have canceled instead.
+// time.Timer.Stop cannot prevent an already-fired callback from running, so
+// this interleaving cannot be forced deterministically through the real
+// timer; calling startJob directly, exactly as fireRecheck would from
+// inside that callback, exercises the same code path without depending on
+// goroutine scheduling.
+func TestEngine_StartJob_RacesStopAlreadyCanceled(t *testing.T) {
+	var mu sync.Mutex
+	var count int
+
+	e, root := newTestEngine(t, overlay.New(), Options{
+		OnResult: func(*Result) {
+			mu.Lock()
+			count++
+			mu.Unlock()
+		},
+	})
+	dir := filepath.Join(root, "debounce")
+	key := unitKey{dir: dir, variant: variantBase}
+
+	e.Stop()
+
+	ctx, finish := e.startJob(context.Background(), key)
+	defer finish()
+	if ctx.Err() == nil {
+		t.Fatal("startJob after Stop returned a live context, want it pre-canceled")
+	}
+
+	if _, err := e.runRecheck(ctx, key); err == nil {
+		t.Fatal("runRecheck with a post-Stop context succeeded, want it to bail on the canceled context")
+	}
+
+	mu.Lock()
+	got := count
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("OnResult called %d times for a recheck started after Stop, want 0", got)
+	}
 }

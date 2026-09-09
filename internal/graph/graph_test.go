@@ -32,6 +32,21 @@ func TestLoadMode_NeverRequestsExportFile(t *testing.T) {
 	}
 }
 
+// withTestCacheDir points cacheBaseDir at a fresh t.TempDir() for the
+// duration of t, restoring the previous value once t completes. This is the
+// seam every test touching CacheFile/SaveCache/LoadCache/Stale must go
+// through: cacheBaseDir's production default (os.UserCacheDir()) ignores
+// XDG_CACHE_HOME on darwin, so setting that environment variable alone does
+// not isolate these calls from the developer's real
+// ~/Library/Caches/golance directory on that platform.
+func withTestCacheDir(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	prev := cacheBaseDir
+	cacheBaseDir = func() string { return dir }
+	t.Cleanup(func() { cacheBaseDir = prev })
+}
+
 func loadTestdata(t *testing.T) *Snapshot {
 	t.Helper()
 	root, err := filepath.Abs(filepath.Join("testdata", "simple"))
@@ -204,7 +219,7 @@ func TestCache_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("abs testdata root: %v", err)
 	}
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	withTestCacheDir(t)
 
 	snap := loadTestdata(t)
 	patterns := []string{"./..."}
@@ -243,7 +258,7 @@ func TestLoadCache_RejectsOldVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("abs testdata root: %v", err)
 	}
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	withTestCacheDir(t)
 	patterns := []string{"./..."}
 
 	old := diskCache{Version: cacheVersion - 1, Patterns: patterns, Packages: map[string]*Package{}}
@@ -269,7 +284,7 @@ func TestLoadCache_RejectsOldVersion(t *testing.T) {
 // just a modification to one that still exists (see Stale's doc).
 func TestStale_DeletedTrackedFile(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	withTestCacheDir(t)
 
 	goWork := filepath.Join(root, "go.work")
 	if err := os.WriteFile(goWork, []byte("go 1.23\n"), 0o600); err != nil {

@@ -71,7 +71,7 @@ func gitModuleRepoWithWorktree(t *testing.T) (mainRoot, otherRoot string) {
 // own cold `go list`.
 func TestCache_SharedAcrossWorktrees(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	withTestCacheDir(t)
 	mainRoot, otherRoot := gitModuleRepoWithWorktree(t)
 
 	if !Shared(mainRoot) || !Shared(otherRoot) {
@@ -132,7 +132,7 @@ func TestCache_DependencyPathsStayAbsoluteAcrossWorktrees(t *testing.T) {
 	// about-to-be-fake $HOME.
 	modcache := realGOMODCACHE(t)
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	withTestCacheDir(t)
 	// Point GOMODCACHE at the real, already-populated module cache instead
 	// of letting it default under the now-sandboxed $HOME: this fixture's
 	// whole point is exercising a real module-cache dependency (see
@@ -182,7 +182,7 @@ func TestCache_DependencyPathsStayAbsoluteAcrossWorktrees(t *testing.T) {
 // which would silently produce nonsense paths.
 func TestCache_VersionBumpDiscardsSharedSnapshot(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	withTestCacheDir(t)
 	mainRoot, otherRoot := gitModuleRepoWithWorktree(t)
 
 	patterns := []string{"./..."}

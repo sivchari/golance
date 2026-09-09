@@ -245,10 +245,24 @@ func (s *Server) Context() context.Context {
 // for detached background work a handler starts that must outlive the
 // call that started it (e.g. launching the indexer subprocess, a
 // debounced reindex) but should still stop once the session itself ends.
+//
+// A panic in fn is recovered and logged with a stack trace, mirroring
+// callRequestHandler's and callNotificationHandler's own handler-panic
+// recovery, rather than left to unwind: unlike a request or notification,
+// detached background work has no dispatch-loop caller left to fail
+// gracefully by the time fn runs, so an unrecovered panic here would take
+// the whole process down instead of just this one piece of background
+// work. wg.Done still runs either way, so a panicking fn cannot wedge
+// Serve's shutdown-time drain.
 func (s *Server) Go(fn func(ctx context.Context)) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Printf("rpc: panic in background task: %v\n%s", r, debug.Stack())
+			}
+		}()
 		fn(s.Context())
 	}()
 }
