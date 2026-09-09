@@ -16,23 +16,24 @@ import (
 
 // Revalidate reports whether any root package in snap would need real work
 // (a parse/type-check) if [Build] ran against db and its CAS right now: a
-// missing or stale [store.UnitPointer], a toolchain fingerprint mismatch, or
-// a genuine change to its own content or a direct dependency's exported API
-// (see the package doc's key composition). relative must match the
-// Options.RelativePaths value db was last built or reindexed with, so a
-// stored [store.UnitPointer].Files path is joined back onto snap.Dir()
-// correctly before comparison.
+// missing or stale [store.UnitPointer], a toolchain fingerprint mismatch, a
+// genuine change to its own content or a direct dependency's exported API
+// (see the package doc's key composition), or a recorded [store.UnitPointer]
+// whose blob has gone missing from the CAS entirely (see packageChanged's
+// doc). relative must match the Options.RelativePaths value db was last
+// built or reindexed with, so a stored [store.UnitPointer].Files path is
+// joined back onto snap.Dir() correctly before comparison.
 //
-// It never writes to db, and never touches the CAS at all (every
-// comparison is against already-recorded [store.UnitPointer] values, never
-// a blob's own content) — so it is safe and cheap to run concurrently with
-// any other use of db, including a caller that already has db open for
-// interactive queries or in-session Reindex writes: bbolt permits any
-// number of concurrent readers alongside one writer on the same open
-// handle. Packages are checked concurrently, at a higher fan-out than
-// Build's own Options.Parallelism: unlike Build, this never type-checks
-// anything, so its work is I/O-bound (a stat per file, and occasionally a
-// source read for the content-hash fallback) rather than CPU-bound.
+// It never writes to db. It touches the CAS only to stat (never read) each
+// package's recorded blob — see [store.CAS.Has] — so it remains safe and
+// cheap to run concurrently with any other use of db, including a caller
+// that already has db open for interactive queries or in-session Reindex
+// writes: bbolt permits any number of concurrent readers alongside one
+// writer on the same open handle. Packages are checked concurrently, at a
+// higher fan-out than Build's own Options.Parallelism: unlike Build, this
+// never type-checks anything, so its work is I/O-bound (a stat per file,
+// occasionally a source read for the content-hash fallback, and now one
+// more stat per package for the CAS blob check) rather than CPU-bound.
 func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolchainFP, buildFlagsFP string, relative bool) (bool, error) {
 	stale, wholeDBStale, err := revalidateImpl(ctx, snap, db, toolchainFP, buildFlagsFP, relative)
 	if err != nil {
@@ -69,8 +70,9 @@ func RevalidateStale(ctx context.Context, snap *graph.Snapshot, db *store.DB, to
 // only needs a cheap answer for one specific root package — e.g.
 // internal/server's didOpen-time self-heal — rather than fanning out over
 // the whole workspace. It costs one [store.DB.BuildFingerprint] read, one
-// [store.DB.GetUnit] read, and stat-based hashing of path's own files only;
-// it never touches any other package's files.
+// [store.DB.GetUnit] read, stat-based hashing of path's own files only, and
+// (see packageChanged's doc) one [store.CAS.Has] stat of path's own
+// recorded blob; it never touches any other package's files or blobs.
 //
 // The whole-database build-fingerprint check runs first, exactly as in
 // Revalidate: if it is missing or does not match toolchainFP, PackageChanged
@@ -100,15 +102,47 @@ func PackageChanged(ctx context.Context, snap *graph.Snapshot, db *store.DB, pat
 		return false, fmt.Errorf("index: packagechanged: unknown package %s", path)
 	}
 
+	cas, err := blobCAS(db)
+	if err != nil {
+		return false, err
+	}
+
 	keys := newKeyTable(ctx, db)
-	return packageChanged(ctx, db, keys, snap, pkg, path, toolchainFP, buildFlagsFP, snap.Dir(), relative)
+	return packageChanged(ctx, db, cas, keys, snap, pkg, path, toolchainFP, buildFlagsFP, snap.Dir(), relative)
+}
+
+// blobCAS opens the *store.CAS db's own [store.UnitPointer.BlobKey] values
+// resolve against, via [store.DB.CASDir] — the association cmd/golance's
+// indexer subprocess records right before every [Build] call runs (see its
+// own buildIndex), so any db packageChanged is ever usefully called against
+// in production already has it by the time this runs. cas is nil (ok, no
+// error) when db has no recorded CAS directory at all — a db that predates
+// [store.DB.PutCASDir] or a caller (typically a test) that built one
+// without ever calling it — so packageChanged can fall back to its
+// pre-existing, blob-existence-blind comparison instead of erroring a
+// widely called exported function for a state production code never
+// actually leaves a database in.
+func blobCAS(db *store.DB) (*store.CAS, error) {
+	dir, err := db.CASDir()
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("index: revalidate: read CAS directory: %w", err)
+	}
+	cas, err := store.OpenCAS(dir)
+	if err != nil {
+		return nil, fmt.Errorf("index: revalidate: open CAS directory %s: %w", dir, err)
+	}
+	return cas, nil
 }
 
 // revalidateImpl is the shared implementation behind Revalidate and
-// RevalidateStale: it scans every root package in snap concurrently and
-// reports which ones are stale (see packageChanged), short-circuiting only
-// on the cheap whole-database build-fingerprint check both public entry
-// points document.
+// RevalidateStale: it scans every schedulable package in snap (see
+// schedulableRoot — every root package plus each one's external "_test"
+// package, if it has one) concurrently and reports which ones are stale
+// (see packageChanged), short-circuiting only on the cheap whole-database
+// build-fingerprint check both public entry points document.
 func revalidateImpl(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolchainFP, buildFlagsFP string, relative bool) (stale []string, wholeDBStale bool, err error) {
 	// Cheap whole-database short-circuit: if db was never fully built under
 	// the running toolchain at all (see index.Build's PutBuildFingerprint),
@@ -132,6 +166,11 @@ func revalidateImpl(ctx context.Context, snap *graph.Snapshot, db *store.DB, too
 		return nil, true, nil
 	}
 
+	cas, err := blobCAS(db)
+	if err != nil {
+		return nil, false, err
+	}
+
 	root := snap.Dir()
 	keys := newKeyTable(ctx, db)
 	sem := semaphore.NewWeighted(int64(max(1, runtime.NumCPU()*2)))
@@ -140,7 +179,7 @@ func revalidateImpl(ctx context.Context, snap *graph.Snapshot, db *store.DB, too
 	var firstErr firstErrRecorder
 	var wg sync.WaitGroup
 	for path, pkg := range snap.Packages {
-		if !pkg.Root || len(pkg.GoFiles) == 0 {
+		if !schedulableRoot(snap, pkg) || len(pkg.GoFiles) == 0 {
 			continue
 		}
 		wg.Add(1)
@@ -152,7 +191,7 @@ func revalidateImpl(ctx context.Context, snap *graph.Snapshot, db *store.DB, too
 			}
 			defer sem.Release(1)
 
-			pkgChanged, err := packageChanged(ctx, db, keys, snap, pkg, path, toolchainFP, buildFlagsFP, root, relative)
+			pkgChanged, err := packageChanged(ctx, db, cas, keys, snap, pkg, path, toolchainFP, buildFlagsFP, root, relative)
 			if err != nil {
 				firstErr.record(err)
 				return
@@ -174,10 +213,15 @@ func revalidateImpl(ctx context.Context, snap *graph.Snapshot, db *store.DB, too
 
 // packageChanged reports whether pkg differs from what db last recorded for
 // it, without writing anything: a missing pointer, a toolchain fingerprint
-// mismatch, a dependency that has never been indexed at all, or — the
-// common case — a recomputed combined key ([computeUnitKey]) that no longer
-// matches the stored [store.UnitPointer].BlobKey.
-func packageChanged(ctx context.Context, db *store.DB, keys *keyTable, snap *graph.Snapshot, pkg *graph.Package, path, toolchainFP, buildFlagsFP, root string, relative bool) (bool, error) {
+// mismatch, a dependency that has never been indexed at all, a recomputed
+// combined key ([computeUnitKey]) that no longer matches the stored
+// [store.UnitPointer].BlobKey — the common case — or, the same gap
+// processUnit's own unchanged fast path closes on the write side (see its
+// doc), a BlobKey that still matches but whose blob cas no longer has (e.g.
+// swept by a [store.CAS.GC] pass whose mark set could not read this
+// database in time). cas may be nil (see [blobCAS]'s doc for when and why),
+// in which case that last check is skipped rather than erroring.
+func packageChanged(ctx context.Context, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, pkg *graph.Package, path, toolchainFP, buildFlagsFP, root string, relative bool) (bool, error) {
 	old, err := db.GetUnit(ctx, store.Hash(path))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -224,7 +268,10 @@ func packageChanged(ctx context.Context, db *store.DB, keys *keyTable, snap *gra
 		deps = append(deps, depExportEntry{path: imp, exportHash: rec.exportHash})
 	}
 
-	return computeUnitKey(ownHash, deps) != old.BlobKey, nil
+	if computeUnitKey(ownHash, deps) != old.BlobKey {
+		return true, nil
+	}
+	return cas != nil && !cas.Has(old.BlobKey), nil
 }
 
 // firstErrRecorder keeps the first non-nil error reported to it by any

@@ -305,7 +305,10 @@ func TestNothing(t *testing.T) {}
 // no GoFiles (go/packages legitimately reports these, e.g. a directory
 // containing only an external "_test" package) is counted as Skipped and
 // does not turn Build's return error non-nil, while every other package
-// still builds normally.
+// still builds normally — including that same directory's external "_test"
+// package itself (schedulableRoot), which is a real, non-empty unit of its
+// own even though the ordinary "empty" package sharing its directory has no
+// GoFiles at all.
 func TestBuild_EmptyPackageIsSkippedNotFatal(t *testing.T) {
 	dir := writeEmptyPackageModule(t)
 	snap, err := graph.Load(graph.Options{Dir: dir}, "./...")
@@ -319,11 +322,11 @@ func TestBuild_EmptyPackageIsSkippedNotFatal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if stats.Processed != 1 {
-		t.Errorf("Processed = %d, want 1", stats.Processed)
+	if stats.Processed != 2 {
+		t.Errorf("Processed = %d, want 2 (good, empty_test)", stats.Processed)
 	}
 	if stats.Skipped != 1 {
-		t.Errorf("Skipped = %d, want 1", stats.Skipped)
+		t.Errorf("Skipped = %d, want 1 (empty, no GoFiles)", stats.Skipped)
 	}
 	if stats.Errors != 0 {
 		t.Errorf("Errors = %d, want 0", stats.Errors)

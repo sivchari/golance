@@ -1,7 +1,9 @@
 package index
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -24,6 +26,23 @@ func overlayReader(t *testing.T, path string, content []byte) FileReader {
 	return func(p string) ([]byte, error) {
 		if p == abs {
 			return content, nil
+		}
+		return os.ReadFile(filepath.Clean(p))
+	}
+}
+
+// panicReader returns a FileReader that panics when asked to read path,
+// standing in for a type-checker edge case processUnit does not yet
+// handle, and falls back to disk for everything else.
+func panicReader(t *testing.T, path string) FileReader {
+	t.Helper()
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatalf("abs %s: %v", path, err)
+	}
+	return func(p string) ([]byte, error) {
+		if p == abs {
+			panic("deliberate processUnit panic")
 		}
 		return os.ReadFile(filepath.Clean(p))
 	}
@@ -352,5 +371,43 @@ func Run(name string) string {
 	}
 	if stats.Processed != 1 {
 		t.Errorf("stats.Processed = %d, want 1 (mid only)", stats.Processed)
+	}
+}
+
+// TestReindex_PanicDuringProcessingIsRecordedAsPerPackageError verifies
+// that a panic while resolving mid's own unit (e.g. a type-checker edge
+// case facts extraction does not yet handle) is recovered by
+// processUnitRecovered and reported through Reindex as mid's own
+// per-package error, instead of taking down the caller — the didSave/
+// self-heal path this exercises used to call processUnit directly, with no
+// recovery, so this same panic used to crash the whole server.
+func TestReindex_PanicDuringProcessingIsRecordedAsPerPackageError(t *testing.T) {
+	snap := loadTestSnapshot(t)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+	ctx := context.Background()
+
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
+		t.Fatalf("initial Build: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	reader := panicReader(t, midSrcPath)
+
+	stats, err := Reindex(ctx, snap, db, cas, pkgMid, reader, &Options{})
+	if err == nil {
+		t.Fatal("Reindex returned nil error, want the recovered panic reported as mid's own error")
+	}
+	if !strings.Contains(err.Error(), pkgMid) {
+		t.Errorf("Reindex error = %v, want it to name %s", err, pkgMid)
+	}
+	if stats.Errors != 1 {
+		t.Errorf("stats.Errors = %d, want 1", stats.Errors)
+	}
+	if !strings.Contains(logBuf.String(), "deliberate processUnit panic") {
+		t.Errorf("log output = %q, want it to contain the panic value", logBuf.String())
 	}
 }

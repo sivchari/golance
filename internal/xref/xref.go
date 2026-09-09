@@ -270,6 +270,14 @@ func (r *Resolver) symbolInfoFromIDHash(ctx context.Context, idHash uint64) (Sym
 // to newName, grouped by file. It includes every reference across the
 // defining package's reverse-dependency closure plus the declaration itself.
 //
+// When target is a type, renaming it also renames every promoted-field use
+// its own name implies: embedding a type in a struct makes the type's name
+// double as that field's implicit name (e.g. `Container{Box: ...}`), so a
+// composite-literal key or selector expression using that promoted name
+// must be rewritten too, even though it resolves to a distinct *types.Var
+// field object rather than to target's own *types.TypeName -- see
+// embeddedFieldSymbols.
+//
 // TODO(v0.1): no collision check against an existing newName in scope.
 func (r *Resolver) Rename(ctx context.Context, file string, line, col int, newName string) (map[string][]Edit, error) {
 	l, c, err := toUint32Pos(line, col)
@@ -290,6 +298,22 @@ func (r *Resolver) Rename(ctx context.Context, file string, line, col int, newNa
 		return nil, err
 	}
 	locs := append([]Location{declLoc}, refs...)
+
+	if target.Kind == index.KindType || target.Kind == index.KindInterface {
+		fields, err := r.embeddedFieldSymbols(ctx, refs)
+		if err != nil {
+			return nil, err
+		}
+		if len(fields) > 0 {
+			fieldRefs, err := r.locationsForAll(ctx, fields)
+			if err != nil {
+				return nil, err
+			}
+			locs = append(locs, fieldRefs...)
+		}
+	}
+
+	locs = dedupeLocations(locs)
 	sortLocations(locs)
 
 	edits := make(map[string][]Edit)
@@ -297,6 +321,49 @@ func (r *Resolver) Rename(ctx context.Context, file string, line, col int, newNa
 		edits[loc.File] = append(edits[loc.File], Edit{Line: loc.Line, Col: loc.Col, EndCol: loc.EndCol, NewText: newName})
 	}
 	return edits, nil
+}
+
+// embeddedFieldSymbols returns the resolvedSymbol for the promoted field
+// implicitly declared at each of locs that names an anonymous struct field
+// -- one entry per struct that embeds the renamed type. An embedded type's
+// name doubles as that field's own name, so go/types records the same
+// identifier both as a use of the type (already among the renamed type's
+// own references, hence present in locs) and as the definition of a
+// distinct *types.Var field; the latter is what a composite-literal key or
+// selector expression using the promoted name actually resolves to, and it
+// is never itself among the type's own references (see the doc on Rename).
+// Only KindType/KindInterface renames call this, since only a type name can
+// be embedded as an anonymous field.
+func (r *Resolver) embeddedFieldSymbols(ctx context.Context, locs []Location) ([]resolvedSymbol, error) {
+	var out []resolvedSymbol
+	for _, loc := range locs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		pkgPath, ok := r.pkgPathForFile(loc.File)
+		if !ok {
+			continue
+		}
+		pkgHash := store.Hash(pkgPath)
+		u, err := r.unitBlob(ctx, pkgHash)
+		if err != nil {
+			continue
+		}
+		v, err := store.NewView(u.Facts)
+		if err != nil {
+			continue
+		}
+		fileIdx, ok := r.fileIndexOf(v, loc.File)
+		if !ok {
+			continue
+		}
+		s, ok := symbolAtPosition(v, fileIdx, loc.Line, loc.Col)
+		if !ok || s.Kind() != index.KindField {
+			continue
+		}
+		out = append(out, resolvedSymbol{PkgHash: pkgHash, IDHash: s.IDHash(), Kind: s.Kind(), Name: s.Name()})
+	}
+	return out, nil
 }
 
 func sortLocations(locs []Location) {

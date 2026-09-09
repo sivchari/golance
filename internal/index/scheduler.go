@@ -26,17 +26,30 @@ type scheduler struct {
 	left        int32
 }
 
-// newScheduler prepares a scheduler over snap's root packages and seeds its
-// ready channel with every package that has no unfinished dependency (a
-// zero in-degree in the root-only subgraph). total is the number of root
-// packages to process; a scheduler for total == 0 has nothing to do.
+// schedulableRoot reports whether pkg is one of the (up to two per
+// directory) units Build processes as an independent job: an ordinary Root
+// (workspace) package, or its external "_test"-suffixed test package (see
+// isExternalTestOfRoot) — a second, distinct pkgPath sharing the same
+// directory. graph.go's fromPackages already gives that package its own
+// real pkgPath, so no (dir, variant) key is needed the way
+// internal/check.Engine's unitKey uses one; this predicate plays the same
+// role schedulableRoot(pkg) == pkg.Root alone used to.
+func schedulableRoot(snap *graph.Snapshot, pkg *graph.Package) bool {
+	return pkg.Root || isExternalTestOfRoot(snap, pkg)
+}
+
+// newScheduler prepares a scheduler over snap's schedulable packages (see
+// schedulableRoot) and seeds its ready channel with every package that has
+// no unfinished dependency (a zero in-degree in that subgraph). total is the
+// number of packages to process; a scheduler for total == 0 has nothing to
+// do.
 func newScheduler(snap *graph.Snapshot, cache *typecheck.Cache, onEvicted func(string, int)) (*scheduler, int) {
 	fanIn, dependents := computeFanIn(snap)
 
 	var total int
 	pendingDeps := make(map[string]*int32, len(snap.Packages))
 	for path, pkg := range snap.Packages {
-		if !pkg.Root {
+		if !schedulableRoot(snap, pkg) {
 			continue
 		}
 		total++
@@ -105,14 +118,20 @@ func (s *scheduler) finish(path string) {
 	}
 }
 
-// computeFanIn returns, for every root (workspace) package in snap, the
-// number of direct root importers (fan-in), plus a dependents map from
-// import path to the root packages that import it directly.
+// computeFanIn returns, for every schedulable package in snap (see
+// schedulableRoot), the number of direct root importers (fan-in), plus a
+// dependents map from import path to the schedulable packages that import
+// it directly. An external test package's own import of its base package
+// (always a Root package) is what lets computeFanIn keep that base
+// package's decoded *types.Package warm in the shared typecheck.Cache until
+// the external test unit has also finished with it, and what makes the
+// external test unit itself become ready once its base package finishes
+// (see finish).
 func computeFanIn(snap *graph.Snapshot) (fanIn map[string]int32, dependents map[string][]string) {
 	fanIn = make(map[string]int32, len(snap.Packages))
 	dependents = make(map[string][]string, len(snap.Packages))
 	for path, pkg := range snap.Packages {
-		if !pkg.Root {
+		if !schedulableRoot(snap, pkg) {
 			continue
 		}
 		for _, dep := range pkg.Imports {

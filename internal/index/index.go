@@ -219,30 +219,45 @@ func runBuildJob(ctx context.Context, sem *semaphore.Weighted, fset *token.FileS
 	if err := sem.Acquire(ctx, 1); err != nil {
 		return results.recordFatal(err)
 	}
-	outcome, skipped, typeChecked, err := processUnitRecovered(ctx, fset, imp, exp, snap, db, cas, keys, opts, path)
+	outcome, skipped, typeChecked, err := processUnitRecovered(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, readFileDisk, true)
 	sem.Release(1)
-	return results.record(outcome, skipped, typeChecked, err)
+	return results.record(path, outcome, skipped, typeChecked, err)
 }
 
 // processUnitRecovered wraps processUnit with a panic recovery so that one
 // poisoned package (e.g. a type-checker edge case facts extraction does not
 // yet handle) degrades that single package into a processing error instead
-// of crashing the whole indexer subprocess mid-run, taking down every other
-// package's results with it. This mirrors record's existing fatal-vs-
-// per-package split (see buildResults.record's doc): a recovered panic is
-// reported exactly like any other single-package processUnit error, never
-// as the fatal error Build itself returns. The panic value and package path
-// are logged (via the standard logger, since Options carries none) because
-// record itself only counts a per-package error into Stats.Errors and
-// otherwise discards it — without this, a panic's cause would vanish
-// entirely instead of merely being contained.
-func processUnitRecovered(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, snap *graph.Snapshot, db *store.DB, cas *store.CAS, keys *keyTable, opts *Options, path string) (outcome *unitOutcome, skipped, typeChecked bool, err error) {
+// of crashing the whole run mid-way, taking down every other package's
+// results with it. Both Build (via runBuildJob, always reading from disk)
+// and Reindex (via reindexOne, whose changed package may read through an
+// editor overlay) call through here with their own reader/trustStat, so
+// panic containment is identical for both without either caller's read
+// semantics changing. A recovered panic is reported exactly like any other
+// single-package processUnit error — see runBuildJob's and reindexOne's own
+// docs for how each caller folds that into its fatal-vs-per-package split.
+// The panic value and package path are logged (via the standard logger,
+// since Options carries none) because a per-package error is otherwise only
+// counted into Stats.Errors and discarded — without this, a panic's cause
+// would vanish entirely instead of merely being contained.
+//
+// This is also the one place that completes processUnit's own "calls
+// keys.set on success" half of keyTable's set-or-fail invariant (see
+// keyTable's doc): whenever processUnit returns (or panics, converted to an
+// error above) a non-nil err, that means it did not itself call keys.set for
+// path, so this always calls keys.fail for path in that case — regardless
+// of which of processUnit's several error-return sites was hit — so a
+// dependent looked up through keys later in this same run can never
+// silently resolve path against a stale prior-run record for it.
+func processUnitRecovered(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, snap *graph.Snapshot, db *store.DB, cas *store.CAS, keys *keyTable, opts *Options, path string, reader FileReader, trustStat bool) (outcome *unitOutcome, skipped, typeChecked bool, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("index: panic processing package %s: %v\n%s", path, rec, debug.Stack())
 			outcome, skipped, typeChecked = nil, false, false
 			err = fmt.Errorf("index: panic processing package %s: %v", path, rec)
 		}
+		if err != nil {
+			keys.fail(path, err)
+		}
 	}()
-	return processUnit(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, readFileDisk, true)
+	return processUnit(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
 }

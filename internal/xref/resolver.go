@@ -2,6 +2,7 @@ package xref
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go/token"
 	"go/types"
@@ -105,25 +106,39 @@ func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool, opts
 		// only, even though snap.Packages also carries the whole transitive
 		// closure (module dependencies and the standard library — see
 		// internal/graph's loadMode doc): the facts index this Resolver
-		// reads from only ever covers root packages
-		// (internal/index/scheduler.go's doc), so a dependency file's own
-		// pkgPath would resolve here only to send resolveAt straight into a
-		// GetUnit call that can never succeed. Excluding it here instead
-		// makes pkgPathForFile report "not part of any known package" for a
-		// dependency file exactly like it already does for a genuinely
-		// unresolvable one (e.g. a testdata fixture) — the same ordinary,
-		// low-noise miss internal/server.definitionFallback's ad-hoc
+		// reads from only ever covers schedulable packages
+		// (internal/index/scheduler.go's schedulableRoot: every root package,
+		// plus each one's own external "_test" package, if it has one), so a
+		// genuine dependency file's own pkgPath would resolve here only to
+		// send resolveAt straight into a GetUnit call that can never
+		// succeed. Excluding it here instead makes pkgPathForFile report
+		// "not part of any known package" for a dependency file exactly like
+		// it already does for a genuinely unresolvable one (e.g. a testdata
+		// fixture) — the same ordinary, low-noise miss
+		// internal/server.definitionFallback's ad-hoc
 		// CheckedPackage/SamePackageDefinition/DependencyDefinition chain
 		// already answers on its own, rather than a wrapped "read facts for
 		// X: store: not found" that reads like a genuine index failure for
 		// what is, for every dependency file, an entirely expected outcome.
-		if !pkg.Root {
+		if pkg.Root {
+			for _, f := range pkg.GoFiles {
+				fileToPkg[f] = path
+			}
+			dirToPkg[pkg.Dir] = path
 			continue
 		}
-		for _, f := range pkg.GoFiles {
-			fileToPkg[f] = path
+		// A directory's external "_test" package (isExternalTestOfRoot) gets
+		// its own fileToPkg entries, under its own distinct pkgPath — never
+		// a dirToPkg entry, for the identical misrouting reason
+		// internal/server.setWorkspace's own copy of this exclusion
+		// documents: it can share pkg.Dir with the base package it tests, so
+		// only files the graph already positively knows to be its own
+		// (pkg.GoFiles, from a real go/packages node) are added.
+		if isExternalTestOfRoot(snap, pkg) {
+			for _, f := range pkg.GoFiles {
+				fileToPkg[f] = path
+			}
 		}
-		dirToPkg[pkg.Dir] = path
 	}
 	r := &Resolver{
 		db:            db,
@@ -146,11 +161,18 @@ func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool, opts
 
 // unitBlob loads and decodes pkgHash's current [store.UnitBlob] via db's
 // UnitPointer and cas, serving a repeat call for the same content from
-// r.units instead of re-reading and re-decoding the CAS blob. It returns
-// [store.ErrNotFound] if pkgHash has never been indexed. A canceled ctx
-// surfaces as ctx's own error (see [store.DB.GetUnit] and [store.CAS.Get]),
-// letting a caller distinguish a real cancellation from an ordinary "not
-// found" miss.
+// r.units instead of re-reading and re-decoding the CAS blob. The error it
+// returns always wraps [store.ErrNotFound] when pkgHash has no usable data,
+// with a message distinguishing which of the two ways that can happen: no
+// [store.UnitPointer] recorded at all (pkgHash was never indexed), or one
+// recorded whose BlobKey names a blob no longer present in the CAS — a
+// dangling pointer, e.g. left by a [store.CAS.GC] pass whose mark set could
+// not read this database in time (see its own safety doc); internal/index's
+// processUnit and packageChanged both now detect and repair this case on
+// the write side, so it should self-heal on the next Build/Reindex/
+// RevalidateStale rather than recur. A canceled ctx surfaces as ctx's own
+// error (see [store.DB.GetUnit] and [store.CAS.Get]), letting a caller
+// distinguish a real cancellation from an ordinary "not found" miss.
 //
 // db.GetUnit's own bbolt read always runs first, even on what turns out to
 // be a cache hit: it is the only way to learn pkgHash's CURRENT BlobKey,
@@ -159,6 +181,9 @@ func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool, opts
 func (r *Resolver) unitBlob(ctx context.Context, pkgHash uint64) (store.UnitBlob, error) {
 	ptr, err := r.db.GetUnit(ctx, pkgHash)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return store.UnitBlob{}, fmt.Errorf("xref: no facts recorded for %s: %w", r.pkgPathForHash(pkgHash), store.ErrNotFound)
+		}
 		return store.UnitBlob{}, err
 	}
 	if u, ok := r.units.get(ptr.BlobKey); ok {
@@ -169,7 +194,7 @@ func (r *Resolver) unitBlob(ctx context.Context, pkgHash uint64) (store.UnitBlob
 		return store.UnitBlob{}, err
 	}
 	if !ok {
-		return store.UnitBlob{}, store.ErrNotFound
+		return store.UnitBlob{}, fmt.Errorf("xref: facts blob %x missing from CAS for %s: %w", ptr.BlobKey, r.pkgPathForHash(pkgHash), store.ErrNotFound)
 	}
 	u, err := store.DecodeUnitBlob(blob)
 	if err != nil {
@@ -177,6 +202,17 @@ func (r *Resolver) unitBlob(ctx context.Context, pkgHash uint64) (store.UnitBlob
 	}
 	r.units.put(ptr.BlobKey, &u)
 	return u, nil
+}
+
+// pkgPathForHash returns pkgHash's import path via r.pkgPathByHash, falling
+// back to its hex form on the rare miss (a pkgHash unitBlob is asked about
+// that names no package in the current snapshot at all), so an error
+// message always names something instead of going blank.
+func (r *Resolver) pkgPathForHash(pkgHash uint64) string {
+	if p, ok := r.pkgPathByHash[pkgHash]; ok {
+		return p
+	}
+	return fmt.Sprintf("pkg#%x", pkgHash)
 }
 
 // resolvedSymbol identifies one symbol definition: the defining package's
@@ -375,30 +411,55 @@ func (r *Resolver) Invalidate(pkgPaths []string) {
 }
 
 // pkgPathForFile resolves file to its containing package's import path,
-// among root (workspace) packages only — see New's doc for why a
-// dependency file is deliberately never found here. r.fileToPkg (built from
-// graph.Package.GoFiles) never lists an in-package _test.go file at all —
-// internal/graph's loadMode loads without packages.Config.Tests, the same
-// gap testFilesInPackage exists to close for the facts index itself (see
-// internal/index/testfiles.go) — so a position inside one always misses
-// there. This falls back to matching file's directory against a known
-// package's Dir, mirroring internal/check.GraphSource.PackageForFile's
-// identical fallback and internal/server.workspace's dirToPkg.
+// among schedulable (root, or a root's own external "_test") packages only
+// — see New's doc for why a genuine dependency file is deliberately never
+// found here. A directory's own external "_test" package file resolves
+// directly via r.fileToPkg (see New's isExternalTestOfRoot handling), to
+// its own distinct pkgPath rather than the base package's, since the two
+// packages' facts live in separate units (see isExternalTestOfRoot).
 //
-// The directory fallback alone is not enough to trust file: it also
-// matches an external "_test"-suffixed test package file or an unrelated
-// ad-hoc file sitting in the same directory, neither of which
-// testFilesInPackage folds into the unit's facts. Rather than duplicate
-// that package-clause filtering here, this returns the directory's
-// candidate pkgPath as-is and lets resolveAt's subsequent fileIndexOf
-// lookup against the unit's own facts file table — the source of truth for
-// what was actually indexed — reject file if it never made it in.
+// r.fileToPkg (built from graph.Package.GoFiles) never lists an in-package
+// _test.go file at all — internal/graph's loadMode loads without
+// packages.Config.Tests, the same gap testFilesInPackage exists to close
+// for the facts index itself (see internal/index/testfiles.go) — so a
+// position inside one always misses there. This falls back to matching
+// file's directory against a known package's Dir, mirroring
+// internal/check.GraphSource.PackageForFile's identical fallback and
+// internal/server.workspace's dirToPkg.
+//
+// The directory fallback alone is not enough to trust file: it also matches
+// an unrelated ad-hoc file sitting in the same directory, which
+// testFilesInPackage does not fold into the base unit's facts. Rather than
+// duplicate that package-clause filtering here, this returns the
+// directory's candidate pkgPath as-is and lets resolveAt's subsequent
+// fileIndexOf lookup against the unit's own facts file table — the source
+// of truth for what was actually indexed — reject file if it never made it
+// in.
 func (r *Resolver) pkgPathForFile(file string) (string, bool) {
 	if pkgPath, ok := r.fileToPkg[file]; ok {
 		return pkgPath, true
 	}
 	pkgPath, ok := r.dirToPkg[filepath.Dir(file)]
 	return pkgPath, ok
+}
+
+// isExternalTestOfRoot reports whether pkg is a workspace directory's
+// external "_test"-suffixed test package: pkg.ForTest names a Root package
+// sharing pkg's own directory. Mirrors internal/index's and
+// internal/server's identically-named predicates (kept as separate copies
+// per package, the same way this package's own root-only exclusion already
+// mirrors internal/check.GraphSource's).
+//
+// The directory check excludes the rare intermediate-test-variant case
+// documented on graph.Package.ForTest: a ForTest-tagged entry whose real
+// files live in a completely different directory is not this directory's
+// own test package at all.
+func isExternalTestOfRoot(snap *graph.Snapshot, pkg *graph.Package) bool {
+	if pkg.ForTest == "" {
+		return false
+	}
+	base, ok := snap.Packages[pkg.ForTest]
+	return ok && base.Root && base.Dir == pkg.Dir
 }
 
 // fileIndexOf returns the index of file (an absolute path) in v's file

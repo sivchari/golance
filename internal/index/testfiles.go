@@ -20,7 +20,17 @@ import (
 // completion/inlay hints in test files): a file only counts as "in package"
 // if its own package clause matches pkg's canonical (non-test) package
 // name, so the external "_test"-suffixed test package contributes nothing
-// here either, exactly as it does not for check.Engine.
+// here either. That package gets its own, separate facts-index unit instead
+// (see isExternalTestOfRoot and processUnit's own handling of pkg.GoFiles),
+// mirroring how internal/check.Engine gives it its own variantExternalTest
+// unit rather than folding it into the base package's.
+//
+// pkg itself being that external test package (pkg.ForTest != "") reports
+// no test files at all: its own GoFiles, reported directly by the graph
+// (see graph.go's fromPackages), is already its complete, correct file set,
+// so there is nothing here to add — scanning the directory again by its own
+// "_test"-suffixed package clause would just rediscover, and duplicate, the
+// very files pkg.GoFiles already lists.
 //
 // File content is read through reader rather than os.ReadFile directly, so
 // a Reindex run driven by an editor overlay (see FileReader's doc) sees a
@@ -37,6 +47,9 @@ import (
 // rest of the package are unaffected, only this run's test-file coverage is
 // skipped.
 func testFilesInPackage(pkg *graph.Package, reader FileReader) []string {
+	if pkg.ForTest != "" {
+		return nil
+	}
 	name, ok := canonicalPackageName(pkg.GoFiles, reader)
 	if !ok {
 		return nil
@@ -106,4 +119,31 @@ func effectiveGoFiles(goFiles, testFiles []string) []string {
 	out = append(out, goFiles...)
 	out = append(out, testFiles...)
 	return out
+}
+
+// isExternalTestOfRoot reports whether pkg is a workspace directory's
+// external "_test"-suffixed test package: pkg.ForTest names a Root package
+// sharing pkg's own directory. graph.go's fromPackages already gives such a
+// package its own real, distinct pkgPath (see graph.Package.ForTest's own
+// doc) — internal/index's units are already keyed by pkgPath, so unlike
+// internal/check.GraphSource (which synthesizes an on-demand marker
+// pkgPath, needed there for editor-overlay-aware, not-yet-graph-known
+// files) nothing further needs synthesizing here; scheduler.go's
+// schedulableRoot uses this directly to decide which directories get a
+// second, independent facts-index unit alongside their base package,
+// mirroring check.Engine's own two-variants-per-directory model
+// (variantBase/variantExternalTest).
+//
+// The directory check excludes the rare intermediate-test-variant case
+// documented on graph.Package.ForTest: a ForTest-tagged entry whose real
+// files live in a completely different directory (e.g. a GOROOT package
+// rebuilt specially for a workspace test's own context, never otherwise
+// reached) is not this directory's own test package at all, and must not
+// be scheduled or resolved as though it were.
+func isExternalTestOfRoot(snap *graph.Snapshot, pkg *graph.Package) bool {
+	if pkg.ForTest == "" {
+		return false
+	}
+	base, ok := snap.Packages[pkg.ForTest]
+	return ok && base.Root && base.Dir == pkg.Dir
 }

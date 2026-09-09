@@ -104,14 +104,19 @@ func orderedReverseClosure(snap *graph.Snapshot, changedPkg string) []string {
 	return ordered
 }
 
-// reindexOne resolves path via processUnit and persists its outcome (if
-// any), updating stats. It distinguishes two error sources, mirroring
-// Build's own fatal-vs-per-package split (see [buildResults.record] and
-// [buildResults.flushPendingLocked]):
-//   - a processUnit failure (path's own parse/type-check/facts error) is
-//     one package's problem: it counts toward stats.Errors and is returned
-//     non-fatal (fatal=false), so Reindex's closure walk keeps going past
-//     it exactly as before.
+// reindexOne resolves path via processUnitRecovered and persists its
+// outcome (if any), updating stats. It distinguishes two error sources,
+// mirroring Build's own fatal-vs-per-package split (see
+// [buildResults.record] and [buildResults.flushPendingLocked]):
+//   - a processUnitRecovered failure — path's own parse/type-check/facts
+//     error, or a recovered panic from a type-checker edge case facts
+//     extraction does not yet handle — is one package's problem: it counts
+//     toward stats.Errors and is returned non-fatal (fatal=false), so
+//     Reindex's closure walk keeps going past it exactly as before. A panic
+//     is folded into this same case rather than treated as fatal because
+//     its cause is specific to path's own source, not to db or any package
+//     downstream of it — exactly the distinction Build's own recovery
+//     draws for the very same panic (see processUnitRecovered's doc).
 //   - a db.PutUnit failure means db can no longer be trusted to accept any
 //     further write this run; it is returned fatal (fatal=true) so the
 //     caller can stop the closure walk instead of re-type-checking every
@@ -120,7 +125,7 @@ func orderedReverseClosure(snap *graph.Snapshot, changedPkg string) []string {
 // A persist failure for the pointer-only refresh path stays best-effort,
 // not fatal — see [buildResults.flushPtrsLocked]'s identical rationale.
 func reindexOne(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, opts *Options, path string, reader FileReader, trustStat bool, stats *Stats) (fatal bool, err error) {
-	outcome, skipped, typeChecked, err := processUnit(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
+	outcome, skipped, typeChecked, err := processUnitRecovered(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
 	if err != nil {
 		stats.Errors++
 		return false, fmt.Errorf("index: reindex: %s: %w", path, err)

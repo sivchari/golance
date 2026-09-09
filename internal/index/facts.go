@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/tools/go/types/objectpath"
 
+	"github.com/sivchari/golance/internal/depcheck"
 	"github.com/sivchari/golance/internal/store"
 )
 
@@ -353,7 +354,26 @@ func isSkippedObject(obj types.Object) bool {
 // checking one package matches the SymbolID computed while checking obj's
 // defining package). Objects unreachable from their package scope (e.g.
 // function-local variables) fall back to a position-based path.
+//
+// obj is normalized through [depcheck.OriginObject] first: a field or
+// method reached through an INSTANTIATED generic type (e.g.
+// connect.Request[T].Msg, or a method call on Box[Concrete]) is a
+// synthetic *types.Var/*types.Func go/types creates for that
+// instantiation, not identity-equal to its origin declaration — and
+// objectpath.Encoder.For, which only ever walks origin declarations
+// reachable from package scope, cannot encode a path for it, so without
+// this normalization addRef's call here would silently fall back to the
+// position-based path below while addDef's call for the very same
+// field/method's own declaration succeeds via the origin's objectpath —
+// two different SymbolID strings, hence two different IDHashes, for what
+// is unambiguously the same symbol. That mismatch made every reference
+// through an instantiated generic type invisible to References/Rename: the
+// posting was written under the wrong IDHash and so never matched the
+// declaration's own SymbolID lookup. See OriginObject's own doc for why
+// this call is a no-op for every other kind of object (the overwhelming
+// common case).
 func symbolID(obj types.Object, enc *objectpath.Encoder, fset *token.FileSet) string {
+	obj = depcheck.OriginObject(obj)
 	pkgPath := obj.Pkg().Path()
 	if path, err := enc.For(obj); err == nil {
 		return store.BuildSymbolID(pkgPath, string(path))
