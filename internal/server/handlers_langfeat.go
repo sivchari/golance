@@ -83,10 +83,14 @@ func (s *Server) checkedPackageFromDep(ws *workspace, dcp *depcheck.CheckedPacka
 // checkedFileResult is checkedFile's result: the package's CheckedPackage,
 // the exact buffer content it was checked against, and the query's byte
 // offset into it. Ok is false when the workspace is not loaded yet, path
-// is not part of a known package (e.g. a testdata fixture, an external
-// _test package file, or a brand-new unsaved file the graph hasn't picked
-// up yet — see check.Engine.Get), or pos does not resolve to a valid
-// offset in Text — all "no result", not request failures.
+// is not part of a known package at all (e.g. a testdata fixture, or a
+// brand-new unsaved file the graph hasn't picked up yet — see
+// check.Engine.Get), or pos does not resolve to a valid offset in Text —
+// all "no result", not request failures. A position inside an external
+// "_test" package file resolves correctly here: ws.engine.Get routes
+// through check.Engine's own file-to-package resolution
+// (check.GraphSource.PackageForFile), which recognizes such a file and
+// type-checks it as its own distinct unit rather than reporting it unknown.
 type checkedFileResult struct {
 	cp     *check.CheckedPackage
 	path   string

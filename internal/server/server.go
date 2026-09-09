@@ -176,6 +176,17 @@ type Server struct {
 	// runs at a time.
 	idxMu sync.Mutex
 
+	// reindexWG counts detached reindex attempts currently registered
+	// against the database s.idx.Load() pointed at when they registered
+	// (see documentsync.go's beginReindex/reindexIfStillCurrent).
+	// revalidateIndex's rebuild branch (indexer.go) waits on this — while
+	// still holding idxMu, so no new registration can race the wait itself,
+	// since beginReindex also requires idxMu — before closing the database
+	// it is about to replace, so a detached reindex's write against it is
+	// always either fully registered-and-completed before that Close, or
+	// never registered (and so never attempted) at all.
+	reindexWG sync.WaitGroup
+
 	diagMu sync.Mutex
 	// diagFiles is keyed by check.Result.PkgPath, not directory: a directory
 	// can hold two independent units (its base package and, separately, its
@@ -474,12 +485,13 @@ func (s *Server) drainPendingOpens(ws *workspace) {
 // graph-known, non-workspace package (GOROOT or a module-cache dependency —
 // see internal/depcheck's package doc) containing path, if any. A workspace
 // package — one that matched a Load pattern directly (graph.Package.Root) —
+// or a workspace directory's own external "_test" package (isExternalTestOfRoot)
 // always returns ok=false here, even though fileToPkg/dirToPkg know it too:
-// a workspace file keeps using ws.engine's own compilation pipeline
-// (internal/typecheck's export-data importer for ITS dependencies remains
-// the right tool for compilation input, per internal/depcheck's package
-// doc); only a dependency file routes to ws.depProvider (see
-// resolveCheckedPackage). Mirrors internal/check.GraphSource.PackageForFile's
+// a workspace file (of either kind) keeps using ws.engine's own compilation
+// pipeline (internal/typecheck's export-data importer for ITS dependencies
+// remains the right tool for compilation input, per internal/depcheck's
+// package doc); only a genuine dependency file routes to ws.depProvider
+// (see resolveCheckedPackage). Mirrors internal/check.GraphSource.PackageForFile's
 // file-then-directory fallback, over the same fileToPkg/dirToPkg maps.
 func (ws *workspace) nonWorkspacePackageForFile(path string) (pkgPath string, ok bool) {
 	pp, hit := ws.fileToPkg[path]
@@ -490,18 +502,21 @@ func (ws *workspace) nonWorkspacePackageForFile(path string) (pkgPath string, ok
 		return "", false
 	}
 	pkg, ok := ws.snap.Package(pp)
-	if !ok || pkg.Root {
+	if !ok || pkg.Root || isExternalTestOfRoot(ws.snap, pkg) {
 		return "", false
 	}
 	return pp, true
 }
 
 // pkgPathForFile returns the import path of the package containing path, if
-// path is part of the loaded workspace. If path is not itself a known Go
-// file (e.g. an in-package _test.go file, which ws.fileToPkg never
-// includes — see internal/graph's loadMode), it falls back to matching
-// path's directory against a known package's directory, exactly as
-// internal/check.GraphSource.PackageForFile does for the same case.
+// path is part of the loaded workspace. An external "_test" package's own
+// file (isExternalTestOfRoot) resolves directly via ws.fileToPkg, to its own
+// distinct pkgPath rather than the base package's. If path is not itself a
+// known Go file at all (e.g. an in-package _test.go file, which
+// ws.fileToPkg never includes — see internal/graph's loadMode), it falls
+// back to matching path's directory against a known package's directory,
+// exactly as internal/check.GraphSource.PackageForFile does for the same
+// case.
 func (s *Server) pkgPathForFile(path string) (string, bool) {
 	ws := s.workspace()
 	if ws == nil {

@@ -497,11 +497,13 @@ func (s *Server) handleRename(ctx context.Context, params json.RawMessage) (any,
 	}
 
 	changes := make(map[uri.URI][]protocol.TextEdit, len(edits))
+	var unresolved int
 	for file, fes := range edits {
 		var out []protocol.TextEdit
 		for _, e := range fes {
 			rng, ok := s.correctResultRange(file, e.Line, e.Col, e.EndCol)
 			if !ok {
+				unresolved++
 				continue
 			}
 			out = append(out, protocol.TextEdit{Range: rng, NewText: e.NewText})
@@ -509,6 +511,17 @@ func (s *Server) handleRename(ctx context.Context, params json.RawMessage) (any,
 		if len(out) > 0 {
 			changes[uri.File(file)] = out
 		}
+	}
+	if unresolved > 0 {
+		// A rename must be all-or-nothing: applying only the references whose
+		// range happened to resolve would leave the rest of the occurrences
+		// under the old name, silently producing code that no longer
+		// compiles with no indication why. Refuse the whole edit instead of
+		// returning the partial WorkspaceEdit, the same all-or-nothing
+		// contract dirtyRenameFiles enforces above for unsaved edits.
+		msg := fmt.Sprintf("golance: cannot safely rename %q; %d reference(s) could not be resolved against the current file contents", p.NewName, unresolved)
+		s.logger.Printf("server: rename %q: refusing, %d reference range(s) unresolved", p.NewName, unresolved)
+		return nil, rpc.NewError(int32(protocol.ErrorCodesInternalError), msg)
 	}
 	return &protocol.WorkspaceEdit{Changes: changes}, nil
 }

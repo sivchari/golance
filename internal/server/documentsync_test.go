@@ -12,6 +12,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/sivchari/golance/internal/check"
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/index"
 	"github.com/sivchari/golance/internal/rpc"
@@ -236,7 +237,7 @@ func Shout(name string, n int) string {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, idx, midFile := newDepCacheReindexServer(t)
+			s, idx, midFile, _ := newDepCacheReindexServer(t)
 			ws := s.workspace()
 			// Warm depCache with a decoded entry for both mid and top,
 			// mirroring what a real recheck of some other package importing
@@ -267,14 +268,15 @@ func Shout(name string, n int) string {
 
 // newDepCacheReindexServer builds the leaf/mid/top synthetic module,
 // indexes it, and returns a workspace-ready server over it plus its
-// installed index state and mid's file path — the fixture
-// TestReindex_NarrowsDepCacheInvalidationToActuallyChangedHops drives.
-func newDepCacheReindexServer(t *testing.T) (*Server, *indexState, string) {
+// installed index state and mid's and top's file paths — the fixture
+// TestReindex_NarrowsDepCacheInvalidationToActuallyChangedHops and
+// TestReindex_PropagatesDependencyAPIChangeToOpenDependent drive.
+func newDepCacheReindexServer(t *testing.T) (s *Server, idx *indexState, midFile, topFile string) {
 	t.Helper()
 	dir := t.TempDir()
 	writeModuleFile(t, dir, "go.mod", "module example.com/depcachetest\n\ngo 1.23\n")
 	writeModuleFile(t, dir, "leaf/leaf.go", "package leaf\n\n// Hello returns a greeting for name.\nfunc Hello(name string) string { return \"hello \" + name }\n")
-	midFile := writeModuleFile(t, dir, "mid/mid.go", `package mid
+	midFile = writeModuleFile(t, dir, "mid/mid.go", `package mid
 
 import "example.com/depcachetest/leaf"
 
@@ -283,7 +285,7 @@ func Shout(name string) string {
 	return leaf.Hello(name)
 }
 `)
-	writeModuleFile(t, dir, "top/top.go", `package top
+	topFile = writeModuleFile(t, dir, "top/top.go", `package top
 
 import "example.com/depcachetest/mid"
 
@@ -315,11 +317,130 @@ func Run(name string) string {
 	}
 
 	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
-	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	s = New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(dir, snap)
-	idx := &indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)}
+	idx = &indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)}
 	s.idx.Store(idx)
-	return s, idx, midFile
+	return s, idx, midFile, topFile
+}
+
+// TestReindex_PropagatesDependencyAPIChangeToOpenDependent is a regression
+// test for the C2 finding in audit-silent-failures.md: a dependency
+// package's exported API changing must reach ws.engine's own per-unit
+// cache, not just ws.depCache/idx.resolver — otherwise an already-checked,
+// open dependent file keeps serving type information built against the
+// dependency's OLD export data indefinitely, since its own content (and so
+// its own contentHash) never changed. top imports mid; top is checked (and
+// so cached) via the engine first, then mid's exported Shout signature
+// changes (an added parameter) and is reindexed the same way a save would.
+// Before ws.engine.InvalidateDependency existed, top's next Get returned the
+// same stale, error-free CheckedPackage verbatim; with it, the cache entry
+// for top's directory is dropped, so the next Get re-type-checks top against
+// mid's new signature and surfaces the resulting arity mismatch.
+func TestReindex_PropagatesDependencyAPIChangeToOpenDependent(t *testing.T) {
+	const pkgMid = "example.com/depcachetest/mid"
+
+	s, idx, midFile, topFile := newDepCacheReindexServer(t)
+	ws := s.workspace()
+
+	topSrc, err := os.ReadFile(topFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", topFile, err)
+	}
+	openDoc(t, s, topFile, string(topSrc))
+
+	before, err := ws.engine.Get(context.Background(), topFile)
+	if err != nil {
+		t.Fatalf("Get(top) before mid's signature change: %v", err)
+	}
+	if diags := check.Diagnostics(before, s.overlay); len(diags) != 0 {
+		t.Fatalf("Get(top) before mid's signature change already has diagnostics: %v", diags)
+	}
+
+	const editedMid = `package mid
+
+import "example.com/depcachetest/leaf"
+
+// Shout returns a greeting for name, repeated n times.
+func Shout(name string, n int) string {
+	out := leaf.Hello(name)
+	for i := 1; i < n; i++ {
+		out += out
+	}
+	return out
+}
+`
+	// depcheck.Provider (the fallback depexport's ExportData uses for a
+	// workspace pkgPath, see internal/depcheck.Provider.Delete's doc) parses
+	// straight from disk, never through the overlay, so mid's saved content
+	// must actually land on disk for its re-check to see the new signature —
+	// mirroring a real save, which writes disk before/alongside didSave.
+	if err := os.WriteFile(midFile, []byte(editedMid), 0o600); err != nil {
+		t.Fatalf("write %s: %v", midFile, err)
+	}
+	openDoc(t, s, midFile, editedMid)
+	s.reindex(context.Background(), ws, idx, pkgMid)
+
+	after, err := ws.engine.Get(context.Background(), topFile)
+	if err != nil {
+		t.Fatalf("Get(top) after mid's signature change: %v", err)
+	}
+	if after == before {
+		t.Fatal("Get(top) after mid's signature change returned the same cached CheckedPackage; ws.engine was never invalidated for top's directory")
+	}
+	diags := check.Diagnostics(after, s.overlay)
+	if len(diags) == 0 {
+		t.Fatal("Get(top) after mid's signature change still reports no diagnostics; top was rechecked against mid's OLD (cached) signature instead of the new one")
+	}
+}
+
+// TestReindex_DoesNotInvalidateUnrelatedDependentOnBodyOnlyChange guards the
+// cost side of the same fix: reindexing mid with a body-only edit (its
+// exported Shout signature unchanged) must not touch top's cached
+// CheckedPackage in ws.engine at all, since Stats.Changed — and so the
+// reverse-dependency closure ws.engine.InvalidateDependency is scoped
+// to — is just {mid} in that case. Observed the same way as its sibling
+// test: an untouched cache entry makes Get return the identical
+// *CheckedPackage instance.
+func TestReindex_DoesNotInvalidateUnrelatedDependentOnBodyOnlyChange(t *testing.T) {
+	const pkgMid = "example.com/depcachetest/mid"
+
+	s, idx, midFile, topFile := newDepCacheReindexServer(t)
+	ws := s.workspace()
+
+	topSrc, err := os.ReadFile(topFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", topFile, err)
+	}
+	openDoc(t, s, topFile, string(topSrc))
+
+	before, err := ws.engine.Get(context.Background(), topFile)
+	if err != nil {
+		t.Fatalf("Get(top) before mid's body-only edit: %v", err)
+	}
+
+	const editedMid = `package mid
+
+import "example.com/depcachetest/leaf"
+
+// Shout returns a greeting for name.
+func Shout(name string) string {
+	return leaf.Hello(name) + "!"
+}
+`
+	if err := os.WriteFile(midFile, []byte(editedMid), 0o600); err != nil {
+		t.Fatalf("write %s: %v", midFile, err)
+	}
+	openDoc(t, s, midFile, editedMid)
+	s.reindex(context.Background(), ws, idx, pkgMid)
+
+	after, err := ws.engine.Get(context.Background(), topFile)
+	if err != nil {
+		t.Fatalf("Get(top) after mid's body-only edit: %v", err)
+	}
+	if after != before {
+		t.Fatal("Get(top) after mid's body-only edit returned a different CheckedPackage; a body-only dependency edit must not evict an unrelated dependent from ws.engine's cache")
+	}
 }
 
 // TestHandleDidSave_ReindexNeverOrphanedByShutdown covers Finding 7: the
@@ -427,7 +548,7 @@ func TestHandleDidSave_ReindexedOnceIndexBecomesAvailable(t *testing.T) {
 		}
 		buildTestIndexDB(t, snap, dbPath, cas)
 
-		if s.openIndexAfterBuild(context.Background(), dbPath, nil, "") {
+		if s.openIndexAfterBuild(context.Background(), dbPath, nil, "", 0) {
 			t.Fatal("openIndexAfterBuild locked = true, want false")
 		}
 		idx := s.idx.Load()

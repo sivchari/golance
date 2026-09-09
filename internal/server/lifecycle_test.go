@@ -113,6 +113,98 @@ func TestHandleInitialize_ReturnsBeforeGraphLoadCompletes(t *testing.T) {
 	})
 }
 
+// TestLoadWorkspaceAsync_ColdBuildRepairsPackageDroppedByBuild is a
+// regression test for the cold-build path (tryWarmOpen finds no database,
+// so buildIndex runs): loadWorkspaceAsync must run the same revalidateIndex
+// pass afterward that the warm-open branch already ran, since per
+// internal/index.Build's own contract a package's parse/type-check failure
+// never changes the indexer's exit code — that package simply never gets a
+// UnitPointer written, silently, with the rest of the build reporting
+// success (see loadWorkspaceAsync's own doc and openIndexAfterBuild's
+// stderr/errors=N surfacing).
+//
+// This does not drive buildIndex (and therefore loadWorkspaceAsync) itself:
+// that launches a real indexer subprocess via os.Executable(), which under
+// `go test` resolves to this very test binary — at best a hang, at worst a
+// recursive re-run of this whole suite (the same hazard
+// TestRevalidateIndex_LargeStaleSetFallsBackToFullRebuild documents).
+// Instead it reproduces exactly what buildIndex/openIndexAfterBuild leave
+// behind after a cold build that silently dropped one package — a database
+// with a build fingerprint (index.Build's own PutBuildFingerprint) and
+// every other root package present, but no UnitPointer at all for the
+// dropped one — installs it via s.idx.Store exactly as openIndexAfterBuild
+// does, and then calls s.revalidateIndex with the same ctx loadWorkspaceAsync
+// now always calls it with, regardless of which branch installed idx.
+func TestLoadWorkspaceAsync_ColdBuildRepairsPackageDroppedByBuild(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	writeTempFile(t, dir, "go.mod", "module example.com/coldbuildtest\n\ngo 1.26\n")
+	aDir := filepath.Join(dir, "pkga")
+	if err := os.MkdirAll(aDir, 0o750); err != nil {
+		t.Fatalf("mkdir pkga: %v", err)
+	}
+	writeTempFile(t, aDir, "pkga.go", "package pkga\n\n// V returns 1.\nfunc V() int { return 1 }\n")
+
+	// Loaded before pkgb exists, so this snapshot never even lists it — the
+	// same shape a real per-package build failure leaves behind (see
+	// TestRevalidateIndex_TargetedRepairFixesMissingPackageWithoutFullRebuild):
+	// buildIndex's own index.Build call simply never writes a UnitPointer
+	// for a package it fails to process, indistinguishable at the database
+	// level from a package the snapshot it built against never knew about.
+	snapWithoutB, err := graph.Load(graph.Options{Dir: dir}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load (before pkgb exists): %v", err)
+	}
+
+	bDir := filepath.Join(dir, "pkgb")
+	if err := os.MkdirAll(bDir, 0o750); err != nil {
+		t.Fatalf("mkdir pkgb: %v", err)
+	}
+	writeTempFile(t, bDir, "pkgb.go", "package pkgb\n\n// W returns 2.\nfunc W() int { return 2 }\n")
+
+	fullSnap, err := graph.Load(graph.Options{Dir: dir}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load (with pkgb): %v", err)
+	}
+	if _, ok := fullSnap.Packages["example.com/coldbuildtest/pkgb"]; !ok {
+		t.Fatal("pkgb missing from fullSnap; test setup is wrong")
+	}
+
+	dbPath := indexDBFile(dir)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+	cas, err := store.OpenCAS(casDir(dir))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	buildTestIndexDB(t, snapWithoutB, dbPath, cas)
+
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	s.setWorkspace(dir, fullSnap)
+
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	idx := &indexState{db: db, cas: cas, resolver: s.newResolver(db, cas, fullSnap, RelativeIndexPaths(dir))}
+	s.idx.Store(idx)
+	t.Cleanup(func() { _ = db.Close() })
+
+	// The exact call loadWorkspaceAsync now makes unconditionally after
+	// either the warm-open or the cold-build branch installs idx.
+	s.revalidateIndex(context.Background(), dir)
+
+	got := s.idx.Load()
+	if got != idx {
+		t.Errorf("s.idx after revalidateIndex = %p, want the same %p (a targeted repair must not close-and-rebuild)", got, idx)
+	}
+	if _, err := got.db.GetUnit(context.Background(), store.Hash("example.com/coldbuildtest/pkgb")); err != nil {
+		t.Fatalf("GetUnit(pkgb) after revalidateIndex: %v (want the build-dropped package repaired in place)", err)
+	}
+}
+
 // TestHandleInitialized_SetsClientInitialized covers the ordering guarantee
 // workspaceReadyRefreshes relies on: s.clientInitialized only becomes true
 // once handleInitialized runs, i.e. once the client's own "initialized"

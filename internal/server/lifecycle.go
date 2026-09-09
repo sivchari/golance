@@ -97,7 +97,27 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 // database already exists (tryWarmOpen) — with a cheap in-process check
 // (revalidateIndex) catching it up in the background if anything changed
 // since it was last built — or build it from scratch by launching the
-// indexer subprocess (buildIndex) otherwise.
+// indexer subprocess (buildIndex) otherwise. Either branch ends with one
+// revalidateIndex pass: a cold build is not exempt from needing one, since
+// per internal/index.Build's own contract an individual package's
+// parse/type-check failure never changes the indexer's exit code or
+// prevents the rest of the build — that package simply ends up with no
+// UnitPointer ever written for it (see openIndexAfterBuild's own doc on
+// surfacing that build's stderr and errors=N count). Immediately calling
+// revalidateIndex against the database buildIndex just installed finds
+// exactly that package "stale" (index.RevalidateStale treats a missing
+// UnitPointer as changed) and repairs it in place — self-healing a
+// transient failure (e.g. a package that only fails to type-check because
+// a sibling package's build raced ahead of a generated file) without
+// waiting for whatever external trigger (a save, a watched-file change)
+// would otherwise be the first thing to ever revalidate this root. This
+// cannot spin: revalidateIndex runs its repair pass exactly once per
+// loadWorkspaceAsync call, never in a retry loop, so a package that fails
+// deterministically is reindexed at most once more here (logged via
+// reindex's own error path) and left alone — not attempted again until the
+// next independent trigger revalidates the workspace, exactly as it would
+// have been if it had first gone stale after a normal warm-open instead of
+// during this cold build.
 //
 // A shared graph cache (graph.Shared — every worktree of one git repository
 // reads and writes the same cache file, see graph.CacheFile) is trusted
@@ -131,10 +151,10 @@ func (s *Server) loadWorkspaceAsync(ctx context.Context, root string) {
 
 	if idx, ok := s.tryWarmOpen(root); ok {
 		s.idx.Store(idx)
-		s.revalidateIndex(ctx, root)
 	} else {
 		s.buildIndex(ctx, root)
 	}
+	s.revalidateIndex(ctx, root)
 
 	// Opportunistic, low-priority CAS GC: see runStartupCASGC's doc. Backgrounded
 	// on its own, separate from loadWorkspaceAsync's own goroutine, so an

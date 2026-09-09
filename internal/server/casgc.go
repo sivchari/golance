@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"path/filepath"
 	"time"
 
@@ -9,13 +10,14 @@ import (
 
 // otherDBOpenTimeout bounds how long RunCASGC waits to read another index
 // database before giving up on including it in this round's mark set (see
-// (*store.CAS).GC's safety doc). Short, since GC must never meaningfully
-// delay whatever triggered it (server startup or a schema rebuild) and a
-// database RunCASGC cannot open within this window is, by construction,
-// exclusively locked by some other live process's writer handle (see
-// store.DB's own doc on bbolt's whole-handle-lifetime lock) — waiting
-// longer would not change the outcome for a genuinely busy writer, only
-// delay GC for one that will still be busy on the next pass anyway.
+// collectOtherCASMarks's doc for what happens to the mark set when it does).
+// Short, since GC must never meaningfully delay whatever triggered it
+// (server startup or a schema rebuild) and a database RunCASGC cannot open
+// within this window is, by construction, exclusively locked by some other
+// live process's writer handle (see store.DB's own doc on bbolt's
+// whole-handle-lifetime lock) — waiting longer would not change the outcome
+// for a genuinely busy writer, only delay GC for one that will still be busy
+// on the next pass anyway.
 const otherDBOpenTimeout = 50 * time.Millisecond
 
 // indexDBGlobPattern matches every index database file — shared
@@ -37,6 +39,20 @@ const indexDBGlobPattern = "index-*.db"
 // (*Server).instrument's slow-request line, only when a sweep actually ran
 // (never for a MaybeGC call skipped by the interval throttle).
 //
+// The invariant this whole call must uphold: a blob may only be swept when
+// every index database sharing casPath was actually read this round. A
+// database this call could not open (otherDBOpenTimeout) or whose CASDir
+// could not be read makes the mark set an under-approximation of what is
+// genuinely still referenced — sweeping against it risks deleting a blob
+// some other live session's UnitPointer still names, which nothing ever
+// repairs (see collectOtherCASMarks's doc), unlike an ordinary CAS miss.
+// RunCASGC therefore skips the sweep entirely — logging one line naming how
+// many candidates it could not read — whenever collectOtherCASMarks reports
+// the mark set incomplete, rather than running GC/MaybeGC against a mark set
+// it knows may be missing a live reference. Reclaim is best-effort and can
+// always wait for a quieter moment (the next call, once whatever was locked
+// or unreadable this round has cleared); a swept live blob cannot be undone.
+//
 // ownPath is ownDB's own file path, skipped when enumerating other
 // candidates: this process already holds it open (typically in write
 // mode), so a second OpenReadOnly attempt against the very same file would
@@ -54,7 +70,8 @@ const indexDBGlobPattern = "index-*.db"
 //
 // stats/ran report exactly what the underlying GC/MaybeGC call reported
 // (ran is always true when force is true), for a caller — or a test — that
-// wants the outcome directly instead of parsing the log line.
+// wants the outcome directly instead of parsing the log line. Both are zero
+// whenever the sweep was skipped, deferred, or failed.
 func RunCASGC(logf func(format string, args ...any), casPath, ownPath string, ownDB *store.DB, force bool) (stats store.GCStats, ran bool) {
 	if ownDB == nil {
 		return store.GCStats{}, false
@@ -70,7 +87,11 @@ func RunCASGC(logf func(format string, args ...any), casPath, ownPath string, ow
 		logf("golance: cas gc: collect own blob keys: %v", err)
 		return store.GCStats{}, false
 	}
-	collectOtherCASMarks(casPath, ownPath, marks)
+	if unreadable := collectOtherCASMarks(casPath, ownPath, marks); unreadable > 0 {
+		logf("golance: cas gc: deferred: %d other index database(s) sharing this CAS could not be read within %s; reclaim requires every one of them to be read first",
+			unreadable, otherDBOpenTimeout)
+		return store.GCStats{}, false
+	}
 
 	now := time.Now()
 	if force {
@@ -109,16 +130,21 @@ func (s *Server) runStartupCASGC(root string) {
 
 // collectOtherCASMarks adds every BlobKey recorded in every OTHER index
 // database sharing casPath into marks, skipping ownPath (see RunCASGC's
-// doc) and, silently, any candidate that cannot be opened read-only within
-// otherDBOpenTimeout (a live writer) or that records no CASDir at all or a
-// different one (a database predating this feature, or one for an
-// unrelated repository) — see (*store.CAS).GC's safety doc for why an
-// incomplete mark set here is a reclaim-speed tradeoff, not a correctness
-// one.
-func collectOtherCASMarks(casPath, ownPath string, marks map[uint64]struct{}) {
+// doc), and reports how many candidates it could not fold into that mark
+// set with any confidence: one currently held open by some other live
+// writer, unreachable within otherDBOpenTimeout, or one whose own CASDir
+// value it could not read for any reason other than never having been
+// recorded (store.ErrNotFound). A candidate that opened cleanly but records
+// no CASDir at all (a database predating this feature) or a different one
+// (an unrelated repository's database sharing this same cache directory) is
+// legitimately not a contributor to casPath's mark set and does not count
+// toward the returned total — only a candidate this call genuinely could
+// not read makes the mark set an under-approximation RunCASGC must not
+// sweep against (see its own doc for why).
+func collectOtherCASMarks(casPath, ownPath string, marks map[uint64]struct{}) (unreadable int) {
 	matches, err := filepath.Glob(filepath.Join(cacheBaseDir(), "golance", indexDBGlobPattern))
 	if err != nil {
-		return
+		return 0
 	}
 	for _, path := range matches {
 		if path == ownPath {
@@ -126,11 +152,17 @@ func collectOtherCASMarks(casPath, ownPath string, marks map[uint64]struct{}) {
 		}
 		db, err := store.OpenReadOnlyTimeout(path, otherDBOpenTimeout)
 		if err != nil {
+			unreadable++
 			continue
 		}
-		if dir, err := db.CASDir(); err == nil && dir == casPath {
+		dir, err := db.CASDir()
+		switch {
+		case err == nil && dir == casPath:
 			_ = db.CollectBlobKeys(marks)
+		case err != nil && !errors.Is(err, store.ErrNotFound):
+			unreadable++
 		}
 		_ = db.Close()
 	}
+	return unreadable
 }

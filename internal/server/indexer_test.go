@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +34,27 @@ func newWorkspaceOnlyServer(t *testing.T) *Server {
 	s := New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(root, snap)
 	return s
+}
+
+// newWorkspaceOnlyServerWithLogBuffer is newWorkspaceOnlyServer with s's own
+// logger backed by a buffer instead of t.Logf, so a test can assert on the
+// exact text openIndexAfterBuild logs (e.g. the indexer stderr block or the
+// errors=N warning) rather than only on s.idx's resulting state.
+func newWorkspaceOnlyServerWithLogBuffer(t *testing.T) (*Server, *bytes.Buffer) {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("testdata", "module"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+	var buf bytes.Buffer
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	s := New(rpcServer, Options{Logger: log.New(&buf, "", 0)})
+	s.setWorkspace(root, snap)
+	return s, &buf
 }
 
 // openTestCAS returns a fresh CAS under a temp directory.
@@ -71,7 +95,7 @@ func TestOpenIndexAfterBuild_FallsBackToExistingDBOnFailure(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "index.db")
 	buildTestIndexDB(t, snap, dbPath, openTestCAS(t))
 
-	s.openIndexAfterBuild(context.Background(), dbPath, errors.New("boom"), "indexer stderr")
+	s.openIndexAfterBuild(context.Background(), dbPath, errors.New("boom"), "indexer stderr", 0)
 
 	idx := s.idx.Load()
 	if idx == nil {
@@ -91,7 +115,7 @@ func TestOpenIndexAfterBuild_NoDatabaseStaysUnavailable(t *testing.T) {
 	s := newWorkspaceOnlyServer(t)
 	dbPath := filepath.Join(t.TempDir(), "never-built.db")
 
-	s.openIndexAfterBuild(context.Background(), dbPath, errors.New("boom"), "indexer stderr")
+	s.openIndexAfterBuild(context.Background(), dbPath, errors.New("boom"), "indexer stderr", 0)
 
 	if idx := s.idx.Load(); idx != nil {
 		t.Fatal("idx is non-nil; want nil when the indexer failed and no database was ever built")
@@ -106,7 +130,7 @@ func TestOpenIndexAfterBuild_Success(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "index.db")
 	buildTestIndexDB(t, snap, dbPath, openTestCAS(t))
 
-	s.openIndexAfterBuild(context.Background(), dbPath, nil, "")
+	s.openIndexAfterBuild(context.Background(), dbPath, nil, "", 0)
 
 	idx := s.idx.Load()
 	if idx == nil {
@@ -114,6 +138,99 @@ func TestOpenIndexAfterBuild_Success(t *testing.T) {
 	}
 	if err := idx.db.Close(); err != nil {
 		t.Errorf("db.Close: %v", err)
+	}
+}
+
+// TestOpenIndexAfterBuild_CleanExitLogsNonEmptyStderr verifies that a
+// clean-exit build's stderr is no longer silently discarded: per
+// internal/index.Build's contract, a non-zero exit is reserved for
+// conditions that leave the whole build untrustworthy, so a per-package
+// panic or unexpected diagnostic that still leaves waitErr nil would
+// otherwise never appear in the log at all.
+func TestOpenIndexAfterBuild_CleanExitLogsNonEmptyStderr(t *testing.T) {
+	s, logBuf := newWorkspaceOnlyServerWithLogBuffer(t)
+	snap := s.workspace().snap
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	buildTestIndexDB(t, snap, dbPath, openTestCAS(t))
+
+	s.openIndexAfterBuild(context.Background(), dbPath, nil, "panic: something went wrong\n", 0)
+
+	idx := s.idx.Load()
+	if idx == nil {
+		t.Fatal("idx is nil after a successful build")
+	}
+	t.Cleanup(func() { _ = idx.db.Close() })
+
+	if !strings.Contains(logBuf.String(), "panic: something went wrong") {
+		t.Errorf("log output = %q, want it to contain the non-empty stderr from a clean-exit build", logBuf.String())
+	}
+}
+
+// TestOpenIndexAfterBuild_NoStderrLogsNothingExtra verifies the converse of
+// TestOpenIndexAfterBuild_CleanExitLogsNonEmptyStderr: an empty stderr on a
+// clean exit must not log an empty stderr block.
+func TestOpenIndexAfterBuild_NoStderrLogsNothingExtra(t *testing.T) {
+	s, logBuf := newWorkspaceOnlyServerWithLogBuffer(t)
+	snap := s.workspace().snap
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	buildTestIndexDB(t, snap, dbPath, openTestCAS(t))
+
+	s.openIndexAfterBuild(context.Background(), dbPath, nil, "", 0)
+
+	idx := s.idx.Load()
+	if idx == nil {
+		t.Fatal("idx is nil after a successful build")
+	}
+	t.Cleanup(func() { _ = idx.db.Close() })
+
+	if strings.Contains(logBuf.String(), "indexer stderr") {
+		t.Errorf("log output = %q, want no stderr block logged when stderr was empty", logBuf.String())
+	}
+}
+
+// TestOpenIndexAfterBuild_StatsErrorsLogsWarning verifies that statsErrors >
+// 0 (the indexer's own "STATS ... errors=N" count — see indexStatsMessage)
+// produces a visible warning naming the count, instead of relying solely on
+// the $/progress "end" notification's Message, which many clients ignore.
+func TestOpenIndexAfterBuild_StatsErrorsLogsWarning(t *testing.T) {
+	s, logBuf := newWorkspaceOnlyServerWithLogBuffer(t)
+	snap := s.workspace().snap
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	buildTestIndexDB(t, snap, dbPath, openTestCAS(t))
+
+	s.openIndexAfterBuild(context.Background(), dbPath, nil, "", 3)
+
+	idx := s.idx.Load()
+	if idx == nil {
+		t.Fatal("idx is nil after a successful build")
+	}
+	t.Cleanup(func() { _ = idx.db.Close() })
+
+	got := logBuf.String()
+	if !strings.Contains(got, "3") {
+		t.Errorf("log output = %q, want it to name the package error count (3)", got)
+	}
+}
+
+// TestOpenIndexAfterBuild_ZeroStatsErrorsLogsNoWarning verifies the converse
+// of TestOpenIndexAfterBuild_StatsErrorsLogsWarning: statsErrors == 0 must
+// not produce the warning.
+func TestOpenIndexAfterBuild_ZeroStatsErrorsLogsNoWarning(t *testing.T) {
+	s, logBuf := newWorkspaceOnlyServerWithLogBuffer(t)
+	snap := s.workspace().snap
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	buildTestIndexDB(t, snap, dbPath, openTestCAS(t))
+
+	s.openIndexAfterBuild(context.Background(), dbPath, nil, "", 0)
+
+	idx := s.idx.Load()
+	if idx == nil {
+		t.Fatal("idx is nil after a successful build")
+	}
+	t.Cleanup(func() { _ = idx.db.Close() })
+
+	if strings.Contains(logBuf.String(), "package error(s)") {
+		t.Errorf("log output = %q, want no package-error warning when statsErrors is 0", logBuf.String())
 	}
 }
 
@@ -133,7 +250,7 @@ func TestOpenIndexAfterBuild_SuccessResetsWarnFlags(t *testing.T) {
 	s.indexBuildingWarned.Store(true)
 	s.indexFailedWarned.Store(true)
 
-	s.openIndexAfterBuild(context.Background(), dbPath, nil, "")
+	s.openIndexAfterBuild(context.Background(), dbPath, nil, "", 0)
 
 	idx := s.idx.Load()
 	if idx == nil {
@@ -317,22 +434,32 @@ func TestSpawnIndexer_BoundToContext(t *testing.T) {
 // relayIndexProgress might read off the same stream.
 func TestIndexStatsMessage(t *testing.T) {
 	tests := []struct {
-		name    string
-		line    string
-		wantMsg string
-		wantOK  bool
+		name     string
+		line     string
+		wantMsg  string
+		wantErrs int
+		wantOK   bool
 	}{
 		{
-			name:    "typical build",
-			line:    "STATS processed=3 skipped=40 errors=0 typechecked=1",
-			wantMsg: "1 type-checked, 2 resolved from cache, 40 unchanged, 0 error(s)",
-			wantOK:  true,
+			name:     "typical build",
+			line:     "STATS processed=3 skipped=40 errors=0 typechecked=1",
+			wantMsg:  "1 type-checked, 2 resolved from cache, 40 unchanged, 0 error(s)",
+			wantErrs: 0,
+			wantOK:   true,
 		},
 		{
-			name:    "CAS-hit-only build",
-			line:    "STATS processed=1 skipped=2 errors=0 typechecked=0",
-			wantMsg: "0 type-checked, 1 resolved from cache, 2 unchanged, 0 error(s)",
-			wantOK:  true,
+			name:     "CAS-hit-only build",
+			line:     "STATS processed=1 skipped=2 errors=0 typechecked=0",
+			wantMsg:  "0 type-checked, 1 resolved from cache, 2 unchanged, 0 error(s)",
+			wantErrs: 0,
+			wantOK:   true,
+		},
+		{
+			name:     "build with package errors",
+			line:     "STATS processed=5 skipped=10 errors=2 typechecked=5",
+			wantMsg:  "5 type-checked, 0 resolved from cache, 10 unchanged, 2 error(s)",
+			wantErrs: 2,
+			wantOK:   true,
 		},
 		{
 			name:   "progress line",
@@ -347,14 +474,42 @@ func TestIndexStatsMessage(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			msg, ok := indexStatsMessage(tt.line)
+			msg, errs, ok := indexStatsMessage(tt.line)
 			if ok != tt.wantOK {
 				t.Fatalf("indexStatsMessage(%q) ok = %v, want %v", tt.line, ok, tt.wantOK)
 			}
 			if ok && msg != tt.wantMsg {
-				t.Errorf("indexStatsMessage(%q) = %q, want %q", tt.line, msg, tt.wantMsg)
+				t.Errorf("indexStatsMessage(%q) msg = %q, want %q", tt.line, msg, tt.wantMsg)
+			}
+			if ok && errs != tt.wantErrs {
+				t.Errorf("indexStatsMessage(%q) errs = %d, want %d", tt.line, errs, tt.wantErrs)
 			}
 		})
+	}
+}
+
+// TestRelayIndexProgress_ReturnsStatsErrors verifies relayIndexProgress
+// plumbs the "STATS ... errors=N" line's own count back to its caller
+// (runIndexBuild, which passes it on to openIndexAfterBuild), not just into
+// the $/progress "end" notification's Message.
+func TestRelayIndexProgress_ReturnsStatsErrors(t *testing.T) {
+	s := newWorkspaceOnlyServer(t)
+
+	r := strings.NewReader("PROGRESS 1 2\nPROGRESS 2 2\nSTATS processed=2 skipped=0 errors=4 typechecked=2\n")
+	if got := s.relayIndexProgress(r); got != 4 {
+		t.Errorf("relayIndexProgress() = %d, want 4", got)
+	}
+}
+
+// TestRelayIndexProgress_NoStatsLineReturnsZero verifies the converse: no
+// "STATS ..." line at all (e.g. the subprocess died before ever writing
+// one) must not be mistaken for a package error count.
+func TestRelayIndexProgress_NoStatsLineReturnsZero(t *testing.T) {
+	s := newWorkspaceOnlyServer(t)
+
+	r := strings.NewReader("PROGRESS 1 2\n")
+	if got := s.relayIndexProgress(r); got != 0 {
+		t.Errorf("relayIndexProgress() = %d, want 0", got)
 	}
 }
 
@@ -539,7 +694,7 @@ func TestOpenIndexAfterBuild_LockedSharedIndexFallsBackToPrivateIndex(t *testing
 	}
 	t.Cleanup(func() { _ = held.Close() })
 
-	locked := s.openIndexAfterBuild(context.Background(), sharedDBPath, nil, "")
+	locked := s.openIndexAfterBuild(context.Background(), sharedDBPath, nil, "", 0)
 	if !locked {
 		t.Fatal("openIndexAfterBuild(shared, locked by another session) locked = false, want true")
 	}
@@ -562,7 +717,7 @@ func TestOpenIndexAfterBuild_LockedSharedIndexFallsBackToPrivateIndex(t *testing
 	}
 	buildTestIndexDB(t, snap, privateDBPath, cas)
 
-	locked = s.openIndexAfterBuild(context.Background(), privateDBPath, nil, "")
+	locked = s.openIndexAfterBuild(context.Background(), privateDBPath, nil, "", 0)
 	if locked {
 		t.Fatal("openIndexAfterBuild(private) locked = true, want false")
 	}
@@ -598,7 +753,7 @@ func TestStop_RemovesPrivateIndexFiles(t *testing.T) {
 	}
 	buildTestIndexDB(t, snap, privateDBPath, cas)
 
-	if s.openIndexAfterBuild(context.Background(), privateDBPath, nil, "") {
+	if s.openIndexAfterBuild(context.Background(), privateDBPath, nil, "", 0) {
 		t.Fatal("openIndexAfterBuild(private) locked = true, want false")
 	}
 	if s.idx.Load() == nil {

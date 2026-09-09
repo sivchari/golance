@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,7 +122,8 @@ func TestRunCASGC_UnionAcrossDatabasesProtectsReferencedBlob(t *testing.T) {
 // CAS directory being swept: a database for an unrelated repository, and
 // one that predates the CASDir meta field entirely (CASDir returns
 // ErrNotFound), must both be excluded even though their files sit in the
-// same shared cache directory.
+// same shared cache directory — and, since both opened and read cleanly,
+// neither counts toward the returned unreadable total either.
 func TestRunCASGC_MismatchedOrMissingCASDirIgnored(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	casPath := filepath.Join(t.TempDir(), "cas")
@@ -148,32 +150,38 @@ func TestRunCASGC_MismatchedOrMissingCASDirIgnored(t *testing.T) {
 	}
 
 	marks := map[uint64]struct{}{}
-	collectOtherCASMarks(casPath, "", marks)
+	unreadable := collectOtherCASMarks(casPath, "", marks)
 
 	if len(marks) != 0 {
 		t.Errorf("collectOtherCASMarks() marks = %v, want empty (neither database's CASDir matches casPath)", marks)
 	}
+	if unreadable != 0 {
+		t.Errorf("collectOtherCASMarks() unreadable = %d, want 0 (both databases opened and read cleanly)", unreadable)
+	}
 }
 
-// TestRunCASGC_LockedOtherDatabaseIsSkipped documents the safety tradeoff
-// (*store.CAS).GC's doc describes: a database currently held open by
-// another live writer cannot be read within otherDBOpenTimeout, so its
-// references are excluded from this round's mark set — a blob it alone
-// references, old enough to be past GraceWindow, is swept despite still
-// being that (unreachable-this-round) database's current target. This is
-// the documented tradeoff, not a bug: CAS.Get's self-healing miss path
-// means the worst outcome is a recompute, never data loss.
-func TestRunCASGC_LockedOtherDatabaseIsSkipped(t *testing.T) {
+// TestRunCASGC_LockedOtherDatabaseDefersTheWholeSweep verifies the
+// completeness invariant RunCASGC's own doc describes: a database currently
+// held open by another live writer cannot be read within otherDBOpenTimeout,
+// so the mark set this round would build is an under-approximation of what
+// is genuinely still referenced. Sweeping against it anyway would risk
+// deleting a blob that (unreachable-this-round) database's own UnitPointer
+// still names — unlike an ordinary CAS miss, nothing ever repairs that. So
+// RunCASGC must skip the sweep entirely, leaving every blob (including one
+// past GraceWindow with no reader at all) untouched, and log why.
+func TestRunCASGC_LockedOtherDatabaseDefersTheWholeSweep(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	casPath := filepath.Join(t.TempDir(), "cas")
 	cas, err := store.OpenCAS(casPath)
 	if err != nil {
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
-	if err := cas.Put(1, []byte("blob")); err != nil {
-		t.Fatalf("Put: %v", err)
+	for _, key := range []uint64{1, 2} {
+		if err := cas.Put(key, []byte("blob")); err != nil {
+			t.Fatalf("Put(%d): %v", key, err)
+		}
+		backdateBlob(t, casPath, key)
 	}
-	backdateBlob(t, casPath, 1)
 
 	cacheDir := filepath.Join(cacheBaseDir(), "golance")
 	if err := os.MkdirAll(cacheDir, 0o750); err != nil {
@@ -186,8 +194,9 @@ func TestRunCASGC_LockedOtherDatabaseIsSkipped(t *testing.T) {
 		t.Fatalf("store.Open(own): %v", err)
 	}
 	t.Cleanup(func() { _ = own.Close() })
-	// ownDB references nothing; only the locked database below references
-	// blob 1.
+	// ownDB references nothing; blob 1 is referenced only by the locked
+	// database below, and blob 2 is referenced by nothing at all — both
+	// must survive, since an incomplete mark set must not sweep anything.
 
 	lockedPath := filepath.Join(cacheDir, "index-locked.db")
 	locked, err := store.Open(lockedPath)
@@ -205,15 +214,27 @@ func TestRunCASGC_LockedOtherDatabaseIsSkipped(t *testing.T) {
 	// store.DB's doc) rather than closed here, simulating a live session
 	// still using it.
 
-	stats, ran := RunCASGC(t.Logf, casPath, ownPath, own, true)
-	if !ran {
-		t.Fatal("RunCASGC(force=true) ran = false, want true")
+	var logged []string
+	logf := func(format string, args ...any) { logged = append(logged, fmt.Sprintf(format, args...)) }
+
+	stats, ran := RunCASGC(logf, casPath, ownPath, own, true)
+	if ran {
+		t.Error("RunCASGC(force=true) ran = true with an unreadable candidate database, want false (deferred)")
 	}
-	if cas.Has(1) {
-		t.Error("blob 1, referenced only by a currently-locked database, survived GC; want swept (documented tradeoff — see this test's doc)")
+	if stats != (store.GCStats{}) {
+		t.Errorf("RunCASGC stats = %+v, want zero value when deferred", stats)
 	}
-	if stats.SweptCount != 1 {
-		t.Errorf("SweptCount = %d, want 1", stats.SweptCount)
+	if !cas.Has(1) {
+		t.Error("blob 1 was swept despite an incomplete mark set, want kept")
+	}
+	if !cas.Has(2) {
+		t.Error("blob 2 was swept despite an incomplete mark set, want kept")
+	}
+	if len(logged) != 1 {
+		t.Fatalf("logged %d line(s), want exactly 1 explaining the deferral: %v", len(logged), logged)
+	}
+	if !strings.Contains(logged[0], "deferred") {
+		t.Errorf("logged line %q does not mention the deferral", logged[0])
 	}
 }
 
