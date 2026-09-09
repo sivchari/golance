@@ -152,7 +152,7 @@ func TestParseCodeLensSettings(t *testing.T) {
 
 	t.Run("explicit override wins, unspecified sources keep their default", func(t *testing.T) {
 		raw := mustMarshal(t, map[string]any{"codelenses": map[string]bool{"test": true}})
-		got := parseCodeLensSettings(raw)
+		got := parseCodeLensSettings(protocol.LSPAny(raw))
 		if !got[codeLensTest] {
 			t.Error("test source not enabled by explicit override")
 		}
