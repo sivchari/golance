@@ -419,6 +419,27 @@ func (p *Provider) putFull(pkgPath string, cp *CheckedPackage) {
 	p.fullLRU.put(pkgPath, cp)
 }
 
+// Delete drops each of pkgPaths from both the declarations-only and
+// full-body LRUs, if cached. Callers use this after a workspace package's
+// on-disk export data changes (didSave's background reindex, see
+// internal/server.Server.reindex): unlike a GOROOT/module-cache dependency,
+// which Provider assumes is immutable for a fixed dependency set (see
+// Provider's own doc), a workspace package is reachable through this same
+// Provider too — depexport.Cache.ExportData falls back to Provider.Package
+// for ANY pkgPath its MetadataSource resolves, including a workspace
+// package imported by another workspace package, since only a
+// GOROOT/module-cache directory is treated as immutable enough to persist
+// to the CAS there — and nothing else in Provider notices that content
+// changing underneath a cached entry.
+func (p *Provider) Delete(pkgPaths ...string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, pkgPath := range pkgPaths {
+		p.lru.delete(pkgPath)
+		p.fullLRU.delete(pkgPath)
+	}
+}
+
 const unsafePkgPath = "unsafe"
 
 // unsafePackage returns the synthetic CheckedPackage for the "unsafe"
@@ -691,6 +712,7 @@ func docAt(files []*ast.File, fset *token.FileSet, pos token.Pos) string {
 // instance for cp's own PkgPath — onto the equivalent types.Object inside
 // cp.Types(). See Decl's doc for the two strategies tried.
 func resolveObject(cp *CheckedPackage, obj types.Object) (types.Object, error) {
+	obj = OriginObject(obj)
 	if path, err := objectpath.For(obj); err == nil {
 		if target, err := objectpath.Object(cp.pkg, path); err == nil {
 			return target, nil
@@ -700,6 +722,46 @@ func resolveObject(cp *CheckedPackage, obj types.Object) (types.Object, error) {
 		return target, nil
 	}
 	return nil, fmt.Errorf("depcheck: could not resolve %s in %s", obj.Name(), cp.pkgPath)
+}
+
+// OriginObject normalizes obj to the declaration objectpath.For can encode a
+// path for, when obj is a synthetic object go/types created while
+// instantiating a generic type: a field or method reached through an
+// instantiated generic type (e.g. connect.Request[T].Msg, or a method on
+// Box[Concrete]) is a distinct *types.Var/*types.Func from its origin
+// declaration — not identity-equal to it, even though both live in the same
+// *types.Package — so objectpath.For's traversal, which only walks origin
+// declarations reachable from package scope, cannot find a path for the
+// synthetic one directly ("can't find path" from
+// golang.org/x/tools/go/types/objectpath). types.Var and types.Func both
+// expose Origin() for exactly this: it returns the receiver unchanged for
+// every object that is not itself such a synthetic instantiation artifact,
+// so calling it unconditionally here is a no-op for the common, non-generic
+// case, and for a promoted field/method reached through an embedded
+// instantiated generic type (the same synthetic object is returned by
+// go/types either way). No equivalent normalization is needed for
+// *types.TypeName or a plain generic function's *types.Func: go/types
+// creates exactly one object per declaration for those — instantiating a
+// named type or a generic function produces a new go/types.Type or
+// types.Instance, never a second Var/Func/TypeName — so an identifier
+// referring to either already resolves to the origin object without help.
+//
+// Exported for internal/langfeat's own direct objectpath.For call sites
+// (hover, completion-doc, call hierarchy): resolveObject above needs it to
+// bridge Decl's cross-instance *types.Package boundary, but those callers
+// hit the identical "can't find path" obstacle earlier, encoding an
+// objectpath straight from a live obj resolved against cp's own Info,
+// before any depcheck.Provider round-trip -- the same normalization applies
+// either way.
+func OriginObject(obj types.Object) types.Object {
+	switch o := obj.(type) {
+	case *types.Var:
+		return o.Origin()
+	case *types.Func:
+		return o.Origin()
+	default:
+		return obj
+	}
 }
 
 // declIdent returns the *ast.Ident at pos among files — the declaring

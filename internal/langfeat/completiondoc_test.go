@@ -77,6 +77,39 @@ func TestResolveCompletionDoc_CrossPackage(t *testing.T) {
 	}
 }
 
+// TestResolveCompletionDoc_CrossPackage_GenericField verifies
+// ResolveCompletionDoc's cross-package branch resolves a completion
+// candidate reached through an INSTANTIATED generic dependency type
+// (genericdep.Box[Concrete].Msg): selectorObjectForLabel's
+// types.LookupFieldOrMethod produces the same synthetic, as-instantiated
+// field Var TestDependencyDefinition_Generics's field case does, so this
+// exercises depcheck.OriginObject's normalization on a second, independent
+// call site.
+func TestResolveCompletionDoc_CrossPackage_GenericField(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "genericuse", "genericuse.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "b.Msg") + len("b.")
+
+	got, err := langfeat.ResolveCompletionDoc(cp, reader, langfeat.CompletionDocKey{File: path, Offset: offset, Label: "Msg"})
+	if err != nil {
+		t.Fatalf("ResolveCompletionDoc: %v", err)
+	}
+	if got == nil {
+		t.Fatal("ResolveCompletionDoc returned nil, want a result")
+	}
+	const wantPkgPath = "example.com/langfeatmod/genericdep"
+	if got.PkgPath != wantPkgPath {
+		t.Errorf("PkgPath = %q, want %q", got.PkgPath, wantPkgPath)
+	}
+	if got.ObjPath == "" {
+		t.Error("ObjPath is empty, want a resolvable objectpath (Box.Msg reached through an instantiated generic type)")
+	}
+}
+
 func TestResolveCompletionDoc_NoMatch(t *testing.T) {
 	reader := overlay.New()
 	cp, path := newCheckedPackage(t, reader, "completiondoc", "completiondoc.go")

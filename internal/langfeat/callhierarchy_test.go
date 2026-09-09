@@ -1,6 +1,7 @@
 package langfeat_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/sivchari/golance/internal/langfeat"
@@ -123,6 +124,57 @@ func TestFuncDeclaration_CrossPackage(t *testing.T) {
 	}
 	if info.ObjPath != "Double" {
 		t.Errorf("ObjPath = %q, want %q", info.ObjPath, "Double")
+	}
+}
+
+// TestFuncDeclaration_CrossPackage_GenericMethod verifies FuncDeclaration's
+// cross-package branch resolves a method reached through an INSTANTIATED
+// generic dependency type (a call to genericdep.Box[Concrete].ValueDescribe):
+// objectpath.For(fn) previously failed on the synthetic, as-instantiated
+// *types.Func go/types creates for a method on an instantiated named type
+// (see depcheck.OriginObject's doc), which FuncDeclaration's own doc treats
+// as "unreachable via objectpath" and silently degrades to (nil, nil) --
+// exactly like a genuinely unreachable function-local type's method, even
+// though this one really is reachable. The roundtrip through dp.DeclAt
+// proves ObjPath is not merely non-empty but actually resolves back to
+// Box's own ValueDescribe declaration.
+func TestFuncDeclaration_CrossPackage_GenericMethod(t *testing.T) {
+	reader := overlay.New()
+	cp, path, dp := newCheckedPackageWithProvider(t, reader, "genericuse", "genericuse.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "b.ValueDescribe") + len("b.")
+	fn, ok := langfeat.CallHierarchyFuncAt(cp, path, offset)
+	if !ok {
+		t.Fatal("CallHierarchyFuncAt ok = false, want true")
+	}
+
+	info, err := langfeat.FuncDeclaration(cp, fn)
+	if err != nil {
+		t.Fatalf("FuncDeclaration: %v", err)
+	}
+	if info == nil {
+		t.Fatal("FuncDeclaration returned nil, want a result (a method reached through an instantiated generic dependency type)")
+	}
+	if info.SameFile != "" {
+		t.Errorf("SameFile = %q, want \"\" (a cross-package result)", info.SameFile)
+	}
+	const wantPkgPath = "example.com/langfeatmod/genericdep"
+	if info.PkgPath != wantPkgPath {
+		t.Errorf("PkgPath = %q, want %q", info.PkgPath, wantPkgPath)
+	}
+	if info.ObjPath == "" {
+		t.Fatal("ObjPath is empty, want a resolvable objectpath")
+	}
+
+	declID, _, err := dp.DeclAt(context.Background(), info.PkgPath, info.ObjPath)
+	if err != nil {
+		t.Fatalf("DeclAt(%s, %s): %v", info.PkgPath, info.ObjPath, err)
+	}
+	if declID.Name != "ValueDescribe" {
+		t.Errorf("DeclAt resolved to %q, want %q", declID.Name, "ValueDescribe")
 	}
 }
 

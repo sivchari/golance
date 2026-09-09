@@ -60,5 +60,15 @@ func (l *lruCache) evictOldest() {
 	l.order.Remove(back)
 }
 
+// delete removes pkgPath's cached entry, if present. A no-op otherwise.
+func (l *lruCache) delete(pkgPath string) {
+	el, ok := l.index[pkgPath]
+	if !ok {
+		return
+	}
+	delete(l.index, pkgPath)
+	l.order.Remove(el)
+}
+
 // len returns the number of entries currently cached.
 func (l *lruCache) len() int { return l.order.Len() }

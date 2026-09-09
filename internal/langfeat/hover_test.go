@@ -2,6 +2,7 @@ package langfeat_test
 
 import (
 	"bytes"
+	"context"
 	"strings"
 	"testing"
 
@@ -87,6 +88,47 @@ func TestHover_CrossPackage(t *testing.T) {
 	}
 	if got.ObjPath == "" {
 		t.Error("ObjPath is empty, want a non-empty objectpath encoding of strings.Builder")
+	}
+}
+
+// TestHover_CrossPackage_GenericField verifies Hover's cross-package branch
+// resolves a field reached through an INSTANTIATED generic dependency type
+// (genericdep.Box[Concrete].Msg, mirroring connectrpc.com/connect's
+// Request[T]/Response[T].Msg shape): before depcheck.OriginObject existed,
+// objectpath.For(obj) failed on the synthetic, as-instantiated field Var
+// (see its doc), leaving PkgPath/ObjPath both empty even though the field
+// really is reachable. The roundtrip through dp.DeclAt proves ObjPath is not
+// merely non-empty but actually resolves back to Box's own Msg field.
+func TestHover_CrossPackage_GenericField(t *testing.T) {
+	reader := overlay.New()
+	cp, path, dp := newCheckedPackageWithProvider(t, reader, "genericuse", "genericuse.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "b.Msg") + len("b.")
+
+	got, err := langfeat.Hover(cp, path, offset)
+	if err != nil {
+		t.Fatalf("Hover: %v", err)
+	}
+	if got == nil {
+		t.Fatal("Hover returned nil, want a result")
+	}
+	const wantPkgPath = "example.com/langfeatmod/genericdep"
+	if got.PkgPath != wantPkgPath {
+		t.Errorf("PkgPath = %q, want %q", got.PkgPath, wantPkgPath)
+	}
+	if got.ObjPath == "" {
+		t.Fatal("ObjPath is empty, want a non-empty objectpath encoding of Box.Msg")
+	}
+
+	declID, _, err := dp.DeclAt(context.Background(), got.PkgPath, got.ObjPath)
+	if err != nil {
+		t.Fatalf("DeclAt(%s, %s): %v", got.PkgPath, got.ObjPath, err)
+	}
+	if declID.Name != "Msg" {
+		t.Errorf("DeclAt resolved to %q, want %q", declID.Name, "Msg")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"go/types"
 
 	"github.com/sivchari/golance/internal/check"
+	"github.com/sivchari/golance/internal/depcheck"
 	"github.com/sivchari/golance/internal/overlay"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/types/objectpath"
@@ -59,7 +60,11 @@ func ResolveCompletionDoc(cp *check.CheckedPackage, reader overlay.FileReader, k
 	if obj.Pkg() == nil {
 		return nil, nil // universe/builtin object: no doc source
 	}
-	objPath, err := objectpath.For(obj)
+	// depcheck.OriginObject normalizes a field/method reached through an
+	// instantiated generic type to its origin declaration -- see its doc for
+	// why objectpath.For cannot encode a path for the synthetic,
+	// as-instantiated object directly.
+	objPath, err := objectpath.For(depcheck.OriginObject(obj))
 	if err == nil {
 		return &CompletionDocInfo{PkgPath: obj.Pkg().Path(), ObjPath: string(objPath)}, nil
 	}

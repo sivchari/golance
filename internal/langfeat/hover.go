@@ -5,6 +5,7 @@ import (
 	"go/types"
 
 	"github.com/sivchari/golance/internal/check"
+	"github.com/sivchari/golance/internal/depcheck"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/types/objectpath"
 )
@@ -54,7 +55,11 @@ func Hover(cp *check.CheckedPackage, file string, offset int) (*HoverInfo, error
 	case obj.Pkg() == nil:
 		hoverBuiltin(obj, info)
 	default:
-		if objPath, err := objectpath.For(obj); err == nil {
+		// depcheck.OriginObject normalizes a field/method reached through an
+		// instantiated generic type (e.g. connect.Request[T].Msg) to its
+		// origin declaration -- see its doc for why objectpath.For cannot
+		// encode a path for the synthetic, as-instantiated object directly.
+		if objPath, err := objectpath.For(depcheck.OriginObject(obj)); err == nil {
 			info.PkgPath, info.ObjPath = obj.Pkg().Path(), string(objPath)
 		}
 	}
