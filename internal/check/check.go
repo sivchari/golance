@@ -199,14 +199,18 @@ type Engine struct {
 	jobs    map[unitKey]*dirState
 	flights map[unitKey]*flight
 
-	// debounceWG counts debounce-triggered background rechecks that have
-	// been armed but not yet resolved — see armDebounceLocked (Add, under
-	// e.mu) and fireRecheck (Done, via defer). Wait blocks on it; Stop does
-	// not, by design (see Stop's own doc), so this exists purely to give a
-	// caller like a test's cleanup — which is about to delete the temp
-	// directories a still-running recheck could still be reading from or
-	// writing to — a way to block until that is no longer possible.
-	debounceWG sync.WaitGroup
+	// pendingWG counts every recheck that has been armed or started but not
+	// yet resolved: debounce-triggered ones (armDebounceLocked Adds under
+	// e.mu, fireRecheck Dones via defer) and request-driven flights alike
+	// (getOrStartFlight Adds, runFlight Dones via defer). Wait blocks on it;
+	// Stop does not, by design (see Stop's own doc), so this exists to give
+	// a caller that must know no recheck can still be touching anything — a
+	// test cleanup about to delete the temp directories one could still be
+	// reading from or writing to, say — a way to block until that holds.
+	// Flights must be counted too, not just debounces: a flight observes
+	// e.ctx only at runRecheck's own checkpoints, so Stop returning says
+	// nothing about whether one is still running.
+	pendingWG sync.WaitGroup
 }
 
 // New returns an Engine that resolves files to packages via snap, reads
@@ -343,6 +347,7 @@ func (e *Engine) getOrStartFlight(key unitKey, hash string) *flight {
 	e.flights[key] = fl
 	e.mu.Unlock()
 
+	e.pendingWG.Add(1)
 	go e.runFlight(key, fl)
 	return fl
 }
@@ -357,6 +362,7 @@ func (e *Engine) getOrStartFlight(key unitKey, hash string) *flight {
 // this goroutine is not covered by rpc.Server.callRequestHandler's own
 // panic recovery, since it can outlive the request that started it.
 func (e *Engine) runFlight(key unitKey, fl *flight) {
+	defer e.pendingWG.Done()
 	defer func() {
 		if r := recover(); r != nil {
 			fl.cp, fl.err = nil, fmt.Errorf("check: panic during recheck of %s: %v", key.dir, r)
@@ -454,14 +460,14 @@ func (e *Engine) armDebounceLocked(key unitKey) {
 	if st.timer != nil {
 		if st.timer.Stop() {
 			// The timer being superseded never fired, so fireRecheck's
-			// defer e.debounceWG.Done() (matching the Add below) will
+			// defer e.pendingWG.Done() (matching the Add below) will
 			// never run for it; balance it here instead. If Stop returns
 			// false the timer had already fired (or been stopped once
 			// already) and that invocation owns its own Done call.
-			e.debounceWG.Done()
+			e.pendingWG.Done()
 		}
 	}
-	e.debounceWG.Add(1)
+	e.pendingWG.Add(1)
 	st.timer = time.AfterFunc(e.opts.DebounceDelay, func() { e.fireRecheck(key) })
 }
 
@@ -481,7 +487,7 @@ func (e *Engine) armDebounceLocked(key unitKey) {
 // failure is picked up by the next independent trigger (a further edit, a
 // watched-file event) instead of retried in a loop.
 func (e *Engine) fireRecheck(key unitKey) {
-	defer e.debounceWG.Done()
+	defer e.pendingWG.Done()
 	ctx, finish := e.startJob(context.Background(), key)
 	defer finish()
 	if _, err := e.runRecheck(ctx, key); err != nil && ctx.Err() == nil {
@@ -714,9 +720,9 @@ func (e *Engine) Stop() {
 			if st.timer.Stop() {
 				// Canceled before it ever fired, so fireRecheck's own
 				// Done (matching armDebounceLocked's Add) will never run
-				// for it — balance debounceWG here, mirroring
+				// for it — balance pendingWG here, mirroring
 				// armDebounceLocked's identical re-arm case.
-				e.debounceWG.Done()
+				e.pendingWG.Done()
 			}
 			st.timer = nil
 		}
@@ -726,14 +732,15 @@ func (e *Engine) Stop() {
 	}
 }
 
-// Wait blocks until every debounce-triggered background recheck that had
-// already been armed or started before this call returns — i.e. until
-// none can still be reading or writing anything. It does not itself
-// cancel or stop anything; call Stop first so no new debounce timer can
-// arm after Wait begins (Wait does not block a concurrent Invalidate from
-// arming a fresh one, which would otherwise never be observed).
+// Wait blocks until every recheck already armed or running when it was
+// called has finished — debounce-triggered ones and request-driven
+// flights alike — i.e. until none can still be reading or writing
+// anything. It does not itself cancel or stop anything; call Stop first,
+// so no new work can start after Wait begins (Wait does not block a
+// concurrent Invalidate or Get from starting some, which it would then
+// never observe).
 func (e *Engine) Wait() {
-	e.debounceWG.Wait()
+	e.pendingWG.Wait()
 }
 
 // evictLocked removes the least recently used cache entry outside the
