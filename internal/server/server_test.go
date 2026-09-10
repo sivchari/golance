@@ -61,6 +61,19 @@ func stopWorkspaceEngineOnCleanup(t *testing.T, s *Server) {
 			ws.engine.Stop()
 			ws.engine.Wait()
 		}
+		// Detached reindexes a handler started (didOpen's facts self-heal,
+		// a didSave reindex) are drained by Serve in production; a test
+		// that calls handlers directly has no Serve, so it must drain them
+		// here or one keeps writing to the index and CAS that this test's
+		// own t.TempDir cleanup is about to remove. This is the same
+		// Store(nil)-then-Wait sequence under idxMu that revalidateIndex's
+		// rebuild branch uses (see beginReindex's doc for why holding the
+		// lock across both is what makes a late registration impossible
+		// rather than a race).
+		s.idxMu.Lock()
+		s.idx.Store(nil)
+		s.reindexWG.Wait()
+		s.idxMu.Unlock()
 	})
 }
 
