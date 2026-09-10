@@ -32,7 +32,12 @@ type Options struct {
 	// toolchain upgrade. Defaults to runtime.Version().
 	ToolchainFingerprint string
 	// BuildFlagsFingerprint is folded into each package's content hash so
-	// a build-flags change (e.g. -tags) invalidates the index. Optional.
+	// a build-flags change (e.g. -tags, GOOS/GOARCH, CGO_ENABLED)
+	// invalidates the index. Left empty, it defaults to the snapshot's own
+	// [graph.Snapshot.BuildFlagsFingerprint] — the build configuration
+	// go/packages actually resolved that snapshot's packages under — so a
+	// caller only needs to set this explicitly to pin a different value
+	// than the snapshot it is passing (e.g. a test).
 	BuildFlagsFingerprint string
 	// RelativePaths, if set, stores source file paths (the facts blob's
 	// file table and store.UnitPointer.Files) relative to the workspace
@@ -134,6 +139,7 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 	// opts, and &o is threaded through the call chain in place of a second
 	// Options parameter copy at each hop (gocritic hugeParam).
 	o := opts.withDefaults()
+	o.BuildFlagsFingerprint = resolveBuildFlagsFingerprint(snap, o.BuildFlagsFingerprint)
 	start := time.Now()
 
 	fset := token.NewFileSet()
@@ -195,6 +201,21 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 		}
 	}
 	return stats, err
+}
+
+// resolveBuildFlagsFingerprint returns fp unchanged when non-empty, or
+// snap's own [graph.Snapshot.BuildFlagsFingerprint] otherwise. Every real
+// production caller of Build/Reindex/Revalidate/RevalidateStale/
+// PackageChanged leaves its own build-flags fingerprint parameter empty
+// (see the package doc), so this is what actually makes a GOFLAGS/GOOS/
+// GOARCH/CGO_ENABLED change reach the cache key in practice; an explicit fp
+// lets a test (or a future caller with a reason to) pin a specific value
+// instead of snap's.
+func resolveBuildFlagsFingerprint(snap *graph.Snapshot, fp string) string {
+	if fp != "" {
+		return fp
+	}
+	return snap.BuildFlagsFingerprint()
 }
 
 // nonRootCount returns the number of non-root (stdlib/module-cache)

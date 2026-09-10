@@ -22,7 +22,10 @@ import (
 // whose blob has gone missing from the CAS entirely (see packageChanged's
 // doc). relative must match the Options.RelativePaths value db was last
 // built or reindexed with, so a stored [store.UnitPointer].Files path is
-// joined back onto snap.Dir() correctly before comparison.
+// joined back onto snap.Dir() correctly before comparison. buildFlagsFP left
+// empty defaults to snap's own [graph.Snapshot.BuildFlagsFingerprint] (see
+// [resolveBuildFlagsFingerprint]), exactly like Options.BuildFlagsFingerprint
+// does for Build/Reindex.
 //
 // It never writes to db. It touches the CAS only to stat (never read) each
 // package's recorded blob — see [store.CAS.Has] — so it remains safe and
@@ -35,7 +38,7 @@ import (
 // occasionally a source read for the content-hash fallback, and now one
 // more stat per package for the CAS blob check) rather than CPU-bound.
 func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolchainFP, buildFlagsFP string, relative bool) (bool, error) {
-	stale, wholeDBStale, err := revalidateImpl(ctx, snap, db, toolchainFP, buildFlagsFP, relative)
+	stale, wholeDBStale, err := revalidateImpl(ctx, snap, db, toolchainFP, resolveBuildFlagsFingerprint(snap, buildFlagsFP), relative)
 	if err != nil {
 		return false, err
 	}
@@ -63,7 +66,7 @@ func Revalidate(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolcha
 // snap: the caller needs the complete stale set, not merely proof that one
 // exists, so there is no early exit once the first stale package is found.
 func RevalidateStale(ctx context.Context, snap *graph.Snapshot, db *store.DB, toolchainFP, buildFlagsFP string, relative bool) ([]string, bool, error) {
-	return revalidateImpl(ctx, snap, db, toolchainFP, buildFlagsFP, relative)
+	return revalidateImpl(ctx, snap, db, toolchainFP, resolveBuildFlagsFingerprint(snap, buildFlagsFP), relative)
 }
 
 // PackageChanged is Revalidate's single-package variant, for a caller that
@@ -108,7 +111,7 @@ func PackageChanged(ctx context.Context, snap *graph.Snapshot, db *store.DB, pat
 	}
 
 	keys := newKeyTable(ctx, db)
-	return packageChanged(ctx, db, cas, keys, snap, pkg, path, toolchainFP, buildFlagsFP, snap.Dir(), relative)
+	return packageChanged(ctx, db, cas, keys, snap, pkg, path, toolchainFP, resolveBuildFlagsFingerprint(snap, buildFlagsFP), snap.Dir(), relative)
 }
 
 // blobCAS opens the *store.CAS db's own [store.UnitPointer.BlobKey] values
@@ -256,11 +259,7 @@ func packageChanged(ctx context.Context, db *store.DB, cas *store.CAS, keys *key
 	}
 
 	var deps []depExportEntry
-	for _, imp := range pkg.Imports {
-		d, ok := snap.Packages[imp]
-		if !ok || !d.Root || len(d.GoFiles) == 0 {
-			continue
-		}
+	for _, imp := range directDepImports(snap, pkg) {
 		rec, ok := keys.get(imp)
 		if !ok {
 			return true, nil // a dependency that has never been indexed at all: conservatively report changed.

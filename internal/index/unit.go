@@ -233,7 +233,14 @@ func checkAndStoreOutcome(fset *token.FileSet, imp *typecheck.Importer, cas *sto
 
 // directDepExports returns pkg's direct workspace (root) dependencies'
 // current export-hash contributions to its own [computeUnitKey], resolved
-// through keys. Dependency-ordered processing (Build's scheduler, or
+// through keys — walking both pkg.Imports and pkg.TestImports (an
+// in-package test file's own extra imports, disjoint from Imports by
+// construction — see graph.Package.TestImports's doc), so a package whose
+// only edge to a dependency is through its own _test.go file still gets a
+// combined key that changes when that dependency's export data does; this
+// is what actually makes [graph.Snapshot.ClosureUnits] walking it worth
+// doing (see Reindex's closure walk) rather than every visit resolving to
+// an unchanged no-op. Dependency-ordered processing (Build's scheduler, or
 // Reindex's topologically-ordered closure walk) never asks for a dependency
 // before it has itself finished this run — resolved and stable in db (if
 // left untouched), freshly resolved (if touched), or, if it was touched but
@@ -245,11 +252,7 @@ func checkAndStoreOutcome(fset *token.FileSet, imp *typecheck.Importer, cas *sto
 // state.
 func directDepExports(snap *graph.Snapshot, keys *keyTable, pkg *graph.Package) ([]depExportEntry, error) {
 	var deps []depExportEntry
-	for _, imp := range pkg.Imports {
-		d, ok := snap.Packages[imp]
-		if !ok || !d.Root || len(d.GoFiles) == 0 {
-			continue // non-workspace or empty dependency: excluded from the key, see computeUnitKey's doc.
-		}
+	for _, imp := range directDepImports(snap, pkg) {
 		rec, ok := keys.get(imp)
 		if !ok {
 			if failErr := keys.failure(imp); failErr != nil {
@@ -260,6 +263,29 @@ func directDepExports(snap *graph.Snapshot, keys *keyTable, pkg *graph.Package) 
 		deps = append(deps, depExportEntry{path: imp, exportHash: rec.exportHash})
 	}
 	return deps, nil
+}
+
+// directDepImports returns the import paths of pkg's direct workspace
+// (root, non-empty) dependencies, folding in both pkg.Imports and
+// pkg.TestImports (an in-package test file's own extra imports, disjoint
+// from Imports by construction — see graph.Package.TestImports's doc) —
+// the shared dependency set directDepExports and revalidate.go's
+// packageChanged both need for their own key/staleness computation to
+// recognize a dependency pkg reaches only through its own _test.go file
+// (see graph.Snapshot.ClosureUnits' identical fold, the reverse direction
+// of this same relationship).
+func directDepImports(snap *graph.Snapshot, pkg *graph.Package) []string {
+	var out []string
+	for _, imports := range [][]string{pkg.Imports, pkg.TestImports} {
+		for _, imp := range imports {
+			d, ok := snap.Packages[imp]
+			if !ok || !d.Root || len(d.GoFiles) == 0 {
+				continue // non-workspace or empty dependency: excluded from the key, see computeUnitKey's doc.
+			}
+			out = append(out, imp)
+		}
+	}
+	return out
 }
 
 // checkResult bundles one package's freshly type-checked outputs.

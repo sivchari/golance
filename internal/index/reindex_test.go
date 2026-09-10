@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/sivchari/golance/internal/store"
@@ -43,6 +44,28 @@ func panicReader(t *testing.T, path string) FileReader {
 	return func(p string) ([]byte, error) {
 		if p == abs {
 			panic("deliberate processUnit panic")
+		}
+		return os.ReadFile(filepath.Clean(p))
+	}
+}
+
+// blockingOverlayReader returns a FileReader that serves content for path,
+// closing started (once) and then waiting on release before returning it
+// each time path is read — letting a test force a specific interleaving
+// between this reader's own Reindex call and a concurrent one. It falls
+// back to disk immediately for everything else.
+func blockingOverlayReader(t *testing.T, path string, content []byte, started chan<- struct{}, release <-chan struct{}) FileReader {
+	t.Helper()
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatalf("abs %s: %v", path, err)
+	}
+	var once sync.Once
+	return func(p string) ([]byte, error) {
+		if p == abs {
+			once.Do(func() { close(started) })
+			<-release
+			return content, nil
 		}
 		return os.ReadFile(filepath.Clean(p))
 	}
@@ -409,5 +432,203 @@ func TestReindex_PanicDuringProcessingIsRecordedAsPerPackageError(t *testing.T) 
 	}
 	if !strings.Contains(logBuf.String(), "deliberate processUnit panic") {
 		t.Errorf("log output = %q, want it to contain the panic value", logBuf.String())
+	}
+}
+
+// TestReindex_ConcurrentReindexDoesNotLetOlderClobberNewer verifies the
+// invariant genTable exists to uphold: two Reindex calls racing on the same
+// package, with no ordering guarantee between them, must never let a call
+// started earlier but still running overwrite a faster call's write that
+// already committed after it started — otherwise the index would end up
+// describing content no longer on disk, with nothing to detect it (see
+// H7). The older call's reader is held blocked on its own read of mid.go
+// until the newer call has already persisted, forcing the exact
+// interleaving that used to clobber the newer write.
+func TestReindex_ConcurrentReindexDoesNotLetOlderClobberNewer(t *testing.T) {
+	snap := loadTestSnapshot(t)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+	ctx := context.Background()
+
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
+		t.Fatalf("initial Build: %v", err)
+	}
+
+	older := []byte(`// Package mid depends on leaf.
+package mid
+
+import (
+	"strings"
+
+	"example.com/idxmod/leaf"
+)
+
+// Shout returns an uppercase greeting for name (older save).
+func Shout(name string) string {
+	greeting := leaf.Hello(name)
+	return strings.ToUpper(greeting.Message) + "?"
+}
+`)
+	newer := []byte(`// Package mid depends on leaf.
+package mid
+
+import (
+	"strings"
+
+	"example.com/idxmod/leaf"
+)
+
+// Shout returns an uppercase greeting for name (newer save).
+func Shout(name string) string {
+	greeting := leaf.Hello(name)
+	return strings.ToUpper(greeting.Message) + "!"
+}
+`)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	olderReader := blockingOverlayReader(t, midSrcPath, older, started, release)
+
+	olderDone := make(chan error, 1)
+	go func() {
+		_, err := Reindex(ctx, snap, db, cas, pkgMid, olderReader, &Options{})
+		olderDone <- err
+	}()
+
+	<-started // the older call has been assigned its generation and is now blocked reading mid.go.
+
+	newerReader := overlayReader(t, midSrcPath, newer)
+	if _, err := Reindex(ctx, snap, db, cas, pkgMid, newerReader, &Options{}); err != nil {
+		t.Fatalf("newer Reindex: %v", err)
+	}
+
+	close(release)
+	if err := <-olderDone; err != nil {
+		t.Fatalf("older Reindex: %v", err)
+	}
+
+	got, err := db.GetUnit(ctx, store.Hash(pkgMid))
+	if err != nil {
+		t.Fatalf("GetUnit(mid): %v", err)
+	}
+
+	refDB := openTestDB(t)
+	if _, err := Build(ctx, snap, refDB, cas, &Options{}); err != nil {
+		t.Fatalf("reference Build: %v", err)
+	}
+	if _, err := Reindex(ctx, snap, refDB, cas, pkgMid, overlayReader(t, midSrcPath, newer), &Options{}); err != nil {
+		t.Fatalf("reference Reindex: %v", err)
+	}
+	want, err := refDB.GetUnit(ctx, store.Hash(pkgMid))
+	if err != nil {
+		t.Fatalf("GetUnit(mid) reference: %v", err)
+	}
+
+	if got.ContentHash != want.ContentHash || got.BlobKey != want.BlobKey {
+		t.Errorf("db holds the older (slower) call's write; want the newer (faster) call's: got ContentHash=%d BlobKey=%d, want ContentHash=%d BlobKey=%d", got.ContentHash, got.BlobKey, want.ContentHash, want.BlobKey)
+	}
+}
+
+// TestReindex_ReprocessesTestOnlyImporter is H11's end-to-end regression
+// test: consumer's production code has no import of dep at all — only
+// consumer_test.go (an in-package test file) does. Reindexing dep after an
+// export-changing edit must still walk consumer (via
+// graph.Snapshot.ClosureUnits, which now folds Package.TestImports into its
+// reverse-dependency edges) AND actually rebuild consumer's own combined
+// key (via directDepImports, which now folds pkg.TestImports into what
+// directDepExports resolves) — otherwise consumer would be visited but
+// resolve to an unchanged key and be silently skipped, leaving its facts
+// (in particular consumer_test.go's own reference to dep.V) stale
+// indefinitely.
+func TestReindex_ReprocessesTestOnlyImporter(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "go.mod", "module example.com/testonlyreindex\n\ngo 1.23\n")
+	writeFile(t, dir, "dep/dep.go", `// Package dep is imported only by consumer's in-package test file.
+package dep
+
+// V returns 1.
+func V() int { return 1 }
+`)
+	writeFile(t, dir, "consumer/consumer.go", `// Package consumer has no production import of dep.
+package consumer
+
+// C returns 1.
+func C() int { return 1 }
+`)
+	const testSrc = `package consumer
+
+import (
+	"testing"
+
+	"example.com/testonlyreindex/dep"
+)
+
+// TestC exercises consumer's in-package test variant, the only place this
+// package ever references dep.
+func TestC(t *testing.T) {
+	if C() != 1 || dep.V() != 1 {
+		t.Fatal("unexpected result")
+	}
+}
+`
+	writeFile(t, dir, "consumer/consumer_test.go", testSrc)
+
+	const pkgDep = "example.com/testonlyreindex/dep"
+	const pkgConsumer = "example.com/testonlyreindex/consumer"
+
+	snap := loadSnapshot(t, dir)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+	ctx := context.Background()
+
+	if _, err := Build(ctx, snap, db, cas, &Options{}); err != nil {
+		t.Fatalf("initial Build: %v", err)
+	}
+	before, err := db.GetUnit(ctx, store.Hash(pkgConsumer))
+	if err != nil {
+		t.Fatalf("GetUnit(consumer) before: %v", err)
+	}
+	depV := findSymbolByName(t, db, cas, pkgDep, "V")
+	var referencedBefore bool
+	viewFacts(t, db, cas, pkgConsumer, func(v *store.View) {
+		for _, r := range v.RefsTo(depV) {
+			if r.ToPkgHash() == store.Hash(pkgDep) {
+				referencedBefore = true
+			}
+		}
+	})
+	if !referencedBefore {
+		t.Fatal("fixture invalid: consumer's initial facts have no ref to dep.V")
+	}
+
+	// An export-changing edit to dep (a new exported symbol) that
+	// consumer_test.go never references itself: proves the propagation is
+	// driven by dep's export hash changing, not by consumer_test.go's own
+	// content changing.
+	edited := []byte(`// Package dep is imported only by consumer's in-package test file.
+package dep
+
+// V returns 1.
+func V() int { return 1 }
+
+// W is a new exported symbol, added to change dep's export data.
+func W() int { return 2 }
+`)
+	reader := overlayReader(t, filepath.Join(dir, "dep", "dep.go"), edited)
+
+	stats, err := Reindex(ctx, snap, db, cas, pkgDep, reader, &Options{})
+	if err != nil {
+		t.Fatalf("Reindex: %v", err)
+	}
+	if !slices.Contains(stats.Changed, pkgConsumer) {
+		t.Errorf("Stats.Changed = %v, want it to contain %s (a test-only importer of dep)", stats.Changed, pkgConsumer)
+	}
+
+	after, err := db.GetUnit(ctx, store.Hash(pkgConsumer))
+	if err != nil {
+		t.Fatalf("GetUnit(consumer) after: %v", err)
+	}
+	if after.BlobKey == before.BlobKey {
+		t.Error("consumer's BlobKey unchanged after dep's export data changed; consumer was not actually reprocessed")
 	}
 }
