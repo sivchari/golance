@@ -132,13 +132,55 @@ func TestDidChangeWithInvalidRangeReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("DidChange() error = nil, want error")
 	}
-	// The overlay content must be left untouched by a failed change.
-	text, _, _, ok := o.Get(u)
-	if !ok {
-		t.Fatal("Get() ok = false, want true")
+	// A failed change leaves the overlay with no trustworthy baseline to
+	// apply further incremental edits against, so the entry must be dropped
+	// rather than kept around with stale content Get would otherwise keep
+	// answering with forever.
+	if _, _, _, ok := o.Get(u); ok {
+		t.Fatal("Get() ok = true after a failed DidChange, want the overlay dropped")
 	}
-	if string(text) != "short" {
-		t.Fatalf("text after failed change = %q, want unchanged %q", text, "short")
+}
+
+// TestDidChangeWithInvalidRangeFallsBackToDiskContent verifies that once a
+// failed DidChange drops the overlay (see TestDidChangeWithInvalidRangeReturnsError),
+// ReadFile serves on-disk content instead of continuing to answer with the
+// stale pre-failure overlay text.
+func TestDidChangeWithInvalidRangeFallsBackToDiskContent(t *testing.T) {
+	o := New()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.go")
+	if err := os.WriteFile(path, []byte("package disk\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	u := uri.File(path)
+	o.DidOpen(&protocol.DidOpenTextDocumentParams{TextDocument: protocol.TextDocumentItem{
+		URI: u, LanguageID: "go", Version: 1, Text: "package overlay\n",
+	}})
+
+	err := o.DidChange(&protocol.DidChangeTextDocumentParams{
+		TextDocument: protocol.VersionedTextDocumentIdentifier{
+			TextDocumentIdentifier: protocol.TextDocumentIdentifier{URI: u},
+		},
+		ContentChanges: []protocol.TextDocumentContentChangeEvent{
+			&protocol.TextDocumentContentChangePartial{
+				Range: protocol.Range{
+					Start: protocol.Position{Line: 9, Character: 0},
+					End:   protocol.Position{Line: 9, Character: 0},
+				},
+				Text: "x",
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("DidChange() error = nil, want error")
+	}
+
+	got, err := o.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(got) != "package disk\n" {
+		t.Fatalf("ReadFile() after a failed DidChange = %q, want disk content %q", got, "package disk\n")
 	}
 }
 

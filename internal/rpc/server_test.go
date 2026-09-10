@@ -334,6 +334,57 @@ func TestCancelRequestCancelsHandlerContext(t *testing.T) {
 	})
 }
 
+// TestCancelRequestDoesNotDiscardResultTheHandlerAlreadyComputed is a
+// regression test for Finding M1: dispatchRequest used to decide
+// cancellation by re-checking reqCtx.Err() after the handler already
+// returned, so a $/cancelRequest that reached reqCtx before the handler's
+// own decision (but after the handler had already produced a valid result
+// without itself observing the cancellation) discarded that valid result.
+// The handler here deliberately waits for ctx.Done() and then still returns
+// a normal result instead of ctx.Err(), simulating work that had already
+// completed by the time the cancellation arrived; the response must be that
+// result, not "request cancelled".
+func TestCancelRequestDoesNotDiscardResultTheHandlerAlreadyComputed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestServer(t)
+		started := make(chan struct{})
+		s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
+		s.Handle("slow", Background, func(ctx context.Context, _ json.RawMessage) (any, error) {
+			close(started)
+			<-ctx.Done()
+			return map[string]string{"ok": "true"}, nil
+		})
+
+		in := strings.NewReader(
+			frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`) +
+				frame(t, `{"jsonrpc":"2.0","id":2,"method":"slow","params":{}}`) +
+				frame(t, `{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":2}}`),
+		)
+		var out bytes.Buffer
+		done := make(chan error, 1)
+		go func() { done <- s.Serve(context.Background(), in, &out) }()
+
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("handler never started")
+		}
+
+		if err := <-done; err != nil {
+			t.Fatalf("Serve() error = %v", err)
+		}
+		frames := readFrames(t, out.Bytes())
+		f := frameForID(t, frames, 2)
+		if f["error"] != nil {
+			t.Fatalf("frame = %v, want a result, not an error (the handler never observed the cancellation)", f)
+		}
+		result, _ := f["result"].(map[string]any)
+		if result["ok"] != "true" {
+			t.Fatalf("result = %v, want ok=true", f["result"])
+		}
+	})
+}
+
 func TestCancelRequestForUnknownIDIsNoop(t *testing.T) {
 	s := newTestServer(t)
 	// No request with id=99 was ever sent; the cancel notification must be
@@ -341,6 +392,28 @@ func TestCancelRequestForUnknownIDIsNoop(t *testing.T) {
 	in := strings.NewReader(frame(t, `{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":99}}`))
 	if err := s.Serve(context.Background(), in, &bytes.Buffer{}); err != nil {
 		t.Fatalf("Serve() error = %v", err)
+	}
+}
+
+// TestServeLogsDegenerateFrame is a regression test for Finding L4: a frame
+// with neither Method nor ID matches none of isRequest/isNotification/
+// isResponse, so Serve's dispatch switch used to silently ignore it with no
+// default case and no log line. It must now be observable.
+func TestServeLogsDegenerateFrame(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	s := NewServer(WithLogger(logger))
+	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
+
+	in := strings.NewReader(
+		frame(t, `{"jsonrpc":"2.0"}`) +
+			frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`),
+	)
+	if err := s.Serve(context.Background(), in, &bytes.Buffer{}); err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+	if !strings.Contains(buf.String(), "dropping frame") {
+		t.Fatalf("log output = %q, want a line about the dropped degenerate frame", buf.String())
 	}
 }
 

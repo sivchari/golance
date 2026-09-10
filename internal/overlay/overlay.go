@@ -118,7 +118,12 @@ func (o *Overlay) DidOpen(p *protocol.DidOpenTextDocumentParams) {
 
 // DidChange applies p's content changes to the tracked overlay for
 // p.TextDocument.URI. It returns ErrNotOpen if the document has no tracked
-// overlay.
+// overlay. If applying the changes fails (e.g. a range naming an invalid
+// UTF-16 offset), the overlay no longer has a trustworthy baseline to apply
+// further incremental changes against, so the tracked entry is dropped
+// entirely rather than left at its pre-change content: ReadFile/Get fall
+// back to on-disk content for this URI, the same fallback DidClose leaves in
+// place, until a fresh DidOpen re-establishes tracking.
 func (o *Overlay) DidChange(p *protocol.DidChangeTextDocumentParams) error {
 	u := p.TextDocument.URI
 	o.mu.Lock()
@@ -129,6 +134,7 @@ func (o *Overlay) DidChange(p *protocol.DidChangeTextDocumentParams) error {
 	}
 	text, err := applyContentChanges(doc.text, p.ContentChanges)
 	if err != nil {
+		delete(o.docs, u)
 		return fmt.Errorf("overlay: apply content changes for %s: %w", u, err)
 	}
 	doc.text = text
