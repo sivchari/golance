@@ -22,7 +22,7 @@ import (
 func TestNavAudit_Implementation(t *testing.T) {
 	requireGopls(t)
 	s, _, root := newTestServer(t)
-	cacheDir := t.TempDir()
+	g := sharedGopls(t, root)
 
 	cases := []navPos{
 		{"interface decl (Speaker)", "iface/iface.go", "Speaker", 1},
@@ -46,8 +46,7 @@ func TestNavAudit_Implementation(t *testing.T) {
 			}
 			golanceLocs := locsFromLSP(mustLocationSlice(t, result))
 
-			goplsOut, _ := runGopls(t, cacheDir, root, "implementation", goplsPosArg(t, root, file, pos))
-			goplsLocs := parseSpanLines(goplsOut)
+			goplsLocs := g.implementation(t, file, pos)
 
 			if !locsEqualSet(golanceLocs, goplsLocs) {
 				reportMismatchf(t, "Implementation", p.label, "mismatch at %s %q occurrence %d:\n golance = [%s]\n gopls   = [%s]",
@@ -62,7 +61,7 @@ func TestNavAudit_Implementation(t *testing.T) {
 func TestNavAudit_CallHierarchy(t *testing.T) {
 	requireGopls(t)
 	s, _, root := newTestServer(t)
-	cacheDir := t.TempDir()
+	g := sharedGopls(t, root)
 
 	cases := []navPos{
 		{"outgoing calls, promoted interface methods (useGreeter)", "iface/iface.go", "useGreeter", 1},
@@ -90,26 +89,27 @@ func TestNavAudit_CallHierarchy(t *testing.T) {
 			}
 			item := items[0]
 
-			goplsOut, gerr := runGopls(t, cacheDir, root, "call_hierarchy", goplsPosArg(t, root, file, pos))
-			if gerr != nil {
-				t.Fatalf("gopls call_hierarchy: %v (%s)", gerr, goplsOut)
+			goplsItems := g.prepareCallHierarchy(t, file, pos)
+			if len(goplsItems) != 1 {
+				t.Fatalf("gopls textDocument/prepareCallHierarchy = %#v, want exactly one item", goplsItems)
 			}
-			goplsCallers, goplsCallees := parseGoplsCallHierarchy(goplsOut)
+			goplsItem := goplsItems[0]
 
 			t.Run("outgoing", func(t *testing.T) {
-				checkOutgoingCalls(t, s, &p, &item, goplsCallees)
+				checkOutgoingCalls(t, s, g, &p, &item, &goplsItem)
 			})
 			t.Run("incoming", func(t *testing.T) {
-				checkIncomingCalls(t, s, &p, &item, goplsCallers)
+				checkIncomingCalls(t, s, g, &p, &item, &goplsItem)
 			})
 		})
 	}
 }
 
-// checkOutgoingCalls compares golance's handleOutgoingCalls result for item
-// against goplsCallees (parsed from gopls's own call_hierarchy output),
-// as an order-insensitive set of callee locations.
-func checkOutgoingCalls(t *testing.T, s *Server, p *navPos, item *protocol.CallHierarchyItem, goplsCallees []callHierarchyEdge) {
+// checkOutgoingCalls compares golance's handleOutgoingCalls result for
+// item against gopls's own callHierarchy/outgoingCalls for goplsItem, as
+// an order-insensitive set of callee locations -- both extracted the same
+// way, from each call's own "to" item's own SelectionRange.
+func checkOutgoingCalls(t *testing.T, s *Server, g *goplsLSP, p *navPos, item, goplsItem *protocol.CallHierarchyItem) {
 	t.Helper()
 	outResult, err := s.handleOutgoingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyOutgoingCallsParams{Item: *item}))
 	if err != nil {
@@ -123,9 +123,10 @@ func checkOutgoingCalls(t *testing.T, s *Server, p *navPos, item *protocol.CallH
 	for i := range calls {
 		golanceLocs = append(golanceLocs, locFromLSP(protocol.Location{URI: calls[i].To.URI, Range: calls[i].To.SelectionRange}))
 	}
-	goplsLocs := make([]navLoc, 0, len(goplsCallees))
-	for _, e := range goplsCallees {
-		goplsLocs = append(goplsLocs, e.otherEnd)
+	goplsCalls := g.outgoingCalls(t, goplsItem)
+	goplsLocs := make([]navLoc, 0, len(goplsCalls))
+	for i := range goplsCalls {
+		goplsLocs = append(goplsLocs, locFromLSP(protocol.Location{URI: goplsCalls[i].To.URI, Range: goplsCalls[i].To.SelectionRange}))
 	}
 	if !locsEqualSet(golanceLocs, goplsLocs) {
 		t.Errorf("outgoing-call target mismatch at %s %q:\n golance = [%s]\n gopls   = [%s]",
@@ -134,7 +135,7 @@ func checkOutgoingCalls(t *testing.T, s *Server, p *navPos, item *protocol.CallH
 }
 
 // checkIncomingCalls is checkOutgoingCalls' incoming-call counterpart.
-func checkIncomingCalls(t *testing.T, s *Server, p *navPos, item *protocol.CallHierarchyItem, goplsCallers []callHierarchyEdge) {
+func checkIncomingCalls(t *testing.T, s *Server, g *goplsLSP, p *navPos, item, goplsItem *protocol.CallHierarchyItem) {
 	t.Helper()
 	inResult, err := s.handleIncomingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyIncomingCallsParams{Item: *item}))
 	if err != nil {
@@ -148,9 +149,10 @@ func checkIncomingCalls(t *testing.T, s *Server, p *navPos, item *protocol.CallH
 	for i := range calls {
 		golanceLocs = append(golanceLocs, locFromLSP(protocol.Location{URI: calls[i].From.URI, Range: calls[i].From.SelectionRange}))
 	}
-	goplsLocs := make([]navLoc, 0, len(goplsCallers))
-	for _, e := range goplsCallers {
-		goplsLocs = append(goplsLocs, e.otherEnd)
+	goplsCalls := g.incomingCalls(t, goplsItem)
+	goplsLocs := make([]navLoc, 0, len(goplsCalls))
+	for i := range goplsCalls {
+		goplsLocs = append(goplsLocs, locFromLSP(protocol.Location{URI: goplsCalls[i].From.URI, Range: goplsCalls[i].From.SelectionRange}))
 	}
 	if !locsEqualSet(golanceLocs, goplsLocs) {
 		t.Errorf("incoming-call source mismatch at %s %q:\n golance = [%s]\n gopls   = [%s]",
@@ -163,10 +165,7 @@ func checkIncomingCalls(t *testing.T, s *Server, p *navPos, item *protocol.CallH
 func TestNavAudit_TypeHierarchy(t *testing.T) {
 	requireGopls(t)
 	s, _, root := newTestServer(t)
-	g := startGoplsLSP(t, t.TempDir(), root)
-	for _, f := range navauditFiles(t, root) {
-		g.didOpen(t, f)
-	}
+	g := sharedGopls(t, root)
 
 	cases := []struct {
 		label string
@@ -316,6 +315,7 @@ func copyFixtureTree(t *testing.T, src, dst string) {
 func TestNavAudit_Rename(t *testing.T) {
 	requireGopls(t)
 	s, _, root := newTestServer(t)
+	g := sharedGopls(t, root)
 
 	cases := []struct {
 		pos     navPos
@@ -329,7 +329,7 @@ func TestNavAudit_Rename(t *testing.T) {
 		t.Run(c.pos.label, func(t *testing.T) {
 			file, pos := navPosition(t, root, c.pos)
 			golanceByRel := golanceRenameEdits(t, s, root, file, pos, c.newName)
-			goplsByRel := goplsRenameEdits(t, root, &c.pos, pos, c.newName)
+			goplsByRel := goplsRenameEditsLSP(t, g, root, file, pos, c.newName)
 			compareRenameResults(t, &c.pos, golanceByRel, goplsByRel)
 		})
 	}
@@ -366,41 +366,24 @@ func golanceRenameEdits(t *testing.T, s *Server, root, file string, pos protocol
 	return byRel
 }
 
-// goplsRenameEdits runs `gopls rename -w -l` against a disposable copy of
-// root and reads back every file it reports touching, keyed by path
-// relative to that copy (directly comparable to golanceRenameEdits' keys,
-// both relative to their own root).
-func goplsRenameEdits(t *testing.T, root string, p *navPos, pos protocol.Position, newName string) map[string]string {
+// goplsRenameEditsLSP is goplsRenameEdits' shared-session replacement:
+// unlike the CLI's `gopls rename -w`, textDocument/rename never touches
+// disk, so this applies the returned WorkspaceEdit in-memory to each
+// touched file's original content, keyed by path relative to root, through
+// the same applyTextEdits function golanceRenameEdits above already uses
+// for golance's own result -- the comparison is therefore not sensitive to
+// any tool-specific on-disk write behavior on either side.
+func goplsRenameEditsLSP(t *testing.T, g *goplsLSP, root, file string, pos protocol.Position, newName string) map[string]string {
 	t.Helper()
-	// Resolved (not t.TempDir()'s raw path) so it matches the absolute
-	// paths gopls itself emits: on macOS, t.TempDir() lives under a
-	// /var/folders symlink target of /private/var/folders, and gopls's own
-	// output resolves that symlink, making a filepath.Rel against the
-	// unresolved path spuriously wander through a chain of ".." segments
-	// instead of landing inside tmpRoot (see the mission's own
-	// /tmp-vs-/private/tmp note).
-	tmpRoot, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatalf("EvalSymlinks: %v", err)
-	}
-	copyFixtureTree(t, root, tmpRoot)
-	tmpFile := filepath.Join(tmpRoot, "navaudit", filepath.FromSlash(p.file))
-	posArg := goplsPosArg(t, tmpRoot, tmpFile, pos)
-	out, err := runGoplsRename(t, t.TempDir(), tmpRoot, posArg, newName)
-	if err != nil {
-		t.Fatalf("gopls rename: %v (%s)", err, out)
-	}
+	edit := g.rename(t, file, pos, newName)
 	byRel := map[string]string{}
-	for _, line := range splitNonEmptyLines(out) {
-		rel, err := filepath.Rel(tmpRoot, line)
+	for u, edits := range edit.Changes {
+		f := u.FsPath()
+		rel, err := filepath.Rel(root, f)
 		if err != nil {
 			t.Fatalf("filepath.Rel: %v", err)
 		}
-		data, err := os.ReadFile(filepath.Clean(line))
-		if err != nil {
-			t.Fatalf("read %s: %v", line, err)
-		}
-		byRel[rel] = string(data)
+		byRel[rel] = applyTextEdits(t, mustReadFile(t, f), edits)
 	}
 	return byRel
 }

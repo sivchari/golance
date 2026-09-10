@@ -408,3 +408,45 @@ func TestEngine_StartJob_RacesStopAlreadyCanceled(t *testing.T) {
 		t.Fatalf("OnResult called %d times for a recheck started after Stop, want 0", got)
 	}
 }
+
+// TestEngine_Stop_SuppressesPublishFromAFlightPastItsLastCheck covers the
+// half of Stop's contract cancellation alone cannot deliver: a
+// request-driven flight observes e.ctx only at runRecheck's own
+// checkpoints, so one already past its last check still reaches commit
+// after Stop returns and would publish diagnostics computed against a
+// graph the caller has discarded. Driven white-box, by committing a
+// genuinely computed result after Stop, because the window between that
+// last checkpoint and commit cannot be forced deterministically from
+// outside the package.
+func TestEngine_Stop_SuppressesPublishFromAFlightPastItsLastCheck(t *testing.T) {
+	var mu sync.Mutex
+	var count int
+
+	e, root := newTestEngine(t, overlay.New(), Options{
+		OnResult: func(*Result) {
+			mu.Lock()
+			count++
+			mu.Unlock()
+		},
+	})
+	dir := filepath.Join(root, "debounce")
+	key := unitKey{dir: dir, variant: variantBase}
+
+	cp, err := e.Get(context.Background(), filepath.Join(dir, "debounce.go"))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	mu.Lock()
+	count = 0 // ignore the warm-up Get's own publish
+	mu.Unlock()
+
+	e.Stop()
+	e.commit(key, e.nextGen(key), cp)
+
+	mu.Lock()
+	got := count
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("OnResult called %d times for a result committed after Stop, want 0", got)
+	}
+}

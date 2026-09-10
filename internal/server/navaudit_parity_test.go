@@ -5,10 +5,9 @@ package server
 // full findings report). It drives golance's handlers directly through
 // newTestServer, the same in-process pattern handlers_xref_test.go and
 // handlers_typehierarchy_test.go already use, and compares every result
-// against gopls v0.23.0 -- the CLI for definition/references/
-// implementation/call_hierarchy/prepare_rename/rename, and, since gopls's
-// CLI has no subcommand for typeDefinition or typeHierarchy, a live `gopls
-// serve` driven over LSP stdio (navaudit_gopls_helper_test.go).
+// against gopls v0.23.0 -- the package's single shared `gopls serve`
+// session driven over LSP stdio (navaudit_gopls_helper_test.go's
+// sharedGopls), not a fresh CLI process per case.
 //
 // Every test in this file requireGopls(t)-skips when no gopls binary is on
 // PATH, so this suite never fails a machine that simply lacks the oracle.
@@ -20,10 +19,7 @@ package server
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 	"testing"
 
 	"go.lsp.dev/protocol"
@@ -137,7 +133,7 @@ func mustLocationSlice(t *testing.T, result any) protocol.LocationSlice {
 func TestNavAudit_Definition(t *testing.T) {
 	requireGopls(t)
 	s, _, root := newTestServer(t)
-	cacheDir := t.TempDir()
+	g := sharedGopls(t, root)
 
 	for _, p := range navPositions {
 		t.Run(p.label, func(t *testing.T) {
@@ -154,11 +150,7 @@ func TestNavAudit_Definition(t *testing.T) {
 			}
 			golanceLocs := locsFromLSP(mustLocationSlice(t, result))
 
-			goplsOut, gerr := runGoplsDefinitionJSON(t, cacheDir, root, goplsPosArg(t, root, file, pos))
-			goplsLocs, perr := parseGoplsJSONSpans(t, goplsOut)
-			if gerr != nil && perr != nil {
-				t.Fatalf("gopls definition: %v (output: %s)", gerr, goplsOut)
-			}
+			goplsLocs := g.definition(t, file, pos)
 
 			if !locsEqualSet(golanceLocs, goplsLocs) {
 				reportMismatchf(t, "Definition", p.label, "mismatch at %s %q occurrence %d:\n golance = [%s]\n gopls   = [%s]",
@@ -173,11 +165,7 @@ func TestNavAudit_Definition(t *testing.T) {
 func TestNavAudit_TypeDefinition(t *testing.T) {
 	requireGopls(t)
 	s, _, root := newTestServer(t)
-	cacheDir := t.TempDir()
-	g := startGoplsLSP(t, cacheDir, root)
-	for _, f := range navauditFiles(t, root) {
-		g.didOpen(t, f)
-	}
+	g := sharedGopls(t, root)
 
 	for _, p := range navPositions {
 		t.Run(p.label, func(t *testing.T) {
@@ -215,34 +203,12 @@ func TestNavAudit_TypeDefinition(t *testing.T) {
 	}
 }
 
-// navauditFiles lists every .go file (including _test.go) under
-// testdata/module/navaudit, for the LSP driver's didOpen calls.
-func navauditFiles(t *testing.T, root string) []string {
-	t.Helper()
-	base := filepath.Join(root, "navaudit")
-	var out []string
-	err := filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() && strings.HasSuffix(path, ".go") {
-			out = append(out, path)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("walk %s: %v", base, err)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // --- textDocument/references ---
 
 func TestNavAudit_References(t *testing.T) {
 	requireGopls(t)
 	s, _, root := newTestServer(t)
-	cacheDir := t.TempDir()
+	g := sharedGopls(t, root)
 
 	for _, p := range navPositions {
 		t.Run(p.label, func(t *testing.T) {
@@ -260,8 +226,7 @@ func TestNavAudit_References(t *testing.T) {
 			}
 			golanceLocs := locsFromLSP(mustLocationSlice(t, result))
 
-			goplsOut, _ := runGopls(t, cacheDir, root, "references", goplsPosArg(t, root, file, pos))
-			goplsLocs := parseSpanLines(goplsOut)
+			goplsLocs := g.references(t, file, pos)
 
 			if !locsEqualSet(golanceLocs, goplsLocs) {
 				reportMismatchf(t, "References", p.label, "mismatch at %s %q occurrence %d:\n golance = [%s]\n gopls   = [%s]",
@@ -286,7 +251,7 @@ func rangeToNavLoc(file string, r protocol.Range) navLoc {
 func TestNavAudit_PrepareRename(t *testing.T) {
 	requireGopls(t)
 	s, _, root := newTestServer(t)
-	cacheDir := t.TempDir()
+	g := sharedGopls(t, root)
 
 	for _, p := range navPositions {
 		t.Run(p.label, func(t *testing.T) {
@@ -302,24 +267,22 @@ func TestNavAudit_PrepareRename(t *testing.T) {
 				t.Fatalf("golance handlePrepareRename: %v", err)
 			}
 
-			goplsOut, gerr := runGopls(t, cacheDir, root, "prepare_rename", goplsPosArg(t, root, file, pos))
-			goplsLocs := parseSpanLines(goplsOut)
+			goplsLoc, goplsOK := g.prepareRename(t, file, pos)
 
 			rng, golanceOK := result.(*protocol.Range)
-			goplsOK := gerr == nil && len(goplsLocs) == 1
 
 			if golanceOK != goplsOK {
-				t.Errorf("renameable mismatch at %s %q occurrence %d: golance ok=%v, gopls ok=%v (gopls output: %q)",
-					p.file, p.ident, p.occ, golanceOK, goplsOK, goplsOut)
+				t.Errorf("renameable mismatch at %s %q occurrence %d: golance ok=%v, gopls ok=%v",
+					p.file, p.ident, p.occ, golanceOK, goplsOK)
 				return
 			}
 			if !golanceOK {
 				return
 			}
 			golanceLoc := rangeToNavLoc(file, *rng)
-			if !locsEqualSet([]navLoc{golanceLoc}, goplsLocs) {
+			if !locsEqualSet([]navLoc{golanceLoc}, []navLoc{*goplsLoc}) {
 				t.Errorf("range mismatch at %s %q occurrence %d:\n golance = %s\n gopls   = %s",
-					p.file, p.ident, p.occ, golanceLoc, goplsLocs[0])
+					p.file, p.ident, p.occ, golanceLoc, *goplsLoc)
 			}
 		})
 	}

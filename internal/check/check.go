@@ -184,10 +184,12 @@ type Engine struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// retired is set by Retire. commit consults it to suppress
-	// Options.OnResult for a recheck that completes after Retire — see
-	// Retire's doc for why this, and not e.ctx cancellation, is how it stops
-	// a retired Engine from publishing.
+	// retired is set by both Retire and Stop. commit consults it to
+	// suppress Options.OnResult for a recheck that completes after either —
+	// see Retire's doc for why this, and not e.ctx cancellation, is what
+	// stops a discarded Engine from publishing: cancellation only takes
+	// effect at the next ctx check, so a recheck already past its last one
+	// still reaches commit.
 	retired atomic.Bool
 
 	mu      sync.Mutex
@@ -687,6 +689,13 @@ func (e *Engine) Retire() {
 // startJob's doc for the full argument. No debounce-triggered background
 // recheck can reach commit/Options.OnResult once Stop has returned,
 // regardless of how its timer's fire raced this call.
+//
+// Cancellation alone cannot make that promise for a request-driven flight,
+// which observes e.ctx only at runRecheck's own checkpoints: one already
+// past its last check still reaches commit. Stop therefore also marks e
+// retired, which is what commit consults to suppress Options.OnResult — so
+// nothing publishes diagnostics computed against a graph the caller has
+// already discarded.
 // Safe to call more than once.
 //
 // Stop deliberately does not wait for an already-running recheck's I/O to
@@ -696,6 +705,7 @@ func (e *Engine) Retire() {
 // reads or dependency-export writes could still be touching, should call
 // Wait after Stop.
 func (e *Engine) Stop() {
+	e.retired.Store(true)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.cancel()

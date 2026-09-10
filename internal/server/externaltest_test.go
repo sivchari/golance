@@ -120,7 +120,7 @@ func TestExternalTestPackage_ReferencesMatchGopls(t *testing.T) {
 			}
 			golanceLocs := locsFromLSP(mustLocationSlice(t, result))
 
-			goplsOut, _ := runGopls(t, cacheDir, root, "references", goplsPosArg(t, root, tc.file, tc.pos))
+			goplsOut, _ := runGopls(t, cacheDir, root, goplsPosArg(t, root, tc.file, tc.pos))
 			goplsLocs := parseSpanLines(goplsOut)
 
 			if !locsEqualSet(golanceLocs, goplsLocs) {
