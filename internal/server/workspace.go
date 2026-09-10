@@ -638,7 +638,14 @@ func (s *Server) handleDidChangeWatchedFiles(_ context.Context, params json.RawM
 	}
 	for _, ch := range p.Changes {
 		if isModuleFile(ch.URI.FsPath()) {
-			go s.revalidateGraph(graph.Options{Dir: ws.root, Offline: s.opts.Offline}, []string{allPackagesPattern})
+			// s.rpc.Go, not a raw goroutine: tracks this reload the same way
+			// as the server's other detached background work, so Serve's
+			// shutdown-time wg.Wait (see Stop's doc) drains it instead of
+			// letting quitting the editor right after a go.mod change race
+			// an in-flight rebuild.
+			s.rpc.Go(func(context.Context) {
+				s.revalidateGraph(graph.Options{Dir: ws.root, Offline: s.opts.Offline}, []string{allPackagesPattern})
+			})
 			return nil
 		}
 	}

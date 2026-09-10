@@ -88,6 +88,7 @@ func TestSetWorkspace_DepProviderCacheSurvivesReload(t *testing.T) {
 
 	s := &Server{logger: newTestLogger(t)}
 	s.setWorkspace(root, snap1)
+	stopWorkspaceEngineOnCleanup(t, s)
 
 	ctx := context.Background()
 	if _, err := s.workspace().depProvider.Package(ctx, "strings"); err != nil {

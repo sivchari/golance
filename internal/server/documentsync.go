@@ -98,7 +98,7 @@ func (s *Server) selfHealFactsIfStale(ctx context.Context, ws *workspace, path s
 	if !changed {
 		return
 	}
-	s.rpc.Go(func(ctx context.Context) { s.reindexIfStillCurrent(ctx, ws, idx, pkgPath) })
+	s.rpc.Go(func(ctx context.Context) { _ = s.reindexIfStillCurrent(ctx, ws, idx, pkgPath) })
 }
 
 // handleDidChange applies the content change to the document's overlay and
@@ -182,7 +182,7 @@ func (s *Server) handleDidSave(_ context.Context, params json.RawMessage) error 
 	// returns — and tracks it via Serve's own wg, so shutdown waits
 	// (briefly) for it to finish or notice cancellation, rather than
 	// abandoning it mid-write.
-	s.rpc.Go(func(ctx context.Context) { s.reindexIfStillCurrent(ctx, ws, idx, pkgPath) })
+	s.rpc.Go(func(ctx context.Context) { _ = s.reindexIfStillCurrent(ctx, ws, idx, pkgPath) })
 	return nil
 }
 
@@ -229,19 +229,53 @@ func (s *Server) drainDirty(ctx context.Context, ws *workspace) {
 		return
 	}
 	for _, pkgPath := range s.takeDirty() {
-		s.reindexIfStillCurrent(ctx, ws, idx, pkgPath)
+		_ = s.reindexIfStillCurrent(ctx, ws, idx, pkgPath)
 	}
 }
 
-// handleDidClose stops tracking the document's overlay content; its
-// package falls back to on-disk content on the next check.
+// handleDidClose stops tracking the document's overlay content (its
+// package falls back to on-disk content on the next check) and, if this
+// server still has diagnostics published for it, clears them.
+//
+// publishDiagnostics only ever considers currently open files (see its own
+// doc), so once path's overlay is gone here, no future recheck of its
+// package will ever include path in the file set it publishes for again on
+// its own — even once the package is next rechecked for an unrelated
+// reason. Without this, whatever was last shown for path sits in the
+// client's Problems panel indefinitely, regardless of whether it is still
+// accurate: unsaved edits discarded by the close may have been the only
+// reason it had diagnostics at all.
 func (s *Server) handleDidClose(_ context.Context, params json.RawMessage) error {
 	var p protocol.DidCloseTextDocumentParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return err
 	}
+	path := p.TextDocument.URI.FsPath()
 	s.overlay.DidClose(&p)
+	s.clearDiagnosticsForClosedFile(path)
 	return nil
+}
+
+// clearDiagnosticsForClosedFile republishes an empty diagnostic list for
+// path if s.diagFiles still credits some package with having published
+// diagnostics for it (see publishDiagnostics), a no-op otherwise.
+func (s *Server) clearDiagnosticsForClosedFile(path string) {
+	s.diagMu.Lock()
+	found := false
+	for pkgPath, files := range s.diagFiles {
+		if !files[path] {
+			continue
+		}
+		found = true
+		delete(files, path)
+		if len(files) == 0 {
+			delete(s.diagFiles, pkgPath)
+		}
+	}
+	s.diagMu.Unlock()
+	if found {
+		s.notifyDiagnostics(path, nil)
+	}
 }
 
 // beginReindex registers a detached reindex attempt against idx, reporting
@@ -293,13 +327,15 @@ func (s *Server) beginReindex(idx *indexState) bool {
 // particular write ran — the very rebuild that closed idx.db already
 // re-type-checks pkgPath fresh, and a revalidateIndex pass against whatever
 // index is open next catches it otherwise. A bailed-out reindex is
-// therefore redundant work skipped, never a permanently lost fix.
-func (s *Server) reindexIfStillCurrent(ctx context.Context, ws *workspace, idx *indexState, pkgPath string) {
+// therefore redundant work skipped, never a permanently lost fix. Reports
+// nil in that case too, for the same reason: reindex itself already treats
+// its own equivalent bail-out (reindexDBClosedUnderfoot) as no failure.
+func (s *Server) reindexIfStillCurrent(ctx context.Context, ws *workspace, idx *indexState, pkgPath string) error {
 	if !s.beginReindex(idx) {
-		return
+		return nil
 	}
 	defer s.reindexWG.Done()
-	s.reindex(ctx, ws, idx, pkgPath)
+	return s.reindex(ctx, ws, idx, pkgPath)
 }
 
 // reindexDBClosedUnderfoot reports whether err — a failure from
@@ -339,14 +375,22 @@ func reindexDBClosedUnderfoot(err error) bool {
 // byte-identical too), fall back to invalidating pkgPath alone: the overlay
 // content this save just wrote may still differ from what was on disk when
 // Reindex's own trustStat check ran.
-func (s *Server) reindex(ctx context.Context, ws *workspace, idx *indexState, pkgPath string) {
+//
+// The returned error is nil on success or on reindexDBClosedUnderfoot's own
+// benign bail-out, and non-nil for every other failure — logged here either
+// way, so this package's own two fire-and-forget callers (handleDidSave's
+// s.rpc.Go dispatch, drainDirty's loop) can keep ignoring it exactly as
+// before, while repairIndexPackagesLocked (indexer.go), which cannot afford
+// to drop a self-heal failure silently, uses it to report the failure to
+// the client instead of only to this log.
+func (s *Server) reindex(ctx context.Context, ws *workspace, idx *indexState, pkgPath string) error {
 	stats, err := index.Reindex(ctx, ws.snap, idx.db, idx.cas, pkgPath, s.overlay.ReadFile, &index.Options{RelativePaths: RelativeIndexPaths(ws.root)})
 	if err != nil {
 		if reindexDBClosedUnderfoot(err) {
-			return
+			return nil
 		}
 		s.logger.Printf("server: reindex %s: %v", pkgPath, err)
-		return
+		return err
 	}
 	changed := stats.Changed
 	if len(changed) == 0 {
@@ -355,6 +399,7 @@ func (s *Server) reindex(ctx context.Context, ws *workspace, idx *indexState, pk
 	ws.depCache.invalidate(changed)
 	ws.engine.InvalidateDependency(closureDirs(ws, changed))
 	idx.resolver.Invalidate(changed)
+	return nil
 }
 
 // closureDirs resolves each of pkgPaths (Stats.Changed, see reindex) to its

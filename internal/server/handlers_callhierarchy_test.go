@@ -1,11 +1,20 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
+	"github.com/sivchari/golance/internal/graph"
+	"github.com/sivchari/golance/internal/index"
+	"github.com/sivchari/golance/internal/rpc"
+	"github.com/sivchari/golance/internal/store"
+	"github.com/sivchari/golance/internal/xref"
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 )
@@ -308,6 +317,34 @@ func TestHandlePrepareOutgoingCalls_WorkWithoutIndex(t *testing.T) {
 	}
 }
 
+// TestHandleOutgoingCalls_NoIndex_RootPackageCallee is a regression test for
+// Finding H5: crossPackageFuncLocation used to answer a root-package callee
+// it could not yet resolve (the facts index still building) by silently
+// dropping just that one outgoing call, indistinguishable from a callee
+// that genuinely has no locatable declaration — the same PR #30 shape
+// dependencyDefinition (plain "Go to Definition") already guards against.
+// Describe calls callhdep.Double, a different *workspace* (root) package
+// only the facts index can resolve (dependencyFuncDeclaration always
+// declines a root package, see its own doc), so this must fail the whole
+// request with indexUnavailableError rather than silently returning the
+// other two, unaffected callees.
+func TestHandleOutgoingCalls_NoIndex_RootPackageCallee(t *testing.T) {
+	s, snap := newTestServerNoIndex(t)
+	file := snap.Packages["example.com/servermod/callh"].GoFiles[0]
+	pos := identPositionIn(t, file, mustReadFile(t, file), "Describe", 1) // Describe's own declaration
+
+	item := preparedItem(t, s, file, pos)
+	if item.Name != "Describe" {
+		t.Fatalf("prepareCallHierarchy without an index: item.Name = %q, want %q", item.Name, "Describe")
+	}
+
+	result, err := s.handleOutgoingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyOutgoingCallsParams{Item: item}))
+	checkIndexUnavailableError(t, "outgoingCalls(no index, callhdep.Double)", err)
+	if result != nil {
+		t.Errorf("outgoingCalls(no index, callhdep.Double): result = %#v, want nil", result)
+	}
+}
+
 // TestFoldIncomingCalls_ResultOrder pins foldIncomingCalls' deterministic
 // ordering contract directly (compareLocation, by URI then range start), so
 // a client sees the same order across identical requests.
@@ -324,5 +361,94 @@ func TestFoldIncomingCalls_ResultOrder(t *testing.T) {
 	}
 	if !sort.SliceIsSorted(locs, func(i, j int) bool { return compareLocation(locs[i], locs[j]) }) {
 		t.Errorf("handleIncomingCalls result is not sorted by (URI, Range.Start): %+v", locs)
+	}
+}
+
+// newTestServerAtRoot is newTestServer's counterpart for a caller-supplied
+// module root instead of the shared testdata/module: used by tests that
+// need to mutate a fixture file on disk (e.g. removing one) without
+// touching the real, shared testdata tree every other test in this package
+// also reads from.
+func newTestServerAtRoot(t *testing.T, root string) *Server {
+	t.Helper()
+	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+
+	db, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("db.Close: %v", err)
+		}
+	})
+	cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+		t.Fatalf("index.Build: %v", err)
+	}
+
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	s.setWorkspace(root, snap)
+	stopWorkspaceEngineOnCleanup(t, s)
+	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+	return s
+}
+
+// copyTestModule copies testdata/module into a fresh temp directory,
+// returning its path -- for a test that needs to mutate a fixture file on
+// disk without touching the real, shared testdata tree (see
+// internal/xref's identically-named, identically-motivated helper).
+func copyTestModule(t *testing.T) string {
+	t.Helper()
+	src, err := filepath.Abs(filepath.Join("testdata", "module"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	dst := t.TempDir()
+	if err := os.CopyFS(dst, os.DirFS(src)); err != nil {
+		t.Fatalf("copy testdata module: %v", err)
+	}
+	return dst
+}
+
+// TestHandleIncomingCalls_UnreadableSourceFileIsLoggedAndDropped pins the
+// M10 fix: chSourceFileFor used to drop every reference from a file it
+// could not read with no trace at all, so a caller reached only through a
+// file that went missing between indexing and this query silently
+// vanished from the tree. UseAdd (callhuser/callhuser.go) is Add's only
+// cross-package caller in the fixture; removing its source file after the
+// facts index already recorded the reference (so resolver.References still
+// reports it) reproduces exactly that gap. Runs against a temp copy of the
+// fixture module (copyTestModule), never the shared testdata tree.
+func TestHandleIncomingCalls_UnreadableSourceFileIsLoggedAndDropped(t *testing.T) {
+	root := copyTestModule(t)
+	s := newTestServerAtRoot(t, root)
+	file := callhFile(t, root)
+	pos := callhPos(t, file, "Add", 1)
+	item := preparedItem(t, s, file, pos)
+
+	var logBuf bytes.Buffer
+	s.logger = log.New(&logBuf, "", 0)
+
+	callhuserFile := filepath.Join(root, "callhuser", "callhuser.go")
+	if err := os.Remove(callhuserFile); err != nil {
+		t.Fatalf("remove %s: %v", callhuserFile, err)
+	}
+
+	calls := incomingCallsFor(t, s, &item)
+	if _, ok := findIncomingCall(calls, "UseAdd"); ok {
+		t.Errorf("incoming calls still include UseAdd after its source file was removed: %+v", calls)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, callhuserFile) {
+		t.Errorf("log output = %q, want it to name %s", logged, callhuserFile)
 	}
 }

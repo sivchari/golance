@@ -1,7 +1,10 @@
 package server
 
 import (
+	"hash/fnv"
+	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -135,12 +138,30 @@ func (w *watchDebouncer) Stop() {
 	w.runWG.Wait()
 }
 
-// fileFingerprint is a cheap (size, mtime) snapshot of a file's on-disk
-// state, used by watchFingerprints to recognize a workspace/didChangeWatchedFiles
-// event that reports no genuine change.
+// maxFingerprintHashSize bounds how large a file watchFingerprints.changed
+// will read to compute fileFingerprint.hash. (size, mtime) alone is
+// ambiguous on a coarse-mtime filesystem, or against a codegen tool that
+// writes deterministic timestamps: a real edit can land on the exact same
+// (size, mtime) an earlier event for the same path already recorded, making
+// it indistinguishable from a genuine no-op resend without also comparing
+// content. Reading and hashing the whole file settles that for anything
+// this size or smaller; above it, changed conservatively reports a change
+// instead of paying for a large read on every event (this runs per watched
+// file, but a `git pull`/branch switch can report thousands of them in one
+// burst).
+const maxFingerprintHashSize = 1 << 20 // 1 MiB
+
+// fileFingerprint is a (size, mtime, content hash) snapshot of a file's
+// on-disk state, used by watchFingerprints to recognize a
+// workspace/didChangeWatchedFiles event that reports no genuine change.
+// hashed reports whether hash was actually computed (size was within
+// maxFingerprintHashSize and the file was readable) — false makes hash
+// meaningless rather than a false zero-value match.
 type fileFingerprint struct {
 	size    int64
 	modTime int64
+	hash    uint64
+	hashed  bool
 }
 
 // watchFingerprints remembers, per path, the fileFingerprint last observed
@@ -169,17 +190,25 @@ func newWatchFingerprints() *watchFingerprints {
 }
 
 // changed reports whether the event described by (path, typ) represents a
-// genuine change worth acting on — false only when a prior call already
-// recorded the exact same (size, mtime) for path and typ is not a deletion.
-// As a side effect it updates what is remembered for path: a deletion
-// forgets it entirely (so a file later re-created at the same path is
-// compared against nothing, i.e. treated as a real change again, rather
-// than against stale pre-deletion stat data), and any other event records
-// path's current on-disk (size, mtime). If the stat itself fails (a
-// created-then-immediately-deleted file racing this call, for instance)
-// this conservatively reports a real change without touching what is
-// remembered, leaving a later event to settle it once the file's state
-// stabilizes.
+// genuine change worth acting on. As a side effect it updates what is
+// remembered for path: a deletion forgets it entirely (so a file later
+// re-created at the same path is compared against nothing, i.e. treated as
+// a real change again, rather than against stale pre-deletion stat data),
+// and any other event records path's current fileFingerprint. If the stat
+// itself fails (a created-then-immediately-deleted file racing this call,
+// for instance) this conservatively reports a real change without touching
+// what is remembered, leaving a later event to settle it once the file's
+// state stabilizes.
+//
+// A prior call having recorded the exact same (size, mtime) for path is not
+// on its own enough to report no change: on a coarse-mtime filesystem, or
+// against a codegen tool that writes deterministic timestamps, a genuine
+// edit can land on that same (size, mtime) too. Whenever path is
+// maxFingerprintHashSize or smaller, a content hash — computed on every
+// call, not just an ambiguous one, so two fingerprints are always directly
+// comparable — settles it; a larger file has none and any (size, mtime)
+// match for it is trusted as-is, the same way this whole check worked
+// before hashing existed.
 func (f *watchFingerprints) changed(path string, typ protocol.FileChangeType) bool {
 	if typ == protocol.FileChangeTypeDeleted {
 		f.mu.Lock()
@@ -192,12 +221,39 @@ func (f *watchFingerprints) changed(path string, typ protocol.FileChangeType) bo
 		return true
 	}
 	fp := fileFingerprint{size: fi.Size(), modTime: fi.ModTime().UnixNano()}
+	if fp.size <= maxFingerprintHashSize {
+		if h, ok := hashFile(path); ok {
+			fp.hash, fp.hashed = h, true
+		}
+	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if old, ok := f.seen[path]; ok && old == fp {
-		return false
-	}
+	old, ok := f.seen[path]
 	f.seen[path] = fp
+	if !ok || old.size != fp.size || old.modTime != fp.modTime {
+		return true
+	}
+	if fp.hashed && old.hashed {
+		return fp.hash != old.hash
+	}
 	return true
+}
+
+// hashFile returns an FNV-1a content hash of path, or ok=false if it could
+// not be read in full (a race with the file being deleted or truncated
+// between the caller's own os.Stat and this call, for instance) — changed's
+// caller treats that the same as never having hashed it, conservatively
+// reporting a change.
+func hashFile(path string) (sum uint64, ok bool) {
+	f, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return 0, false
+	}
+	defer func() { _ = f.Close() }()
+	h := fnv.New64a()
+	if _, err := io.Copy(h, f); err != nil {
+		return 0, false
+	}
+	return h.Sum64(), true
 }

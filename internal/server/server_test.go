@@ -46,6 +46,24 @@ func newTestLogger(t *testing.T) *log.Logger {
 // trigger the real indexer subprocess (see internal/server/indexer.go).
 // index.Build runs in-process here, the same way internal/index's and
 // internal/xref's own tests build a facts database.
+// stopWorkspaceEngineOnCleanup registers a t.Cleanup that stops s's
+// current workspace's check engine: no test helper otherwise ends a
+// workspace's debounce timers, so a didChange/didSave-armed recheck can
+// fire after the test function returns and log through a logger the test
+// framework has already torn down, panicking with "Log in goroutine after
+// Test... has completed". Reads s.workspace() at cleanup time, not a
+// captured pointer, since a later setWorkspace call in the same test may
+// have swapped it.
+func stopWorkspaceEngineOnCleanup(t *testing.T, s *Server) {
+	t.Helper()
+	t.Cleanup(func() {
+		if ws := s.workspace(); ws != nil {
+			ws.engine.Stop()
+			ws.engine.Wait()
+		}
+	})
+}
+
 func newTestServer(t *testing.T) (*Server, *graph.Snapshot, string) {
 	t.Helper()
 	root, err := filepath.Abs(filepath.Join("testdata", "module"))
@@ -77,6 +95,7 @@ func newTestServer(t *testing.T) (*Server, *graph.Snapshot, string) {
 	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 	s := New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(root, snap)
+	stopWorkspaceEngineOnCleanup(t, s)
 	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
 
 	return s, snap, root
@@ -104,6 +123,7 @@ func newTestServerNoIndex(t *testing.T) (*Server, *graph.Snapshot) {
 	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 	s := New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(root, snap)
+	stopWorkspaceEngineOnCleanup(t, s)
 
 	return s, snap
 }
@@ -274,6 +294,7 @@ func TestCheckedFile_WaitsForWorkspaceThenResolves(t *testing.T) {
 		}
 
 		s.setWorkspace(root, snap)
+		stopWorkspaceEngineOnCleanup(t, s)
 
 		select {
 		case r := <-done:

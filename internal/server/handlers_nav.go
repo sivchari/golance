@@ -1,10 +1,10 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"math"
 	"os"
@@ -12,8 +12,11 @@ import (
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
+	"golang.org/x/tools/go/types/objectpath"
 
 	"github.com/sivchari/golance/internal/check"
+	"github.com/sivchari/golance/internal/depcheck"
+	"github.com/sivchari/golance/internal/diff"
 	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
 	"github.com/sivchari/golance/internal/rpc"
@@ -79,7 +82,7 @@ func (s *Server) handleTypeDefinition(ctx context.Context, params json.RawMessag
 // builtinDefLocation -- the same conversion handleDefinition's own
 // builtinDefinition fallback uses (handlers_xref.go).
 func (s *Server) typeDefinitionBuiltin(info *langfeat.BuiltinDefInfo) (any, error) {
-	loc, ok := builtinDefLocation(info)
+	loc, ok := builtinDefLocation(s.logger, info)
 	if !ok {
 		return protocol.LocationSlice(nil), nil
 	}
@@ -115,8 +118,17 @@ func (s *Server) typeDefinitionSameFile(info *langfeat.TypeDefInfo) (any, error)
 // there. Before dependencyTypeDeclaration existed, that miss was a silent
 // early return (PR #30's report); this now mirrors definitionFallback's
 // identical resolver-then-depProvider chain for plain "Go to Definition".
+//
+// A root-package target the facts index cannot yet answer because it has
+// not finished building (resolverOrWarn's ok=false) is reported via
+// indexUnavailableError instead of an empty result, matching references/
+// implementation/rename: dependencyTypeDeclaration always declines a root
+// package too (see its own doc), so without this distinction such a target
+// would silently look identical to one that genuinely has no declaration —
+// PR #30's regression recurring in this handler's own cross-package chain.
 func (s *Server) typeDefinitionCrossPackage(ctx context.Context, info *langfeat.TypeDefInfo) (any, error) {
-	if resolver, ok := s.resolverOrWarn(); ok {
+	resolver, resolverOK := s.resolverOrWarn()
+	if resolverOK {
 		if loc, ok := resolver.TypeDeclaration(ctx, info.PkgPath, info.ObjPath); ok {
 			if pl, ok := s.correctResultLocation(loc); ok {
 				return protocol.LocationSlice{pl}, nil
@@ -126,7 +138,28 @@ func (s *Server) typeDefinitionCrossPackage(ctx context.Context, info *langfeat.
 	if pl, ok := s.dependencyTypeDeclaration(ctx, info); ok {
 		return protocol.LocationSlice{pl}, nil
 	}
+	if !resolverOK && s.isRootPackage(info.PkgPath) {
+		return nil, s.indexUnavailableError("type definition")
+	}
 	return protocol.LocationSlice(nil), nil
+}
+
+// isRootPackage reports whether pkgPath names a workspace root package, per
+// the current workspace snapshot. dependencyTypeDeclaration/
+// dependencyFuncDeclaration already decline to answer for a root package
+// (see their own doc), for a reason unrelated to index readiness, so their
+// own false return alone cannot tell "the facts index has nothing for this
+// identifier" apart from "the facts index is the only possible source for
+// this identifier and is not ready yet" — callers that need that
+// distinction (typeDefinitionCrossPackage, crossPackageFuncLocation) check
+// this directly alongside resolverOrWarn's own ok.
+func (s *Server) isRootPackage(pkgPath string) bool {
+	ws := s.workspace()
+	if ws == nil {
+		return false
+	}
+	pkg, ok := ws.snap.Packages[pkgPath]
+	return ok && pkg.Root
 }
 
 // dependencyTypeDeclaration is typeDefinitionCrossPackage's fallback for a
@@ -152,6 +185,7 @@ func (s *Server) dependencyTypeDeclaration(ctx context.Context, info *langfeat.T
 	start := fset.Position(id.Pos())
 	end := fset.Position(id.End())
 	if _, err := os.Stat(start.Filename); err != nil {
+		s.logger.Printf("server: dependency type declaration %s#%s: declaration source %s: %v", info.PkgPath, info.ObjPath, start.Filename, err)
 		return protocol.Location{}, false
 	}
 	if start.Line <= 0 || int64(start.Line) > math.MaxUint32 ||
@@ -311,7 +345,7 @@ func (s *Server) handleSelectionRange(ctx context.Context, params json.RawMessag
 	}
 	out := make([]protocol.SelectionRange, len(p.Positions))
 	for i, pos := range p.Positions {
-		out[i] = selectionRangeAt(cp, path, text, pos)
+		out[i] = s.selectionRangeAt(cp, path, text, pos)
 	}
 	return out, nil
 }
@@ -319,20 +353,25 @@ func (s *Server) handleSelectionRange(ctx context.Context, params json.RawMessag
 // selectionRangeAt builds the innermost-to-outermost SelectionRange chain
 // for pos, falling back to a zero-width range at pos if nothing resolves
 // (the LSP response must have one entry per requested position).
-func selectionRangeAt(cp *check.CheckedPackage, path string, text []byte, pos protocol.Position) protocol.SelectionRange {
+func (s *Server) selectionRangeAt(cp *check.CheckedPackage, path string, text []byte, pos protocol.Position) protocol.SelectionRange {
 	fallback := protocol.SelectionRange{Range: protocol.Range{Start: pos, End: pos}}
 	offset, ok := byteOffsetForPosition(text, pos)
 	if !ok {
 		return fallback
 	}
 	ranges, err := langfeat.SelectionRanges(cp, path, offset)
-	if err != nil || len(ranges) == 0 {
+	if err != nil {
+		s.logger.Printf("server: selection ranges %s: %v", path, err)
+		return fallback
+	}
+	if len(ranges) == 0 {
 		return fallback
 	}
 	var node *protocol.SelectionRange
 	for i := len(ranges) - 1; i >= 0; i-- {
 		rng, ok := offsetRangeToLSP(text, ranges[i].StartOffset, ranges[i].EndOffset)
 		if !ok {
+			s.logger.Printf("server: selection range %s: range [%d,%d) outside current buffer", path, ranges[i].StartOffset, ranges[i].EndOffset)
 			continue
 		}
 		node = &protocol.SelectionRange{Range: rng, Parent: node}
@@ -363,73 +402,40 @@ func (s *Server) handleDocumentRangeFormatting(_ context.Context, params json.Ra
 		s.logger.Printf("server: range format %s: %v", path, err)
 		return []protocol.TextEdit{}, nil
 	}
-	edit, ok := rangeFormatEdit(text, formatted, p.Range)
-	if !ok {
+	edits := rangeFormatEdits(text, formatted, p.Range)
+	if edits == nil {
 		return []protocol.TextEdit{}, nil
 	}
-	return []protocol.TextEdit{edit}, nil
+	return edits, nil
 }
 
-// rangeFormatEdit computes gofmt's whole-file change to text as a single
-// edit confined to the smallest contiguous span of changed lines (the
-// common-prefix/common-suffix line diff between text and formatted). ok is
-// false if the file is already formatted, or the changed span does not
-// overlap rng at all.
-func rangeFormatEdit(text, formatted []byte, rng protocol.Range) (protocol.TextEdit, bool) {
-	if bytes.Equal(text, formatted) {
-		return protocol.TextEdit{}, false
-	}
-	fromLines := bytes.Split(text, []byte{'\n'})
-	toLines := bytes.Split(formatted, []byte{'\n'})
-	prefix, suffix := commonPrefixSuffix(fromLines, toLines)
-
-	fromOffs := lineOffsets(fromLines)
-	toOffs := lineOffsets(toLines)
-	changeStart := fromOffs[prefix]
-	changeEndFrom := fromOffs[len(fromLines)-suffix]
-	changeEndTo := toOffs[len(toLines)-suffix]
-
-	startPos, ok1 := overlay.UTF16PositionForByteOffset(text, changeStart)
-	endPos, ok2 := overlay.UTF16PositionForByteOffset(text, changeEndFrom)
-	if !ok1 || !ok2 {
-		return protocol.TextEdit{}, false
-	}
-	editRange := protocol.Range{Start: startPos, End: endPos}
-	if !rangesOverlap(editRange, rng) {
-		return protocol.TextEdit{}, false
-	}
-	return protocol.TextEdit{Range: editRange, NewText: string(formatted[toOffs[prefix]:changeEndTo])}, true
-}
-
-// commonPrefixSuffix returns the number of leading and (non-overlapping)
-// trailing lines a and b have in common.
-func commonPrefixSuffix(a, b [][]byte) (prefix, suffix int) {
-	n := min(len(a), len(b))
-	for prefix < n && bytes.Equal(a[prefix], b[prefix]) {
-		prefix++
-	}
-	maxSuffix := n - prefix
-	for suffix < maxSuffix && bytes.Equal(a[len(a)-1-suffix], b[len(b)-1-suffix]) {
-		suffix++
-	}
-	return prefix, suffix
-}
-
-// lineOffsets returns, for each index in [0, len(lines)], the byte offset
-// of the start of lines[idx] in bytes.Join(lines, "\n") — lineOffsets(lines)
-// [len(lines)] is that joined content's total length.
-func lineOffsets(lines [][]byte) []int {
-	offs := make([]int, len(lines)+1)
-	pos := 0
-	for i, l := range lines {
-		offs[i] = pos
-		pos += len(l)
-		if i < len(lines)-1 {
-			pos++ // the '\n' separating this line from the next
+// rangeFormatEdits computes gofmt's change to text as the minimal set of
+// line-granularity edits (see internal/diff, which computes them via Myers'
+// shortest-edit-script algorithm on the already-gofmt'd text), then keeps
+// only the edits whose range overlaps rng. Each returned edit's NewText is
+// an exact substring of formatted, so it is what gofmt already produced for
+// that region in place — never a fragment reformatted in isolation, which
+// could lose indentation context and no longer match gofmt's own output.
+// This also means a hunk for an unrelated, independently-misformatted
+// region elsewhere in the file is never returned alongside one that
+// overlaps rng, matching gopls's per-hunk-confined
+// textDocument/rangeFormatting. Returns nil if text is already formatted or
+// no hunk overlaps rng.
+func rangeFormatEdits(text, formatted []byte, rng protocol.Range) []protocol.TextEdit {
+	var out []protocol.TextEdit
+	for _, e := range diff.Lines(text, formatted) {
+		startPos, ok1 := overlay.UTF16PositionForByteOffset(text, e.Start)
+		endPos, ok2 := overlay.UTF16PositionForByteOffset(text, e.End)
+		if !ok1 || !ok2 {
+			continue
 		}
+		editRange := protocol.Range{Start: startPos, End: endPos}
+		if !rangesOverlap(editRange, rng) {
+			continue
+		}
+		out = append(out, protocol.TextEdit{Range: editRange, NewText: e.New})
 	}
-	offs[len(lines)] = pos
-	return offs
+	return out
 }
 
 func rangesOverlap(a, b protocol.Range) bool {
@@ -473,10 +479,12 @@ func (s *Server) handleDocumentLink(ctx context.Context, params json.RawMessage)
 	for _, l := range links {
 		rng, ok := offsetRangeToLSP(text, l.Range.StartOffset, l.Range.EndOffset)
 		if !ok {
+			s.logger.Printf("server: document link %s: range [%d,%d) outside current buffer", path, l.Range.StartOffset, l.Range.EndOffset)
 			continue
 		}
 		target, ok := documentLinkTarget(ws, l.PkgPath)
 		if !ok {
+			s.logger.Printf("server: document link %s: no link target for import %q", path, l.PkgPath)
 			continue
 		}
 		out = append(out, protocol.DocumentLink{Range: rng, Target: &target})
@@ -566,7 +574,13 @@ func (s *Server) handleCompletionResolve(ctx context.Context, params json.RawMes
 	if info == nil {
 		return &item, nil
 	}
-	if doc := s.completionDoc(ctx, info); doc != "" {
+	var doc string
+	if info.UnimportedSelector != "" {
+		doc = s.unimportedCompletionDoc(ctx, ws, cp.PkgPath(), info.UnimportedSelector, key.Label)
+	} else {
+		doc = s.completionDoc(ctx, info)
+	}
+	if doc != "" {
 		item.Documentation = protocol.String(doc)
 	}
 	return &item, nil
@@ -586,4 +600,49 @@ func (s *Server) completionDoc(ctx context.Context, info *langfeat.CompletionDoc
 		return ""
 	}
 	return s.crossPackageDoc(ctx, info.PkgPath, info.ObjPath)
+}
+
+// unimportedCompletionDoc resolves the doc comment for label, an exported
+// member of whichever graph-known package named selector the completionItem/
+// resolve request's original candidate actually came from (see
+// langfeat.CompletionDocInfo.UnimportedSelector's doc): ResolveCompletionDoc
+// itself has no graph access to redo appendUnimportedCompletions's own
+// package-name-to-import-path lookup, so this repeats it here, trying each
+// candidate package sharing selector's declared name (ws.depProvider parses
+// from source, the same doc-capable path crossPackageDoc already uses for
+// an already-imported dependency) and stopping at the first whose scope
+// actually declares label.
+func (s *Server) unimportedCompletionDoc(ctx context.Context, ws *workspace, ownPath, selector, label string) string {
+	var errs []string
+	for _, path := range ws.pkgNameIndex[selector] {
+		if path == ownPath {
+			continue
+		}
+		candidate, err := ws.depProvider.Package(ctx, path)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", path, err))
+			continue
+		}
+		obj := candidate.Types().Scope().Lookup(label)
+		if obj == nil || !obj.Exported() {
+			continue
+		}
+		objPath, err := objectpath.For(depcheck.OriginObject(obj))
+		if err != nil {
+			continue
+		}
+		if doc := s.crossPackageDoc(ctx, path, string(objPath)); doc != "" {
+			return doc
+		}
+	}
+	// Logged only once every same-named candidate has been tried and none
+	// produced a result, mirroring unimportedMemberItems's identical
+	// precedent (handlers_completion_unimported.go): several packages
+	// sharing selector's declared name, with only one actually usable here,
+	// is the ordinary case and stays silent.
+	if len(errs) > 0 {
+		s.logger.Printf("server: unimported completion doc for %s.%s: %d candidate package(s) failed to parse: %s",
+			selector, label, len(errs), strings.Join(errs, "; "))
+	}
+	return ""
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -101,6 +102,7 @@ func TestHandleDidOpen_QueuedBeforeWorkspaceReadyThenDrained(t *testing.T) {
 		t.Fatalf("graph.Load: %v", err)
 	}
 	s.setWorkspace(root, snap)
+	stopWorkspaceEngineOnCleanup(t, s)
 
 	s.pendingOpensMu.Lock()
 	stillPending := s.pendingOpens[file]
@@ -155,6 +157,7 @@ func TestHandleDidSave_TestFileReindexesNewSymbol(t *testing.T) {
 		rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 		s := New(rpcServer, Options{Logger: newTestLogger(t)})
 		s.setWorkspace(dir, snap)
+		stopWorkspaceEngineOnCleanup(t, s)
 		s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
 
 		openDoc(t, s, testFile, testSrc)
@@ -250,7 +253,7 @@ func Shout(name string, n int) string {
 			}
 
 			openDoc(t, s, midFile, tt.edited)
-			s.reindex(context.Background(), ws, idx, pkgMid)
+			_ = s.reindex(context.Background(), ws, idx, pkgMid)
 
 			for _, p := range []string{pkgMid, pkgTop} {
 				before := ws.depCache.cache.Decodes()
@@ -319,6 +322,7 @@ func Run(name string) string {
 	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 	s = New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(dir, snap)
+	stopWorkspaceEngineOnCleanup(t, s)
 	idx = &indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)}
 	s.idx.Store(idx)
 	return s, idx, midFile, topFile
@@ -379,7 +383,7 @@ func Shout(name string, n int) string {
 		t.Fatalf("write %s: %v", midFile, err)
 	}
 	openDoc(t, s, midFile, editedMid)
-	s.reindex(context.Background(), ws, idx, pkgMid)
+	_ = s.reindex(context.Background(), ws, idx, pkgMid)
 
 	after, err := ws.engine.Get(context.Background(), topFile)
 	if err != nil {
@@ -432,7 +436,7 @@ func Shout(name string) string {
 		t.Fatalf("write %s: %v", midFile, err)
 	}
 	openDoc(t, s, midFile, editedMid)
-	s.reindex(context.Background(), ws, idx, pkgMid)
+	_ = s.reindex(context.Background(), ws, idx, pkgMid)
 
 	after, err := ws.engine.Get(context.Background(), topFile)
 	if err != nil {
@@ -570,6 +574,99 @@ func TestHandleDidSave_ReindexedOnceIndexBecomesAvailable(t *testing.T) {
 	})
 }
 
+// TestHandleDidClose_ClearsOwnedDiagnostics is a regression test for
+// Finding M11: publishDiagnostics only ever notifies for currently open
+// files (see its own doc), so a file closed without any later recheck of
+// its package used to keep whatever diagnostics it last had forever in the
+// client's Problems panel. It pre-populates s.diagFiles the way a prior
+// publishDiagnostics call for the file's package would have, then asserts
+// handleDidClose republishes an empty diagnostics list for it.
+func TestHandleDidClose_ClearsOwnedDiagnostics(t *testing.T) {
+	var out bytes.Buffer
+	pr, pw := io.Pipe()
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+
+	done := make(chan struct{})
+	go func() {
+		_ = rpcServer.Serve(context.Background(), pr, &out)
+		close(done)
+	}()
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+	<-done
+
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	file := filepath.Join(t.TempDir(), "a.go")
+	s.overlay.DidOpen(&protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{URI: uri.File(file), Version: 1, Text: "package a\n"},
+	})
+
+	s.diagMu.Lock()
+	s.diagFiles["example.com/a"] = map[string]bool{file: true}
+	s.diagMu.Unlock()
+
+	closeParams := mustMarshal(t, &protocol.DidCloseTextDocumentParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+	})
+	if err := s.handleDidClose(context.Background(), closeParams); err != nil {
+		t.Fatalf("handleDidClose: %v", err)
+	}
+
+	written := out.String()
+	if !strings.Contains(written, `"method":"textDocument/publishDiagnostics"`) {
+		t.Fatalf("handleDidClose did not publish diagnostics for the closed file: %q", written)
+	}
+	if !strings.Contains(written, `"diagnostics":[]`) {
+		t.Fatalf("handleDidClose's publish did not clear diagnostics (want an empty list): %q", written)
+	}
+
+	s.diagMu.Lock()
+	stillOwned := s.diagFiles["example.com/a"][file]
+	s.diagMu.Unlock()
+	if stillOwned {
+		t.Fatal("s.diagFiles still credits example.com/a with diagnostics for the closed file")
+	}
+}
+
+// TestHandleDidClose_NoDiagnosticsIsNoOp verifies that closing a file this
+// server never published diagnostics for sends no
+// textDocument/publishDiagnostics notification at all — handleDidClose's
+// clearing behavior (see TestHandleDidClose_ClearsOwnedDiagnostics) must not
+// manufacture a spurious empty-diagnostics publish for every close.
+func TestHandleDidClose_NoDiagnosticsIsNoOp(t *testing.T) {
+	var out bytes.Buffer
+	pr, pw := io.Pipe()
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+
+	done := make(chan struct{})
+	go func() {
+		_ = rpcServer.Serve(context.Background(), pr, &out)
+		close(done)
+	}()
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+	<-done
+
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	file := filepath.Join(t.TempDir(), "a.go")
+	s.overlay.DidOpen(&protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{URI: uri.File(file), Version: 1, Text: "package a\n"},
+	})
+
+	closeParams := mustMarshal(t, &protocol.DidCloseTextDocumentParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+	})
+	if err := s.handleDidClose(context.Background(), closeParams); err != nil {
+		t.Fatalf("handleDidClose: %v", err)
+	}
+
+	if written := out.String(); strings.Contains(written, `"method":"textDocument/publishDiagnostics"`) {
+		t.Fatalf("handleDidClose published diagnostics for a file that never had any: %q", written)
+	}
+}
+
 // TestHandleDidOpen_SelfHealsMissingFacts is a regression test for GAP 2's
 // didOpen path: opening a file whose package the facts index has never
 // recorded a store.UnitPointer for at all (the same state GAP 1's
@@ -619,6 +716,7 @@ func TestHandleDidOpen_SelfHealsMissingFacts(t *testing.T) {
 		rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 		s := New(rpcServer, Options{Logger: newTestLogger(t)})
 		s.setWorkspace(dir, fullSnap)
+		stopWorkspaceEngineOnCleanup(t, s)
 		s.idx.Store(&indexState{db: db2, cas: cas, resolver: xref.New(db2, cas, fullSnap, false)})
 
 		openParams := mustMarshal(t, &protocol.DidOpenTextDocumentParams{
@@ -706,6 +804,7 @@ func TestHandleDidOpen_NoSelfHealWhenFresh(t *testing.T) {
 		rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 		s := New(rpcServer, Options{Logger: newTestLogger(t)})
 		s.setWorkspace(dir, snap)
+		stopWorkspaceEngineOnCleanup(t, s)
 		s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
 
 		const pkgGreet = "example.com/didopenfresh/greet"

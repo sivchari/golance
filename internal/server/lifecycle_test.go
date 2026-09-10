@@ -183,6 +183,7 @@ func TestLoadWorkspaceAsync_ColdBuildRepairsPackageDroppedByBuild(t *testing.T) 
 	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 	s := New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(dir, fullSnap)
+	stopWorkspaceEngineOnCleanup(t, s)
 
 	db, err := store.Open(dbPath)
 	if err != nil {

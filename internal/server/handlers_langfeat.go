@@ -283,12 +283,19 @@ func (s *Server) handleSignatureHelp(ctx context.Context, params json.RawMessage
 	if activeParam > math.MaxUint32 {
 		activeParam = math.MaxUint32
 	}
+	// ActiveParameter is set both on the SignatureInformation (the
+	// spec-preferred location since 3.16.0) and here, on SignatureHelp
+	// itself: a client that has not adopted the newer per-signature field
+	// reads only this top-level one, and — like gopls itself, which sets
+	// both — would otherwise always see parameter 0 highlighted regardless
+	// of where the cursor actually is.
 	return &protocol.SignatureHelp{
 		Signatures: []protocol.SignatureInformation{{
 			Label:           info.Label,
 			Parameters:      sigParams,
 			ActiveParameter: protocol.NewNullable(uint32(activeParam)),
 		}},
+		ActiveParameter: protocol.NewNullable(uint32(activeParam)),
 	}, nil
 }
 

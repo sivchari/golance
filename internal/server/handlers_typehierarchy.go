@@ -49,7 +49,10 @@ func (s *Server) handlePrepareTypeHierarchy(ctx context.Context, params json.Raw
 	if info == nil {
 		return []protocol.TypeHierarchyItem(nil), nil
 	}
-	item, ok := s.typeHierarchyItemFromPrepare(ctx, info)
+	item, ok, err := s.typeHierarchyItemFromPrepare(ctx, info)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return []protocol.TypeHierarchyItem(nil), nil
 	}
@@ -64,18 +67,26 @@ func (s *Server) handlePrepareTypeHierarchy(ctx context.Context, params json.Raw
 // (pkgPath, objPath) -> Location lookup with no func-specific behavior) --
 // the identical chain handlers_callhierarchy.go's callHierarchyItem already
 // uses for a func/method's own declaration, reused here for a type's.
-func (s *Server) typeHierarchyItemFromPrepare(ctx context.Context, info *langfeat.TypeHierarchyPrepareInfo) (protocol.TypeHierarchyItem, bool) {
+//
+// err is non-nil only when crossPackageFuncLocation reports the target is a
+// root-package declaration the facts index cannot yet answer because it has
+// not finished building — see callHierarchyItem's identical doc.
+func (s *Server) typeHierarchyItemFromPrepare(ctx context.Context, info *langfeat.TypeHierarchyPrepareInfo) (protocol.TypeHierarchyItem, bool, error) {
 	var loc protocol.Location
 	var ok bool
 	if info.SameFile != "" {
 		loc, ok = s.sameFileCallHierarchyLocation(info.SameFile, info.Range)
 	} else {
-		loc, ok = s.crossPackageFuncLocation(ctx, info.PkgPath, info.ObjPath)
+		var unavailable bool
+		loc, ok, unavailable = s.crossPackageFuncLocation(ctx, info.PkgPath, info.ObjPath)
+		if unavailable {
+			return protocol.TypeHierarchyItem{}, false, s.indexUnavailableError("type hierarchy")
+		}
 	}
 	if !ok {
-		return protocol.TypeHierarchyItem{}, false
+		return protocol.TypeHierarchyItem{}, false, nil
 	}
-	return typeHierarchyItem(info.Name, info.IsInterface, info.PkgPath, loc), true
+	return typeHierarchyItem(info.Name, info.IsInterface, info.PkgPath, loc), true, nil
 }
 
 // handleTypeHierarchySupertypes answers typeHierarchy/supertypes.

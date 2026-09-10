@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"github.com/sivchari/golance/internal/index"
 	"github.com/sivchari/golance/internal/rpc"
 	"github.com/sivchari/golance/internal/store"
+	"go.lsp.dev/protocol"
 )
 
 // newWorkspaceOnlyServer builds a Server with its workspace populated (so
@@ -33,6 +35,7 @@ func newWorkspaceOnlyServer(t *testing.T) *Server {
 	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 	s := New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(root, snap)
+	stopWorkspaceEngineOnCleanup(t, s)
 	return s
 }
 
@@ -54,6 +57,7 @@ func newWorkspaceOnlyServerWithLogBuffer(t *testing.T) (*Server, *bytes.Buffer) 
 	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 	s := New(rpcServer, Options{Logger: log.New(&buf, "", 0)})
 	s.setWorkspace(root, snap)
+	stopWorkspaceEngineOnCleanup(t, s)
 	return s, &buf
 }
 
@@ -488,6 +492,99 @@ func TestIndexStatsMessage(t *testing.T) {
 	}
 }
 
+// newNotifyCaptureServer builds a workspace-only Server exactly like
+// newWorkspaceOnlyServer, wired over an rpc.Server whose outbound
+// notifications land in the returned buffer instead of nowhere — for
+// asserting on exactly which $/progress or window/* notifications a call
+// sends. Mirrors TestResolverOrWarn_UsesLogMessageNotShowMessage's own
+// pattern: Serve is run to completion over an already-closed pipe first, so
+// its later Notify calls have a clean happens-before edge into out with
+// nothing left concurrent.
+func newNotifyCaptureServer(t *testing.T) (*Server, *bytes.Buffer) {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("testdata", "module"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+
+	var out bytes.Buffer
+	pr, pw := io.Pipe()
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	done := make(chan struct{})
+	go func() {
+		_ = rpcServer.Serve(context.Background(), pr, &out)
+		close(done)
+	}()
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+	<-done
+
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	s.setWorkspace(root, snap)
+	stopWorkspaceEngineOnCleanup(t, s)
+	return s, &out
+}
+
+// TestRelayIndexProgress_DoesNotSendEndNotification is a regression test for
+// the informational audit's Finding 2 (the hover/completion-doc race): the
+// $/progress "end" notification must never come from relayIndexProgress
+// itself — only from notifyIndexProgressEnd, called by runIndexBuild once
+// openIndexAfterBuild has actually installed s.idx. relayIndexProgress used
+// to send "end" the instant the indexer subprocess's stdout stream closed,
+// which is always strictly before openIndexAfterBuild even starts (see
+// notifyIndexProgressEnd's own doc) — a client that treated that "end" as
+// "the index is now queryable" could read s.idx while it was still nil.
+func TestRelayIndexProgress_DoesNotSendEndNotification(t *testing.T) {
+	s, out := newNotifyCaptureServer(t)
+
+	r := strings.NewReader("PROGRESS 1 2\nPROGRESS 2 2\nSTATS processed=2 skipped=0 errors=0 typechecked=2\n")
+	statsErrors, began, summary := s.relayIndexProgress(r)
+	if statsErrors != 0 || !began || summary == "" {
+		t.Fatalf("relayIndexProgress() = (%d, %v, %q), want (0, true, non-empty)", statsErrors, began, summary)
+	}
+
+	written := out.String()
+	if !strings.Contains(written, `"kind":"begin"`) {
+		t.Errorf("relayIndexProgress() did not send a begin notification: %q", written)
+	}
+	if !strings.Contains(written, `"kind":"report"`) {
+		t.Errorf("relayIndexProgress() did not send a report notification: %q", written)
+	}
+	if strings.Contains(written, `"kind":"end"`) {
+		t.Errorf("relayIndexProgress() sent an end notification itself, want none (only notifyIndexProgressEnd may): %q", written)
+	}
+}
+
+// TestNotifyIndexProgressEnd_SendsEndWithSummary verifies
+// notifyIndexProgressEnd's own half of the contract
+// TestRelayIndexProgress_DoesNotSendEndNotification pins the other half of:
+// given relayIndexProgress's own (began, summary) result, it sends exactly
+// one $/progress "end" carrying summary as its Message, and is a no-op when
+// began is false (nothing to end).
+func TestNotifyIndexProgressEnd_SendsEndWithSummary(t *testing.T) {
+	s, out := newNotifyCaptureServer(t)
+
+	s.notifyIndexProgressEnd(true, "2 type-checked, 0 error(s)")
+	written := out.String()
+	if !strings.Contains(written, `"kind":"end"`) {
+		t.Errorf("notifyIndexProgressEnd(true, ...) did not send an end notification: %q", written)
+	}
+	if !strings.Contains(written, "2 type-checked, 0 error(s)") {
+		t.Errorf("notifyIndexProgressEnd(true, ...) end notification missing its summary Message: %q", written)
+	}
+
+	out.Reset()
+	s.notifyIndexProgressEnd(false, "should not appear")
+	if out.Len() != 0 {
+		t.Errorf("notifyIndexProgressEnd(false, ...) sent %q, want nothing (no matching begin)", out.String())
+	}
+}
+
 // TestRelayIndexProgress_ReturnsStatsErrors verifies relayIndexProgress
 // plumbs the "STATS ... errors=N" line's own count back to its caller
 // (runIndexBuild, which passes it on to openIndexAfterBuild), not just into
@@ -496,7 +593,7 @@ func TestRelayIndexProgress_ReturnsStatsErrors(t *testing.T) {
 	s := newWorkspaceOnlyServer(t)
 
 	r := strings.NewReader("PROGRESS 1 2\nPROGRESS 2 2\nSTATS processed=2 skipped=0 errors=4 typechecked=2\n")
-	if got := s.relayIndexProgress(r); got != 4 {
+	if got, _, _ := s.relayIndexProgress(r); got != 4 {
 		t.Errorf("relayIndexProgress() = %d, want 4", got)
 	}
 }
@@ -508,8 +605,44 @@ func TestRelayIndexProgress_NoStatsLineReturnsZero(t *testing.T) {
 	s := newWorkspaceOnlyServer(t)
 
 	r := strings.NewReader("PROGRESS 1 2\n")
-	if got := s.relayIndexProgress(r); got != 0 {
+	if got, _, _ := s.relayIndexProgress(r); got != 0 {
 		t.Errorf("relayIndexProgress() = %d, want 0", got)
+	}
+}
+
+// TestRelayIndexProgress_LineLargerThanOldDefaultBufferStillParses is a
+// regression test for Finding L12: relayIndexProgress used to build its
+// bufio.Scanner with no explicit buffer size, relying on the package's
+// unstated default (bufio.MaxScanTokenSize, 64KiB). A line past that but
+// still well within the new explicit maxProgressLine bound (1 MiB) used to
+// kill the whole scan — dropping every later line, including the STATS line
+// statsErrors depends on — and must not anymore.
+func TestRelayIndexProgress_LineLargerThanOldDefaultBufferStillParses(t *testing.T) {
+	s := newWorkspaceOnlyServer(t)
+
+	long := strings.Repeat("x", 100*1024) // > 64KiB, < maxProgressLine
+	r := strings.NewReader(long + "\nPROGRESS 1 2\nSTATS processed=2 skipped=0 errors=4 typechecked=2\n")
+	if got, _, _ := s.relayIndexProgress(r); got != 4 {
+		t.Errorf("relayIndexProgress() = %d, want 4 (a line past the old implicit default must not drop the rest of the stream)", got)
+	}
+}
+
+// TestRelayIndexProgress_OversizedLineIsLoggedByName is a regression test
+// for Finding L12: a line past maxProgressLine still ends the scan (a
+// bufio.Scanner cannot resume past a too-long token), but must name the
+// cause explicitly — not the same generic "read indexer progress" message
+// every other read failure gets — since it specifically means the STATS
+// line statsErrors depends on was likely never reached.
+func TestRelayIndexProgress_OversizedLineIsLoggedByName(t *testing.T) {
+	s, logs := newWorkspaceOnlyServerWithLogBuffer(t)
+
+	huge := strings.Repeat("x", 2<<20) // > maxProgressLine (1 MiB)
+	r := strings.NewReader("PROGRESS 1 2\n" + huge + "\nSTATS processed=2 skipped=0 errors=4 typechecked=2\n")
+	if got, _, _ := s.relayIndexProgress(r); got != 0 {
+		t.Errorf("relayIndexProgress() = %d, want 0 (the STATS line after the oversized one must never be reached)", got)
+	}
+	if !strings.Contains(logs.String(), "progress line exceeded") {
+		t.Errorf("log output = %q, want a message naming the oversized-line cause", logs.String())
 	}
 }
 
@@ -614,6 +747,7 @@ func TestRevalidateIndex_TargetedRepairFixesMissingPackageWithoutFullRebuild(t *
 	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 	s := New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(dir, fullSnap)
+	stopWorkspaceEngineOnCleanup(t, s)
 
 	idx, ok := s.tryWarmOpen(dir)
 	if !ok {
@@ -637,6 +771,99 @@ func TestRevalidateIndex_TargetedRepairFixesMissingPackageWithoutFullRebuild(t *
 	}
 	if len(infos) == 0 {
 		t.Fatal(`WorkspaceSymbol("W") returned nothing for pkgb after the repair, want its facts queryable exactly like a normally-built package`)
+	}
+}
+
+// TestRepairIndexPackagesLocked_ReportsFailureViaLogMessage is a regression
+// test for Finding H2: revalidateIndex's cold-start self-heal repair pass
+// used to leave the only trace of a package it failed to repair in the
+// server's own log file (s.reindex's internal s.logger.Printf) -- nothing a
+// client, or a user who never opens that log, could ever see. pkgb starts
+// out stale exactly like TestRevalidateIndex_TargetedRepairFixesMissingPackageWithoutFullRebuild
+// (a UnitPointer missing entirely from the warm-opened database), but its
+// own source file is removed from disk before the repair runs, forcing
+// index.Reindex to fail for a real reason (a read error, not a type error —
+// a type error records a diagnostic and still counts as success), so the
+// repair must now report that failure to the client via window/logMessage.
+func TestRepairIndexPackagesLocked_ReportsFailureViaLogMessage(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	writeTempFile(t, dir, "go.mod", "module example.com/repairfailtest\n\ngo 1.26\n")
+	aDir := filepath.Join(dir, "pkga")
+	if err := os.MkdirAll(aDir, 0o750); err != nil {
+		t.Fatalf("mkdir pkga: %v", err)
+	}
+	writeTempFile(t, aDir, "pkga.go", "package pkga\n\n// V returns 1.\nfunc V() int { return 1 }\n")
+
+	snapBeforeB, err := graph.Load(graph.Options{Dir: dir}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load (before pkgb exists): %v", err)
+	}
+
+	dbPath := indexDBFile(dir)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+	cas, err := store.OpenCAS(casDir(dir))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	buildTestIndexDB(t, snapBeforeB, dbPath, cas)
+
+	bDir := filepath.Join(dir, "pkgb")
+	if err := os.MkdirAll(bDir, 0o750); err != nil {
+		t.Fatalf("mkdir pkgb: %v", err)
+	}
+	pkgbFile := writeTempFile(t, bDir, "pkgb.go", "package pkgb\n\n// W returns 2.\nfunc W() int { return 2 }\n")
+	fullSnap, err := graph.Load(graph.Options{Dir: dir}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load (with pkgb): %v", err)
+	}
+	if _, ok := fullSnap.Packages["example.com/repairfailtest/pkgb"]; !ok {
+		t.Fatal("pkgb missing from fullSnap; test setup is wrong")
+	}
+
+	// pkgb is still known to fullSnap (staleIndexPackages flags it exactly
+	// as the successful-repair test above does, from the snapshot/database
+	// mismatch alone), but its own file is now gone from disk -- forcing the
+	// repair itself to fail for real instead of merely recording a
+	// type-check diagnostic.
+	if err := os.Remove(pkgbFile); err != nil {
+		t.Fatalf("remove pkgb.go: %v", err)
+	}
+
+	var out bytes.Buffer
+	pr, pw := io.Pipe()
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	done := make(chan struct{})
+	go func() {
+		_ = rpcServer.Serve(context.Background(), pr, &out)
+		close(done)
+	}()
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+	<-done
+
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	s.setWorkspace(dir, fullSnap)
+	stopWorkspaceEngineOnCleanup(t, s)
+
+	idx, ok := s.tryWarmOpen(dir)
+	if !ok {
+		t.Fatal("tryWarmOpen() = not ok, want ok")
+	}
+	s.idx.Store(idx)
+	t.Cleanup(func() { _ = idx.db.Close() })
+
+	s.revalidateIndex(context.Background(), dir)
+
+	written := out.String()
+	if !strings.Contains(written, protocol.MethodWindowLogMessage) {
+		t.Errorf("revalidateIndex did not send %s for the failed repair: %q", protocol.MethodWindowLogMessage, written)
+	}
+	if !strings.Contains(written, "pkgb") {
+		t.Errorf("revalidateIndex's failure notice did not name the failed package (pkgb): %q", written)
 	}
 }
 

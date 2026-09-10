@@ -85,19 +85,18 @@ var navPositions = []navPos{
 // closes in the coordinated fix wave the audit's own doc calls for, delete
 // its entry here so this suite starts enforcing it too.
 var knownGaps = map[string]bool{
-	"TypeDefinition/nested instantiation alias decl":                              true,
-	"TypeDefinition/interface method call promoted through embedding (g.Speak())": true,
-	"TypeDefinition/interface method call (g.Name())":                             true,
-	"TypeDefinition/method promoted through two embedding levels":                 true,
-	"TypeDefinition/in-package _test.go symbol use":                               true,
-	"TypeDefinition/external _test package symbol use":                            true,
-
+	// gopls v0.23.0 cannot find references to a generic type's field when
+	// reached only through a plain (non-generic) type alias of an
+	// instantiation: golance's References on generics.Box[T].Value finds 10
+	// locations, including reexport.go:15 (navg.IntBox{Value: 1}) and
+	// reexport.go:27 (ReBox{Value: 3}); gopls finds only the other 8,
+	// omitting both. IntBox and ReBox are both plain aliases of Box[int], so
+	// a Value: key in either composite literal genuinely does set Box[int]'s
+	// own field -- golance's broader answer is the correct one, gopls's
+	// shorter one is the gap. Kept allowlisted rather than promoted to an
+	// enforced case: the suite treats gopls as its oracle, and there is
+	// nothing to change on golance's side to make the two agree.
 	"References/generic field use in method body": true,
-
-	"Implementation/interface decl (Speaker)": true,
-
-	"Rename/generic struct, cross-package fanout":      true,
-	"Rename/func referenced from both test-file kinds": true,
 }
 
 // reportMismatch logs a golance-vs-gopls disagreement for feature/label:

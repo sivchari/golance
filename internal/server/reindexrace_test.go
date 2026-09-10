@@ -51,6 +51,7 @@ func newReindexRaceServer(t *testing.T) (s *Server, ws *workspace, idx *indexSta
 	rpcServer := rpc.NewServer(rpc.WithLogger(logger))
 	s = New(rpcServer, Options{Logger: logger})
 	s.setWorkspace(root, snap)
+	stopWorkspaceEngineOnCleanup(t, s)
 	idx = &indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)}
 	s.idx.Store(idx)
 
@@ -119,7 +120,7 @@ func TestReindexWG_RebuildCloseWaitsForRegisteredReindex(t *testing.T) {
 		// Still correctly blocked: safe to perform the registered write now.
 	}
 
-	s.reindex(context.Background(), ws, idx, reindexRaceTestPkg)
+	_ = s.reindex(context.Background(), ws, idx, reindexRaceTestPkg)
 	s.reindexWG.Done()
 
 	select {
@@ -159,7 +160,7 @@ func TestReindex_DatabaseClosedExternally_SkipsSilently(t *testing.T) {
 
 	// s.idx still points at idx — nothing told the server this specific
 	// database handle was closed, exactly like the race this test pins.
-	s.reindex(context.Background(), ws, idx, reindexRaceTestPkg)
+	_ = s.reindex(context.Background(), ws, idx, reindexRaceTestPkg)
 
 	if buf.String() != "" {
 		t.Errorf("reindex against an externally-closed database logged %q, want silence (self-heals on the next trigger — see reindexDBClosedUnderfoot's doc)", buf.String())
