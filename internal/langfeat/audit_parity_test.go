@@ -1,10 +1,14 @@
 package langfeat_test
 
-// This file pins two gopls-parity gaps found while auditing golance's
+// This file covers two gopls-parity findings from auditing golance's
 // informational/editing LSP features against a real gopls v0.23.0 (see
 // ./audit-informational.md at the repo root for the full comparison and
-// severity assessment). Both cases were verified by running gopls's own
-// `symbols`/`semtok` CLI subcommands against these exact fixture files.
+// severity assessment): documentSymbol nesting (finding #9, now fixed —
+// this test asserts the fixed, gopls-matching outline shape) and
+// semanticTokens' const/static modifier (finding #11, fixed by this
+// change — see TestSemanticTokens_PackageLevelConst_MatchesGoplsStatic's
+// own doc). Both were verified by running gopls's own `symbols`/`semtok`
+// CLI subcommands against these exact fixture files.
 
 import (
 	"bytes"
@@ -59,25 +63,23 @@ func childNames(syms []langfeat.Symbol) []string {
 	return names
 }
 
-// TestSemanticTokens_PackageLevelConst_OverTaggedStatic pins a real
-// mismatch: golance marks a package-level const's semantic token with
-// BOTH ModReadonly and ModStatic (see semantic.go's staticModifiers,
-// exercised here through internal/langfeat/testdata/module/auditfeat/
-// consts.go's LevelDebug), and internal/langfeat/semantic_test.go's own
-// TestSemanticTokens_ConstIsReadonlyAndStatic asserts that combination as
-// intentional. `gopls semtok` disagrees: run against both this fixture and
-// testdata/module/symbols/symbols.go, gopls tags a package-level CONST
+// TestSemanticTokens_PackageLevelConst_MatchesGoplsStatic closes a
+// previously deferred gopls-parity gap: golance used to mark a
+// package-level const's semantic token with BOTH ModReadonly and
+// ModStatic (see semantic.go's staticModifiers, exercised here through
+// internal/langfeat/testdata/module/auditfeat/consts.go's LevelDebug).
+// `gopls semtok`, run against both this fixture and
+// testdata/module/symbols/symbols.go, tags a package-level CONST
 // (MaxWidgets) "definition readonly" only — never "static" — while a
 // package-level VAR (Count) gets "definition static" only, never
-// "readonly". Root cause: objectKind (semantic.go) maps both *types.Const
-// and an ordinary *types.Var to the same TokenVariable kind, and
-// staticModifiers' ModStatic check keys only on that shared kind, not on
-// the object actually being a non-const variable. Left unfixed here: doing
-// so would need to also change semantic_test.go's existing assertion,
-// which this audit's own ground rule (touch no existing test file) rules
-// out — see audit-informational.md for the full writeup and a suggested
-// one-line fix for whoever owns that test.
-func TestSemanticTokens_PackageLevelConst_OverTaggedStatic(t *testing.T) {
+// "readonly". staticModifiers now gates its ModStatic check on the object
+// NOT being a *types.Const (in addition to the existing TokenVariable/
+// package-level checks), matching gopls exactly; this test, and
+// internal/langfeat/semantic_test.go's renamed
+// TestSemanticTokens_ConstIsReadonlyNotStatic, were both updated together
+// with that fix — see audit-informational.md finding #11 for the original
+// writeup.
+func TestSemanticTokens_PackageLevelConst_MatchesGoplsStatic(t *testing.T) {
 	reader := overlay.New()
 	cp, path := newCheckedPackage(t, reader, "auditfeat", "consts.go")
 	text, err := reader.ReadFile(path)
@@ -91,9 +93,9 @@ func TestSemanticTokens_PackageLevelConst_OverTaggedStatic(t *testing.T) {
 	}
 
 	tok := definitionTokenAt(t, text, toks, "LevelDebug Level = iota", "LevelDebug")
-	want := langfeat.ModDefinition | langfeat.ModReadonly | langfeat.ModStatic
+	want := langfeat.ModDefinition | langfeat.ModReadonly
 	if tok.Modifiers != want {
-		t.Fatalf("LevelDebug modifiers = %#x, want %#x (definition|readonly|static) — if this changed, golance now matches gopls and this test (and its doc comment) should be updated", tok.Modifiers, want)
+		t.Fatalf("LevelDebug modifiers = %#x, want %#x (definition|readonly, no static — matching gopls)", tok.Modifiers, want)
 	}
 }
 

@@ -110,6 +110,39 @@ func TestResolveCompletionDoc_CrossPackage_GenericField(t *testing.T) {
 	}
 }
 
+// TestResolveCompletionDoc_UnimportedSelector is a regression test for
+// Finding L3's completiondoc.go half: a completionItem/resolve request for
+// an unimported-package-member candidate (e.g. "fmt.Sprintf" with fmt not
+// yet imported — see langfeat.Unimported) used to resolve nothing at all,
+// since objectForLabel's ordinary selector resolution can never find fmt
+// (it was never imported). ResolveCompletionDoc now reports
+// UnimportedSelector for this shape instead of a bare nil, so the server
+// layer (which has the graph access this package deliberately lacks) can
+// redo the same package-name lookup and still show a doc.
+func TestResolveCompletionDoc_UnimportedSelector(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "unimported", "unimported.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "fmt.Sp") + len("fmt.Sp")
+
+	got, err := langfeat.ResolveCompletionDoc(cp, reader, langfeat.CompletionDocKey{File: path, Offset: offset, Label: "Sprintf"})
+	if err != nil {
+		t.Fatalf("ResolveCompletionDoc: %v", err)
+	}
+	if got == nil {
+		t.Fatal("ResolveCompletionDoc returned nil, want a result carrying UnimportedSelector")
+	}
+	if got.UnimportedSelector != "fmt" {
+		t.Errorf("UnimportedSelector = %q, want fmt", got.UnimportedSelector)
+	}
+	if got.Doc != "" || got.PkgPath != "" {
+		t.Errorf("got = %+v, want only UnimportedSelector set (this package cannot resolve fmt itself)", got)
+	}
+}
+
 func TestResolveCompletionDoc_NoMatch(t *testing.T) {
 	reader := overlay.New()
 	cp, path := newCheckedPackage(t, reader, "completiondoc", "completiondoc.go")

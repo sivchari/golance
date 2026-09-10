@@ -72,3 +72,30 @@ func TestSignatureHelp_VariadicCapsActiveParam(t *testing.T) {
 		t.Errorf("Label = %q, want it to describe a variadic ...int param", got.Label)
 	}
 }
+
+// TestSignatureHelp_LabelNamesTheCallee asserts Label leads with the
+// called function/method's own short name (matching gopls's own
+// signatureHelp label, e.g. "Add(a int, b int) int"), not the bare,
+// unnamed rendering types.TypeString(sig, ...) alone would produce (e.g.
+// "func(a int, b int) int") — see signatureLabel's own doc.
+func TestSignatureHelp_LabelNamesTheCallee(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "signature", "signature.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "return Add(1, 2)") + len("return Add(")
+
+	got, err := langfeat.SignatureHelp(cp, path, offset)
+	if err != nil {
+		t.Fatalf("SignatureHelp: %v", err)
+	}
+	if got == nil {
+		t.Fatal("SignatureHelp returned nil, want a result")
+	}
+	const want = "Add(a int, b int) int"
+	if got.Label != want {
+		t.Errorf("Label = %q, want %q", got.Label, want)
+	}
+}

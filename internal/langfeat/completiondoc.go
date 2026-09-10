@@ -25,13 +25,26 @@ type CompletionDocKey struct {
 
 // CompletionDocInfo is the result of resolving a CompletionDocKey: the
 // object's doc comment, if it is declared in the same package as the query
-// (Doc is then already the answer), or enough to look it up in a different
-// package's on-disk facts index (PkgPath/ObjPath) otherwise.
+// (Doc is then already the answer), enough to look it up in a different
+// package's on-disk facts index (PkgPath/ObjPath) otherwise, or — if the
+// candidate was actually an unimported-package-member completion item (see
+// Unimported) — UnimportedSelector, since this package has no graph access
+// to resolve that case itself (see ResolveCompletionDoc's own doc).
 type CompletionDocInfo struct {
 	Doc string
 
 	PkgPath string
 	ObjPath string
+
+	// UnimportedSelector is the base identifier's name (e.g. "fmt" for a
+	// "fmt.Sp" candidate with fmt not yet imported) when key's candidate came
+	// from the unimported-package-member completion path instead of an
+	// ordinary resolved object. The caller must redo the same
+	// package-name-to-import-path lookup its own unimported-completion
+	// pipeline used to build the candidate in the first place, find
+	// key.Label among that package's members, and doc it the same way a
+	// resolved PkgPath/ObjPath above would be.
+	UnimportedSelector string
 }
 
 // ResolveCompletionDoc re-derives the completion context at (key.File,
@@ -50,8 +63,11 @@ func ResolveCompletionDoc(cp *check.CheckedPackage, reader overlay.FileReader, k
 	}
 	path, _ := astutil.PathEnclosingInterval(astFile, ctxPos, ctxPos)
 
-	obj := objectForLabel(cp, ctxPos, path, key.Label)
+	obj, unimportedSelector := objectForLabel(cp, ctxPos, path, key.Label)
 	if obj == nil {
+		if unimportedSelector != "" {
+			return &CompletionDocInfo{UnimportedSelector: unimportedSelector}, nil
+		}
 		return nil, nil
 	}
 	if obj.Pkg() == cp.Package() {
@@ -74,9 +90,19 @@ func ResolveCompletionDoc(cp *check.CheckedPackage, reader overlay.FileReader, k
 // objectForLabel re-resolves the same completion context Completion uses
 // (an enclosing selector, or lexical scope) and looks up label directly as
 // a types.Object, rather than building the full []CompletionItem list.
-func objectForLabel(cp *check.CheckedPackage, ctxPos token.Pos, path []ast.Node, label string) types.Object {
+// unimportedSelector is non-empty only when obj is nil because the
+// enclosing selector's base matches unresolvedSelectorBase's shape (see its
+// own doc) — the caller's only path to a useful answer for that case.
+func objectForLabel(cp *check.CheckedPackage, ctxPos token.Pos, path []ast.Node, label string) (obj types.Object, unimportedSelector string) {
 	if sel := enclosingSelector(path); sel != nil {
-		return selectorObjectForLabel(cp, sel, label)
+		if obj := selectorObjectForLabel(cp, sel, label); obj != nil {
+			return obj, ""
+		}
+		name, ok := unresolvedSelectorBase(cp, sel)
+		if !ok {
+			return nil, ""
+		}
+		return nil, name
 	}
 	scope := cp.Package().Scope().Innermost(ctxPos)
 	if scope == nil {
@@ -84,10 +110,10 @@ func objectForLabel(cp *check.CheckedPackage, ctxPos token.Pos, path []ast.Node,
 	}
 	for s := scope; s != nil; s = s.Parent() {
 		if obj := s.Lookup(label); obj != nil {
-			return obj
+			return obj, ""
 		}
 	}
-	return nil
+	return nil, ""
 }
 
 // selectorObjectForLabel is objectForLabel's counterpart for "x.<label>"

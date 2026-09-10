@@ -89,12 +89,19 @@ func TestSemanticTokens_MethodAndReceiver(t *testing.T) {
 	}
 }
 
-func TestSemanticTokens_ConstIsReadonlyAndStatic(t *testing.T) {
+// TestSemanticTokens_ConstIsReadonlyNotStatic asserts a package-level
+// const carries ModReadonly but NOT ModStatic, matching gopls v0.23.0's
+// own `semtok` output (`gopls semtok` never tags a const "static", only a
+// package-level var — see audit-informational.md finding #11 and
+// staticModifiers' own doc). This used to assert readonly|static together
+// as intentional; that was gopls-diverging and has been corrected to match
+// gopls, the project's parity standard.
+func TestSemanticTokens_ConstIsReadonlyNotStatic(t *testing.T) {
 	toks, text, _ := semanticTokens(t, "semantic", "semantic.go")
 	tok := tokenAt(t, toks, text, "MaxShapes = 16")
-	want := langfeat.ModDefinition | langfeat.ModReadonly | langfeat.ModStatic
+	want := langfeat.ModDefinition | langfeat.ModReadonly
 	if tok.Kind != langfeat.TokenVariable || tok.Modifiers != want {
-		t.Errorf("MaxShapes = %+v, want Kind=TokenVariable Modifiers=%v (definition|readonly|static)", tok, want)
+		t.Errorf("MaxShapes = %+v, want Kind=TokenVariable Modifiers=%v (definition|readonly, no static)", tok, want)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"strings"
 
 	"github.com/sivchari/golance/internal/check"
 	"golang.org/x/tools/go/ast/astutil"
@@ -43,10 +44,44 @@ func SignatureHelp(cp *check.CheckedPackage, file string, offset int) (*SigInfo,
 	}
 
 	return &SigInfo{
-		Label:       types.TypeString(sig, qualifier(cp.Package())),
+		Label:       signatureLabel(call.Fun, sig, cp),
 		Params:      params,
 		ActiveParam: activeParamIndex(call, pos, sig),
 	}, nil
+}
+
+// signatureLabel renders sig as gopls itself does: the called function or
+// method's own short name in place of the bare "func" keyword
+// types.TypeString(sig, ...) would otherwise render a *types.Signature
+// with (e.g. "func(a int, b int) int" instead of "Add(a int, b int)
+// int") — matching gopls's own signatureHelp label exactly, since a
+// *types.Signature alone carries no name (that lives on the *types.Func,
+// not its Type()). fun with no resolvable short name (e.g. an
+// immediately-invoked function literal) falls back to the bare, unnamed
+// signature.
+func signatureLabel(fun ast.Expr, sig *types.Signature, cp *check.CheckedPackage) string {
+	label := types.TypeString(sig, qualifier(cp.Package()))
+	if name := calleeName(fun); name != "" {
+		return name + strings.TrimPrefix(label, "func")
+	}
+	return label
+}
+
+// calleeName returns the short (unqualified, receiver-less) name of the
+// function or method fun (a call expression's Fun) resolves to: the
+// identifier itself for a plain call, or the selector's own name for a
+// method call or package-qualified call — matching how gopls's own
+// signatureHelp label names the callee. "" for anything else (e.g. a
+// function literal), which signatureLabel falls back on.
+func calleeName(fun ast.Expr) string {
+	switch e := fun.(type) {
+	case *ast.Ident:
+		return e.Name
+	case *ast.SelectorExpr:
+		return e.Sel.Name
+	default:
+		return ""
+	}
 }
 
 // enclosingCall returns the nearest *ast.CallExpr in path, or nil if path

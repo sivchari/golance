@@ -1,9 +1,10 @@
 package check
 
 import (
+	"go/scanner"
 	"go/token"
-	"unicode"
-	"unicode/utf8"
+	"go/types"
+	"reflect"
 
 	"github.com/sivchari/golance/internal/overlay"
 )
@@ -38,72 +39,108 @@ type Diag struct {
 func Diagnostics(cp *CheckedPackage, reader overlay.FileReader) []Diag {
 	var out []Diag
 	for _, e := range cp.parseErrs {
-		if d, ok := diagAt(reader, e.Pos, e.Msg, SeverityError); ok {
+		if d, ok := diagAt(reader, e.Pos, e.Pos, e.Msg, SeverityError); ok {
 			out = append(out, d)
 		}
 	}
 	for _, e := range cp.typeErrs {
-		pos := cp.fset.Position(e.Pos)
+		start, end, ok := typeErrorRange(cp.fset, e)
+		if !ok {
+			start = cp.fset.Position(e.Pos)
+			end = start
+		}
 		sev := SeverityError
 		if e.Soft {
 			sev = SeverityWarning
 		}
-		if d, ok := diagAt(reader, pos, e.Msg, sev); ok {
+		if d, ok := diagAt(reader, start, end, e.Msg, sev); ok {
 			out = append(out, d)
 		}
 	}
 	return out
 }
 
-// diagAt builds a Diag at pos, extending the end position to the end of the
-// identifier starting at pos when there is one, otherwise leaving start and
-// end equal.
-func diagAt(reader overlay.FileReader, pos token.Position, msg string, sev Severity) (Diag, bool) {
-	text, err := reader.ReadFile(pos.Filename)
+// diagAt builds a Diag spanning [start, end). When start and end are equal —
+// a parse error (which carries only one position), or a type error whose own
+// span collapsed to zero-width (see typeErrorRange) — end is extended to the
+// end of the token starting at start, so the diagnostic is never zero-width
+// when the underlying source has an actual token there.
+func diagAt(reader overlay.FileReader, start, end token.Position, msg string, sev Severity) (Diag, bool) {
+	text, err := reader.ReadFile(start.Filename)
 	if err != nil {
 		return Diag{}, false
 	}
-	start, ok := overlay.UTF16PositionForByteOffset(text, pos.Offset)
+	startPos, ok := overlay.UTF16PositionForByteOffset(text, start.Offset)
 	if !ok {
 		return Diag{}, false
 	}
-	end := start
-	if endOffset := identEnd(text, pos.Offset); endOffset > pos.Offset {
+	endOffset := end.Offset
+	if endOffset <= start.Offset {
+		endOffset = identEnd(text, start.Offset)
+	}
+	endPos := startPos
+	if endOffset > start.Offset {
 		if e, ok := overlay.UTF16PositionForByteOffset(text, endOffset); ok {
-			end = e
+			endPos = e
 		}
 	}
 	return Diag{
-		File:      pos.Filename,
-		StartLine: start.Line,
-		StartCol:  start.Character,
-		EndLine:   end.Line,
-		EndCol:    end.Character,
+		File:      start.Filename,
+		StartLine: startPos.Line,
+		StartCol:  startPos.Character,
+		EndLine:   endPos.Line,
+		EndCol:    endPos.Character,
 		Message:   msg,
 		Severity:  sev,
 	}, true
 }
 
-// identEnd returns the byte offset one past the identifier starting at
-// offset in text, or offset itself if text[offset:] does not start with an
-// identifier.
-func identEnd(text []byte, offset int) int {
-	i := offset
-	first := true
-	for i < len(text) {
-		r, size := utf8.DecodeRune(text[i:])
-		if !isIdentRune(r, first) {
-			break
-		}
-		i += size
-		first = false
+// typeErrorRange extracts the precise span err's own producer (go/types)
+// computed for it — e.g. an entire CallExpr or CompositeLit, not just its
+// start — via the unexported go116start/go116end fields every types.Error
+// has carried since Go 1.16 (the same fields
+// golang.org/x/tools/internal/typesinternal.ErrorCodeStartEnd reads,
+// by the identical reflection technique, pending the still-open proposal
+// https://go.dev/issue/71803 to make them part of the public API: this is
+// what lets gopls itself report a type error's true extent instead of a
+// single position). ok is false if the fields are unreadable (a future Go
+// version could remove them) or the span collapsed to zero-width, in which
+// case the caller falls back to a token-boundary heuristic.
+func typeErrorRange(fset *token.FileSet, err types.Error) (start, end token.Position, ok bool) {
+	v := reflect.ValueOf(err)
+	startField := v.FieldByName("go116start")
+	endField := v.FieldByName("go116end")
+	if !startField.IsValid() || !endField.IsValid() {
+		return token.Position{}, token.Position{}, false
 	}
-	return i
+	startPos, endPos := token.Pos(startField.Int()), token.Pos(endField.Int())
+	if !startPos.IsValid() || !endPos.IsValid() || startPos == endPos {
+		return token.Position{}, token.Position{}, false
+	}
+	return fset.Position(startPos), fset.Position(endPos), true
 }
 
-func isIdentRune(r rune, first bool) bool {
-	if first {
-		return unicode.IsLetter(r) || r == '_'
+// identEnd returns the byte offset one past the token starting at offset in
+// text — an identifier, keyword, or literal (string, rune, number) — or
+// offset itself if text[offset:] does not start with one of those.
+func identEnd(text []byte, offset int) int {
+	if offset < 0 || offset >= len(text) {
+		return offset
 	}
-	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
+	fset := token.NewFileSet()
+	f := fset.AddFile("", fset.Base(), len(text)-offset)
+	var s scanner.Scanner
+	s.Init(f, text[offset:], nil, 0)
+	pos, tok, lit := s.Scan()
+	if f.Offset(pos) != 0 {
+		return offset
+	}
+	switch {
+	case tok.IsLiteral(): // IDENT, INT, FLOAT, IMAG, CHAR, STRING
+		return offset + len(lit)
+	case tok.IsKeyword():
+		return offset + len(tok.String())
+	default:
+		return offset
+	}
 }

@@ -404,10 +404,11 @@ func bodylessFuncIdents(astFile *ast.File) map[*ast.Ident]bool {
 // ModDefinition — so callers may cache the result per obj.
 func staticModifiers(cp *check.CheckedPackage, obj types.Object, kind TokenKind) TokenModifier {
 	var m TokenModifier
-	if _, ok := obj.(*types.Const); ok {
+	_, isConst := obj.(*types.Const)
+	if isConst {
 		m |= ModReadonly
 	}
-	if kind == TokenVariable && isPackageLevel(obj) {
+	if kind == TokenVariable && !isConst && isPackageLevel(obj) {
 		m |= ModStatic
 	}
 	if canBeDeprecated(kind, obj) && isDeprecated(cp, obj) {

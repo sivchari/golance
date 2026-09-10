@@ -2,12 +2,21 @@ package xref
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/sivchari/golance/internal/index"
 	"github.com/sivchari/golance/internal/store"
+	"golang.org/x/tools/go/ast/astutil"
 )
 
 // toUint32Pos converts line and col — always non-negative in practice, an
@@ -42,9 +51,12 @@ func (r *Resolver) Definition(ctx context.Context, file string, line, col int) (
 	if err != nil {
 		return nil, err
 	}
-	_, _, loc, ok := r.symbolByHash(ctx, target.PkgHash, target.IDHash)
-	if !ok {
-		return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
+	_, _, loc, err := r.symbolByHash(ctx, target.PkgHash, target.IDHash)
+	if err != nil {
+		if errors.Is(err, errSymbolNotFound) {
+			return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
+		}
+		return nil, err
 	}
 	return []Location{loc}, nil
 }
@@ -101,9 +113,12 @@ func (r *Resolver) References(ctx context.Context, file string, line, col int, i
 
 	var out []Location
 	if includeDecl {
-		_, _, loc, ok := r.symbolByHash(ctx, target.PkgHash, target.IDHash)
-		if !ok {
-			return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
+		_, _, loc, err := r.symbolByHash(ctx, target.PkgHash, target.IDHash)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
+			}
+			return nil, err
 		}
 		out = append(out, loc)
 	}
@@ -257,9 +272,12 @@ func (r *Resolver) symbolInfoFromIDHash(ctx context.Context, idHash uint64) (Sym
 		if !ok {
 			continue
 		}
-		name, kind, loc, ok := r.symbolByHash(ctx, store.Hash(pkgPath), idHash)
-		if !ok {
-			continue
+		name, kind, loc, err := r.symbolByHash(ctx, store.Hash(pkgPath), idHash)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				continue
+			}
+			return SymbolInfo{}, false, err
 		}
 		return SymbolInfo{Name: name, Kind: kind, Container: pkgPath, Location: loc}, true, nil
 	}
@@ -289,9 +307,12 @@ func (r *Resolver) Rename(ctx context.Context, file string, line, col int, newNa
 		return nil, err
 	}
 
-	_, _, declLoc, ok := r.symbolByHash(ctx, target.PkgHash, target.IDHash)
-	if !ok {
-		return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
+	_, _, declLoc, err := r.symbolByHash(ctx, target.PkgHash, target.IDHash)
+	if err != nil {
+		if errors.Is(err, errSymbolNotFound) {
+			return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
+		}
+		return nil, err
 	}
 	refs, err := r.locationsForAll(ctx, []resolvedSymbol{target})
 	if err != nil {
@@ -320,7 +341,222 @@ func (r *Resolver) Rename(ctx context.Context, file string, line, col int, newNa
 	for _, loc := range locs {
 		edits[loc.File] = append(edits[loc.File], Edit{Line: loc.Line, Col: loc.Col, EndCol: loc.EndCol, NewText: newName})
 	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	docEdits, err := docCommentEdits(declLoc.File, declLoc.Line, declLoc.Col, target.Name, newName)
+	if err != nil {
+		return nil, err
+	}
+	edits[declLoc.File] = append(edits[declLoc.File], docEdits...)
+
 	return edits, nil
+}
+
+// docCommentEdits returns the edits needed to rewrite every whole-word
+// occurrence of oldName within the doc comment gopls v0.23.0's own renamer
+// (internal/golang/rename.go's docComment, in golang.org/x/tools/gopls)
+// would rewrite for the declaration at (file, declLine, declCol) -- not a
+// "the comment starts with the name" prefix check, despite that being the
+// documented Go convention a doc comment follows: gopls instead walks up
+// from the declaring identifier to the nearest enclosing *ast.FuncDecl,
+// *ast.Field, *ast.GenDecl, or a *ast.TypeSpec/*ast.ValueSpec that carries
+// its own Doc (see findDocOwner), and, once such a CommentGroup is found,
+// regexp-replaces every \bOLDNAME\b match anywhere within it -- including a
+// later line of a multi-line comment, and every repeated mention on one
+// line -- not merely a leading occurrence. A comment belonging to a
+// different declaration that merely mentions the same text is never
+// touched, because the walk only ever starts from oldName's own declaring
+// identifier. Returns (nil, nil) when that declaration has no such comment
+// to rewrite.
+//
+// Deliberate divergence: gopls's own rename separately rewrites doc-link
+// references elsewhere in the package, e.g. "[pkg.Box]" in an unrelated
+// declaration's comment (see gopls's updateCommentDocLinks). This function
+// only ever touches the renamed declaration's OWN doc comment, matching
+// this package's existing "edit whatever the type-checked facts index
+// resolves, not free text elsewhere" scope for Rename (see the func's own
+// doc); closing that separate gap is future work, not part of this fix.
+func docCommentEdits(file string, declLine, declCol uint32, oldName, newName string) ([]Edit, error) {
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		return nil, fmt.Errorf("xref: read %s for doc comment rename: %w", file, err)
+	}
+	fset := token.NewFileSet()
+	astFile, err := parser.ParseFile(fset, file, data, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("xref: parse %s for doc comment rename: %w", file, err)
+	}
+
+	id := identAt(fset, astFile, declLine, declCol, oldName)
+	if id == nil {
+		return nil, nil
+	}
+	path, _ := astutil.PathEnclosingInterval(astFile, id.Pos(), id.End())
+	doc := findDocOwner(fset, astFile, id, path)
+	if doc == nil {
+		return nil, nil
+	}
+
+	tf := fset.File(astFile.Pos())
+	nameRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(oldName) + `\b`)
+	var edits []Edit
+	for _, c := range doc.List {
+		if isDirectiveComment(c.Text) {
+			continue
+		}
+		// go/parser strips \r from Comment.Text, so a later line's start is
+		// looked up from tf's own line table (tf.LineStart) rather than
+		// derived by summing stripped-line lengths, keeping byte offsets
+		// correct even when the source uses CRLF line endings.
+		lines := strings.Split(c.Text, "\n")
+		firstLine := tf.Line(c.Pos())
+		for i, line := range lines {
+			lineStart := c.Pos()
+			if i > 0 {
+				lineStart = tf.LineStart(firstLine + i)
+			}
+			for _, m := range nameRe.FindAllStringIndex(line, -1) {
+				start := tf.Position(lineStart + token.Pos(m[0]))
+				end := tf.Position(lineStart + token.Pos(m[1]))
+				edits = append(edits, Edit{
+					Line:    u32pos(start.Line),
+					Col:     u32pos(start.Column),
+					EndCol:  u32pos(end.Column),
+					NewText: newName,
+				})
+			}
+		}
+	}
+	return edits, nil
+}
+
+// u32pos converts a go/token.Position's Line or Column (always positive
+// for a position go/parser itself produced) to uint32, panicking on the
+// same "this should be structurally impossible" grounds as resolver.go's
+// u32len.
+func u32pos(n int) uint32 {
+	if n < 0 || n > math.MaxUint32 {
+		panic(fmt.Sprintf("xref: position %d out of uint32 range", n))
+	}
+	return uint32(n)
+}
+
+// identAt returns the *ast.Ident named name positioned at exactly (line,
+// col) in astFile, or nil if none does -- there is always at most one,
+// since two identifiers can never start at the same byte position.
+func identAt(fset *token.FileSet, astFile *ast.File, line, col uint32, name string) *ast.Ident {
+	var found *ast.Ident
+	ast.Inspect(astFile, func(n ast.Node) bool {
+		if found != nil {
+			return false
+		}
+		id, ok := n.(*ast.Ident)
+		if !ok || id.Name != name {
+			return true
+		}
+		pos := fset.Position(id.Pos())
+		if u32pos(pos.Line) == line && u32pos(pos.Column) == col {
+			found = id
+		}
+		return true
+	})
+	return found
+}
+
+// findDocOwner returns the doc comment gopls's own renamer would rewrite
+// for id, whose ancestor chain -- innermost (id itself) first -- is path,
+// as returned by [astutil.PathEnclosingInterval]. Mirrors gopls's
+// internal/golang.docComment: the first *ast.FuncDecl, *ast.Field, or
+// *ast.GenDecl found while walking outward owns the comment; a
+// *ast.TypeSpec or *ast.ValueSpec only owns it if it carries its own Doc
+// (a per-spec comment inside a grouped declaration), otherwise the walk
+// continues past it to its own enclosing GenDecl; any other node kind
+// means there is no doc comment, with one exception -- gopls also treats a
+// comment immediately above a "name := expr" statement as that
+// declaration's doc, since ":=" has no Doc field of its own to carry one
+// (see precedingComment).
+func findDocOwner(fset *token.FileSet, astFile *ast.File, id *ast.Ident, path []ast.Node) *ast.CommentGroup {
+	for _, n := range path {
+		switch decl := n.(type) {
+		case *ast.FuncDecl:
+			return decl.Doc
+		case *ast.Field:
+			return decl.Doc
+		case *ast.GenDecl:
+			return decl.Doc
+		case *ast.TypeSpec:
+			if decl.Doc != nil {
+				return decl.Doc
+			}
+		case *ast.ValueSpec:
+			if decl.Doc != nil {
+				return decl.Doc
+			}
+		case *ast.Ident:
+			// id itself, the walk's own starting point; keep going outward.
+		case *ast.AssignStmt:
+			if decl.Tok != token.DEFINE {
+				return nil
+			}
+			return precedingComment(fset, astFile, id)
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// precedingComment returns the comment group ending on the line
+// immediately above id's own line, the ":=" doc-comment convention
+// findDocOwner's *ast.AssignStmt case implements.
+func precedingComment(fset *token.FileSet, astFile *ast.File, id *ast.Ident) *ast.CommentGroup {
+	identLine := fset.Position(id.Pos()).Line
+	for _, c := range astFile.Comments {
+		if c.Pos() > id.Pos() {
+			continue
+		}
+		if fset.Position(c.End()).Line+1 == identLine {
+			return c
+		}
+	}
+	return nil
+}
+
+// isDirectiveComment reports whether text -- a single "//"-style comment
+// line's full text, including its leading "//" -- is a compiler or tool
+// directive (e.g. "//go:generate", "//line file:1") rather than doc prose,
+// using the same "//line " / "//[a-z0-9]+:[a-z0-9]" shape go/printer and
+// gopls itself both recognize a directive by. Rename must skip these:
+// rewriting inside one would corrupt the directive instead of renaming a
+// mention of oldName, and a directive is never doc prose in the first
+// place.
+func isDirectiveComment(text string) bool {
+	if len(text) < 3 || text[1] != '/' {
+		return false
+	}
+	c := text[2:]
+	if c == "" {
+		return false
+	}
+	if strings.HasPrefix(c, "line ") {
+		return true
+	}
+	colon := strings.IndexByte(c, ':')
+	if colon <= 0 || colon+1 >= len(c) {
+		return false
+	}
+	for i := 0; i <= colon+1; i++ {
+		if i == colon {
+			continue
+		}
+		b := c[i]
+		if (b < 'a' || b > 'z') && (b < '0' || b > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // embeddedFieldSymbols returns the resolvedSymbol for the promoted field

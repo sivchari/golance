@@ -15,8 +15,8 @@ import (
 // matches, or ctx is canceled.
 func (r *Resolver) TypeDeclaration(ctx context.Context, pkgPath, objPath string) (Location, bool) {
 	idHash := store.Hash(store.BuildSymbolID(pkgPath, objPath))
-	_, _, loc, ok := r.symbolByHash(ctx, store.Hash(pkgPath), idHash)
-	return loc, ok
+	_, _, loc, err := r.symbolByHash(ctx, store.Hash(pkgPath), idHash)
+	return loc, err == nil
 }
 
 // SymbolDoc returns the doc comment recorded for the object identified by

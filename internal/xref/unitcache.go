@@ -59,6 +59,28 @@ const entrySizeOverhead = 64
 // individually are; copying breaks that aliasing so an entry retains
 // (and size accounts for) only the bytes its callers actually use.
 //
+// get trusts a BlobKey match with no further verification, unlike this
+// package's own SymbolID hash resolution (symbolByHash's callers, and
+// internal/store.DB.VerifySymbolIDString more generally — see
+// store.Hash's doc on why THAT one verifies): the two are not actually
+// symmetric risks. Verifying a SymbolID hash means checking it against the
+// one specific original string a caller already has in hand, out of the
+// many genuinely different SymbolID strings across a whole workspace's
+// worth of symbols that could plausibly share a 64-bit bucket. A BlobKey
+// collision would instead have to be a genuine collision in
+// internal/index's computeUnitKey (ownHash, deps) formula — index.Build/
+// Reindex's own write path, which unitCache never influences or
+// independently observes — and unitCache has no analogous "original" to
+// re-check a get() hit against: entry.facts/entry.export ARE what was
+// decoded from cas.Get(blobKey) at put time (see put's doc), so comparing
+// them to themselves would verify nothing. A colliding BlobKey would
+// already make cas.Get(blobKey) itself return the wrong blob to whichever
+// caller decoded it fresh, before unitCache is ever involved — the same
+// accepted, unavoidable 64-bit-hash risk implementation.go's
+// MethodFingerprint doc and store.UnitPointer's own field docs (PkgHash,
+// ContentHash, ExportHash, ...) already carry for every other hash this
+// codebase persists.
+//
 // Safe for concurrent use: Resolver's own methods are called concurrently
 // by the server's request dispatch (see Resolver's doc), so every access
 // below is serialized by mu, mirroring internal/typecheck.Cache's own

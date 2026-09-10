@@ -2,6 +2,7 @@ package check
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -122,6 +123,59 @@ func TestEngine_Invalidate_CancelsInFlightRecheck(t *testing.T) {
 	})
 }
 
+// flakyReader wraps a FileReader so its first n ReadFile calls (across every
+// path) fail with a transient-looking error, and every call after that
+// passes straight through — modeling a directory read racing an external
+// file rewrite (git checkout, an editor's atomic save) that clears up on its
+// own by the time a retry reads it again.
+type flakyReader struct {
+	overlay.FileReader
+	remaining int32
+}
+
+func (f *flakyReader) ReadFile(path string) ([]byte, error) {
+	if atomic.AddInt32(&f.remaining, -1) >= 0 {
+		return nil, fmt.Errorf("flakyReader: transient read failure for %s", path)
+	}
+	return f.FileReader.ReadFile(path)
+}
+
+// TestEngine_FireRecheck_RetriesTransientReadFailure is a regression test
+// for Finding H6: a debounce-triggered background recheck (fireRecheck) that
+// hits a transient read failure used to discard runRecheck's result outright
+// and never retry, leaving diagnostics frozen with nothing left to
+// retrigger a check for the directory. Two failures are enough to fail both
+// of canonicalPackageName's own attempts (the known-goFiles probe and its
+// candidates fallback) within a single runRecheck call, forcing resolveFiles
+// itself to fail — the same shape a real racing rewrite produces.
+func TestEngine_FireRecheck_RetriesTransientReadFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		reader := &flakyReader{FileReader: overlay.New(), remaining: 2}
+		var mu sync.Mutex
+		var count int
+
+		e, root := newTestEngine(t, reader, Options{
+			DebounceDelay: 20 * time.Millisecond,
+			OnResult: func(*Result) {
+				mu.Lock()
+				count++
+				mu.Unlock()
+			},
+		})
+		dir := filepath.Join(root, "debounce")
+
+		e.Invalidate(dir)
+		time.Sleep(300 * time.Millisecond)
+
+		mu.Lock()
+		got := count
+		mu.Unlock()
+		if got != 1 {
+			t.Fatalf("OnResult called %d times, want 1 (a transient read failure must be retried, not silently dropped)", got)
+		}
+	})
+}
+
 // TestEngine_Stop_CancelsInFlightBackgroundRecheck covers the fix for
 // Finding 5: a debounce-triggered background recheck already in flight when
 // the caller (e.g. Server.setWorkspace, discarding this Engine for a fresh
@@ -163,6 +217,81 @@ func TestEngine_Stop_CancelsInFlightBackgroundRecheck(t *testing.T) {
 		mu.Unlock()
 		if got != 0 {
 			t.Fatalf("OnResult called %d times after Stop, want 0 (the in-flight job must be canceled before it can publish)", got)
+		}
+	})
+}
+
+// TestEngine_Wait_ReturnsPromptlyAfterStopCancelsPendingTimer is a
+// regression test for a debounceWG accounting bug: Stop successfully
+// canceling a debounce timer that had not yet fired must balance the Add
+// armDebounceLocked made for it, or Wait — a caller's only way to block
+// until no in-flight recheck can still be touching disk, see Wait's own
+// doc — hangs forever for the overwhelmingly common case (a test whose
+// debounce delay never actually elapses before cleanup runs Stop).
+func TestEngine_Wait_ReturnsPromptlyAfterStopCancelsPendingTimer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e, root := newTestEngine(t, overlay.New(), Options{DebounceDelay: 200 * time.Millisecond})
+		dir := filepath.Join(root, "debounce")
+
+		e.Invalidate(dir)
+		e.Stop()
+
+		done := make(chan struct{})
+		go func() {
+			e.Wait()
+			close(done)
+		}()
+		synctest.Wait()
+		select {
+		case <-done:
+		default:
+			t.Fatal("Wait() did not return once every bubble goroutine settled; Stop canceling a never-fired timer left debounceWG's counter unbalanced")
+		}
+	})
+}
+
+// TestEngine_Wait_BlocksUntilInFlightRecheckActuallyFinishes covers the
+// other half of Wait's contract: it must still block for a recheck that
+// had already started (past armDebounceLocked, mid-runRecheck) when Stop
+// canceled it, until that goroutine actually returns — not just until
+// Stop's own call completes, which per Stop's own doc cannot make that
+// happen instantaneously.
+func TestEngine_Wait_BlocksUntilInFlightRecheckActuallyFinishes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		gr := &gatingReader{
+			FileReader: overlay.New(),
+			started:    make(chan struct{}),
+			release:    make(chan struct{}),
+		}
+		e, root := newTestEngine(t, gr, Options{DebounceDelay: 20 * time.Millisecond})
+		dir := filepath.Join(root, "debounce")
+
+		e.Invalidate(dir)
+		select {
+		case <-gr.started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("background recheck never started")
+		}
+
+		e.Stop()
+
+		done := make(chan struct{})
+		go func() {
+			e.Wait()
+			close(done)
+		}()
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("Wait() returned before the in-flight recheck's gated read was ever released")
+		default:
+		}
+
+		close(gr.release)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Wait() never returned after the in-flight recheck finished")
 		}
 	})
 }

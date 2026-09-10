@@ -2,6 +2,7 @@ package xref
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go/types"
 	"sort"
@@ -86,12 +87,17 @@ func (r *Resolver) confirmSupertypeCandidate(ctx context.Context, k candidateKey
 	if err := ctx.Err(); err != nil {
 		return TypeHierarchyItemInfo{}, false, err
 	}
-	iname, _, loc, ok := r.symbolByHash(ctx, k.PkgHash, k.TypeSymbolIDHash)
-	if !ok {
-		return TypeHierarchyItemInfo{}, false, nil
+	iname, _, loc, err := r.symbolByHash(ctx, k.PkgHash, k.TypeSymbolIDHash)
+	if err != nil {
+		if errors.Is(err, errSymbolNotFound) {
+			diag.skipCandidate(k, err)
+			return TypeHierarchyItemInfo{}, false, nil
+		}
+		return TypeHierarchyItemInfo{}, false, err
 	}
 	ipath, ok := r.pkgPathByHash[k.PkgHash]
 	if !ok {
+		diag.skipCandidate(k, errUnknownDefiningPackage)
 		return TypeHierarchyItemInfo{}, false, nil
 	}
 	inamed, err := r.resolveNamed(ctx, ipath, iname)
@@ -199,13 +205,18 @@ func interfaceFingerprints(iface *types.Interface, generic bool) map[string]uint
 // unexported candidate is resolvable this way), falling back to a live
 // types.Implements decode when generic or the fingerprints do not confirm.
 func (r *Resolver) confirmSubtypeCandidate(ctx context.Context, k candidateKey, byName map[string][]store.MethodEntry, iface *types.Interface, names []string, ifaceFPs map[string]uint64, generic bool, diag *implDiag) (TypeHierarchyItemInfo, bool, error) {
-	cname, ckind, loc, ok := r.symbolByHash(ctx, k.PkgHash, k.TypeSymbolIDHash)
-	if !ok {
-		return TypeHierarchyItemInfo{}, false, nil
+	cname, ckind, loc, err := r.symbolByHash(ctx, k.PkgHash, k.TypeSymbolIDHash)
+	if err != nil {
+		if errors.Is(err, errSymbolNotFound) {
+			diag.skipCandidate(k, err)
+			return TypeHierarchyItemInfo{}, false, nil
+		}
+		return TypeHierarchyItemInfo{}, false, err
 	}
 	isInterface := ckind == index.KindInterface
 	cpath, ok := r.pkgPathByHash[k.PkgHash]
 	if !ok {
+		diag.skipCandidate(k, errUnknownDefiningPackage)
 		return TypeHierarchyItemInfo{}, false, nil
 	}
 	if !generic && fingerprintsConfirm(byName, names, ifaceFPs) {
@@ -320,12 +331,27 @@ func (r *Resolver) methodEntriesOfEitherKind(ctx context.Context, methodName str
 	diag.recordLookup(methodName, len(entries))
 	set := make(map[candidateKey][]store.MethodEntry, len(entries))
 	for _, e := range entries {
-		_, kind, _, ok := r.symbolByHash(ctx, e.PkgHash, e.TypeSymbolIDHash)
-		if !ok || (kind != index.KindType && kind != index.KindInterface) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		_, kind, _, err := r.symbolByHash(ctx, e.PkgHash, e.TypeSymbolIDHash)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		if kind != index.KindType && kind != index.KindInterface {
 			continue
 		}
-		_, mKind, _, mOk := r.symbolByHash(ctx, e.MethodPkgHash, e.MethodIDHash)
-		if !mOk || mKind != index.KindMethod {
+		_, mKind, _, err := r.symbolByHash(ctx, e.MethodPkgHash, e.MethodIDHash)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		if mKind != index.KindMethod {
 			continue
 		}
 		k := candidateKey{PkgHash: e.PkgHash, TypeSymbolIDHash: e.TypeSymbolIDHash}

@@ -248,9 +248,12 @@ func (r *Resolver) resolveAt(ctx context.Context, file string, line, col uint32)
 	}
 
 	if ref, ok := v.RefsAt(fileIdx, line, col); ok {
-		out, found := r.resolveRefTarget(ctx, ref)
-		if !found {
-			return resolvedSymbol{}, fmt.Errorf("xref: no symbol at %s:%d:%d", file, line, col)
+		out, err := r.resolveRefTarget(ctx, ref)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				return resolvedSymbol{}, fmt.Errorf("xref: no symbol at %s:%d:%d", file, line, col)
+			}
+			return resolvedSymbol{}, err
 		}
 		return out, nil
 	}
@@ -262,13 +265,22 @@ func (r *Resolver) resolveAt(ctx context.Context, file string, line, col uint32)
 
 // resolveRefTarget looks up ref's target symbol's kind and name from its
 // defining package's facts.
-func (r *Resolver) resolveRefTarget(ctx context.Context, ref store.Ref) (resolvedSymbol, bool) {
-	name, kind, _, ok := r.symbolByHash(ctx, ref.ToPkgHash(), ref.ToSymbolIDHash())
-	if !ok {
-		return resolvedSymbol{}, false
+func (r *Resolver) resolveRefTarget(ctx context.Context, ref store.Ref) (resolvedSymbol, error) {
+	name, kind, _, err := r.symbolByHash(ctx, ref.ToPkgHash(), ref.ToSymbolIDHash())
+	if err != nil {
+		return resolvedSymbol{}, err
 	}
-	return resolvedSymbol{PkgHash: ref.ToPkgHash(), IDHash: ref.ToSymbolIDHash(), Kind: kind, Name: name}, true
+	return resolvedSymbol{PkgHash: ref.ToPkgHash(), IDHash: ref.ToSymbolIDHash(), Kind: kind, Name: name}, nil
 }
+
+// errSymbolNotFound is symbolByHash's sentinel for an ordinary miss: idHash
+// names nothing in pkgHash's current facts, or those facts do not exist at
+// all. Every genuine failure symbolByHash can hit ends up as this same
+// error, EXCEPT ctx being canceled or timing out, which symbolByHash always
+// returns as-is (see its own doc) so a caller can tell the two apart with a
+// plain errors.Is check instead of both looking identically like "no such
+// candidate".
+var errSymbolNotFound = errors.New("xref: symbol not found")
 
 // symbolByHash returns the name, kind, and declaration location recorded for
 // idHash in pkgHash's facts blob. It goes through unitBlob (full), not a
@@ -279,25 +291,38 @@ func (r *Resolver) resolveRefTarget(ctx context.Context, ref store.Ref) (resolve
 // types.Implements) — a Facts-only read here would cost a partial read now
 // and a full read again right after, strictly more bytes than one full
 // read up front.
-func (r *Resolver) symbolByHash(ctx context.Context, pkgHash, idHash uint64) (name string, kind uint8, loc Location, ok bool) {
+//
+// The returned error is always either errSymbolNotFound (see its doc) or,
+// when ctx was canceled or timed out during unitBlob's read, ctx's own
+// error unwrapped from it: a candidate-resolution loop over many
+// symbolByHash calls (implementation.go's implementingTypes and its
+// siblings) must check for the latter with errors.Is(err, ctx.Err()) or
+// simply propagate any non-errSymbolNotFound error outward, rather than
+// `continue`-ing past it the same way it does an ordinary miss — doing so
+// would silently turn a query that was actually interrupted partway
+// through into what looks like a complete, merely-empty(er) result.
+func (r *Resolver) symbolByHash(ctx context.Context, pkgHash, idHash uint64) (name string, kind uint8, loc Location, err error) {
 	u, err := r.unitBlob(ctx, pkgHash)
 	if err != nil {
-		return "", 0, Location{}, false
+		if cerr := ctx.Err(); cerr != nil {
+			return "", 0, Location{}, cerr
+		}
+		return "", 0, Location{}, errSymbolNotFound
 	}
 	v, err := store.NewView(u.Facts)
 	if err != nil {
-		return "", 0, Location{}, false
+		return "", 0, Location{}, errSymbolNotFound
 	}
 	s, found := v.LookupSymbol(idHash)
 	if !found {
-		return "", 0, Location{}, false
+		return "", 0, Location{}, errSymbolNotFound
 	}
 	path, err := v.FileAt(int(s.FileIdx()))
 	if err != nil {
-		return "", 0, Location{}, false
+		return "", 0, Location{}, errSymbolNotFound
 	}
 	loc = Location{File: absPath(r.root, path, r.relative), Line: s.Line(), Col: s.Col(), EndCol: s.Col() + u32len(len(s.Name()))}
-	return s.Name(), s.Kind(), loc, true
+	return s.Name(), s.Kind(), loc, nil
 }
 
 // resolveNamed decodes pkgPath's export data through r's shared cache and

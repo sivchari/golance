@@ -419,7 +419,11 @@ func TestWorkspaceSymbol_NoMatch(t *testing.T) {
 // Rename touches inpkgtest's in-package "_test.go" file too, the same
 // closure-independent completeness fix described in
 // TestReferences_SpansDefiningAndReferencingPackages' doc (Rename shares
-// locationsForAll with References).
+// locationsForAll with References). impl.go's count is one more than
+// References' own 4: testdata/module/impl/impl.go:5's "// Person
+// implements Greeter via Greet." is Person's own doc comment, and
+// docCommentEdits rewrites it too (see TestRename_MatchesGoplsDocComment
+// for the matrix of doc-comment cases this covers).
 func TestRename_EditsEveryReferenceAcrossFiles(t *testing.T) {
 	r, snap := newTestResolver(t)
 
@@ -435,7 +439,7 @@ func TestRename_EditsEveryReferenceAcrossFiles(t *testing.T) {
 	user2File := goFile(t, snap, pkgUser2, "user2.go")
 	inpkgtestTestFile := inpkgtestTestFile(t, snap)
 
-	want := map[string]int{implFile: 4, userFile: 2, user2File: 1, inpkgtestTestFile: 2}
+	want := map[string]int{implFile: 5, userFile: 2, user2File: 1, inpkgtestTestFile: 2}
 	if len(edits) != len(want) {
 		t.Fatalf("Rename touched %d files, want %d: %+v", len(edits), len(want), edits)
 	}
