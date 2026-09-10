@@ -214,6 +214,94 @@ func TestSnapshot_ClosureUnits(t *testing.T) {
 	}
 }
 
+// TestSnapshot_ClosureUnits_IncludesTestOnlyImporter is H11's regression
+// test: testdata/testimportclosure's consumer package has NO production
+// import of dep at all — only consumer_test.go (an in-package test file)
+// does, recorded on Package.TestImports rather than Imports (see
+// TestLoad_TestOnlyImports's identical fixture shape). Before revDeps also
+// walked TestImports, ClosureUnits(dep) never reached consumer at all, so a
+// reindex driven off dep's export data change never revisited consumer's
+// test-only facts, leaving them stale indefinitely.
+func TestSnapshot_ClosureUnits_IncludesTestOnlyImporter(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("testdata", "testimportclosure"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	snap, err := Load(Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	const depPath = "example.com/closuretest/dep"
+	const consumerPath = "example.com/closuretest/consumer"
+
+	consumer, ok := snap.Package(consumerPath)
+	if !ok {
+		t.Fatalf("Package(%s) missing", consumerPath)
+	}
+	if slices.Contains(consumer.Imports, depPath) {
+		t.Fatalf("fixture invalid: Package(%s).Imports already contains %s; this test needs a TEST-ONLY edge (see Package.TestImports's doc)", consumerPath, depPath)
+	}
+	if !slices.Contains(consumer.TestImports, depPath) {
+		t.Fatalf("fixture invalid: Package(%s).TestImports = %v, want it to contain %s", consumerPath, consumer.TestImports, depPath)
+	}
+
+	got := snap.ClosureUnits(depPath)
+	if !slices.Contains(got, consumerPath) {
+		t.Errorf("ClosureUnits(%s) = %v, want it to include %s (an in-package-test-only importer)", depPath, got, consumerPath)
+	}
+	n := 0
+	for _, p := range got {
+		if p == consumerPath {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("ClosureUnits(%s) lists %s %d time(s), want exactly 1 (no double-count across Imports/TestImports)", depPath, consumerPath, n)
+	}
+}
+
+// TestLoad_TestOnlyImportCycleDoesNotFail is H11's cycle-safety regression
+// test: testdata/testcycle's q imports p in production, and p's in-package
+// test file imports q back — legal in Go (go list's own "p [p.test]"/"p"
+// split makes it not a real build cycle) but a genuine cycle in the
+// combined Imports+TestImports graph topoOrder now walks (see its own
+// doc). Before its cycle-safe fallback, folding TestImports into topoOrder
+// at all would have made THIS Load call fail outright with an import-cycle
+// error, for a legal Go pattern that has nothing wrong with it.
+func TestLoad_TestOnlyImportCycleDoesNotFail(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("testdata", "testcycle"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	snap, err := Load(Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	const pPath = "example.com/testcycle/p"
+	const qPath = "example.com/testcycle/q"
+
+	pkgP, ok := snap.Package(pPath)
+	if !ok {
+		t.Fatalf("Package(%s) missing", pPath)
+	}
+	if !slices.Contains(pkgP.TestImports, qPath) {
+		t.Fatalf("fixture invalid: Package(%s).TestImports = %v, want it to contain %s", pPath, pkgP.TestImports, qPath)
+	}
+
+	counts := make(map[string]int, len(snap.Order))
+	for _, path := range snap.Order {
+		counts[path]++
+	}
+	if counts[pPath] != 1 {
+		t.Errorf("Order lists %s %d time(s), want exactly 1", pPath, counts[pPath])
+	}
+	if counts[qPath] != 1 {
+		t.Errorf("Order lists %s %d time(s), want exactly 1", qPath, counts[qPath])
+	}
+}
+
 func TestCache_RoundTrip(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("testdata", "simple"))
 	if err != nil {

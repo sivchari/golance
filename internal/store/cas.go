@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -34,6 +35,80 @@ func OpenCAS(dir string) (*CAS, error) {
 		return nil, fmt.Errorf("store: create CAS directory %s: %w", dir, err)
 	}
 	return &CAS{dir: dir}, nil
+}
+
+// membersDirName is the CAS-directory-relative folder holding one marker
+// file per index database that has ever recorded this directory as its own
+// via DB.PutCASDir (see recordCASMember/CASMembers). internal/server's CAS
+// GC reads it to build its candidate set for "every other database sharing
+// this CAS" before ever trying to open any of them: an index database's own
+// on-disk path is a deterministic function of its workspace root, not of
+// its CAS directory (see internal/server's indexDBFile/casDir), so nothing
+// about a database's path or filename can answer that question, and a
+// database GC cannot open at all could otherwise never be attributed to a
+// CAS by reading its content either.
+const membersDirName = ".members"
+
+// recordCASMember marks dbPath as an index database currently claiming dir
+// as its own CAS directory, called by DB.PutCASDir right after it records
+// the same fact inside dbPath's own database file. The marker file's name
+// is dbPath's hash (bounded-length, collision-safe as a filename); its
+// content is dbPath itself, so CASMembers can recover the original path
+// without needing that hash to be reversible. Idempotent: recording the
+// same (dir, dbPath) pair again just rewrites identical bytes. Marker files
+// are never removed — a worktree whose database is later deleted leaves a
+// harmless orphaned marker behind (see CASMembers' own doc for why that is
+// an accepted tradeoff, not a correctness problem).
+func recordCASMember(dir, dbPath string) error {
+	membersDir := filepath.Join(dir, membersDirName)
+	if err := os.MkdirAll(membersDir, 0o750); err != nil {
+		return fmt.Errorf("store: create CAS members directory %s: %w", membersDir, err)
+	}
+	h := sha256.Sum256([]byte(dbPath))
+	markerPath := filepath.Join(membersDir, fmt.Sprintf("%x", h[:16]))
+	if err := os.WriteFile(markerPath, []byte(dbPath), 0o600); err != nil {
+		return fmt.Errorf("store: write CAS member marker %s: %w", markerPath, err)
+	}
+	return nil
+}
+
+// CASMembers returns the on-disk path of every index database that has ever
+// recorded dir as its own CAS directory via DB.PutCASDir, read directly
+// from dir's own marker files (see recordCASMember) rather than by opening
+// or globbing any index database file itself — the only way to attribute a
+// database to dir before knowing whether that database can even be opened,
+// so a caller like internal/server's CAS GC does not have to choose between
+// treating every index database on the machine as a potential member of
+// dir (risking an unrelated repository's database blocking this one) or
+// giving up on attributing a database it cannot open at all (see (*CAS).GC's
+// doc on why an incomplete mark set must defer the whole sweep).
+//
+// A returned path is a candidate, not a guarantee: it may no longer exist
+// (its database file was since removed) or, in the unlikely event dbPath
+// was reused for an unrelated root, may since have recorded a different
+// CASDir. A caller that manages to open the path should still confirm via
+// (*DB).CASDir before trusting its contents (see internal/server's
+// collectOtherCASMarks).
+func CASMembers(dir string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(dir, membersDirName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("store: list CAS members %s: %w", dir, err)
+	}
+	paths := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Clean(filepath.Join(dir, membersDirName, e.Name())))
+		if err != nil {
+			continue
+		}
+		paths = append(paths, string(data))
+	}
+	return paths, nil
 }
 
 // blobPath returns the on-disk path for key, sharded two hex digits deep so
@@ -155,9 +230,9 @@ type GCStats struct {
 // union of every UnitPointer.BlobKey currently recorded across every index
 // database that shares this CAS directory (see internal/server's wiring,
 // which builds it via (*DB).CollectBlobKeys across this session's own
-// warm-opened database plus every other index-*.db/*.private-*.db file in
-// the cache directory whose (*DB).CASDir matches — see that meta field's
-// own doc for why a filename cannot answer this instead).
+// warm-opened database plus every other database CASMembers(dir) reports —
+// see that function's own doc for why a candidate set built by opening or
+// globbing every index database on the machine would not be safe here).
 //
 // Safety: a blob GC removes despite still being the correct target for some
 // database's UnitPointer is not a correctness bug — [CAS.Get] already

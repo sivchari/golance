@@ -1,10 +1,14 @@
 package graph
 
 import (
+	"bytes"
+	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -201,7 +205,7 @@ func TestCache_VersionBumpDiscardsSharedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read cache file: %v", err)
 	}
-	patched := strings.Replace(string(data), `"version":5`, `"version":4`, 1)
+	patched := strings.Replace(string(data), fmt.Sprintf(`"version":%d`, cacheVersion), `"version":4`, 1)
 	if patched == string(data) {
 		t.Fatal("version field not found in cache JSON; test needs updating")
 	}
@@ -211,5 +215,60 @@ func TestCache_VersionBumpDiscardsSharedSnapshot(t *testing.T) {
 
 	if _, ok := LoadCache(otherRoot, patterns, nil); ok {
 		t.Error("LoadCache(otherRoot) = ok for a cache written under an old version, want a miss")
+	}
+}
+
+// TestRepoKey_LogsOnUnexpectedGitFailure regression-tests M4's sibling
+// finding M12: RepoKey used to fall back to (root, false) identically
+// whether root was genuinely not a git repository or `git` itself could
+// not even be invoked, with no way to tell the two apart from the logs.
+// Pointing PATH at an empty directory forces exec.Command's Output() to
+// fail with an *exec.Error (git not found) rather than the *exec.ExitError
+// an ordinary "fatal: not a git repository" produces — the case RepoKey
+// must log, since silently losing the worktree/CAS/graph-cache sharing
+// speedup to a broken PATH is otherwise indistinguishable from the routine,
+// expected non-git-directory case.
+func TestRepoKey_LogsOnUnexpectedGitFailure(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	repoKeyWarnOnce = sync.Once{}
+	t.Cleanup(func() { repoKeyWarnOnce = sync.Once{} })
+
+	var buf bytes.Buffer
+	prevOut := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prevOut) })
+
+	root := t.TempDir()
+	key, shared := RepoKey(root)
+	if shared {
+		t.Errorf("RepoKey(%s) shared = true, want false when git cannot even be invoked", root)
+	}
+	if key != root {
+		t.Errorf("RepoKey(%s) key = %s, want root itself", root, key)
+	}
+	if !strings.Contains(buf.String(), root) {
+		t.Errorf("RepoKey log output = %q, want it to name %s", buf.String(), root)
+	}
+}
+
+// TestRepoKey_DoesNotLogForOrdinaryNonGitDir verifies the routine, expected
+// case (a plain directory git itself reports is not a repository) stays
+// silent — only an unexpected inability to invoke git at all should log
+// (see TestRepoKey_LogsOnUnexpectedGitFailure).
+func TestRepoKey_DoesNotLogForOrdinaryNonGitDir(t *testing.T) {
+	repoKeyWarnOnce = sync.Once{}
+	t.Cleanup(func() { repoKeyWarnOnce = sync.Once{} })
+
+	var buf bytes.Buffer
+	prevOut := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prevOut) })
+
+	root := t.TempDir()
+	if _, shared := RepoKey(root); shared {
+		t.Errorf("RepoKey(%s) shared = true, want false for a non-git directory", root)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("RepoKey log output = %q, want none for the routine non-git-directory case", buf.String())
 	}
 }

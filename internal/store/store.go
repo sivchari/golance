@@ -124,18 +124,33 @@ type DB struct {
 // caller's usual "nothing indexed yet" recovery path (index.Revalidate
 // reports every package as not-yet-in-db, triggering a full rebuild — see
 // internal/server.indexNeedsRebuild) already handles an empty database
-// correctly.
+// correctly. This case discards IN PLACE, inside a single write transaction
+// on the handle Open already holds (see resetStale), rather than closing
+// and reopening the file: bdb's OS-level exclusive lock is therefore held
+// continuously from the moment this call acquires it to the moment it
+// returns, so a second process racing the identical discard-and-recreate
+// decision for the same path (e.g. two golance sessions opening the same
+// stale root at once) simply blocks on that lock instead of being able to
+// remove a file the first process has already started writing fresh
+// records into.
 //
 // A path whose bytes bbolt cannot even parse as a database at all — its two
 // meta pages both invalid, e.g. because something outside golance truncated
-// or overwrote the file, or a write was torn by a full disk — gets the exact
-// same discard-and-recreate treatment (see isCorrupt), just one step
-// earlier: discardStale needs a transaction to run at all to read the meta
-// bucket, which bbolt.Open itself never reaches for a file this broken.
-// Without this, such a file would fail every future Open attempt forever —
-// unlike every other Open failure this package recognizes (a lock held by
-// another live session; a missing parent directory), there is no future
-// event that could ever make it openable again.
+// or overwrote the file, or a write was torn by a full disk — gets the same
+// discard-and-recreate treatment (see isCorrupt), just one step earlier and
+// by necessity via remove-then-reopen rather than resetStale's in-place
+// wipe: bbolt.Open itself failed, so there is no bdb handle — and so no
+// lock — for this call to hold across the recreate. Two sessions racing
+// THIS specific case at once (both finding path corrupt at the same
+// instant) could in principle still lose one's concurrently-in-flight
+// rebuild the same way the schema-mismatch case used to; this residual
+// window is accepted rather than closed, since a corrupt database is
+// already a rare precondition (a prior crash or full disk) and, like every
+// other case here, self-heals on the losing session's next Open — the
+// alternative (holding some OTHER lock, e.g. a sibling lock file, purely to
+// cover this one already-rare case) would add a second locking primitive
+// for a race narrower than the ordinary "two sessions open the same brand
+// new path at once" race every fresh Open already has to tolerate.
 func Open(path string) (*DB, error) {
 	bdb, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: openTimeout})
 	recreated := false
@@ -151,15 +166,9 @@ func Open(path string) (*DB, error) {
 	}
 	if !recreated && discardStale(bdb) {
 		recreated = true
-		if err := bdb.Close(); err != nil {
-			return nil, fmt.Errorf("store: close stale %s: %w", path, err)
-		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("store: remove stale %s: %w", path, err)
-		}
-		bdb, err = bbolt.Open(path, 0o600, &bbolt.Options{Timeout: openTimeout})
-		if err != nil {
-			return nil, wrapOpenErr(path, err)
+		if err := resetStale(bdb); err != nil {
+			_ = bdb.Close()
+			return nil, fmt.Errorf("store: reset stale %s: %w", path, err)
 		}
 	}
 	err = bdb.Update(func(tx *bbolt.Tx) error {
@@ -176,6 +185,45 @@ func Open(path string) (*DB, error) {
 	}
 	return &DB{bolt: bdb, path: path, recreated: recreated}, nil
 }
+
+// resetStale discards every top-level bucket bdb currently has — whatever
+// was written under a previous schemaVersion, or under a legacy layout that
+// predates schemaVersion (and so may not even share bucket names with
+// allBuckets) — inside a single write transaction on bdb, which Open has
+// already opened and locked. The caller (Open) recreates allBuckets fresh
+// and rewrites schemaVersionKey in its own following transaction; this one
+// only needs to leave bdb with nothing left over from before. Two-pass
+// (collect names, then delete) rather than deleting while iterating
+// tx.ForEach's own cursor, which bbolt does not document as safe to mutate
+// under.
+//
+// testResetStaleHook, when non-nil, runs synchronously inside this
+// transaction after every existing bucket has been deleted but before it
+// commits — solely so a test can observe that bdb's lock is still held at
+// that point (see TestOpen_DiscardStaleHoldsLockThroughout), which a real
+// caller never needs to know.
+func resetStale(bdb *bbolt.DB) error {
+	return bdb.Update(func(tx *bbolt.Tx) error {
+		var names [][]byte
+		if err := tx.ForEach(func(name []byte, _ *bbolt.Bucket) error {
+			names = append(names, append([]byte(nil), name...))
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, name := range names {
+			if err := tx.DeleteBucket(name); err != nil {
+				return err
+			}
+		}
+		if testResetStaleHook != nil {
+			testResetStaleHook()
+		}
+		return nil
+	})
+}
+
+var testResetStaleHook func()
 
 // isCorrupt reports whether err — a bbolt.Open failure — means path exists
 // but its content is not (or no longer) a readable bbolt database, as
@@ -314,19 +362,25 @@ func (db *DB) WasRecreated() bool { return db.recreated }
 var casDirKey = []byte("\x00golance:casdir")
 
 // PutCASDir records dir as this database's owning CAS directory, overwriting
-// any previous value. internal/server calls this once right after every
-// successful Open, alongside the CAS directory it always opens in lockstep
-// (see internal/server's casDir/tryWarmOpen/openIndexAfterBuild): unlike
-// indexDBFile, which is keyed by root and so never shared across worktrees,
-// casDir is keyed by repository identity and IS shared — there is no way to
-// invert an index database's own filename hash back to the CAS directory it
-// was built against, so a CAS GC pass that needs to enumerate every
-// database sharing one CAS directory (see (*CAS).GC's doc) reads this
-// meta value back out of each database file it finds instead.
+// any previous value, and records this database's own path as one of dir's
+// members (see recordCASMember/CASMembers) so a CAS GC pass can find it as
+// a candidate later without ever having to open or glob for it. internal/
+// server calls this once right after every successful Open, alongside the
+// CAS directory it always opens in lockstep (see internal/server's
+// casDir/tryWarmOpen/openIndexAfterBuild): unlike indexDBFile, which is
+// keyed by root and so never shared across worktrees, casDir is keyed by
+// repository identity and IS shared — there is no way to invert an index
+// database's own filename hash back to the CAS directory it was built
+// against, so the member marker this call also writes is the only record
+// of that association a GC pass over dir can read without opening this
+// database file itself.
 func (db *DB) PutCASDir(dir string) error {
-	return db.bolt.Update(func(tx *bbolt.Tx) error {
+	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
 		return tx.Bucket(bucketMeta).Put(casDirKey, []byte(dir))
-	})
+	}); err != nil {
+		return err
+	}
+	return recordCASMember(dir, db.path)
 }
 
 // CASDir returns the CAS directory last recorded via PutCASDir. It returns
@@ -353,21 +407,43 @@ func (db *DB) CASDir() (string, error) {
 // at a time — only the resulting uint64 keys accumulate in marks, never any
 // blob content. A record that fails to decode (a corrupt or foreign-schema
 // entry, which discardStale/schemaVersion should already rule out in
-// practice) is skipped rather than aborting the whole scan: GC's own
-// correctness never depends on a complete mark set (see the package doc's
-// "CAS garbage collection" section), only on not sweeping something it
-// easily could have known was still referenced.
-func (db *DB) CollectBlobKeys(marks map[uint64]struct{}) error {
-	return db.bolt.View(func(tx *bbolt.Tx) error {
+// practice) is skipped rather than aborting the whole scan, but counted in
+// skipped rather than silently dropped: unlike an ordinary CAS miss, a
+// BlobKey this call could not even read because its own record failed to
+// decode is exactly the kind of gap that can make marks an
+// under-approximation of what db still references, so a caller building a
+// GC mark set (see internal/server's RunCASGC) must be able to tell the
+// difference between "read every record" and "read every record that
+// happened to decode" before it trusts marks enough to sweep against it.
+func (db *DB) CollectBlobKeys(marks map[uint64]struct{}) (skipped int, err error) {
+	err = db.bolt.View(func(tx *bbolt.Tx) error {
 		c := tx.Bucket(bucketUnit).Cursor()
 		for _, v := c.First(); v != nil; _, v = c.Next() {
-			p, err := decodeUnitPointer(v)
-			if err != nil {
+			p, decodeErr := decodeUnitPointer(v)
+			if decodeErr != nil {
+				skipped++
 				continue
 			}
 			marks[p.BlobKey] = struct{}{}
 		}
 		return nil
+	})
+	return skipped, err
+}
+
+// PutRawUnitRecord writes raw directly as pkgHash's "unit" bucket entry,
+// bypassing encodeUnitPointer entirely — something no production caller
+// ever has a reason to do (every real writer goes through
+// PutUnit/PutUnitsBatch/PutUnitPointersBatch, which always encode a valid
+// UnitPointer). Test-only, exported so internal/server's CAS GC tests can
+// simulate a corrupt or foreign-schema "unit" record (see CollectBlobKeys's
+// own doc on why one must never abort a scan) without reaching into
+// package store's private encoding via a raw bbolt handle of their own —
+// mirroring OpenReadOnly's identical test-only exported-for-a-good-reason
+// precedent.
+func PutRawUnitRecord(db *DB, pkgHash uint64, raw []byte) error {
+	return db.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketUnit).Put(hashKey(pkgHash), raw)
 	})
 }
 
@@ -383,12 +459,15 @@ func (db *DB) CollectBlobKeys(marks map[uint64]struct{}) error {
 // re-reads and rewrites the entire database, which is wasted work for a
 // database that was already reasonably sized.
 //
-// On any failure past the point where the original file has been closed,
-// Compact still leaves db.bolt reopened against db.path (the original,
-// untouched database if the rename step itself failed; the successfully
-// compacted one otherwise) before returning its error, so a caller that
-// only logs Compact's failure and carries on (see cmd/golance's own
-// caller) is never left holding a permanently unusable handle.
+// On any failure past the point where the temp file has been compacted and
+// closed, Compact still leaves db.bolt reopened against db.path (the
+// original, untouched database if closing it or the rename step failed; the
+// successfully compacted one otherwise) before returning its error, so a
+// caller that only logs Compact's failure and carries on (see cmd/golance's
+// own caller) is never left holding a permanently unusable handle — the
+// reopen in replaceWithCompacted runs unconditionally, not only on the
+// success path, specifically so a failure to close the original handle
+// cannot skip it.
 func (db *DB) Compact() error {
 	if db.readOnly {
 		return errors.New("store: Compact called on a read-only database handle")
@@ -407,28 +486,40 @@ func (db *DB) Compact() error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("store: compact %s: close temp file: %w", db.path, err)
 	}
-	if err := db.bolt.Close(); err != nil {
+	return db.replaceWithCompacted(tmpPath, db.bolt.Close)
+}
+
+// replaceWithCompacted closes db's original bbolt handle via closeOrig
+// (ordinarily db.bolt.Close, overridden by a test), renames tmpPath (the
+// already-compacted, already-closed file Compact just produced) into
+// db.path, and reopens db.bolt against whichever file ends up there —
+// always, even when closeOrig itself fails, rather than only on the
+// success path: Compact's own doc promises a usable handle on return no
+// matter what failed, and skipping the reopen after a close failure would
+// break that promise for exactly the failure mode it exists to cover. A
+// failed rename (including one skipped because closeOrig failed) leaves
+// db.path as the original, untouched database, so reopening it afterward
+// serves that instead of the (possibly only partially written) temp file.
+func (db *DB) replaceWithCompacted(tmpPath string, closeOrig func() error) error {
+	closeErr := closeOrig()
+	var renameErr error
+	if closeErr == nil {
+		renameErr = os.Rename(tmpPath, db.path)
+	}
+	if closeErr != nil || renameErr != nil {
 		_ = os.Remove(tmpPath)
-		return fmt.Errorf("store: compact %s: close original before replacing: %w", db.path, err)
 	}
 
-	renameErr := os.Rename(tmpPath, db.path)
-	if renameErr != nil {
-		_ = os.Remove(tmpPath)
-	}
-	// db.path now names a valid database file either way: the freshly
-	// compacted one on a successful rename, or — os.Rename either fully
-	// succeeds or leaves its destination untouched, never partially — the
-	// original, un-compacted one if the rename itself failed. Reopen
-	// whichever it is so a caller that only logs Compact's error (see
-	// cmd/golance's own caller) is left with a usable handle instead of a
-	// permanently closed one.
 	reopened, reopenErr := bbolt.Open(db.path, 0o600, &bbolt.Options{Timeout: openTimeout})
 	if reopenErr != nil {
 		return fmt.Errorf("store: compact %s: reopen after compaction: %w", db.path, reopenErr)
 	}
 	db.bolt = reopened
-	if renameErr != nil {
+
+	switch {
+	case closeErr != nil:
+		return fmt.Errorf("store: compact %s: close original before replacing: %w", db.path, closeErr)
+	case renameErr != nil:
 		return fmt.Errorf("store: compact %s: rename temp file into place: %w", db.path, renameErr)
 	}
 	return nil

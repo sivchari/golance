@@ -87,11 +87,12 @@ func (g GraphMetadataSource) Package(pkgPath string) (dir string, goFiles, impor
 // concurrent callers (via the LRU and singleflight) needs no further
 // synchronization.
 type CheckedPackage struct {
-	pkgPath string
-	dir     string
-	files   []*ast.File
-	pkg     *types.Package
-	info    *types.Info
+	pkgPath    string
+	dir        string
+	files      []*ast.File
+	pkg        *types.Package
+	info       *types.Info
+	incomplete bool // see Incomplete's doc
 }
 
 // PkgPath returns the package's import path.
@@ -113,6 +114,21 @@ func (cp *CheckedPackage) Types() *types.Package { return cp.pkg }
 // PackageWithBodies; one returned by Package has every declaration fully
 // resolved but no body-level detail (IgnoreFuncBodies).
 func (cp *CheckedPackage) Info() *types.Info { return cp.info }
+
+// Incomplete reports whether checking cp reported at least one error —
+// either directly (types.Config.Error fired while checking cp's own files,
+// e.g. one of its own transitive imports could not be resolved) or
+// transitively (an import this check resolved was itself Incomplete — see
+// ctxImporter.ImportFrom, needed because referencing an already-degraded
+// import's Invalid-typed symbols does not reliably make go/types call Error
+// again on its own). check's own Error callback is deliberately best-effort
+// (a dependency's source is assumed to compile, so a real error there must
+// still degrade to a usable, if imperfect, CheckedPackage rather than
+// failing outright — see check's doc) — Incomplete exists so a caller that
+// must not trust or persist a degraded result (internal/depexport's
+// machine-global CAS) can tell the difference, without that best-effort
+// fallback itself changing for interactive navigation callers.
+func (cp *CheckedPackage) Incomplete() bool { return cp.incomplete }
 
 // DefaultCap is the LRU's default entry capacity (Options.Cap's zero
 // value): small and deliberately so — dependency navigation is bursty and
@@ -488,16 +504,25 @@ func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool) (
 		Instances:  make(map[*ast.Ident]types.Instance),
 		Implicits:  make(map[ast.Node]types.Object),
 	}
+	imp := &ctxImporter{p: p, ctx: ctx}
+	var hadErr bool
 	conf := types.Config{
-		Importer:         &ctxImporter{p: p, ctx: ctx},
+		Importer:         imp,
 		IgnoreFuncBodies: !withBodies,
-		Error:            func(error) {}, // best-effort: a dependency's own source is immutable and assumed to compile; a type error here degrades to a possibly-incomplete pkg rather than failing the whole check.
+		// best-effort: a dependency's own source is immutable and assumed to
+		// compile; a type error here (including an unresolved transitive
+		// import) degrades to a possibly-incomplete pkg rather than failing
+		// the whole check. hadErr — folded into the returned
+		// CheckedPackage.Incomplete — lets a caller that must not persist a
+		// degraded result (internal/depexport) refuse to, without this
+		// best-effort fallback itself changing.
+		Error: func(error) { hadErr = true },
 	}
 	pkg, _ := conf.Check(pkgPath, p.fset, files, info)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &CheckedPackage{pkgPath: pkgPath, dir: dir, files: files, pkg: pkg, info: info}, nil
+	return &CheckedPackage{pkgPath: pkgPath, dir: dir, files: files, pkg: pkg, info: info, incomplete: hadErr || imp.importIncomplete}, nil
 }
 
 // ctxImporter implements types.ImporterFrom by resolving each import back
@@ -527,6 +552,16 @@ func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool) (
 type ctxImporter struct {
 	p   *Provider
 	ctx context.Context
+
+	// importIncomplete is set once ImportFrom resolves an import that is
+	// itself Incomplete, so the check currently underway inherits that —
+	// see CheckedPackage.Incomplete's doc for why this propagation is
+	// needed rather than relying on types.Config.Error alone. Read only
+	// after conf.Check (in check) returns, from the same goroutine that
+	// built imp and drove that call — types.Config.Check invokes
+	// ImportFrom synchronously (see this type's own doc), so no
+	// synchronization is needed for this field.
+	importIncomplete bool
 }
 
 func (imp *ctxImporter) Import(path string) (*types.Package, error) {
@@ -542,12 +577,14 @@ func (imp *ctxImporter) ImportFrom(path, _ string, _ types.ImportMode) (*types.P
 		return nil, err
 	}
 	if cp, ok := imp.p.getFull(path); ok {
+		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
 		return cp.Types(), nil
 	}
 	cp, err := imp.p.Package(imp.ctx, path)
 	if err != nil {
 		return nil, err
 	}
+	imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
 	return cp.Types(), nil
 }
 
