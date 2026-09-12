@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +18,7 @@ import (
 	"go.lsp.dev/uri"
 
 	"github.com/sivchari/golance/internal/index"
+	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
 	"github.com/sivchari/golance/internal/rpc"
 	"github.com/sivchari/golance/internal/store"
@@ -214,10 +216,11 @@ func TestReferences_TransitionsFromIndexUnavailableToResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
-	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+	relative := RelativeIndexPaths(snap.Dir())
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{RelativePaths: relative}); err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}
-	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, relative)})
 
 	result, err := s.handleReferences(context.Background(), params)
 	if err != nil {
@@ -254,10 +257,11 @@ func TestWorkspaceSymbol_TransitionsFromIndexUnavailableToResults(t *testing.T) 
 	if err != nil {
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
-	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+	relative := RelativeIndexPaths(snap.Dir())
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{RelativePaths: relative}); err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}
-	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, relative)})
 
 	result, err := s.handleWorkspaceSymbol(context.Background(), params)
 	if err != nil {
@@ -417,9 +421,12 @@ func TestHandleRename_AppliesEditsAcrossCleanBuffer(t *testing.T) {
 	if !ok {
 		t.Fatalf("handleRename(clean buffer) has no edits for %s: %#v", path, edit.Changes)
 	}
-	// greet.go's "Hello" occurs twice: the declaration and useHello's call.
-	if len(edits) != 2 {
-		t.Errorf("handleRename(clean buffer) edit count = %d, want 2 (declaration + call site)", len(edits))
+	// greet.go's "Hello" occurs three times a rename must rewrite: the
+	// declaration, useHello's call, and the declaration's own doc comment
+	// ("// Hello returns a Greeting for name."), which Resolver.Rename
+	// rewrites the way gopls does — see internal/xref's docCommentEdits.
+	if len(edits) != 3 {
+		t.Errorf("handleRename(clean buffer) edit count = %d, want 3 (declaration + call site + doc comment)", len(edits))
 	}
 }
 
@@ -840,5 +847,84 @@ func TestHandleTypeDefinition_Builtin(t *testing.T) {
 	}
 	if _, err := os.Stat(target); err != nil {
 		t.Errorf("type definition file %s does not exist on disk: %v", target, err)
+	}
+}
+
+// TestHandleTypeDefinition_NoIndex_OtherWorkspacePackage is a regression
+// test for Finding H5: typeDefinitionCrossPackage used to answer a
+// root-package target it could not yet resolve (the facts index still
+// building) with a silent empty result, indistinguishable from "this type
+// genuinely has no locatable declaration" -- the exact PR #30 shape
+// dependencyDefinition (plain "Go to Definition") already guards against.
+// depuse.UseGreet's parameter is typed greet.Greeting, a type declared in a
+// different *workspace* (root) package only the facts index can resolve
+// (dependencyTypeDeclaration always declines a root package, see its own
+// doc), so this must answer indexUnavailableError instead.
+func TestHandleTypeDefinition_NoIndex_OtherWorkspacePackage(t *testing.T) {
+	s, snap := newTestServerNoIndex(t)
+	depusePkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(depusePkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	depuseFile := depusePkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(depuseFile))
+	if err != nil {
+		t.Fatalf("read %s: %v", depuseFile, err)
+	}
+	pos := identPositionIn(t, depuseFile, data, "Greeting", 1) // greet.Greeting reference
+
+	result, err := s.handleTypeDefinition(context.Background(), mustMarshal(t, &protocol.TypeDefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(depuseFile)},
+			Position:     pos,
+		},
+	}))
+	checkIndexUnavailableError(t, "typeDefinition(no index, greet.Greeting)", err)
+	if result != nil {
+		t.Errorf("typeDefinition(no index, greet.Greeting): result = %#v, want nil", result)
+	}
+}
+
+// TestXrefPosition_OverlayReadErrorIsLogged pins the L7 fix: xrefPosition
+// used to report ok=false identically whether the overlay read genuinely
+// failed (e.g. the file vanished from disk) or pos merely fell outside an
+// up-to-date buffer's bounds (an ordinary, self-healing race -- see
+// xrefPosition's own doc). Only the former is now logged.
+func TestXrefPosition_OverlayReadErrorIsLogged(t *testing.T) {
+	s, _, root := newTestServer(t)
+	var logBuf bytes.Buffer
+	s.logger = log.New(&logBuf, "", 0)
+
+	missing := filepath.Join(root, "does-not-exist.go")
+	if _, _, ok := s.xrefPosition(missing, protocol.Position{}); ok {
+		t.Fatalf("xrefPosition(%s) ok=true, want false for a nonexistent file", missing)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, missing) {
+		t.Errorf("log output = %q, want it to name %s", logged, missing)
+	}
+}
+
+// TestBuiltinDefLocation_MissingFileIsLogged is a regression test for the
+// first half of Finding L9's remainder: builtinDefLocation used to report
+// ok=false with no trace at all when builtin.go's resolved path no longer
+// exists on disk (a relocated or removed toolchain install) — silently
+// breaking Hover/Definition/TypeDefinition for every predeclared identifier
+// for the rest of the process (see loadBuiltinFileOnce's process-lifetime
+// cache) with nothing to explain why.
+func TestBuiltinDefLocation_MissingFileIsLogged(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := log.New(&logBuf, "", 0)
+	missing := filepath.Join(t.TempDir(), "does-not-exist", "builtin.go")
+
+	loc, ok := builtinDefLocation(logger, &langfeat.BuiltinDefInfo{Filename: missing, Line: 1, Col: 1, EndCol: 2})
+	if ok {
+		t.Fatalf("builtinDefLocation(%s) ok=true, want false for a nonexistent file (got %+v)", missing, loc)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, missing) {
+		t.Errorf("log output = %q, want it to name %s", logged, missing)
 	}
 }

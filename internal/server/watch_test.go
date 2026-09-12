@@ -382,6 +382,78 @@ func TestHandleDidChangeWatchedFiles_RepeatedNoOpEventIsSuppressed(t *testing.T)
 	})
 }
 
+// TestHandleDidChangeWatchedFiles_SameSizeAndMtimeContentChangeIsDetected is
+// a regression test for Finding M5: a coarse-mtime filesystem, or a codegen
+// tool that writes deterministic timestamps, can make a genuine edit land on
+// exactly the same (size, mtime) an earlier event for the same path already
+// recorded. Before watchFingerprints also hashed content, that made the
+// fingerprint check indistinguishable from a genuine no-op resend, silently
+// dropping the event and skipping revalidation entirely for that file. Here
+// the content changes (same byte length) between two events, and os.Chtimes
+// pins both to the identical timestamp, so only a content hash can tell them
+// apart.
+func TestHandleDidChangeWatchedFiles_SameSizeAndMtimeContentChangeIsDetected(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		root := t.TempDir()
+		populateTempModule(t, root)
+		snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+		if err != nil {
+			t.Fatalf("graph.Load: %v", err)
+		}
+		s := newWorkspaceOnlyServerAt(t, root, snap)
+		knownFile := s.workspace().snap.Packages["example.com/servermod/greet"].GoFiles[0]
+
+		calls := installSpyWatch(s)
+		t.Cleanup(s.watch.Stop)
+
+		pinnedTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		original, err := os.ReadFile(filepath.Clean(knownFile))
+		if err != nil {
+			t.Fatalf("read %s: %v", knownFile, err)
+		}
+		if err := os.Chtimes(knownFile, pinnedTime, pinnedTime); err != nil {
+			t.Fatalf("Chtimes: %v", err)
+		}
+
+		if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+			Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
+		})); err != nil {
+			t.Fatalf("handleDidChangeWatchedFiles: %v", err)
+		}
+		select {
+		case <-calls:
+		case <-time.After(2 * time.Second):
+			t.Fatal("watch was never scheduled for the first event")
+		}
+
+		// Same byte length, different content, mtime pinned back to the exact
+		// same instant: the shape of a coarse-mtime filesystem or a
+		// deterministic-timestamp codegen tool masking a real edit.
+		edited := "package greet\n\n// Hello returns X greeting.\nfunc Hello() string { return \"hi\" }\n"
+		if len(edited) != len(original) {
+			t.Fatalf("fixture byte length changed: got %d, want %d (edited content must be same-size to reproduce the ambiguous fingerprint)", len(edited), len(original))
+		}
+		if err := os.WriteFile(knownFile, []byte(edited), 0o600); err != nil {
+			t.Fatalf("write %s: %v", knownFile, err)
+		}
+		if err := os.Chtimes(knownFile, pinnedTime, pinnedTime); err != nil {
+			t.Fatalf("Chtimes: %v", err)
+		}
+
+		if err := s.handleDidChangeWatchedFiles(context.Background(), mustMarshal(t, &protocol.DidChangeWatchedFilesParams{
+			Changes: []protocol.FileEvent{{URI: uri.File(knownFile), Type: protocol.FileChangeTypeChanged}},
+		})); err != nil {
+			t.Fatalf("handleDidChangeWatchedFiles: %v", err)
+		}
+		select {
+		case <-calls:
+		case <-time.After(2 * time.Second):
+			t.Fatal("watch was never scheduled for a same-size, same-mtime content change; the ambiguous (size, mtime) match was trusted instead of settled by content hash")
+		}
+	})
+}
+
 // watchCall records one s.watch run invocation, for installSpyWatch.
 type watchCall struct {
 	root   string
@@ -457,5 +529,6 @@ func newWorkspaceOnlyServerAt(t *testing.T, root string, snap *graph.Snapshot) *
 	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 	s := New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(root, snap)
+	stopWorkspaceEngineOnCleanup(t, s)
 	return s
 }

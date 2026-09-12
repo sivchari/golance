@@ -184,10 +184,12 @@ type Engine struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// retired is set by Retire. commit consults it to suppress
-	// Options.OnResult for a recheck that completes after Retire — see
-	// Retire's doc for why this, and not e.ctx cancellation, is how it stops
-	// a retired Engine from publishing.
+	// retired is set by both Retire and Stop. commit consults it to
+	// suppress Options.OnResult for a recheck that completes after either —
+	// see Retire's doc for why this, and not e.ctx cancellation, is what
+	// stops a discarded Engine from publishing: cancellation only takes
+	// effect at the next ctx check, so a recheck already past its last one
+	// still reaches commit.
 	retired atomic.Bool
 
 	mu      sync.Mutex
@@ -196,6 +198,19 @@ type Engine struct {
 	cache   map[unitKey]*cacheEntry
 	jobs    map[unitKey]*dirState
 	flights map[unitKey]*flight
+
+	// pendingWG counts every recheck that has been armed or started but not
+	// yet resolved: debounce-triggered ones (armDebounceLocked Adds under
+	// e.mu, fireRecheck Dones via defer) and request-driven flights alike
+	// (getOrStartFlight Adds, runFlight Dones via defer). Wait blocks on it;
+	// Stop does not, by design (see Stop's own doc), so this exists to give
+	// a caller that must know no recheck can still be touching anything — a
+	// test cleanup about to delete the temp directories one could still be
+	// reading from or writing to, say — a way to block until that holds.
+	// Flights must be counted too, not just debounces: a flight observes
+	// e.ctx only at runRecheck's own checkpoints, so Stop returning says
+	// nothing about whether one is still running.
+	pendingWG sync.WaitGroup
 }
 
 // New returns an Engine that resolves files to packages via snap, reads
@@ -332,6 +347,7 @@ func (e *Engine) getOrStartFlight(key unitKey, hash string) *flight {
 	e.flights[key] = fl
 	e.mu.Unlock()
 
+	e.pendingWG.Add(1)
 	go e.runFlight(key, fl)
 	return fl
 }
@@ -346,6 +362,7 @@ func (e *Engine) getOrStartFlight(key unitKey, hash string) *flight {
 // this goroutine is not covered by rpc.Server.callRequestHandler's own
 // panic recovery, since it can outlive the request that started it.
 func (e *Engine) runFlight(key unitKey, fl *flight) {
+	defer e.pendingWG.Done()
 	defer func() {
 		if r := recover(); r != nil {
 			fl.cp, fl.err = nil, fmt.Errorf("check: panic during recheck of %s: %v", key.dir, r)
@@ -389,6 +406,44 @@ func (e *Engine) Invalidate(dir string) {
 	}
 }
 
+// InvalidateDependency drops the cached CheckedPackage for each of dirs (both
+// variants, see unitKey) that Engine already knows about (see
+// unitKnownLocked), and arms the same debounce-triggered recheck+publish
+// Invalidate does for those. A dir Engine has never resolved — never Get's
+// or SetFocus'd, i.e. never opened — is left alone entirely: it has nothing
+// cached that a stale dependency could have left stale in the first place
+// (a content-hash cache hit can only ever return a previously committed
+// entry), so there is nothing to drop and nothing worth scheduling a
+// recheck for.
+//
+// This exists for Server.reindex's reverse-dependency closure of a saved
+// package: unlike Invalidate's own callers (didOpen/didChange/didSave, each
+// scoped to the one file its own notification is about, always already
+// known by the time it calls Invalidate — see Invalidate's doc), dirs here
+// can span an arbitrary number of OTHER packages nothing in that
+// notification touched directly, most of which — in a large workspace — the
+// engine may never have resolved at all. Arming Invalidate's own
+// unconditional debounce for every one of them would schedule a full
+// recheck, and publish diagnostics, for a file the user never opened, on
+// every save of a widely-imported package; gating on unitKnownLocked instead
+// bounds the work (and the diagnostics traffic) to units the engine already
+// has live, which is exactly the set whose cached type information this
+// dependency change could have made wrong.
+func (e *Engine) InvalidateDependency(dirs []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, dir := range dirs {
+		for _, v := range [...]variant{variantBase, variantExternalTest} {
+			key := unitKey{dir: dir, variant: v}
+			if !e.unitKnownLocked(key) {
+				continue
+			}
+			delete(e.cache, key)
+			e.armDebounceLocked(key)
+		}
+	}
+}
+
 // unitKnownLocked reports whether Engine has ever resolved or cached key.
 // Callers must hold e.mu.
 func (e *Engine) unitKnownLocked(key unitKey) bool {
@@ -403,16 +458,41 @@ func (e *Engine) unitKnownLocked(key unitKey) bool {
 func (e *Engine) armDebounceLocked(key unitKey) {
 	st := e.jobStateLocked(key)
 	if st.timer != nil {
-		st.timer.Stop()
+		if st.timer.Stop() {
+			// The timer being superseded never fired, so fireRecheck's
+			// defer e.pendingWG.Done() (matching the Add below) will
+			// never run for it; balance it here instead. If Stop returns
+			// false the timer had already fired (or been stopped once
+			// already) and that invocation owns its own Done call.
+			e.pendingWG.Done()
+		}
 	}
+	e.pendingWG.Add(1)
 	st.timer = time.AfterFunc(e.opts.DebounceDelay, func() { e.fireRecheck(key) })
 }
 
-// fireRecheck runs the debounce-triggered background recheck job for key.
+// fireRecheck runs the debounce-triggered background recheck job for key,
+// retrying once, immediately, if the attempt fails for a reason other than
+// ctx being canceled. Unlike Get, nothing is waiting on this call to notice
+// a failure and retry it itself — without this, a momentary read error (a
+// directory listing or file read racing an external rewrite, e.g. a git
+// checkout or the editor's own atomic save landing mid-read) would discard
+// runRecheck's result outright and leave the client's diagnostics frozen at
+// whatever was last published, with nothing left to ever retrigger a check
+// for key again. A canceled ctx (Stop, or a newer debounce superseding this
+// one via startJob) is not a failure and is never retried. A retry that
+// fails again is left alone rather than retried further here — the same
+// "at most once" self-heal bound this package's callers already rely on
+// elsewhere (see internal/server's loadWorkspaceAsync) — so a persistent
+// failure is picked up by the next independent trigger (a further edit, a
+// watched-file event) instead of retried in a loop.
 func (e *Engine) fireRecheck(key unitKey) {
+	defer e.pendingWG.Done()
 	ctx, finish := e.startJob(context.Background(), key)
 	defer finish()
-	_, _ = e.runRecheck(ctx, key)
+	if _, err := e.runRecheck(ctx, key); err != nil && ctx.Err() == nil {
+		_, _ = e.runRecheck(ctx, key)
+	}
 }
 
 // jobStateLocked returns key's dirState, creating it if necessary. Callers
@@ -432,8 +512,30 @@ func (e *Engine) jobStateLocked(key unitKey) *dirState {
 // no-op if a newer background job has since superseded this one. This is
 // used only for debounce-triggered background rechecks (fireRecheck); Get
 // does not call it.
+//
+// If e.ctx is already canceled — Stop has already run, or is running
+// concurrently and reaches its own e.mu section either before or after this
+// one — the returned context is pre-canceled and never registered as key's
+// dirState.cancel. This is what makes Stop's contract airtight against a
+// debounce timer that fires concurrently with Stop itself (see
+// armDebounceLocked's time.AfterFunc: Stop cannot prevent an already-fired
+// timer's callback from running, only from doing anything once it does):
+// whichever of the two goroutines reaches e.mu first, the other observes a
+// fully consistent outcome — either this job registers before Stop's own
+// pass, and Stop's loop below cancels it like any other, or Stop's
+// e.cancel() has already run, and this call sees e.ctx.Err() != nil and
+// bails before registering anything Stop could otherwise miss. Either way,
+// fireRecheck's caller ends up with a context runRecheck rejects at its very
+// first check (before any file I/O or type-checking), so it can never reach
+// commit/Options.OnResult once Stop has returned.
 func (e *Engine) startJob(parent context.Context, key unitKey) (context.Context, func()) {
 	e.mu.Lock()
+	if e.ctx.Err() != nil {
+		e.mu.Unlock()
+		ctx, cancel := context.WithCancel(parent)
+		cancel()
+		return ctx, func() {}
+	}
 	st := e.jobStateLocked(key)
 	if st.timer != nil {
 		st.timer.Stop()
@@ -583,20 +685,62 @@ func (e *Engine) Retire() {
 // from the engine's own lifetime: Stop still reclaims it. See Retire for
 // the alternative that stops background publishing without aborting
 // in-flight request-driven work.
+//
+// This contract holds even for a debounce timer that fires concurrently
+// with Stop itself: time.Timer.Stop cannot prevent an already-fired
+// timer's callback from running, so this loop alone cannot guarantee such a
+// callback never calls Options.OnResult — the guarantee instead comes from
+// startJob observing e.ctx (canceled above, under the same e.mu this loop
+// holds) before registering any job Stop could otherwise race past. See
+// startJob's doc for the full argument. No debounce-triggered background
+// recheck can reach commit/Options.OnResult once Stop has returned,
+// regardless of how its timer's fire raced this call.
+//
+// Cancellation alone cannot make that promise for a request-driven flight,
+// which observes e.ctx only at runRecheck's own checkpoints: one already
+// past its last check still reaches commit. Stop therefore also marks e
+// retired, which is what commit consults to suppress Options.OnResult — so
+// nothing publishes diagnostics computed against a graph the caller has
+// already discarded.
 // Safe to call more than once.
+//
+// Stop deliberately does not wait for an already-running recheck's I/O to
+// actually finish (cancellation only takes effect at runRecheck's next
+// ctx.Err() check, not instantaneously) — a caller that needs that
+// guarantee, e.g. before deleting the temp directories a recheck's disk
+// reads or dependency-export writes could still be touching, should call
+// Wait after Stop.
 func (e *Engine) Stop() {
+	e.retired.Store(true)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.cancel()
 	for _, st := range e.jobs {
 		if st.timer != nil {
-			st.timer.Stop()
+			if st.timer.Stop() {
+				// Canceled before it ever fired, so fireRecheck's own
+				// Done (matching armDebounceLocked's Add) will never run
+				// for it — balance pendingWG here, mirroring
+				// armDebounceLocked's identical re-arm case.
+				e.pendingWG.Done()
+			}
 			st.timer = nil
 		}
 		if st.cancel != nil {
 			st.cancel()
 		}
 	}
+}
+
+// Wait blocks until every recheck already armed or running when it was
+// called has finished — debounce-triggered ones and request-driven
+// flights alike — i.e. until none can still be reading or writing
+// anything. It does not itself cancel or stop anything; call Stop first,
+// so no new work can start after Wait begins (Wait does not block a
+// concurrent Invalidate or Get from starting some, which it would then
+// never observe).
+func (e *Engine) Wait() {
+	e.pendingWG.Wait()
 }
 
 // evictLocked removes the least recently used cache entry outside the

@@ -59,14 +59,21 @@ func (s *Server) callHierarchyTarget(ctx context.Context, u uri.URI, pos protoco
 // (crossPackageFuncLocation) -- the identical chain
 // typeDefinitionCrossPackage uses for a named type's declaration, applied
 // here to a func/method's own declaration instead.
-func (s *Server) callHierarchyItem(ctx context.Context, cp *check.CheckedPackage, fn *types.Func) (protocol.CallHierarchyItem, bool) {
+//
+// err is non-nil only when crossPackageFuncLocation reports the target is a
+// root-package declaration the facts index cannot yet answer because it has
+// not finished building — the same indexUnavailableError signal references/
+// implementation/rename already use, so callHierarchyItem's own callers
+// (prepare, outgoing calls) can fail the whole request instead of silently
+// dropping just that one item, indistinguishable from a genuine miss.
+func (s *Server) callHierarchyItem(ctx context.Context, cp *check.CheckedPackage, fn *types.Func) (protocol.CallHierarchyItem, bool, error) {
 	info, err := langfeat.FuncDeclaration(cp, fn)
 	if err != nil {
 		s.logger.Printf("server: call hierarchy declaration for %s: %v", fn.Name(), err)
-		return protocol.CallHierarchyItem{}, false
+		return protocol.CallHierarchyItem{}, false, nil
 	}
 	if info == nil {
-		return protocol.CallHierarchyItem{}, false
+		return protocol.CallHierarchyItem{}, false, nil
 	}
 
 	var loc protocol.Location
@@ -74,10 +81,14 @@ func (s *Server) callHierarchyItem(ctx context.Context, cp *check.CheckedPackage
 	if info.SameFile != "" {
 		loc, ok = s.sameFileCallHierarchyLocation(info.SameFile, info.Range)
 	} else {
-		loc, ok = s.crossPackageFuncLocation(ctx, info.PkgPath, info.ObjPath)
+		var unavailable bool
+		loc, ok, unavailable = s.crossPackageFuncLocation(ctx, info.PkgPath, info.ObjPath)
+		if unavailable {
+			return protocol.CallHierarchyItem{}, false, s.indexUnavailableError("call hierarchy")
+		}
 	}
 	if !ok {
-		return protocol.CallHierarchyItem{}, false
+		return protocol.CallHierarchyItem{}, false, nil
 	}
 
 	detail := callHierarchyDetail(fn.Pkg().Path(), loc.URI.FsPath())
@@ -88,7 +99,7 @@ func (s *Server) callHierarchyItem(ctx context.Context, cp *check.CheckedPackage
 		URI:            loc.URI,
 		Range:          loc.Range,
 		SelectionRange: loc.Range,
-	}, true
+	}, true, nil
 }
 
 // sameFileCallHierarchyLocation converts a same-package FuncDeclInfo (byte
@@ -114,15 +125,26 @@ func (s *Server) sameFileCallHierarchyLocation(file string, r langfeat.Range) (p
 // type-specific behavior -- the same one typeDefinitionCrossPackage already
 // uses for a named type), falling back to ws.depProvider for a standard
 // library or module dependency package otherwise.
-func (s *Server) crossPackageFuncLocation(ctx context.Context, pkgPath, objPath string) (protocol.Location, bool) {
-	if resolver, ok := s.resolverOrWarn(); ok {
+//
+// unavailable is true only when pkgPath names a root package and the facts
+// index has not finished building yet (resolverOrWarn's ok=false):
+// dependencyFuncDeclaration always declines a root package regardless of
+// index readiness (see its own doc), so ok=false there does not by itself
+// mean "no declaration exists" -- see isRootPackage's doc for why this
+// distinction matters to every caller of this method.
+func (s *Server) crossPackageFuncLocation(ctx context.Context, pkgPath, objPath string) (loc protocol.Location, ok, unavailable bool) {
+	resolver, resolverOK := s.resolverOrWarn()
+	if resolverOK {
 		if loc, ok := resolver.TypeDeclaration(ctx, pkgPath, objPath); ok {
 			if pl, ok := s.correctResultLocation(loc); ok {
-				return pl, true
+				return pl, true, false
 			}
 		}
 	}
-	return s.dependencyFuncDeclaration(ctx, pkgPath, objPath)
+	if pl, ok := s.dependencyFuncDeclaration(ctx, pkgPath, objPath); ok {
+		return pl, true, false
+	}
+	return protocol.Location{}, false, !resolverOK && s.isRootPackage(pkgPath)
 }
 
 // dependencyFuncDeclaration is crossPackageFuncLocation's fallback for a
@@ -151,6 +173,7 @@ func (s *Server) dependencyFuncDeclaration(ctx context.Context, pkgPath, objPath
 	// dependencyDefinition (handlers_xref.go) and dependencyTypeDeclaration
 	// (handlers_nav.go) already use for their own depcheck results.
 	if _, err := os.Stat(start.Filename); err != nil {
+		s.logger.Printf("server: dependency call hierarchy declaration %s#%s: declaration source %s: %v", pkgPath, objPath, start.Filename, err)
 		return protocol.Location{}, false
 	}
 	if start.Line <= 0 || int64(start.Line) > math.MaxUint32 ||
@@ -175,7 +198,10 @@ func (s *Server) handlePrepareCallHierarchy(ctx context.Context, params json.Raw
 	if !ok {
 		return []protocol.CallHierarchyItem(nil), nil
 	}
-	item, ok := s.callHierarchyItem(ctx, cf.cp, fn)
+	item, ok, err := s.callHierarchyItem(ctx, cf.cp, fn)
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return []protocol.CallHierarchyItem(nil), nil
 	}
@@ -203,7 +229,10 @@ func (s *Server) handleOutgoingCalls(ctx context.Context, params json.RawMessage
 
 	out := make([]protocol.CallHierarchyOutgoingCall, 0, len(calls))
 	for _, c := range calls {
-		item, ok := s.callHierarchyItem(ctx, cf.cp, c.Callee)
+		item, ok, err := s.callHierarchyItem(ctx, cf.cp, c.Callee)
+		if err != nil {
+			return nil, err
+		}
 		if !ok {
 			continue
 		}
@@ -276,7 +305,10 @@ type chSourceFile struct {
 // reference inside it (enclosingCallItem's dedup key), sorted by that
 // declaration's own location for a deterministic result order. It parses
 // each distinct referencing file at most once (cached in files), matching
-// O(result files) rather than O(results).
+// O(result files) rather than O(results). files is local to this one call
+// and discarded when it returns, never reused across requests -- see
+// chSourceFileFor's doc for why that is what makes caching a read/parse
+// failure there safe.
 func (s *Server) foldIncomingCalls(ctx context.Context, locs []xref.Location) []protocol.CallHierarchyIncomingCall {
 	files := make(map[string]*chSourceFile)
 	calls := make(map[protocol.Location]*protocol.CallHierarchyIncomingCall)
@@ -329,7 +361,18 @@ func (s *Server) foldIncomingCalls(ctx context.Context, locs []xref.Location) []
 
 // chSourceFileFor returns path's cached chSourceFile, parsing it (via the
 // current overlay content, dirty-corrected against its on-disk facts-index
-// content if it has unsaved edits) on first use.
+// content if it has unsaved edits) on first use. A read or parse failure is
+// logged and cached as nil/no-AST respectively, so foldIncomingCalls' every
+// reference originating in path is dropped from the result with a visible
+// trace instead of silently -- see its own "sf == nil || sf.astFile == nil"
+// check.
+//
+// Caching a read failure as nil here is sound despite never being retried
+// within this same call: cache is foldIncomingCalls' own local map, built
+// fresh for each callHierarchy/incomingCalls request and discarded when it
+// returns (see its doc), so a transient failure (e.g. a file mid-rename)
+// only ever costs the ONE request it happened during -- the very next
+// incomingCalls request re-reads path from scratch, not this stale nil.
 func (s *Server) chSourceFileFor(path string, cache map[string]*chSourceFile) *chSourceFile {
 	if sf, ok := cache[path]; ok {
 		return sf
@@ -339,13 +382,17 @@ func (s *Server) chSourceFileFor(path string, cache map[string]*chSourceFile) *c
 	if !dirtyOK {
 		t, err := s.overlay.ReadFile(path)
 		if err != nil {
+			s.logger.Printf("server: call hierarchy incoming calls: read %s: %v (every reference in this file is dropped from the result)", path, err)
 			cache[path] = nil
 			return nil
 		}
 		text = t
 	}
 	fset := token.NewFileSet()
-	astFile, _ := parser.ParseFile(fset, path, text, 0)
+	astFile, err := parser.ParseFile(fset, path, text, 0)
+	if err != nil {
+		s.logger.Printf("server: call hierarchy incoming calls: parse %s: %v (every reference in this file is dropped from the result)", path, err)
+	}
 	pkgPath, _ := s.pkgPathForFile(path)
 	sf := &chSourceFile{text: text, fset: fset, astFile: astFile, pkgPath: pkgPath, saved: saved, dirty: dirty, dirtyLinesOK: dirtyOK}
 	cache[path] = sf

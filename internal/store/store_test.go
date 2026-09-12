@@ -474,6 +474,63 @@ func TestOpen_DiscardsDatabaseWithOldSchemaVersion(t *testing.T) {
 	}
 }
 
+// TestOpen_DiscardStaleHoldsLockThroughout verifies that discarding a
+// schema-stale database happens without ever releasing path's OS-level
+// exclusive lock: while resetStale's write transaction is in flight, a
+// concurrent attempt to open the same path must block on that lock rather
+// than succeed, which the old Close/Remove/reopen sequence this replaced
+// could not guarantee — a second process racing the identical discard
+// decision could open the freshly-removed, not-yet-recreated path in that
+// old window and lose whatever it had already started writing (see L2 in
+// audit-silent-failures.md).
+func TestOpen_DiscardStaleHoldsLockThroughout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := writeSchemaVersion(t, path, schemaVersion-1); err != nil {
+		t.Fatalf("writeSchemaVersion() error = %v", err)
+	}
+
+	probed := make(chan struct{})
+	prev := testResetStaleHook
+	testResetStaleHook = func() {
+		defer close(probed)
+		_, err := OpenReadOnlyTimeout(path, 50*time.Millisecond)
+		if err == nil {
+			t.Error("concurrent Open during discard-and-recreate succeeded, want the exclusive lock still held")
+			return
+		}
+		if !IsLocked(err) {
+			t.Errorf("concurrent Open during discard-and-recreate error = %v, want a lock timeout", err)
+		}
+	}
+	t.Cleanup(func() { testResetStaleHook = prev })
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() on a stale database error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	select {
+	case <-probed:
+	default:
+		t.Fatal("testResetStaleHook never ran; Open did not take the discardStale path")
+	}
+	if !reopened.WasRecreated() {
+		t.Error("WasRecreated() = false after Open discarded a stale schema, want true")
+	}
+}
+
 // TestWasRecreated_FreshDatabaseIsFalse verifies WasRecreated is false for a
 // brand new file — there was nothing on disk yet to distrust (see
 // discardStale's doc), so this is not the "schema rebuild" event Compact
@@ -525,7 +582,7 @@ func TestPutCASDirRoundTrip(t *testing.T) {
 		t.Errorf("CASDir() before PutCASDir = %v, want ErrNotFound", err)
 	}
 
-	const dir = "/cache/golance/cas-abc123"
+	dir := filepath.Join(t.TempDir(), "cas-abc123")
 	if err := db.PutCASDir(dir); err != nil {
 		t.Fatalf("PutCASDir() error = %v", err)
 	}
@@ -535,6 +592,33 @@ func TestPutCASDirRoundTrip(t *testing.T) {
 	}
 	if got != dir {
 		t.Errorf("CASDir() = %q, want %q", got, dir)
+	}
+}
+
+// TestPutCASDirRecordsMember verifies PutCASDir also records this
+// database's own path as a member of dir, discoverable via CASMembers
+// without ever opening the database itself -- what internal/server's CAS
+// GC relies on to attribute a candidate to a CAS directory before knowing
+// whether that candidate can even be opened (see CASMembers' own doc).
+func TestPutCASDirRecordsMember(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "index.db")
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	dir := t.TempDir()
+	if err := db.PutCASDir(dir); err != nil {
+		t.Fatalf("PutCASDir() error = %v", err)
+	}
+
+	members, err := CASMembers(dir)
+	if err != nil {
+		t.Fatalf("CASMembers() error = %v", err)
+	}
+	if len(members) != 1 || members[0] != dbPath {
+		t.Errorf("CASMembers(%q) = %v, want [%q]", dir, members, dbPath)
 	}
 }
 
@@ -553,8 +637,12 @@ func TestCollectBlobKeys(t *testing.T) {
 	}
 
 	marks := map[uint64]struct{}{999: {}} // pre-existing entry from another database
-	if err := db.CollectBlobKeys(marks); err != nil {
+	skipped, err := db.CollectBlobKeys(marks)
+	if err != nil {
 		t.Fatalf("CollectBlobKeys() error = %v", err)
+	}
+	if skipped != 0 {
+		t.Errorf("CollectBlobKeys() skipped = %d, want 0 (every record here decodes cleanly)", skipped)
 	}
 
 	want := map[uint64]struct{}{999: {}, 101: {}, 102: {}}
@@ -565,6 +653,45 @@ func TestCollectBlobKeys(t *testing.T) {
 		if _, ok := marks[k]; !ok {
 			t.Errorf("CollectBlobKeys() marks missing key %d", k)
 		}
+	}
+}
+
+// TestCollectBlobKeys_SkipsUndecodableRecord verifies that a "unit" bucket
+// record CollectBlobKeys cannot decode (a corrupt or foreign-schema entry)
+// is both skipped (its BlobKey never reaches marks, since there is no
+// reliable way to read it) and counted in skipped — the signal
+// internal/server's RunCASGC relies on to tell "read every record" apart
+// from "read every record that happened to decode" before trusting the
+// resulting mark set enough to sweep against it (see M7 in
+// audit-silent-failures.md).
+func TestCollectBlobKeys_SkipsUndecodableRecord(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.PutUnit(&UnitEntry{PkgHash: 1, Pointer: UnitPointer{BlobKey: 101}}); err != nil {
+		t.Fatalf("PutUnit() error = %v", err)
+	}
+	// Overwrite pkgHash 2's "unit" record with garbage too short to decode
+	// as a UnitPointer, simulating a corrupt or foreign-schema entry —
+	// bypassing PutUnit, which would refuse to write anything this
+	// malformed itself.
+	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.Bucket(bucketUnit).Put(hashKey(2), []byte{0xff, 0xff})
+	}); err != nil {
+		t.Fatalf("write undecodable unit record: %v", err)
+	}
+
+	marks := make(map[uint64]struct{})
+	skipped, err := db.CollectBlobKeys(marks)
+	if err != nil {
+		t.Fatalf("CollectBlobKeys() error = %v", err)
+	}
+	if skipped != 1 {
+		t.Fatalf("CollectBlobKeys() skipped = %d, want 1", skipped)
+	}
+	if _, ok := marks[101]; !ok {
+		t.Error("CollectBlobKeys() marks missing the decodable record's BlobKey 101")
+	}
+	if len(marks) != 1 {
+		t.Errorf("CollectBlobKeys() marks = %v, want only the decodable record's BlobKey", marks)
 	}
 }
 
@@ -654,5 +781,60 @@ func TestCompact_ReadOnlyHandleErrors(t *testing.T) {
 
 	if err := ro.Compact(); err == nil {
 		t.Fatal("Compact() on a read-only handle succeeded, want an error")
+	}
+}
+
+// TestCompact_ReopensEvenWhenClosingOriginalFails verifies Compact's own
+// documented contract: a caller is left with a usable db.bolt handle even
+// when closing the original, pre-compaction file fails — not just when
+// everything up to that point succeeds (see L1 in
+// audit-silent-failures.md). Exercised through replaceWithCompacted
+// directly with an injected closeOrig, since a genuine bbolt Close failure
+// is not reproducible from outside the package: closing an already-closed
+// *bbolt.DB is itself a documented no-op that reports success, not an
+// error.
+func TestCompact_ReopensEvenWhenClosingOriginalFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := db.PutUnit(&UnitEntry{PkgHash: 1, Pointer: UnitPointer{BlobKey: 7}}); err != nil {
+		t.Fatalf("PutUnit() error = %v", err)
+	}
+
+	tmpPath := path + ".compact-tmp"
+	dst, err := bbolt.Open(tmpPath, 0o600, nil)
+	if err != nil {
+		t.Fatalf("open compact temp file: %v", err)
+	}
+	if err := bbolt.Compact(dst, db.bolt, 0); err != nil {
+		t.Fatalf("bbolt.Compact: %v", err)
+	}
+	if err := dst.Close(); err != nil {
+		t.Fatalf("close compact temp file: %v", err)
+	}
+
+	wantErr := errors.New("simulated close failure")
+	closeErr := db.replaceWithCompacted(tmpPath, func() error {
+		// Actually close the real handle first, so its OS-level lock is
+		// genuinely released (matching what a real bbolt Close failure
+		// still does in practice — see db.go's close(): funlock and
+		// file.Close() both run even when an earlier step, e.g. munmap,
+		// reported an error) — only the RETURNED error is synthetic.
+		_ = db.bolt.Close()
+		return wantErr
+	})
+	if !errors.Is(closeErr, wantErr) {
+		t.Fatalf("replaceWithCompacted() error = %v, want it to wrap %v", closeErr, wantErr)
+	}
+
+	// The whole point: db.bolt must be a live, usable handle despite
+	// closeOrig having failed, exactly as Compact's own doc promises.
+	if _, err := db.GetUnit(context.Background(), 1); err != nil {
+		t.Errorf("GetUnit(1) after a failed-close Compact = %v, want the original record to still be readable through the reopened handle", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Errorf("Close() on the reopened handle error = %v", err)
 	}
 }

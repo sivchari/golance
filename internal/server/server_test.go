@@ -46,6 +46,37 @@ func newTestLogger(t *testing.T) *log.Logger {
 // trigger the real indexer subprocess (see internal/server/indexer.go).
 // index.Build runs in-process here, the same way internal/index's and
 // internal/xref's own tests build a facts database.
+// stopWorkspaceEngineOnCleanup registers a t.Cleanup that stops s's
+// current workspace's check engine: no test helper otherwise ends a
+// workspace's debounce timers, so a didChange/didSave-armed recheck can
+// fire after the test function returns and log through a logger the test
+// framework has already torn down, panicking with "Log in goroutine after
+// Test... has completed". Reads s.workspace() at cleanup time, not a
+// captured pointer, since a later setWorkspace call in the same test may
+// have swapped it.
+func stopWorkspaceEngineOnCleanup(t *testing.T, s *Server) {
+	t.Helper()
+	t.Cleanup(func() {
+		if ws := s.workspace(); ws != nil {
+			ws.engine.Stop()
+			ws.engine.Wait()
+		}
+		// Detached reindexes a handler started (didOpen's facts self-heal,
+		// a didSave reindex) are drained by Serve in production; a test
+		// that calls handlers directly has no Serve, so it must drain them
+		// here or one keeps writing to the index and CAS that this test's
+		// own t.TempDir cleanup is about to remove. This is the same
+		// Store(nil)-then-Wait sequence under idxMu that revalidateIndex's
+		// rebuild branch uses (see beginReindex's doc for why holding the
+		// lock across both is what makes a late registration impossible
+		// rather than a race).
+		s.idxMu.Lock()
+		s.idx.Store(nil)
+		s.reindexWG.Wait()
+		s.idxMu.Unlock()
+	})
+}
+
 func newTestServer(t *testing.T) (*Server, *graph.Snapshot, string) {
 	t.Helper()
 	root, err := filepath.Abs(filepath.Join("testdata", "module"))
@@ -70,14 +101,16 @@ func newTestServer(t *testing.T) (*Server, *graph.Snapshot, string) {
 	if err != nil {
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
-	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+	relative := RelativeIndexPaths(root)
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{RelativePaths: relative}); err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}
 
 	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 	s := New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(root, snap)
-	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+	stopWorkspaceEngineOnCleanup(t, s)
+	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, relative)})
 
 	return s, snap, root
 }
@@ -104,6 +137,7 @@ func newTestServerNoIndex(t *testing.T) (*Server, *graph.Snapshot) {
 	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
 	s := New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(root, snap)
+	stopWorkspaceEngineOnCleanup(t, s)
 
 	return s, snap
 }
@@ -274,6 +308,7 @@ func TestCheckedFile_WaitsForWorkspaceThenResolves(t *testing.T) {
 		}
 
 		s.setWorkspace(root, snap)
+		stopWorkspaceEngineOnCleanup(t, s)
 
 		select {
 		case r := <-done:

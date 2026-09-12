@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -98,18 +99,33 @@ func (s *Server) unimportedMemberItems(ws *workspace, cf checkedFileResult, uctx
 	}
 	ownPath := cf.cp.PkgPath()
 	imp := ws.depCache.importer()
+	var importErrs []string
 	for _, path := range paths {
 		if path == ownPath {
 			continue // never suggest importing the package being edited
 		}
 		pkg, err := imp.ImportFrom(path, "", 0)
 		if err != nil {
+			importErrs = append(importErrs, fmt.Sprintf("%s: %v", path, err))
 			continue
 		}
 		candidate := langfeat.UnimportedPackageCandidate{Name: uctx.Selector, ImportPath: path}
 		if items := langfeat.UnimportedMemberItems(cf.path, cf.text, uctx.Prefix, candidate, pkg); len(items) > 0 {
 			return items
 		}
+	}
+	// Logged only now that every candidate package sharing uctx.Selector's
+	// name has been tried and none produced a result: a candidate ImportFrom
+	// failure alongside another candidate's success is the ordinary "several
+	// packages share this name, only one is actually usable here" case
+	// (see this function's own doc) and stays silent, matching
+	// implementation.go's logImplDiag precedent of reporting only when a
+	// query's final result is empty. Once it is, this is what tells a real
+	// depcheck/depexport failure (e.g. an unresolvable transitive import)
+	// apart from every candidate genuinely lacking the typed member.
+	if len(importErrs) > 0 {
+		s.logger.Printf("server: unimported-member completion for %s.%s: %d candidate package(s) failed to import: %s",
+			uctx.Selector, uctx.Prefix, len(importErrs), strings.Join(importErrs, "; "))
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -144,6 +145,179 @@ func TestProvider_Decl_UnexportedScopeLookup(t *testing.T) {
 	pos := fset.Position(id.Pos())
 	if !filepath.IsAbs(pos.Filename) || filepath.Base(filepath.Dir(pos.Filename)) != "dep" {
 		t.Errorf("Filename = %q, want an absolute path inside the dep fixture package's directory", pos.Filename)
+	}
+}
+
+// findFirstObj returns the types.Object the first identifier named name
+// (source order, across cp's files) resolves to via cp.Info(). Used to pull
+// a synthetic, instantiation-specific types.Object (a field or method
+// reached through an instantiated generic dependency type) straight out of
+// a consumer package's own checked Info, the same way
+// internal/langfeat.DependencyDefinition pulls one out of a workspace
+// package's Info before calling Decl.
+func findFirstObj(t *testing.T, cp *CheckedPackage, name string) types.Object {
+	t.Helper()
+	for _, f := range cp.Files() {
+		var found *ast.Ident
+		ast.Inspect(f, func(n ast.Node) bool {
+			if found != nil {
+				return false
+			}
+			if id, ok := n.(*ast.Ident); ok && id.Name == name {
+				found = id
+				return false
+			}
+			return true
+		})
+		if found != nil {
+			obj := cp.Info().ObjectOf(found)
+			if obj == nil {
+				t.Fatalf("identifier %q has no resolved object", name)
+			}
+			return obj
+		}
+	}
+	t.Fatalf("no identifier named %q found among %s's files", name, cp.pkgPath)
+	return nil
+}
+
+// declMemberPos returns the (line, column) of memberName's declaring
+// identifier — a struct field or a method with a receiver of typeName —
+// parsed independently of any Provider, mirroring declIdentInFile's
+// ground-truth role for top-level declarations.
+func declMemberPos(t *testing.T, path, typeName, memberName string) (line, col int) {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	var found *ast.Ident
+	for _, decl := range f.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if id := methodDeclIdent(d, typeName, memberName); id != nil {
+				found = id
+			}
+		case *ast.GenDecl:
+			if id := fieldDeclIdent(d, typeName, memberName); id != nil {
+				found = id
+			}
+		}
+	}
+	if found == nil {
+		t.Fatalf("no field/method %s.%s found in %s", typeName, memberName, path)
+	}
+	p := fset.Position(found.Pos())
+	return p.Line, p.Column
+}
+
+// methodDeclIdent returns memberName's declaring identifier if d is a
+// method (value or pointer receiver, generic or not) on typeName.
+func methodDeclIdent(d *ast.FuncDecl, typeName, memberName string) *ast.Ident {
+	if d.Recv == nil || len(d.Recv.List) != 1 || d.Name.Name != memberName {
+		return nil
+	}
+	if receiverBaseName(d.Recv.List[0].Type) != typeName {
+		return nil
+	}
+	return d.Name
+}
+
+// receiverBaseName strips a pointer and any generic type arguments off a
+// method receiver's type expression to get the declared type's own name.
+func receiverBaseName(expr ast.Expr) string {
+	if star, ok := expr.(*ast.StarExpr); ok {
+		expr = star.X
+	}
+	switch rt := expr.(type) {
+	case *ast.Ident:
+		return rt.Name
+	case *ast.IndexExpr:
+		if id, ok := rt.X.(*ast.Ident); ok {
+			return id.Name
+		}
+	case *ast.IndexListExpr:
+		if id, ok := rt.X.(*ast.Ident); ok {
+			return id.Name
+		}
+	}
+	return ""
+}
+
+// fieldDeclIdent returns memberName's declaring identifier if d declares
+// typeName as a struct with that field.
+func fieldDeclIdent(d *ast.GenDecl, typeName, memberName string) *ast.Ident {
+	var found *ast.Ident
+	for _, spec := range d.Specs {
+		ts, ok := spec.(*ast.TypeSpec)
+		if !ok || ts.Name.Name != typeName {
+			continue
+		}
+		st, ok := ts.Type.(*ast.StructType)
+		if !ok {
+			continue
+		}
+		for _, field := range st.Fields.List {
+			for _, fname := range field.Names {
+				if fname.Name == memberName {
+					found = fname
+				}
+			}
+		}
+	}
+	return found
+}
+
+// TestProvider_Decl_Generics reproduces the production bug: jump-to-
+// definition into a field or method reached through an INSTANTIATED generic
+// dependency type (dep.Box[Payload], mirroring connectrpc.com/connect's
+// Request[T]/Response[T] shape — Msg *T) failed with "could not resolve"
+// (resolveObject's error), because objectpath.For's traversal only walks
+// origin (uninstantiated) declarations reachable from package scope, and
+// the field/method go/types synthesizes when a generic type is instantiated
+// is a distinct object from its origin declaration. obj is deliberately
+// pulled from a full-body check of the CONSUMER package (user), not dep
+// itself, since only selecting/calling through an instantiated Box[Payload]
+// produces the synthetic object this test exists to resolve.
+func TestProvider_Decl_Generics(t *testing.T) {
+	meta := loadTestGraph(t)
+	ctx := context.Background()
+	const userPkgPath = "example.com/depcheckmod/user"
+	const depPkgPath = "example.com/depcheckmod/dep"
+
+	p := NewProvider(meta, Options{})
+	userCP, err := p.PackageWithBodies(ctx, userPkgPath)
+	if err != nil {
+		t.Fatalf("PackageWithBodies(%s): %v", userPkgPath, err)
+	}
+
+	tests := []struct {
+		name       string
+		identName  string
+		memberName string
+	}{
+		{name: "field", identName: "Msg", memberName: "Msg"},
+		{name: "value receiver method", identName: "ValueDescribe", memberName: "ValueDescribe"},
+		{name: "pointer receiver method", identName: "PointerDescribe", memberName: "PointerDescribe"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obj := findFirstObj(t, userCP, tt.identName)
+
+			id, fset, err := p.Decl(ctx, depPkgPath, obj)
+			if err != nil {
+				t.Fatalf("Decl(%s): %v", tt.identName, err)
+			}
+			if id.Name != tt.memberName {
+				t.Errorf("Decl returned identifier %q, want %q", id.Name, tt.memberName)
+			}
+			pos := fset.Position(id.Pos())
+			wantLine, wantCol := declMemberPos(t, pos.Filename, "Box", tt.memberName)
+			if pos.Line != wantLine || pos.Column != wantCol {
+				t.Errorf("position = %d:%d, want %d:%d (from parsing %s directly)", pos.Line, pos.Column, wantLine, wantCol, pos.Filename)
+			}
+		})
 	}
 }
 

@@ -152,6 +152,9 @@ func TestParseCodeLensSettings(t *testing.T) {
 
 	t.Run("explicit override wins, unspecified sources keep their default", func(t *testing.T) {
 		raw := mustMarshal(t, map[string]any{"codelenses": map[string]bool{"test": true}})
+		// The conversion is required by the toolchain CI builds with, which
+		// rejects the implicit one; a newer local toolchain accepts it and
+		// reports the conversion as unnecessary.
 		got := parseCodeLensSettings(protocol.LSPAny(raw))
 		if !got[codeLensTest] {
 			t.Error("test source not enabled by explicit override")

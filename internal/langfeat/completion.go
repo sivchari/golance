@@ -127,17 +127,10 @@ func Unimported(cp *check.CheckedPackage, text []byte, file string, offset int) 
 	path, _ := astutil.PathEnclosingInterval(astFile, ctxPos, ctxPos)
 
 	if sel := enclosingSelector(path); sel != nil {
-		id, ok := sel.X.(*ast.Ident)
-		if !ok {
-			return UnimportedContext{}, false
+		if name, ok := unresolvedSelectorBase(cp, sel); ok {
+			return UnimportedContext{Selector: name, Prefix: prefix}, true
 		}
-		if _, ok := cp.Info().ObjectOf(id).(*types.PkgName); ok {
-			return UnimportedContext{}, false // already imported; ordinary selectorCompletions handles it
-		}
-		if cp.Info().TypeOf(sel.X) != nil {
-			return UnimportedContext{}, false // resolves to a value; ordinary member completion handles it
-		}
-		return UnimportedContext{Selector: id.Name, Prefix: prefix}, true
+		return UnimportedContext{}, false
 	}
 
 	if prefix == "" {
@@ -211,9 +204,40 @@ func enclosingSelector(path []ast.Node) *ast.SelectorExpr {
 	return nil
 }
 
+// unresolvedSelectorBase reports whether sel.X is a plain identifier that
+// resolves to neither an imported package nor a typed value — the shape
+// Unimported's shape-2 lookup (and ResolveCompletionDoc's identical
+// fallback in completiondoc.go) treats as a candidate unimported-package
+// qualifier instead, along with that identifier's own name. This is also
+// exactly the shape selectorCompletions itself cannot usefully complete
+// (see its own doc): sel.X failing to resolve at all — an undeclared
+// identifier, or one whose own initializer never type-checked far enough to
+// record anything for it — leaves nothing in cp's type information to base
+// member candidates on.
+func unresolvedSelectorBase(cp *check.CheckedPackage, sel *ast.SelectorExpr) (name string, ok bool) {
+	id, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return "", false
+	}
+	if _, ok := cp.Info().ObjectOf(id).(*types.PkgName); ok {
+		return "", false // already imported; ordinary selectorCompletions handles it
+	}
+	if cp.Info().TypeOf(sel.X) != nil {
+		return "", false // resolves to a value (possibly Typ[Invalid]); ordinary member completion handles it
+	}
+	return id.Name, true
+}
+
 // selectorCompletions handles "x.<prefix>" completion: package member
 // completion if x names an imported package, otherwise x's method set
-// (value and pointer receivers) plus its struct fields.
+// (value and pointer receivers) plus its struct fields. It returns nil for
+// unresolvedSelectorBase's shape (x itself failed to resolve to anything) —
+// this package never reads the workspace graph (see Completion's own doc),
+// so it cannot itself tell whether x names some other, not-yet-imported
+// package; the server layer's own Unimported/unresolvedSelectorBase-driven
+// fallback is what actually answers that case (compared directly against
+// gopls's own identical "guess this is an unimported package" completion
+// for a broken selector base — see completion_test.go).
 func selectorCompletions(cp *check.CheckedPackage, sel *ast.SelectorExpr, prefix string) []CompletionItem {
 	if id, ok := sel.X.(*ast.Ident); ok {
 		if pn, ok := cp.Info().ObjectOf(id).(*types.PkgName); ok {
@@ -223,9 +247,6 @@ func selectorCompletions(cp *check.CheckedPackage, sel *ast.SelectorExpr, prefix
 
 	xType := cp.Info().TypeOf(sel.X)
 	if xType == nil {
-		// TODO(v0.1): recover this case with a types.CheckExpr scratch check
-		// of sel.X against the last-good package scope, instead of giving up
-		// on selector completion entirely.
 		return nil
 	}
 	return filterAndRank(memberItems(cp.Package(), xType), prefix)

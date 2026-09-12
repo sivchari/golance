@@ -25,6 +25,7 @@ package graph
 
 import (
 	"fmt"
+	"hash/fnv"
 	"os"
 	"sort"
 	"strings"
@@ -114,8 +115,18 @@ type Snapshot struct {
 	Packages map[string]*Package `json:"packages"`
 	Order    []string            `json:"order"`
 
-	dir     string              // working directory Load ran from, for Dir()/RelativePaths
-	revDeps map[string][]string // import path -> direct importers present in the graph
+	dir string // working directory Load ran from, for Dir()/RelativePaths
+	// revDeps maps an import path to every package that directly imports
+	// it, present in the graph — folding in both Package.Imports and
+	// Package.TestImports (see newSnapshot), so ClosureUnits also reaches a
+	// package whose only edge to pkgPath is through an in-package test
+	// file.
+	revDeps map[string][]string
+
+	// buildFlagsFP is set by Load from the build configuration
+	// packages.Load actually resolved this Snapshot's packages under (see
+	// buildFlagsFingerprint and BuildFlagsFingerprint).
+	buildFlagsFP string
 }
 
 // Options configures a Load call.
@@ -173,7 +184,48 @@ func Load(opts Options, patterns ...string) (*Snapshot, error) {
 	}, nil)
 
 	pkgs := fromPackages(all, rootSet)
-	return newSnapshot(pkgs, opts.Dir)
+	snap := newSnapshot(pkgs, opts.Dir)
+	snap.buildFlagsFP = buildFlagsFingerprint(opts.BuildFlags, cfg.Env)
+	return snap, nil
+}
+
+// buildFlagsFingerprint returns a deterministic fingerprint of the build
+// configuration packages.Load actually resolved packages under: buildFlags
+// (forwarded to packages.Config.BuildFlags, e.g. -tags) plus GOFLAGS,
+// GOOS, GOARCH, and CGO_ENABLED as found in env — the same env Load itself
+// passed to go/packages. A caller that folds this into internal/index's
+// cache key invalidates the index whenever any of these change, even for a
+// package whose own file set happens not to (see
+// internal/index.Options.BuildFlagsFingerprint's doc). GOOS/GOARCH/
+// CGO_ENABLED left unset in env fold in as empty strings rather than their
+// resolved defaults — imprecise but safe: a transition from unset to
+// explicitly set to the same effective default value is reported as a
+// change, at worst costing one redundant rebuild, never masking a real one.
+func buildFlagsFingerprint(buildFlags, env []string) string {
+	h := fnv.New64a()
+	for _, f := range buildFlags {
+		_, _ = h.Write([]byte(f))
+		_, _ = h.Write([]byte{0})
+	}
+	for _, key := range []string{"GOFLAGS", "GOOS", "GOARCH", "CGO_ENABLED"} {
+		_, _ = h.Write([]byte(key))
+		_, _ = h.Write([]byte{'='})
+		_, _ = h.Write([]byte(envLookup(env, key)))
+		_, _ = h.Write([]byte{0})
+	}
+	return fmt.Sprintf("%016x", h.Sum64())
+}
+
+// envLookup returns key's value in env (an os.Environ-style "KEY=VALUE"
+// slice), or "" if key is not present.
+func envLookup(env []string, key string) string {
+	prefix := key + "="
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, prefix); ok {
+			return v
+		}
+	}
+	return ""
 }
 
 // fromPackages converts go/packages results into the graph's own
@@ -330,41 +382,71 @@ func isSyntheticTestBinary(p *packages.Package) bool {
 // newSnapshot builds a Snapshot from a package map, computing the topo
 // order and reverse-dependency index. dir is remembered for Dir()'s own use
 // (relative-path storage in a root-relative facts database).
-func newSnapshot(pkgs map[string]*Package, dir string) (*Snapshot, error) {
-	order, err := topoOrder(pkgs)
-	if err != nil {
-		return nil, err
-	}
+func newSnapshot(pkgs map[string]*Package, dir string) *Snapshot {
+	order := topoOrder(pkgs)
 	revDeps := make(map[string][]string, len(pkgs))
-	for path, pkg := range pkgs {
-		for _, imp := range pkg.Imports {
+	addRevDeps := func(path string, imports []string) {
+		for _, imp := range imports {
 			if _, ok := pkgs[imp]; !ok {
 				continue // not part of the loaded graph
 			}
 			revDeps[imp] = append(revDeps[imp], path)
 		}
 	}
+	for path, pkg := range pkgs {
+		addRevDeps(path, pkg.Imports)
+		// TestImports (see its own doc) is disjoint from Imports by
+		// construction (extraImports only ever records what Imports does
+		// not already have), so this never adds path to the same
+		// revDeps[imp] slice twice for one import path.
+		addRevDeps(path, pkg.TestImports)
+	}
 	for _, importers := range revDeps {
 		sort.Strings(importers)
 	}
-	return &Snapshot{Packages: pkgs, Order: order, dir: dir, revDeps: revDeps}, nil
+	return &Snapshot{Packages: pkgs, Order: order, dir: dir, revDeps: revDeps}
 }
 
 // topoOrder returns the import paths of pkgs in Kahn topological order,
-// dependencies before dependents. Import paths outside pkgs (external to
-// the loaded graph) are treated as already satisfied. Ties are broken
-// lexicographically for a deterministic order.
-func topoOrder(pkgs map[string]*Package) ([]string, error) {
+// dependencies before dependents, respecting both Package.Imports and
+// Package.TestImports edges — internal/index's directDepExports folds both
+// into a package's own combined key, so a package reachable from another
+// only through the latter still needs to be processed first. Import paths
+// outside pkgs (external to the loaded graph) are treated as already
+// satisfied. Ties are broken lexicographically for a deterministic order.
+//
+// Imports alone is always guaranteed acyclic — go/packages.Load itself
+// rejects a real production import cycle before this ever runs — but
+// Imports plus TestImports together are not: an in-package test file may
+// legally import a package that, in production, imports the package under
+// test (see Package.TestImports's own doc for why that edge is never
+// folded into Imports for OTHER cycle-sensitive purposes); go/packages'
+// own "p [p.test]"/"p" split treats that as two distinct compilation units,
+// so it is not a real build-graph cycle even though it looks like one once
+// TestImports edges are added to a single graph here. When that leaves some
+// packages permanently unready, the ordinary walk below stalls before
+// covering every package; rather than fail the whole graph load over a
+// legal Go pattern, every package still unplaced at that point is appended
+// in a fixed (lexicographic) order instead — every acyclic edge, including
+// every OTHER TestImports edge not itself part of the cycle, is still
+// respected; only the cycle-closing edge(s) end up unordered between each
+// other. This makes topoOrder unable to fail today, unlike before
+// TestImports edges were added to its graph.
+func topoOrder(pkgs map[string]*Package) []string {
 	indegree := make(map[string]int, len(pkgs))
 	dependents := make(map[string][]string, len(pkgs))
-	for path, pkg := range pkgs {
-		for _, imp := range pkg.Imports {
+	addEdges := func(path string, imports []string) {
+		for _, imp := range imports {
 			if _, ok := pkgs[imp]; !ok {
 				continue
 			}
 			indegree[path]++
 			dependents[imp] = append(dependents[imp], path)
 		}
+	}
+	for path, pkg := range pkgs {
+		addEdges(path, pkg.Imports)
+		addEdges(path, pkg.TestImports)
 	}
 
 	ready := make([]string, 0, len(pkgs))
@@ -375,11 +457,13 @@ func topoOrder(pkgs map[string]*Package) ([]string, error) {
 	}
 	sort.Strings(ready)
 
+	placed := make(map[string]bool, len(pkgs))
 	order := make([]string, 0, len(pkgs))
 	for len(ready) > 0 {
 		path := ready[0]
 		ready = ready[1:]
 		order = append(order, path)
+		placed[path] = true
 		var newlyReady []string
 		for _, dep := range dependents[path] {
 			indegree[dep]--
@@ -394,9 +478,16 @@ func topoOrder(pkgs map[string]*Package) ([]string, error) {
 	}
 
 	if len(order) != len(pkgs) {
-		return nil, fmt.Errorf("graph: import cycle detected (topo order has %d of %d packages)", len(order), len(pkgs))
+		remaining := make([]string, 0, len(pkgs)-len(order))
+		for path := range pkgs {
+			if !placed[path] {
+				remaining = append(remaining, path)
+			}
+		}
+		sort.Strings(remaining)
+		order = append(order, remaining...)
 	}
-	return order, nil
+	return order
 }
 
 // Package returns the graph node for path, if present.
@@ -411,9 +502,18 @@ func (s *Snapshot) Package(path string) (*Package, bool) {
 // and internal/xref.New).
 func (s *Snapshot) Dir() string { return s.dir }
 
+// BuildFlagsFingerprint returns a fingerprint of the build configuration
+// (build flags plus GOFLAGS/GOOS/GOARCH/CGO_ENABLED) Load actually resolved
+// s's packages under (see buildFlagsFingerprint).
+func (s *Snapshot) BuildFlagsFingerprint() string { return s.buildFlagsFP }
+
 // ClosureUnits returns pkgPath plus the import path of every package in the
 // graph that (transitively) imports pkgPath — the set of packages whose
-// type check result can depend on pkgPath's public API. Mirrors
+// type check result can depend on pkgPath's public API — via either a
+// production import (Package.Imports) or an in-package test file's own
+// import (Package.TestImports): a package reached only through the latter
+// still needs reprocessing when pkgPath's export data changes, exactly like
+// an ordinary importer (see newSnapshot's revDeps construction). Mirrors
 // gopls-lazy's revIndex.ClosureUnits, applied to the go/packages import
 // graph instead of a parsed-imports index.
 func (s *Snapshot) ClosureUnits(pkgPath string) []string {

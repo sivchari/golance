@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
+	"github.com/sivchari/golance/internal/langfeat"
 	"github.com/sivchari/golance/internal/overlay"
 )
 
@@ -153,5 +155,48 @@ func TestHandleCompletion_NoUnimportedContextIsNoOp(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("completion results missing \"Builder\"; got %d item(s): %+v", len(items), items)
+	}
+}
+
+// TestUnimportedMemberItems_ImportErrorIsLogged pins the M9 fix at
+// handlers_completion_unimported.go's own candidate-resolution loop: an
+// ImportFrom failure used to be indistinguishable from "this candidate's
+// exported members just don't match the typed prefix" — both silently
+// `continue`d, so a genuinely broken candidate (its export data
+// undecodable, not merely lacking the wanted member) never left any trace
+// once the loop ran out of candidates. It registers a package name whose
+// only candidate import path resolves to nothing real, so ImportFrom fails
+// for that reason rather than a missing member, and checks the failure
+// reaches s.logger.
+func TestUnimportedMemberItems_ImportErrorIsLogged(t *testing.T) {
+	s, _, root := newTestServer(t)
+	var logBuf bytes.Buffer
+	s.logger = log.New(&logBuf, "", 0)
+
+	ws := s.workspace()
+	if ws == nil {
+		t.Fatal("s.workspace() = nil, want a populated workspace")
+	}
+	const bogusSelector = "doesnotexistpkg"
+	ws.pkgNameIndex[bogusSelector] = []string{"example.com/servermod/doesnotexistpkg"}
+
+	path := filepath.Join(root, "greet", "greet.go")
+	cf := s.checkedFile(context.Background(), uri.File(path), protocol.Position{})
+	if !cf.ok {
+		t.Fatalf("checkedFile(%s) ok=false, want a resolvable checked package", path)
+	}
+
+	uctx := langfeat.UnimportedContext{Selector: bogusSelector, Prefix: ""}
+	items := s.unimportedMemberItems(ws, cf, uctx)
+	if items != nil {
+		t.Errorf("unimportedMemberItems = %+v, want nil (the only candidate import path does not exist)", items)
+	}
+
+	logged := logBuf.String()
+	if !strings.Contains(logged, bogusSelector) {
+		t.Errorf("log output = %q, want it to mention selector %q", logged, bogusSelector)
+	}
+	if !strings.Contains(logged, "example.com/servermod/doesnotexistpkg") {
+		t.Errorf("log output = %q, want it to name the failing candidate import path", logged)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go/parser"
 	"go/token"
+	"log"
 	"math"
 	"os"
 	"strings"
@@ -74,9 +75,17 @@ func (s *Server) indexUnavailableError(feature string) error {
 // into the 1-based line/byte-column coordinates internal/xref queries
 // take, correcting for any unsaved edits (see dirty.go) since xref answers
 // from the on-disk facts index.
+//
+// ok is also false, silently, when pos falls outside text's current bounds
+// (positionToXref): a narrow race between the client's query and a
+// just-applied edit shrinking the file, which the client's very next
+// request already answers against the up-to-date buffer -- logging that
+// would be noise for something that is never actionable. An overlay read
+// failure is a different matter (see below) and is logged.
 func (s *Server) xrefPosition(path string, pos protocol.Position) (line, col int, ok bool) {
 	text, err := s.overlay.ReadFile(path)
 	if err != nil {
+		s.logger.Printf("server: xref position for %s: %v", path, err)
 		return 0, 0, false
 	}
 	l, c, ok := positionToXref(text, pos)
@@ -217,7 +226,7 @@ func (s *Server) builtinDefinition(cf checkedFileResult) (xref.Location, bool) {
 	if info == nil {
 		return xref.Location{}, false
 	}
-	return builtinDefLocation(info)
+	return builtinDefLocation(s.logger, info)
 }
 
 // builtinDefLocation converts a BuiltinDefInfo -- builtinDefinition's own
@@ -225,10 +234,14 @@ func (s *Server) builtinDefinition(cf checkedFileResult) (xref.Location, bool) {
 // named type's TypeDefInfo.Builtin, langfeat.TypeDefinition) -- into an
 // xref.Location. ok is false if builtin.go no longer exists on disk (a
 // relocated or removed toolchain install between resolution and this
-// call) or any coordinate overflows uint32, the same bounds check every
-// other xref.Location construction in this package applies.
-func builtinDefLocation(info *langfeat.BuiltinDefInfo) (xref.Location, bool) {
+// call, logged since every predeclared identifier's hover/definition/
+// typeDefinition silently degrades for the rest of the process once this
+// starts happening — see loadBuiltinFileOnce's own process-lifetime cache)
+// or any coordinate overflows uint32, the same bounds check every other
+// xref.Location construction in this package applies.
+func builtinDefLocation(logger *log.Logger, info *langfeat.BuiltinDefInfo) (xref.Location, bool) {
 	if _, err := os.Stat(info.Filename); err != nil {
+		logger.Printf("server: builtin definition: declaration source %s: %v", info.Filename, err)
 		return xref.Location{}, false
 	}
 	if info.Line <= 0 || int64(info.Line) > math.MaxUint32 ||
@@ -287,6 +300,7 @@ func (s *Server) dependencyDefinition(ctx context.Context, cf checkedFileResult)
 		return xref.Location{}, false
 	}
 	if _, err := os.Stat(info.Filename); err != nil {
+		s.logger.Printf("server: dependency definition %s: declaration source %s: %v", cf.path, info.Filename, err)
 		return xref.Location{}, false
 	}
 	if info.Line <= 0 || int64(info.Line) > math.MaxUint32 ||
@@ -497,11 +511,13 @@ func (s *Server) handleRename(ctx context.Context, params json.RawMessage) (any,
 	}
 
 	changes := make(map[uri.URI][]protocol.TextEdit, len(edits))
+	var unresolved int
 	for file, fes := range edits {
 		var out []protocol.TextEdit
 		for _, e := range fes {
 			rng, ok := s.correctResultRange(file, e.Line, e.Col, e.EndCol)
 			if !ok {
+				unresolved++
 				continue
 			}
 			out = append(out, protocol.TextEdit{Range: rng, NewText: e.NewText})
@@ -509,6 +525,17 @@ func (s *Server) handleRename(ctx context.Context, params json.RawMessage) (any,
 		if len(out) > 0 {
 			changes[uri.File(file)] = out
 		}
+	}
+	if unresolved > 0 {
+		// A rename must be all-or-nothing: applying only the references whose
+		// range happened to resolve would leave the rest of the occurrences
+		// under the old name, silently producing code that no longer
+		// compiles with no indication why. Refuse the whole edit instead of
+		// returning the partial WorkspaceEdit, the same all-or-nothing
+		// contract dirtyRenameFiles enforces above for unsaved edits.
+		msg := fmt.Sprintf("golance: cannot safely rename %q; %d reference(s) could not be resolved against the current file contents", p.NewName, unresolved)
+		s.logger.Printf("server: rename %q: refusing, %d reference range(s) unresolved", p.NewName, unresolved)
+		return nil, rpc.NewError(int32(protocol.ErrorCodesInternalError), msg)
 	}
 	return &protocol.WorkspaceEdit{Changes: changes}, nil
 }

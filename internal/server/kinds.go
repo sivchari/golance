@@ -29,7 +29,12 @@ func completionItemKind(k langfeat.CompletionKind) protocol.CompletionItemKind {
 	}
 }
 
-// documentSymbolKind maps a langfeat.SymbolKind to its LSP equivalent.
+// documentSymbolKind maps a langfeat.SymbolKind to its LSP equivalent, at
+// the same struct-vs-interface granularity workspaceSymbolKind below
+// carries for the facts index's index.KindType/index.KindInterface -- kept
+// consistent so the same declaration does not render with a different
+// outline icon depending on whether a client asked textDocument/
+// documentSymbol or workspace/symbol.
 func documentSymbolKind(k langfeat.SymbolKind) protocol.SymbolKind {
 	switch k {
 	case langfeat.SymbolFunc:
@@ -38,10 +43,14 @@ func documentSymbolKind(k langfeat.SymbolKind) protocol.SymbolKind {
 		return protocol.SymbolKindMethod
 	case langfeat.SymbolType:
 		return protocol.SymbolKindStruct
+	case langfeat.SymbolInterface:
+		return protocol.SymbolKindInterface
 	case langfeat.SymbolVar:
 		return protocol.SymbolKindVariable
 	case langfeat.SymbolConst:
 		return protocol.SymbolKindConstant
+	case langfeat.SymbolField:
+		return protocol.SymbolKindField
 	default:
 		return protocol.SymbolKindVariable
 	}

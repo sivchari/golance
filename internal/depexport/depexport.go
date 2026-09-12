@@ -48,6 +48,16 @@
 // practice: a `replace`-local package is a small, rare fraction of any
 // real dependency closure), just without cross-process/cross-restart
 // reuse.
+//
+// A package whose own check reported an error — most commonly one of its
+// own transitive imports being momentarily unresolvable in the current
+// graph, not a real defect in immutable dependency source — gets the exact
+// same treatment regardless of directory identity (see
+// depcheck.CheckedPackage.Incomplete): ExportData still returns its
+// best-effort result for THIS call's own caller, but never persists it, so
+// a transient resolution failure elsewhere in the workspace can never poison
+// every repository on the machine with an incomplete blob for up to
+// GCMaxAge.
 package depexport
 
 import (
@@ -197,25 +207,7 @@ func (c *Cache) ExportData(pkgPath string) ([]byte, bool, error) {
 	}
 
 	v, err, _ := c.sf.Do(pkgPath, func() (any, error) {
-		if persist {
-			if blob, ok, err := c.cas.Get(context.Background(), key); ok || err != nil {
-				return blob, err
-			}
-		}
-		cp, err := c.provider.Package(context.Background(), pkgPath)
-		if err != nil {
-			return nil, fmt.Errorf("depexport: check %s: %w", pkgPath, err)
-		}
-		blob, err := typecheck.WriteExport(cp.Types(), c.provider.FileSet())
-		if err != nil {
-			return nil, fmt.Errorf("depexport: write export data for %s: %w", pkgPath, err)
-		}
-		if persist {
-			if err := c.cas.Put(key, blob); err != nil {
-				return nil, fmt.Errorf("depexport: persist export data for %s: %w", pkgPath, err)
-			}
-		}
-		return blob, nil
+		return c.checkAndPersist(pkgPath, persist, key)
 	})
 	if err != nil {
 		return nil, false, err
@@ -225,6 +217,42 @@ func (c *Cache) ExportData(pkgPath string) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("depexport: singleflight for %s returned %T, want []byte", pkgPath, v)
 	}
 	return blob, true, nil
+}
+
+// checkAndPersist is ExportData's singleflight-guarded slow path: a CAS hit
+// that raced ahead of this call while it waited to run (persist only),
+// otherwise a fresh declaration-only check via c.provider, persisted to the
+// CAS when persist allows it and the check was not Incomplete (see the
+// field's own doc).
+func (c *Cache) checkAndPersist(pkgPath string, persist bool, key uint64) ([]byte, error) {
+	if persist {
+		if blob, ok, err := c.cas.Get(context.Background(), key); ok || err != nil {
+			return blob, err
+		}
+	}
+	cp, err := c.provider.Package(context.Background(), pkgPath)
+	if err != nil {
+		return nil, fmt.Errorf("depexport: check %s: %w", pkgPath, err)
+	}
+	blob, err := typecheck.WriteExport(cp.Types(), c.provider.FileSet())
+	if err != nil {
+		return nil, fmt.Errorf("depexport: write export data for %s: %w", pkgPath, err)
+	}
+	// cp.Incomplete (see its own doc) means pkgPath's check — or a
+	// transitive import's — reported at least one error, e.g. one of its
+	// own dependencies was momentarily unresolvable in the current graph:
+	// blob still reflects go/types' best-effort result (correct for THIS
+	// call's own caller, see typecheck.NewImporter's identical
+	// resolves-but-does-not-persist contract), but persisting it to the
+	// machine-global CAS would let every repository on this machine keep
+	// being served that same degraded result for up to GCMaxAge, long
+	// after the transient condition that produced it is gone.
+	if persist && !cp.Incomplete() {
+		if err := c.cas.Put(key, blob); err != nil {
+			return nil, fmt.Errorf("depexport: persist export data for %s: %w", pkgPath, err)
+		}
+	}
+	return blob, nil
 }
 
 // immutable reports whether dir falls under c's GOROOT or GOModCache — the

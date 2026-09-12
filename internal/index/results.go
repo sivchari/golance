@@ -2,6 +2,7 @@ package index
 
 import (
 	"errors"
+	"log"
 	"sync"
 
 	"github.com/sivchari/golance/internal/store"
@@ -34,14 +35,19 @@ func newBuildResults(db *store.DB, batchSize int) *buildResults {
 // reserved for conditions that make the whole run's output untrustworthy
 // (see recordFatal); a handful of unbuildable packages among thousands of
 // good ones is not one of them, and must not turn a successful index
-// build into a reported failure.
-func (r *buildResults) record(outcome *unitOutcome, skipped, typeChecked bool, err error) int {
+// build into a reported failure. err is still logged, naming path, via the
+// standard logger — the same mechanism processUnitRecovered's panic
+// recovery already uses (see its doc) — since Stats.Errors alone cannot
+// say which package failed or why, and the caller (cmd/golance's indexer
+// subprocess) exits 0 for this case, so nothing else ever surfaces it.
+func (r *buildResults) record(path string, outcome *unitOutcome, skipped, typeChecked bool, err error) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	switch {
 	case err != nil:
 		r.stats.Errors++
+		log.Printf("index: failed to process package %s: %v", path, err)
 	case skipped:
 		r.stats.Skipped++
 	default:

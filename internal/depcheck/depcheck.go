@@ -87,11 +87,12 @@ func (g GraphMetadataSource) Package(pkgPath string) (dir string, goFiles, impor
 // concurrent callers (via the LRU and singleflight) needs no further
 // synchronization.
 type CheckedPackage struct {
-	pkgPath string
-	dir     string
-	files   []*ast.File
-	pkg     *types.Package
-	info    *types.Info
+	pkgPath    string
+	dir        string
+	files      []*ast.File
+	pkg        *types.Package
+	info       *types.Info
+	incomplete bool // see Incomplete's doc
 }
 
 // PkgPath returns the package's import path.
@@ -113,6 +114,21 @@ func (cp *CheckedPackage) Types() *types.Package { return cp.pkg }
 // PackageWithBodies; one returned by Package has every declaration fully
 // resolved but no body-level detail (IgnoreFuncBodies).
 func (cp *CheckedPackage) Info() *types.Info { return cp.info }
+
+// Incomplete reports whether checking cp reported at least one error —
+// either directly (types.Config.Error fired while checking cp's own files,
+// e.g. one of its own transitive imports could not be resolved) or
+// transitively (an import this check resolved was itself Incomplete — see
+// ctxImporter.ImportFrom, needed because referencing an already-degraded
+// import's Invalid-typed symbols does not reliably make go/types call Error
+// again on its own). check's own Error callback is deliberately best-effort
+// (a dependency's source is assumed to compile, so a real error there must
+// still degrade to a usable, if imperfect, CheckedPackage rather than
+// failing outright — see check's doc) — Incomplete exists so a caller that
+// must not trust or persist a degraded result (internal/depexport's
+// machine-global CAS) can tell the difference, without that best-effort
+// fallback itself changing for interactive navigation callers.
+func (cp *CheckedPackage) Incomplete() bool { return cp.incomplete }
 
 // DefaultCap is the LRU's default entry capacity (Options.Cap's zero
 // value): small and deliberately so — dependency navigation is bursty and
@@ -419,6 +435,27 @@ func (p *Provider) putFull(pkgPath string, cp *CheckedPackage) {
 	p.fullLRU.put(pkgPath, cp)
 }
 
+// Delete drops each of pkgPaths from both the declarations-only and
+// full-body LRUs, if cached. Callers use this after a workspace package's
+// on-disk export data changes (didSave's background reindex, see
+// internal/server.Server.reindex): unlike a GOROOT/module-cache dependency,
+// which Provider assumes is immutable for a fixed dependency set (see
+// Provider's own doc), a workspace package is reachable through this same
+// Provider too — depexport.Cache.ExportData falls back to Provider.Package
+// for ANY pkgPath its MetadataSource resolves, including a workspace
+// package imported by another workspace package, since only a
+// GOROOT/module-cache directory is treated as immutable enough to persist
+// to the CAS there — and nothing else in Provider notices that content
+// changing underneath a cached entry.
+func (p *Provider) Delete(pkgPaths ...string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, pkgPath := range pkgPaths {
+		p.lru.delete(pkgPath)
+		p.fullLRU.delete(pkgPath)
+	}
+}
+
 const unsafePkgPath = "unsafe"
 
 // unsafePackage returns the synthetic CheckedPackage for the "unsafe"
@@ -467,16 +504,25 @@ func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool) (
 		Instances:  make(map[*ast.Ident]types.Instance),
 		Implicits:  make(map[ast.Node]types.Object),
 	}
+	imp := &ctxImporter{p: p, ctx: ctx}
+	var hadErr bool
 	conf := types.Config{
-		Importer:         &ctxImporter{p: p, ctx: ctx},
+		Importer:         imp,
 		IgnoreFuncBodies: !withBodies,
-		Error:            func(error) {}, // best-effort: a dependency's own source is immutable and assumed to compile; a type error here degrades to a possibly-incomplete pkg rather than failing the whole check.
+		// best-effort: a dependency's own source is immutable and assumed to
+		// compile; a type error here (including an unresolved transitive
+		// import) degrades to a possibly-incomplete pkg rather than failing
+		// the whole check. hadErr — folded into the returned
+		// CheckedPackage.Incomplete — lets a caller that must not persist a
+		// degraded result (internal/depexport) refuse to, without this
+		// best-effort fallback itself changing.
+		Error: func(error) { hadErr = true },
 	}
 	pkg, _ := conf.Check(pkgPath, p.fset, files, info)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &CheckedPackage{pkgPath: pkgPath, dir: dir, files: files, pkg: pkg, info: info}, nil
+	return &CheckedPackage{pkgPath: pkgPath, dir: dir, files: files, pkg: pkg, info: info, incomplete: hadErr || imp.importIncomplete}, nil
 }
 
 // ctxImporter implements types.ImporterFrom by resolving each import back
@@ -506,6 +552,16 @@ func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool) (
 type ctxImporter struct {
 	p   *Provider
 	ctx context.Context
+
+	// importIncomplete is set once ImportFrom resolves an import that is
+	// itself Incomplete, so the check currently underway inherits that —
+	// see CheckedPackage.Incomplete's doc for why this propagation is
+	// needed rather than relying on types.Config.Error alone. Read only
+	// after conf.Check (in check) returns, from the same goroutine that
+	// built imp and drove that call — types.Config.Check invokes
+	// ImportFrom synchronously (see this type's own doc), so no
+	// synchronization is needed for this field.
+	importIncomplete bool
 }
 
 func (imp *ctxImporter) Import(path string) (*types.Package, error) {
@@ -521,12 +577,14 @@ func (imp *ctxImporter) ImportFrom(path, _ string, _ types.ImportMode) (*types.P
 		return nil, err
 	}
 	if cp, ok := imp.p.getFull(path); ok {
+		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
 		return cp.Types(), nil
 	}
 	cp, err := imp.p.Package(imp.ctx, path)
 	if err != nil {
 		return nil, err
 	}
+	imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
 	return cp.Types(), nil
 }
 
@@ -691,6 +749,7 @@ func docAt(files []*ast.File, fset *token.FileSet, pos token.Pos) string {
 // instance for cp's own PkgPath — onto the equivalent types.Object inside
 // cp.Types(). See Decl's doc for the two strategies tried.
 func resolveObject(cp *CheckedPackage, obj types.Object) (types.Object, error) {
+	obj = OriginObject(obj)
 	if path, err := objectpath.For(obj); err == nil {
 		if target, err := objectpath.Object(cp.pkg, path); err == nil {
 			return target, nil
@@ -700,6 +759,46 @@ func resolveObject(cp *CheckedPackage, obj types.Object) (types.Object, error) {
 		return target, nil
 	}
 	return nil, fmt.Errorf("depcheck: could not resolve %s in %s", obj.Name(), cp.pkgPath)
+}
+
+// OriginObject normalizes obj to the declaration objectpath.For can encode a
+// path for, when obj is a synthetic object go/types created while
+// instantiating a generic type: a field or method reached through an
+// instantiated generic type (e.g. connect.Request[T].Msg, or a method on
+// Box[Concrete]) is a distinct *types.Var/*types.Func from its origin
+// declaration — not identity-equal to it, even though both live in the same
+// *types.Package — so objectpath.For's traversal, which only walks origin
+// declarations reachable from package scope, cannot find a path for the
+// synthetic one directly ("can't find path" from
+// golang.org/x/tools/go/types/objectpath). types.Var and types.Func both
+// expose Origin() for exactly this: it returns the receiver unchanged for
+// every object that is not itself such a synthetic instantiation artifact,
+// so calling it unconditionally here is a no-op for the common, non-generic
+// case, and for a promoted field/method reached through an embedded
+// instantiated generic type (the same synthetic object is returned by
+// go/types either way). No equivalent normalization is needed for
+// *types.TypeName or a plain generic function's *types.Func: go/types
+// creates exactly one object per declaration for those — instantiating a
+// named type or a generic function produces a new go/types.Type or
+// types.Instance, never a second Var/Func/TypeName — so an identifier
+// referring to either already resolves to the origin object without help.
+//
+// Exported for internal/langfeat's own direct objectpath.For call sites
+// (hover, completion-doc, call hierarchy): resolveObject above needs it to
+// bridge Decl's cross-instance *types.Package boundary, but those callers
+// hit the identical "can't find path" obstacle earlier, encoding an
+// objectpath straight from a live obj resolved against cp's own Info,
+// before any depcheck.Provider round-trip -- the same normalization applies
+// either way.
+func OriginObject(obj types.Object) types.Object {
+	switch o := obj.(type) {
+	case *types.Var:
+		return o.Origin()
+	case *types.Func:
+		return o.Origin()
+	default:
+		return obj
+	}
 }
 
 // declIdent returns the *ast.Ident at pos among files — the declaring

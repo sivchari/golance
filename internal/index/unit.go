@@ -36,11 +36,28 @@ type unitOutcome struct {
 // closure walk) — see the package doc for the key composition that makes
 // this sound for both.
 //
-// It always calls keys.set for path before returning (success or not, as
-// long as ownHash/deps were resolved) so a dependent processed later in the
-// same topologically-ordered run can find it; the one exception is a
-// package with no Go files, which is never a dependency of anything (see
-// directDepExports's filter) and so needs no entry.
+// The stat-only fast path additionally requires cas.Has(old.BlobKey): a
+// recorded key matching what db already has proves db's own bookkeeping is
+// self-consistent, never that the blob it names still exists in cas — a
+// [store.CAS.GC] pass whose mark set could not read this database in time
+// (see its own safety doc) can sweep it out from under an otherwise
+// untouched package. Without this check that package would report
+// "unchanged" forever while every read of it failed, since nothing else
+// ever re-examines a key that already matches. The check costs one extra
+// os.Stat per package on an otherwise stat-only path (see [store.CAS.Has]);
+// that is deliberately not cached here — see the package doc if a
+// benchmark ever shows it matters enough to.
+//
+// It calls keys.set for path on success (see keyTable's own doc) so a
+// dependent processed later in the same topologically-ordered run can find
+// it; the one exception is a package with no Go files, which is never a
+// dependency of anything (see directDepExports's filter) and so needs no
+// entry either way. A non-nil err here never calls keys.set — this
+// function's sole caller, processUnitRecovered, is instead responsible for
+// calling keys.fail for path in that case (see its own doc), so the
+// resulting "exactly one of set or fail" invariant holds regardless of
+// which of processUnit's several error-return sites is hit, without each
+// of them having to remember to do it individually.
 //
 // reader is used only to read goFiles' content when a content-hash
 // recompute or a real type-check is needed — Reindex passes an overlay
@@ -93,15 +110,20 @@ func processUnit(ctx context.Context, fset *token.FileSet, imp *typecheck.Import
 	}
 	combined := computeUnitKey(ownHash, deps)
 
-	if trusted && combined == old.BlobKey {
+	if trusted && combined == old.BlobKey && cas.Has(old.BlobKey) {
 		return unchangedOutcome(pkgHash, path, old, effectiveFiles, opts, root, statOK, trustStat, keys), true, false, nil
 	}
 
-	// The combined key differs from what was last recorded (or there is no
-	// trusted previous pointer at all): try the CAS first. A hit needs no
-	// type-check — this exact content-plus-dependency-API combination was
-	// already built before, e.g. switching back to a previously-visited
-	// branch (this is the common, fast-path case; see the package doc).
+	// The combined key differs from what was last recorded, there is no
+	// trusted previous pointer at all, or old.BlobKey matched but its own
+	// blob is gone from cas (see the cas.Has check above): try the CAS
+	// first. A hit needs no type-check — this exact content-plus-
+	// dependency-API combination was already built before, e.g. switching
+	// back to a previously-visited branch (this is the common, fast-path
+	// case; see the package doc) — except in the dangling-pointer case,
+	// where combined == old.BlobKey but the blob itself is missing, so this
+	// is always a miss there and falls through to a genuine re-type-check
+	// below, rewriting the same key's blob.
 	if blob, ok, err := cas.Get(ctx, combined); err != nil {
 		return nil, false, false, err
 	} else if ok {
@@ -211,24 +233,59 @@ func checkAndStoreOutcome(fset *token.FileSet, imp *typecheck.Importer, cas *sto
 
 // directDepExports returns pkg's direct workspace (root) dependencies'
 // current export-hash contributions to its own [computeUnitKey], resolved
-// through keys. Every entry is guaranteed resolvable: dependency-ordered
-// processing (Build's scheduler, or Reindex's topologically-ordered closure
-// walk) never asks for a dependency before it has itself been fully
-// resolved this run or, if untouched, already stable in db.
+// through keys — walking both pkg.Imports and pkg.TestImports (an
+// in-package test file's own extra imports, disjoint from Imports by
+// construction — see graph.Package.TestImports's doc), so a package whose
+// only edge to a dependency is through its own _test.go file still gets a
+// combined key that changes when that dependency's export data does; this
+// is what actually makes [graph.Snapshot.ClosureUnits] walking it worth
+// doing (see Reindex's closure walk) rather than every visit resolving to
+// an unchanged no-op. Dependency-ordered processing (Build's scheduler, or
+// Reindex's topologically-ordered closure walk) never asks for a dependency
+// before it has itself finished this run — resolved and stable in db (if
+// left untouched), freshly resolved (if touched), or, if it was touched but
+// failed to resolve, explicitly recorded as such via keys.fail (see
+// keyTable's own doc for why get must not fall back to db in that case). So
+// the only way keys.get reports a direct dependency unresolvable here is
+// that last case, and pkg must then also be reported as this run's own
+// error rather than silently keyed against that dependency's stale prior
+// state.
 func directDepExports(snap *graph.Snapshot, keys *keyTable, pkg *graph.Package) ([]depExportEntry, error) {
 	var deps []depExportEntry
-	for _, imp := range pkg.Imports {
-		d, ok := snap.Packages[imp]
-		if !ok || !d.Root || len(d.GoFiles) == 0 {
-			continue // non-workspace or empty dependency: excluded from the key, see computeUnitKey's doc.
-		}
+	for _, imp := range directDepImports(snap, pkg) {
 		rec, ok := keys.get(imp)
 		if !ok {
+			if failErr := keys.failure(imp); failErr != nil {
+				return nil, fmt.Errorf("index: dependency %s of %s failed to resolve this run: %w", imp, pkg.ImportPath, failErr)
+			}
 			return nil, fmt.Errorf("index: dependency %s of %s has no recorded blob key (processed out of order?)", imp, pkg.ImportPath)
 		}
 		deps = append(deps, depExportEntry{path: imp, exportHash: rec.exportHash})
 	}
 	return deps, nil
+}
+
+// directDepImports returns the import paths of pkg's direct workspace
+// (root, non-empty) dependencies, folding in both pkg.Imports and
+// pkg.TestImports (an in-package test file's own extra imports, disjoint
+// from Imports by construction — see graph.Package.TestImports's doc) —
+// the shared dependency set directDepExports and revalidate.go's
+// packageChanged both need for their own key/staleness computation to
+// recognize a dependency pkg reaches only through its own _test.go file
+// (see graph.Snapshot.ClosureUnits' identical fold, the reverse direction
+// of this same relationship).
+func directDepImports(snap *graph.Snapshot, pkg *graph.Package) []string {
+	var out []string
+	for _, imports := range [][]string{pkg.Imports, pkg.TestImports} {
+		for _, imp := range imports {
+			d, ok := snap.Packages[imp]
+			if !ok || !d.Root || len(d.GoFiles) == 0 {
+				continue // non-workspace or empty dependency: excluded from the key, see computeUnitKey's doc.
+			}
+			out = append(out, imp)
+		}
+	}
+	return out
 }
 
 // checkResult bundles one package's freshly type-checked outputs.

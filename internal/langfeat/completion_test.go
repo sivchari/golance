@@ -160,6 +160,44 @@ func TestCompletion_OffsetPastEndOfText(t *testing.T) {
 	}
 }
 
+// TestCompletion_UnresolvedSelectorBaseReturnsNilButUnimportedRecoversIt
+// documents the resolution of Finding L3: "fmt.Sp" with fmt never imported
+// leaves sel.X ("fmt") with no recorded type at all (unlike a broken
+// selector whose base merely has an invalid type, e.g. calling an undefined
+// function — go/types still records Typ[Invalid] for that case, which
+// selectorCompletions already handles by returning zero members rather than
+// nil). Completion's own selectorCompletions has no graph access and so
+// cannot itself tell "fmt" apart from any other undeclared identifier (see
+// its own doc); it correctly returns nil here. That is not a dead end,
+// though: Unimported reports this exact shape as a shape-2 candidate (see
+// TestUnimported_SelectorUnresolvedPackage), which the server layer
+// (appendUnimportedCompletions) resolves into real candidates from the
+// workspace graph — verified directly against gopls v0.23.0, which answers
+// the identical broken-selector position with its own equivalent
+// unimported-package fallback rather than an empty list.
+func TestCompletion_UnresolvedSelectorBaseReturnsNilButUnimportedRecoversIt(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "unimported", "unimported.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "fmt.Sp") + len("fmt.Sp")
+
+	items, err := langfeat.Completion(cp, text, path, offset)
+	if err != nil {
+		t.Fatalf("Completion: %v", err)
+	}
+	if len(items) != 0 {
+		t.Errorf("Completion(fmt.Sp, fmt unimported) = %+v, want none (langfeat has no graph access to resolve fmt itself)", items)
+	}
+
+	uctx, ok := langfeat.Unimported(cp, text, path, offset)
+	if !ok || uctx.Selector != "fmt" {
+		t.Fatalf("Unimported(fmt.Sp) = %+v, ok=%v, want {Selector: fmt, ...}, ok=true — the server layer's fallback that actually answers this position", uctx, ok)
+	}
+}
+
 func TestMergeUnimported(t *testing.T) {
 	items := []langfeat.CompletionItem{{Label: "A"}}
 	candidates := []langfeat.CompletionItem{{Label: "B"}}

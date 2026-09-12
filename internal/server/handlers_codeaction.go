@@ -138,7 +138,11 @@ func (s *Server) addImportFixes(path string, text []byte, offset int, name strin
 		return nil
 	}
 	candidates, err := importCandidates(idx.resolver, ws, pkgPath, name)
-	if err != nil || len(candidates) == 0 {
+	if err != nil {
+		s.logger.Printf("server: import candidates for %q in %s: %v", name, path, err)
+		return nil
+	}
+	if len(candidates) == 0 {
 		return nil
 	}
 	actions, err := langfeat.AddImportFix(path, text, offset, name, candidates)

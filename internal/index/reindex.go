@@ -34,11 +34,20 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 	// identical comment for why (gocritic hugeParam: &o is threaded through
 	// the call chain in place of a second Options parameter copy per hop).
 	o := opts.withDefaults()
+	o.BuildFlagsFingerprint = resolveBuildFlagsFingerprint(snap, o.BuildFlagsFingerprint)
 	start := time.Now()
 
 	if _, ok := snap.Package(changedPkg); !ok {
 		return Stats{}, fmt.Errorf("index: reindex: unknown package %s", changedPkg)
 	}
+
+	// gen orders this call's writes against every other concurrent Reindex
+	// call against db (see genTable's doc): assigned once, up front, and
+	// handed to every write this call attempts, exactly like
+	// check.Engine.nextGen assigns one generation per recheck attempt before
+	// it starts reading content.
+	gt := genTableFor(db)
+	gen := gt.nextGen()
 
 	fset := token.NewFileSet()
 	keys := newKeyTable(ctx, db)
@@ -57,7 +66,7 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 	// trustStat=false: reader may be an editor overlay whose content
 	// differs from disk while disk's own stat stays untouched (see
 	// processUnit's doc).
-	if _, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, &o, changedPkg, reader, false, &stats); err != nil {
+	if _, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, &o, changedPkg, reader, false, gt, gen, &stats); err != nil {
 		stats.Elapsed = time.Since(start)
 		return stats, err
 	}
@@ -69,7 +78,7 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 			break
 		}
 		// trustStat=true: every closure hop is always read from disk.
-		fatal, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, &o, path, readFileDisk, true, &stats)
+		fatal, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, &o, path, readFileDisk, true, gt, gen, &stats)
 		if err != nil {
 			firstErr = errors.Join(firstErr, err)
 			if fatal {
@@ -104,14 +113,19 @@ func orderedReverseClosure(snap *graph.Snapshot, changedPkg string) []string {
 	return ordered
 }
 
-// reindexOne resolves path via processUnit and persists its outcome (if
-// any), updating stats. It distinguishes two error sources, mirroring
-// Build's own fatal-vs-per-package split (see [buildResults.record] and
-// [buildResults.flushPendingLocked]):
-//   - a processUnit failure (path's own parse/type-check/facts error) is
-//     one package's problem: it counts toward stats.Errors and is returned
-//     non-fatal (fatal=false), so Reindex's closure walk keeps going past
-//     it exactly as before.
+// reindexOne resolves path via processUnitRecovered and persists its
+// outcome (if any), updating stats. It distinguishes two error sources,
+// mirroring Build's own fatal-vs-per-package split (see
+// [buildResults.record] and [buildResults.flushPendingLocked]):
+//   - a processUnitRecovered failure — path's own parse/type-check/facts
+//     error, or a recovered panic from a type-checker edge case facts
+//     extraction does not yet handle — is one package's problem: it counts
+//     toward stats.Errors and is returned non-fatal (fatal=false), so
+//     Reindex's closure walk keeps going past it exactly as before. A panic
+//     is folded into this same case rather than treated as fatal because
+//     its cause is specific to path's own source, not to db or any package
+//     downstream of it — exactly the distinction Build's own recovery
+//     draws for the very same panic (see processUnitRecovered's doc).
 //   - a db.PutUnit failure means db can no longer be trusted to accept any
 //     further write this run; it is returned fatal (fatal=true) so the
 //     caller can stop the closure walk instead of re-type-checking every
@@ -119,8 +133,13 @@ func orderedReverseClosure(snap *graph.Snapshot, changedPkg string) []string {
 //
 // A persist failure for the pointer-only refresh path stays best-effort,
 // not fatal — see [buildResults.flushPtrsLocked]'s identical rationale.
-func reindexOne(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, opts *Options, path string, reader FileReader, trustStat bool, stats *Stats) (fatal bool, err error) {
-	outcome, skipped, typeChecked, err := processUnit(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
+//
+// gen is this Reindex call's own generation (see genTable's doc); gt gates
+// both persist branches below against it, so a write from an older,
+// slower-to-complete Reindex call for path never clobbers one a newer call
+// already committed.
+func reindexOne(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, opts *Options, path string, reader FileReader, trustStat bool, gt *genTable, gen uint64, stats *Stats) (fatal bool, err error) {
+	outcome, skipped, typeChecked, err := processUnitRecovered(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
 	if err != nil {
 		stats.Errors++
 		return false, fmt.Errorf("index: reindex: %s: %w", path, err)
@@ -135,6 +154,12 @@ func reindexOne(ctx context.Context, fset *token.FileSet, imp *typecheck.Importe
 		}
 	}
 	if outcome == nil {
+		return false, nil
+	}
+	if !gt.tryCommit(outcome.pkgHash, gen) {
+		// A later Reindex call already committed a write for path; this
+		// call's own result is stale with respect to it and must not
+		// overwrite what that call wrote.
 		return false, nil
 	}
 	if outcome.entry != nil {

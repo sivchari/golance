@@ -312,3 +312,34 @@ func TestHandlePrepareTypeHierarchy_WorksWithoutIndex(t *testing.T) {
 		t.Fatalf("prepareTypeHierarchy without an index: item.Name = %q, want %q", item.Name, "I")
 	}
 }
+
+// TestHandlePrepareTypeHierarchy_NoIndex_OtherWorkspacePackage is a
+// regression test for Finding H5: typeHierarchyItemFromPrepare shares
+// callHierarchyItem's crossPackageFuncLocation chain, and inherited the same
+// gap — a root-package target the facts index cannot yet resolve used to
+// answer a silent empty result, indistinguishable from a type that
+// genuinely has no locatable declaration. depuse.UseGreet's parameter is
+// typed greet.Greeting, a type declared in a different *workspace* (root)
+// package only the facts index can resolve (dependencyFuncDeclaration
+// always declines a root package, see its own doc), so this must answer
+// indexUnavailableError instead.
+func TestHandlePrepareTypeHierarchy_NoIndex_OtherWorkspacePackage(t *testing.T) {
+	s, snap := newTestServerNoIndex(t)
+	depusePkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(depusePkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	depuseFile := depusePkg.GoFiles[0]
+	pos := identPositionIn(t, depuseFile, mustReadFile(t, depuseFile), "Greeting", 1) // greet.Greeting reference
+
+	result, err := s.handlePrepareTypeHierarchy(context.Background(), mustMarshal(t, &protocol.TypeHierarchyPrepareParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(depuseFile)},
+			Position:     pos,
+		},
+	}))
+	checkIndexUnavailableError(t, "prepareTypeHierarchy(no index, greet.Greeting)", err)
+	if result != nil {
+		t.Errorf("prepareTypeHierarchy(no index, greet.Greeting): result = %#v, want nil", result)
+	}
+}

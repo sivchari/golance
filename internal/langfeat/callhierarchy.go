@@ -6,6 +6,7 @@ import (
 	"go/types"
 
 	"github.com/sivchari/golance/internal/check"
+	"github.com/sivchari/golance/internal/depcheck"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/types/objectpath"
 	"golang.org/x/tools/go/types/typeutil"
@@ -82,7 +83,11 @@ func FuncDeclaration(cp *check.CheckedPackage, fn *types.Func) (*FuncDeclInfo, e
 	// for the identical objectpath.For call on a named type. Checking
 	// err == nil (rather than err != nil { return nil, nil }) keeps that
 	// intent explicit in the control flow itself.
-	if objPath, err := objectpath.For(fn); err == nil {
+	// depcheck.OriginObject normalizes a method reached through an
+	// instantiated generic type (a call site on Box[Concrete], say) to its
+	// origin declaration -- see its doc for why objectpath.For cannot encode
+	// a path for the synthetic, as-instantiated *types.Func directly.
+	if objPath, err := objectpath.For(depcheck.OriginObject(fn)); err == nil {
 		return &FuncDeclInfo{PkgPath: fn.Pkg().Path(), ObjPath: string(objPath)}, nil
 	}
 	return nil, nil

@@ -213,6 +213,12 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 			s.dispatchNotification(ctx, &m)
 		case m.isResponse():
 			s.dispatchResponse(&m)
+		default:
+			// Method=="" and ID==nil: not a request, notification, or
+			// response by the JSON-RPC 2.0 envelope rules message.go's
+			// isRequest/isNotification/isResponse implement. No real client
+			// sends this; log it rather than dropping it with no trace.
+			s.logger.Printf("rpc: dropping frame matching no request/notification/response shape: %s", raw)
 		}
 		if lifecycleState(s.state.Load()) == stateExited {
 			return s.exitErr
@@ -245,10 +251,24 @@ func (s *Server) Context() context.Context {
 // for detached background work a handler starts that must outlive the
 // call that started it (e.g. launching the indexer subprocess, a
 // debounced reindex) but should still stop once the session itself ends.
+//
+// A panic in fn is recovered and logged with a stack trace, mirroring
+// callRequestHandler's and callNotificationHandler's own handler-panic
+// recovery, rather than left to unwind: unlike a request or notification,
+// detached background work has no dispatch-loop caller left to fail
+// gracefully by the time fn runs, so an unrecovered panic here would take
+// the whole process down instead of just this one piece of background
+// work. wg.Done still runs either way, so a panicking fn cannot wedge
+// Serve's shutdown-time drain.
 func (s *Server) Go(fn func(ctx context.Context)) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Printf("rpc: panic in background task: %v\n%s", r, debug.Stack())
+			}
+		}()
 		fn(s.Context())
 	}()
 }
@@ -287,7 +307,17 @@ func (s *Server) dispatchRequest(ctx context.Context, m *message) {
 		defer cancel()
 		result, err := s.callRequestHandler(reqCtx, method, reg.handler, params)
 		switch {
-		case reqCtx.Err() != nil:
+		// Checking err here, not reqCtx.Err(), matters: a $/cancelRequest
+		// for this id can call cancel (and so close reqCtx.Done()) at any
+		// point, including in the narrow window after the handler already
+		// returned a valid result. Basing the decision on reqCtx.Err()
+		// would make that race discard an already-computed answer. err
+		// reflects what the handler itself observed — a handler that
+		// notices ctx.Done() is expected to return ctx.Err() (the
+		// convention every handler in this codebase follows) — so a
+		// cancellation that arrives too late for the handler to see it
+		// correctly has no effect on the response.
+		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
 			s.respondError(id, NewError(requestCancelledCode, "request cancelled"))
 		case err != nil:
 			s.respondError(id, toWireError(err))

@@ -3,11 +3,14 @@ package graph
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // cacheVersion guards against loading a diskCache written by an older
@@ -45,7 +48,20 @@ import (
 // anyway so an old, ExportFile-shaped cache is never treated as
 // interchangeable with a new one purely by coincidence of an unrelated
 // field being ignored.
-const cacheVersion = 5
+//
+// v6: LoadCache now additionally rejects a cache whose ModuleDigest (see
+// its own doc) does not match the LOADING root's current go.mod/go.sum/
+// go.work/go.work.sum content, or whose BuildFlagsFP does not match a
+// freshly recomputed buildFlagsFingerprint for the current process — not
+// just the ones diskCache happens to remember (see LoadCache and
+// moduleContentDigest's own docs for why Stale's mtime check alone is not
+// enough for a cache SHARED across worktrees on possibly different
+// branches). A pre-v6 cache's ModuleDigest unmarshals to "", which cannot
+// coincidentally equal a real digest, so LoadCache would already reject it
+// on that check alone; bumping the version anyway makes that one guaranteed
+// reload explicit rather than incidental, per this const's own "bump
+// whenever diskCache's shape changes" policy above.
+const cacheVersion = 6
 
 // diskCache is the on-disk JSON envelope for a persisted Snapshot. Patterns
 // and BuildFlags are folded into the cache key: LoadCache refuses to serve
@@ -56,10 +72,16 @@ const cacheVersion = 5
 // embedFiles/embedPrefixes) is not ported; a non-Go file change under an
 // embed pattern will not invalidate the cache.
 type diskCache struct {
-	Version    int                 `json:"version"`
-	Patterns   []string            `json:"patterns"`
-	BuildFlags []string            `json:"buildFlags,omitempty"`
-	Packages   map[string]*Package `json:"packages"`
+	Version    int      `json:"version"`
+	Patterns   []string `json:"patterns"`
+	BuildFlags []string `json:"buildFlags,omitempty"`
+	// BuildFlagsFP is snap.BuildFlagsFingerprint() as computed by the Load
+	// call that produced the saved Snapshot (see buildFlagsFingerprint) —
+	// round-tripped so a cache hit still carries it, rather than silently
+	// reverting to "" (the empty value a cache written before this field
+	// existed unmarshals into, self-healing on that cache's next real Load).
+	BuildFlagsFP string              `json:"buildFlagsFP,omitempty"`
+	Packages     map[string]*Package `json:"packages"`
 	// ModuleFiles records, keyed by path RELATIVE to the saving worktree's
 	// own root (mirroring Packages' own relPath treatment — see
 	// cacheVersion's v4 note), which of moduleFiles(root) existed when this
@@ -69,6 +91,14 @@ type diskCache struct {
 	// a cache simply cannot detect a deletion that happened before its own
 	// next rebuild, rather than producing a false positive.
 	ModuleFiles map[string]bool `json:"moduleFiles,omitempty"`
+	// ModuleDigest is moduleContentDigest(root) as computed by the
+	// SaveCache call that produced this cache, over the SAVING worktree's
+	// own go.mod/go.sum/go.work/go.work.sum bytes — checked by LoadCache
+	// against the LOADING worktree's own current digest before a shared
+	// cache (see CacheFile) is ever trusted, closing the gap Stale's
+	// mtime-only check leaves for two worktrees on different branches with
+	// unrelated module content (see moduleContentDigest's own doc).
+	ModuleDigest string `json:"moduleDigest,omitempty"`
 }
 
 // RepoKey returns the identity graph's cache uses to decide whether root's
@@ -86,11 +116,29 @@ type diskCache struct {
 // this one rather than keeping an independent implementation, so the CAS,
 // facts index, and graph cache can never disagree about which worktrees
 // share what.
+//
+// A git invocation failure falls back to the same (root, false) a genuine
+// non-git directory does either way — sharing is only ever a speedup, never
+// a correctness requirement, so RepoKey itself never needs to distinguish
+// the two to return a safe answer. It still tells them apart internally: an
+// *exec.ExitError means git itself ran and reported failure (overwhelmingly
+// "fatal: not a git repository", the expected, silent, non-git-directory
+// case), while any other error means git could not even be started (e.g.
+// not on PATH) or was killed — a transient or environmental problem that
+// silently drops this root's session out of worktree sharing until
+// something changes, which is worth one log line (rate-limited to once per
+// process, since the cause is almost always static for a process's whole
+// lifetime — a missing binary or broken PATH does not change between
+// calls) rather than being indistinguishable from the routine case.
 func RepoKey(root string) (key string, shared bool) {
 	cmd := exec.Command("git", "rev-parse", "--git-common-dir")
 	cmd.Dir = root
 	out, err := cmd.Output()
 	if err != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			warnRepoKeyFailure(root, err)
+		}
 		return root, false
 	}
 	dir := strings.TrimSpace(string(out))
@@ -114,6 +162,22 @@ func RepoKey(root string) (key string, shared bool) {
 	return abs, true
 }
 
+// repoKeyWarnOnce rate-limits warnRepoKeyFailure to a single log line per
+// process (see RepoKey's own doc for why once is enough).
+var repoKeyWarnOnce sync.Once
+
+// warnRepoKeyFailure logs that RepoKey could not even run git for root —
+// as opposed to git running and reporting root is not a repository — so a
+// worktree/CAS/graph-cache sharing speedup silently lost to an environment
+// problem (missing git binary, broken PATH, a killed subprocess) is
+// diagnosable instead of looking identical to an ordinary non-git
+// workspace.
+func warnRepoKeyFailure(root string, err error) {
+	repoKeyWarnOnce.Do(func() {
+		log.Printf("graph: git rev-parse --git-common-dir could not run for %s (not a \"fatal: not a git repository\" exit): %v; treating it as a private, unshared workspace", root, err)
+	})
+}
+
 // Shared reports whether root's graph cache (see CacheFile) is shared with
 // other worktrees of the same git repository.
 func Shared(root string) bool {
@@ -121,24 +185,36 @@ func Shared(root string) bool {
 	return shared
 }
 
+// cacheBaseDir resolves the directory CacheFile builds golance's own cache
+// path under. A package-level var, not a plain function call, so a test can
+// replace it directly (see graph_test.go's withTestCacheDir) instead of
+// going through an environment variable: os.UserCacheDir() ignores
+// XDG_CACHE_HOME on darwin (it always returns $HOME/Library/Caches there),
+// so an env-var-only seam would silently fail to isolate CacheFile on that
+// platform, leaving a test reading and writing the developer's real
+// ~/Library/Caches/golance directory instead of its own t.TempDir().
+var cacheBaseDir = defaultCacheBaseDir
+
+func defaultCacheBaseDir() string {
+	if base, err := os.UserCacheDir(); err == nil {
+		return base
+	}
+	return filepath.Join(os.Getenv("HOME"), ".cache")
+}
+
 // CacheFile returns the on-disk cache path for a workspace root, under
-// $XDG_CACHE_HOME (or the platform default via os.UserCacheDir). Keyed by
-// RepoKey(root), not root itself: every worktree of the same git repository
-// resolves to the same path, so a graph cache one worktree already paid to
-// build (see loadMode's doc for that cost on a large monorepo) is directly
-// available to a brand-new sibling worktree instead of that worktree
-// needing its own cold `go list`. A non-git root's RepoKey is root itself
-// (shared=false), so this collapses back to golance's pre-sharing,
-// private-per-root behavior for that case — the same function, no special
-// casing needed.
+// cacheBaseDir(). Keyed by RepoKey(root), not root itself: every worktree of
+// the same git repository resolves to the same path, so a graph cache one
+// worktree already paid to build (see loadMode's doc for that cost on a
+// large monorepo) is directly available to a brand-new sibling worktree
+// instead of that worktree needing its own cold `go list`. A non-git root's
+// RepoKey is root itself (shared=false), so this collapses back to
+// golance's pre-sharing, private-per-root behavior for that case — the same
+// function, no special casing needed.
 func CacheFile(root string) string {
 	key, _ := RepoKey(root)
 	h := sha256.Sum256([]byte(key))
-	base, err := os.UserCacheDir()
-	if err != nil {
-		base = filepath.Join(os.Getenv("HOME"), ".cache")
-	}
-	return filepath.Join(base, "golance", fmt.Sprintf("graph-%x.json", h[:8]))
+	return filepath.Join(cacheBaseDir(), "golance", fmt.Sprintf("graph-%x.json", h[:8]))
 }
 
 // LoadCache reads a Snapshot previously persisted by SaveCache, rejoined
@@ -146,8 +222,16 @@ func CacheFile(root string) string {
 // ITS OWN (possibly different) worktree root is joined back onto root here
 // (see fromDiskPackages/absPath), so a cache another worktree of the same
 // repository saved loads correctly for this one. ok is false when there is
-// no cache file, it is corrupt, or it was built for different patterns or
-// BuildFlags than requested.
+// no cache file, it is corrupt, it was built for different patterns or
+// BuildFlags than requested, its ModuleDigest does not match root's current
+// go.mod/go.sum/go.work/go.work.sum content (see moduleContentDigest), or
+// its BuildFlagsFP does not match a freshly recomputed fingerprint for the
+// CURRENT process environment. The latter two checks are what let a caller
+// (see internal/server's loadWorkspaceAsync) trust a SHARED cache (see
+// CacheFile/Shared) immediately, without waiting for the background
+// revalidateGraph pass Shared/Stale alone would otherwise be the only
+// defense against serving a different worktree's (or a differently
+// configured environment's) contaminated snapshot for.
 func LoadCache(root string, patterns, buildFlags []string) (snap *Snapshot, ok bool) {
 	data, err := os.ReadFile(filepath.Clean(CacheFile(root)))
 	if err != nil {
@@ -160,10 +244,14 @@ func LoadCache(root string, patterns, buildFlags []string) (snap *Snapshot, ok b
 	if saved.Version != cacheVersion || !equalStrings(saved.Patterns, patterns) || !equalStrings(saved.BuildFlags, buildFlags) {
 		return nil, false
 	}
-	snap, err = newSnapshot(fromDiskPackages(saved.Packages, root), root)
-	if err != nil {
+	if saved.ModuleDigest != moduleContentDigest(root) {
 		return nil, false
 	}
+	if saved.BuildFlagsFP != buildFlagsFingerprint(buildFlags, os.Environ()) {
+		return nil, false
+	}
+	snap = newSnapshot(fromDiskPackages(saved.Packages, root), root)
+	snap.buildFlagsFP = saved.BuildFlagsFP
 	return snap, true
 }
 
@@ -192,11 +280,13 @@ func SaveCache(root string, patterns, buildFlags []string, snap *Snapshot) error
 		}
 	}
 	saved := diskCache{
-		Version:     cacheVersion,
-		Patterns:    patterns,
-		BuildFlags:  buildFlags,
-		Packages:    toDiskPackages(snap.Packages, root),
-		ModuleFiles: existed,
+		Version:      cacheVersion,
+		Patterns:     patterns,
+		BuildFlags:   buildFlags,
+		BuildFlagsFP: snap.BuildFlagsFingerprint(),
+		Packages:     toDiskPackages(snap.Packages, root),
+		ModuleFiles:  existed,
+		ModuleDigest: moduleContentDigest(root),
 	}
 	b, err := json.Marshal(saved)
 	if err != nil {
@@ -368,6 +458,31 @@ func moduleFiles(root string) []string {
 		filepath.Join(root, "go.work"),
 		filepath.Join(root, "go.work.sum"),
 	}
+}
+
+// moduleContentDigest returns a SHA-256 digest over the actual bytes of
+// every moduleFiles(root) file, in that fixed order — unlike Stale's mtime
+// comparison, which a DIFFERENT worktree's SaveCache can invalidate simply
+// by writing a newer cache file even when the two worktrees' go.mod/go.sum
+// are unrelated (see Stale's own doc on why mtime alone is not reliable for
+// a cache SHARED across worktrees), this reflects the exact input
+// go/packages.Load would resolve the dependency graph from: an exact match
+// means Load would see the identical module set, an exact miss means it
+// provably would not. A missing file contributes a distinct leading marker
+// byte rather than being skipped outright, so "go.work absent" and "go.work
+// present but empty" digest differently.
+func moduleContentDigest(root string) string {
+	h := sha256.New()
+	for _, f := range moduleFiles(root) {
+		b, err := os.ReadFile(filepath.Clean(f))
+		if err != nil {
+			_, _ = h.Write([]byte{0})
+			continue
+		}
+		_, _ = h.Write([]byte{1})
+		_, _ = h.Write(b)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func equalStrings(a, b []string) bool {

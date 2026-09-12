@@ -271,3 +271,56 @@ func TestEngine_Stop_CancelsInFlightFlight(t *testing.T) {
 		}
 	})
 }
+
+// TestEngine_Wait_BlocksUntilInFlightFlightFinishes pins that Wait covers
+// request-driven flights, not only debounce-triggered rechecks. Stop
+// returning says nothing about whether a flight is still running — it
+// observes e.ctx only at runRecheck's own checkpoints — so a caller that
+// tears down what a flight is reading (a test deleting its temp
+// directories, say) needs Wait to actually block for it.
+func TestEngine_Wait_BlocksUntilInFlightFlightFinishes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		started := make(chan struct{})
+		release := make(chan struct{})
+		var once sync.Once
+		hook := func(imp Importer) Importer {
+			return func() types.ImporterFrom {
+				once.Do(func() {
+					close(started)
+					<-release
+				})
+				return imp()
+			}
+		}
+		e, root := newTestEngineWithImporterHook(t, overlay.New(), Options{}, hook)
+		path := filepath.Join(root, "basic", "basic.go")
+
+		go func() { _, _ = e.Get(context.Background(), path) }()
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("flight never reached the importer factory")
+		}
+
+		e.Stop()
+
+		done := make(chan struct{})
+		go func() {
+			e.Wait()
+			close(done)
+		}()
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("Wait() returned while a flight was still blocked mid-recheck")
+		default:
+		}
+
+		close(release)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Wait() never returned after the flight finished")
+		}
+	})
+}

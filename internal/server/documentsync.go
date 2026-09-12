@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"runtime"
 
+	bolterrors "go.etcd.io/bbolt/errors"
 	"go.lsp.dev/protocol"
 
 	"github.com/sivchari/golance/internal/index"
@@ -96,7 +98,7 @@ func (s *Server) selfHealFactsIfStale(ctx context.Context, ws *workspace, path s
 	if !changed {
 		return
 	}
-	s.rpc.Go(func(ctx context.Context) { s.reindex(ctx, ws, idx, pkgPath) })
+	s.rpc.Go(func(ctx context.Context) { _ = s.reindexIfStillCurrent(ctx, ws, idx, pkgPath) })
 }
 
 // handleDidChange applies the content change to the document's overlay and
@@ -180,7 +182,7 @@ func (s *Server) handleDidSave(_ context.Context, params json.RawMessage) error 
 	// returns — and tracks it via Serve's own wg, so shutdown waits
 	// (briefly) for it to finish or notice cancellation, rather than
 	// abandoning it mid-write.
-	s.rpc.Go(func(ctx context.Context) { s.reindex(ctx, ws, idx, pkgPath) })
+	s.rpc.Go(func(ctx context.Context) { _ = s.reindexIfStillCurrent(ctx, ws, idx, pkgPath) })
 	return nil
 }
 
@@ -227,49 +229,192 @@ func (s *Server) drainDirty(ctx context.Context, ws *workspace) {
 		return
 	}
 	for _, pkgPath := range s.takeDirty() {
-		s.reindex(ctx, ws, idx, pkgPath)
+		_ = s.reindexIfStillCurrent(ctx, ws, idx, pkgPath)
 	}
 }
 
-// handleDidClose stops tracking the document's overlay content; its
-// package falls back to on-disk content on the next check.
+// handleDidClose stops tracking the document's overlay content (its
+// package falls back to on-disk content on the next check) and, if this
+// server still has diagnostics published for it, clears them.
+//
+// publishDiagnostics only ever considers currently open files (see its own
+// doc), so once path's overlay is gone here, no future recheck of its
+// package will ever include path in the file set it publishes for again on
+// its own — even once the package is next rechecked for an unrelated
+// reason. Without this, whatever was last shown for path sits in the
+// client's Problems panel indefinitely, regardless of whether it is still
+// accurate: unsaved edits discarded by the close may have been the only
+// reason it had diagnostics at all.
 func (s *Server) handleDidClose(_ context.Context, params json.RawMessage) error {
 	var p protocol.DidCloseTextDocumentParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
 		return err
 	}
+	path := p.TextDocument.URI.FsPath()
 	s.overlay.DidClose(&p)
+	s.clearDiagnosticsForClosedFile(path)
 	return nil
+}
+
+// clearDiagnosticsForClosedFile republishes an empty diagnostic list for
+// path if s.diagFiles still credits some package with having published
+// diagnostics for it (see publishDiagnostics), a no-op otherwise.
+func (s *Server) clearDiagnosticsForClosedFile(path string) {
+	s.diagMu.Lock()
+	found := false
+	for pkgPath, files := range s.diagFiles {
+		if !files[path] {
+			continue
+		}
+		found = true
+		delete(files, path)
+		if len(files) == 0 {
+			delete(s.diagFiles, pkgPath)
+		}
+	}
+	s.diagMu.Unlock()
+	if found {
+		s.notifyDiagnostics(path, nil)
+	}
+}
+
+// beginReindex registers a detached reindex attempt against idx, reporting
+// ok=false (nothing registered) if idx's own database is no longer the one
+// s.idx currently points at. Guarded end-to-end by s.idxMu — the same lock
+// revalidateIndex's rebuild branch (indexer.go) holds across its own
+// Store(nil)/reindexWG.Wait()/Close() sequence — so the two can never
+// interleave: either this call's check-and-register happens entirely before
+// that rebuild's Store(nil) (in which case its later Wait() correctly
+// blocks on the registration this call just made, and Close() cannot run
+// until the matching Done() below), or entirely after it (in which case
+// s.idx.Load() already disagrees with idx, and this correctly reports
+// ok=false instead of registering against a database about to be closed).
+// There is no window in between where a registration could land after
+// Wait() has already decided to return.
+//
+// The comparison is idx.db against s.idx.Load()'s own db, not the whole
+// *indexState pointer: setWorkspace also replaces s.idx with a fresh
+// *indexState wrapping the SAME db (only its resolver refreshed against a
+// new graph snapshot) on every ordinary workspace reload, which must not be
+// mistaken for the database itself having been closed.
+func (s *Server) beginReindex(idx *indexState) bool {
+	s.idxMu.Lock()
+	defer s.idxMu.Unlock()
+	cur := s.idx.Load()
+	if cur == nil || cur.db != idx.db {
+		return false
+	}
+	s.reindexWG.Add(1)
+	return true
+}
+
+// reindexIfStillCurrent runs reindex against idx only if beginReindex
+// confirms idx's own database is still current, bailing out otherwise
+// without ever attempting a write against it. Both selfHealFactsIfStale and
+// handleDidSave dispatch their background reindex through this rather than
+// calling reindex directly: idx is captured well before this actually runs
+// (s.rpc.Go's own goroutine-scheduling delay, plus reindex's own
+// type-checking time), during which revalidateIndex's rebuild branch can
+// close idx.db out from under a dispatch that raced it — neither
+// selfHealFactsIfStale nor handleDidSave holds s.idxMu while dispatching,
+// deliberately, so a save or open is never blocked behind a concurrent
+// rebuild; only this call's own brief registration step does.
+//
+// Bailing out here can never silently drop a repair still needed:
+// index.PackageChanged (selfHealFactsIfStale) and index.RevalidateStale
+// (revalidateIndex) both re-derive pkgPath's staleness from its on-disk
+// content against whatever db ends up current, independent of whether this
+// particular write ran — the very rebuild that closed idx.db already
+// re-type-checks pkgPath fresh, and a revalidateIndex pass against whatever
+// index is open next catches it otherwise. A bailed-out reindex is
+// therefore redundant work skipped, never a permanently lost fix. Reports
+// nil in that case too, for the same reason: reindex itself already treats
+// its own equivalent bail-out (reindexDBClosedUnderfoot) as no failure.
+func (s *Server) reindexIfStillCurrent(ctx context.Context, ws *workspace, idx *indexState, pkgPath string) error {
+	if !s.beginReindex(idx) {
+		return nil
+	}
+	defer s.reindexWG.Done()
+	return s.reindex(ctx, ws, idx, pkgPath)
+}
+
+// reindexDBClosedUnderfoot reports whether err — a failure from
+// index.Reindex's own persist step — means idx.db was closed while this
+// call was still running, rather than any other write failure. reindexWG
+// (see beginReindex) makes this unreachable for the one Close call site
+// this package fully controls (revalidateIndex's rebuild branch, indexer.go),
+// but idx.db is an ordinary *store.DB a caller outside this package's
+// control could also close directly — a test harness that owns the same db
+// handle newTestServer wired into s.idx being the concrete case this guards
+// against, closing it via t.Cleanup with no knowledge of a self-heal
+// dispatch racing it. reindex treats this outcome exactly like reindexIfStillCurrent's
+// own bail-out: silently redundant, never a lost repair (see its doc).
+func reindexDBClosedUnderfoot(err error) bool {
+	return errors.Is(err, bolterrors.ErrDatabaseNotOpen)
 }
 
 // reindex re-type-checks pkgPath (and, if its export data changed, its
 // reverse-dependency closure) and persists the result to idx.db. On
 // success, it also drops pkgPath and every reverse-dependency-closure hop
 // Reindex actually reprocessed (Stats.Changed) from the check engine's
-// persistent dependency cache and from idx.resolver's own export-data
-// cache, so a later recheck of an open file — or a later cross-reference
-// query, e.g. Go to Implementation — re-decodes freshly written export data
-// instead of reusing a *types.Package decoded from what was on disk before
-// this save (see xref.Resolver.Invalidate's doc for why that reuse would
-// otherwise happen silently). Narrowing to Stats.Changed instead of the
-// whole closure Reindex walked is sound: a hop Reindex skipped had a
-// combined blob key that provably matched what db already had, so its
-// export data provably did not change either — the same guarantee
-// unchangedOutcome already relies on inside Reindex itself. If Stats.Changed
-// comes back empty (Reindex found pkgPath itself byte-identical too), fall
-// back to invalidating pkgPath alone: the overlay content this save just
-// wrote may still differ from what was on disk when Reindex's own trustStat
-// check ran.
-func (s *Server) reindex(ctx context.Context, ws *workspace, idx *indexState, pkgPath string) {
+// persistent dependency cache, from ws.engine's own per-unit cache, and from
+// idx.resolver's own export-data cache, so a later recheck of an open
+// file — or a later cross-reference query, e.g. Go to Implementation —
+// re-decodes freshly written export data instead of reusing a *types.Package
+// decoded from what was on disk before this save (see xref.Resolver.Invalidate's
+// doc for why that reuse would otherwise happen silently, and
+// check.Engine.InvalidateDependency's doc for why ws.engine's own cache
+// needs the identical treatment: its content-hash cache hit test only ever
+// looks at a unit's OWN files, so a dependency's export data changing
+// underneath it leaves a hit indefinitely stale otherwise). Narrowing to
+// Stats.Changed instead of the whole closure Reindex walked is sound: a hop
+// Reindex skipped had a combined blob key that provably matched what db
+// already had, so its export data provably did not change either — the same
+// guarantee unchangedOutcome already relies on inside Reindex itself. If
+// Stats.Changed comes back empty (Reindex found pkgPath itself
+// byte-identical too), fall back to invalidating pkgPath alone: the overlay
+// content this save just wrote may still differ from what was on disk when
+// Reindex's own trustStat check ran.
+//
+// The returned error is nil on success or on reindexDBClosedUnderfoot's own
+// benign bail-out, and non-nil for every other failure — logged here either
+// way, so this package's own two fire-and-forget callers (handleDidSave's
+// s.rpc.Go dispatch, drainDirty's loop) can keep ignoring it exactly as
+// before, while repairIndexPackagesLocked (indexer.go), which cannot afford
+// to drop a self-heal failure silently, uses it to report the failure to
+// the client instead of only to this log.
+func (s *Server) reindex(ctx context.Context, ws *workspace, idx *indexState, pkgPath string) error {
 	stats, err := index.Reindex(ctx, ws.snap, idx.db, idx.cas, pkgPath, s.overlay.ReadFile, &index.Options{RelativePaths: RelativeIndexPaths(ws.root)})
 	if err != nil {
+		if reindexDBClosedUnderfoot(err) {
+			return nil
+		}
 		s.logger.Printf("server: reindex %s: %v", pkgPath, err)
-		return
+		return err
 	}
 	changed := stats.Changed
 	if len(changed) == 0 {
 		changed = []string{pkgPath}
 	}
 	ws.depCache.invalidate(changed)
+	ws.engine.InvalidateDependency(closureDirs(ws, changed))
 	idx.resolver.Invalidate(changed)
+	return nil
+}
+
+// closureDirs resolves each of pkgPaths (Stats.Changed, see reindex) to its
+// package directory via ws.snap, for ws.engine.InvalidateDependency — Engine
+// itself keys its cache by directory, not import path. A pkgPath ws.snap no
+// longer recognizes (removed from the workspace since Reindex last read it,
+// vanishingly unlikely within one reindex call but not provably impossible)
+// is silently skipped: ws.engine can hold nothing cached under a directory
+// it was never told about in the first place.
+func closureDirs(ws *workspace, pkgPaths []string) []string {
+	dirs := make([]string, 0, len(pkgPaths))
+	for _, pkgPath := range pkgPaths {
+		if pkg, ok := ws.snap.Package(pkgPath); ok {
+			dirs = append(dirs, pkg.Dir)
+		}
+	}
+	return dirs
 }

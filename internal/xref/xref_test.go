@@ -419,7 +419,11 @@ func TestWorkspaceSymbol_NoMatch(t *testing.T) {
 // Rename touches inpkgtest's in-package "_test.go" file too, the same
 // closure-independent completeness fix described in
 // TestReferences_SpansDefiningAndReferencingPackages' doc (Rename shares
-// locationsForAll with References).
+// locationsForAll with References). impl.go's count is one more than
+// References' own 4: testdata/module/impl/impl.go:5's "// Person
+// implements Greeter via Greet." is Person's own doc comment, and
+// docCommentEdits rewrites it too (see TestRename_MatchesGoplsDocComment
+// for the matrix of doc-comment cases this covers).
 func TestRename_EditsEveryReferenceAcrossFiles(t *testing.T) {
 	r, snap := newTestResolver(t)
 
@@ -435,7 +439,7 @@ func TestRename_EditsEveryReferenceAcrossFiles(t *testing.T) {
 	user2File := goFile(t, snap, pkgUser2, "user2.go")
 	inpkgtestTestFile := inpkgtestTestFile(t, snap)
 
-	want := map[string]int{implFile: 4, userFile: 2, user2File: 1, inpkgtestTestFile: 2}
+	want := map[string]int{implFile: 5, userFile: 2, user2File: 1, inpkgtestTestFile: 2}
 	if len(edits) != len(want) {
 		t.Fatalf("Rename touched %d files, want %d: %+v", len(edits), len(want), edits)
 	}
@@ -547,16 +551,23 @@ func TestResolveAt_MapsTestFilePositionToUnit(t *testing.T) {
 	}
 }
 
-// TestResolveAt_ExternalTestPackageFileStillDegrades pins that resolveAt's
-// directory fallback (see TestResolveAt_MapsTestFilePositionToUnit) does not
-// blindly trust every file in a known package's directory: inpkgtest's
-// external "_test"-suffixed test package file sits in the same directory as
-// inpkgtest_test.go, but its own package clause ("inpkgtest_test") fails
-// testFilesInPackage's canonical-name filter, so it never joined
-// inpkgtest's facts. fileIndexOf's lookup against the unit's own facts file
-// table — the source of truth for what was actually indexed — must still
-// reject a position here.
-func TestResolveAt_ExternalTestPackageFileStillDegrades(t *testing.T) {
+// pkgInpkgtestExtTest is the real, distinct import path go/packages assigns
+// inpkgtest's external "_test"-suffixed test package (verified via
+// `go list -json -test .`: PkgPath "example.com/xrefmod/inpkgtest_test",
+// ForTest "example.com/xrefmod/inpkgtest") — graph.go's fromPackages
+// preserves this path unchanged (see its own doc), and internal/index now
+// schedules and indexes it as its own unit (schedulableRoot), so it is a
+// real facts-index pkgPath a test can resolve against, distinct from
+// pkgInpkgtest itself.
+const pkgInpkgtestExtTest = "example.com/xrefmod/inpkgtest_test"
+
+// TestResolveAt_ExternalTestPackageFile verifies resolveAt resolves a
+// position inside inpkgtest's external "_test"-suffixed test package file
+// to that package's OWN facts unit (isExternalTestOfRoot), not inpkgtest's:
+// the two are distinct Go packages with distinct facts, so
+// inpkgtest_ext_test.go's own declaration must resolve under
+// pkgInpkgtestExtTest's PkgHash, never inpkgtest's.
+func TestResolveAt_ExternalTestPackageFile(t *testing.T) {
 	r, snap := newTestResolver(t)
 	pkg, ok := snap.Package(pkgInpkgtest)
 	if !ok {
@@ -569,8 +580,18 @@ func TestResolveAt_ExternalTestPackageFileStillDegrades(t *testing.T) {
 	if err != nil {
 		t.Fatalf("toUint32Pos: %v", err)
 	}
-	if _, err := r.resolveAt(context.Background(), extFile, l, c); err == nil {
-		t.Fatal("resolveAt succeeded for a position in the external test package file, want an error (never indexed)")
+	target, err := r.resolveAt(context.Background(), extFile, l, c)
+	if err != nil {
+		t.Fatalf("resolveAt: %v", err)
+	}
+	if target.Name != "ExternalOnly" {
+		t.Errorf("target.Name = %q, want %q", target.Name, "ExternalOnly")
+	}
+	if target.Kind != index.KindFunc {
+		t.Errorf("target.Kind = %d, want %d (KindFunc)", target.Kind, index.KindFunc)
+	}
+	if want := store.Hash(pkgInpkgtestExtTest); target.PkgHash != want {
+		t.Errorf("target.PkgHash = %x, want %x (%s)", target.PkgHash, want, pkgInpkgtestExtTest)
 	}
 }
 

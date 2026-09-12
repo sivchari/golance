@@ -2,6 +2,7 @@ package xref
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go/types"
 	"strings"
@@ -178,9 +179,12 @@ func (r *Resolver) interfacesSatisfiedByMethod(ctx context.Context, named *types
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		iname, _, _, ok := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
-		if !ok {
-			continue
+		iname, _, _, err := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				continue
+			}
+			return nil, err
 		}
 		ipath, ok := r.pkgPathByHash[key.PkgHash]
 		if !ok {
@@ -251,7 +255,11 @@ func (r *Resolver) resolveMethodFunc(ctx context.Context, pkgPath string, idHash
 }
 
 // implementationsOfInterface finds every concrete type in the workspace
-// that implements the interface named.
+// that implements the interface named, plus every OTHER interface whose own
+// method set is a superset of named's -- typically because it embeds named,
+// directly or transitively (e.g. an iface.Greeter that embeds iface.Speaker
+// is one of Speaker's own "implementations", the same way gopls treats
+// interface embedding as an implementation relationship too).
 //
 // The empty interface (interface{}/any) is deliberately excluded: every
 // type in the workspace trivially implements it, so "every type" is not a
@@ -276,19 +284,157 @@ func (r *Resolver) implementationsOfInterface(ctx context.Context, named *types.
 	if err != nil {
 		return nil, err
 	}
+	embedders, err := r.embeddingInterfaces(ctx, named, iface, names, diag)
+	if err != nil {
+		return nil, err
+	}
 	var out []Location
-	for key := range impls {
-		_, _, loc, ok := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
-		if !ok {
-			continue
-		}
-		out = append(out, loc)
+	out, err = r.appendCandidateLocations(ctx, out, impls, diag)
+	if err != nil {
+		return nil, err
+	}
+	out, err = r.appendCandidateLocations(ctx, out, embedders, diag)
+	if err != nil {
+		return nil, err
 	}
 	sortLocations(out)
 	if len(out) == 0 {
 		r.logImplDiag("implementations of interface "+named.Obj().Name(), diag)
 	}
 	return out, nil
+}
+
+// appendCandidateLocations resolves each candidate in impls to its
+// declaration Location via symbolByHash and appends it to out, recording an
+// unresolvable candidate in diag rather than failing the whole query (the
+// same tolerance implementationsOfInterface's own loop already had before
+// it grew a second candidateOccurrences source to append).
+func (r *Resolver) appendCandidateLocations(ctx context.Context, out []Location, impls candidateOccurrences, diag *implDiag) ([]Location, error) {
+	for key := range impls {
+		_, _, loc, err := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				diag.skipCandidate(key, err)
+				continue
+			}
+			return nil, err
+		}
+		out = append(out, loc)
+	}
+	return out, nil
+}
+
+// embeddingInterfaces finds every interface in the workspace, OTHER than
+// ifaceNamed itself, whose own (already-flattened, promotion-included)
+// method set is a superset of ifaceNamed's methodNames -- i.e. every
+// interface that embeds ifaceNamed, directly or through further embedding.
+// Candidate gathering and fingerprint confirmation mirror implementingTypes
+// exactly (see its doc), with two differences specific to an interface
+// candidate: confirmation calls types.Implements(cnamed, iface) directly,
+// with no *types.Pointer wrapping (an interface's method set already is its
+// value method set, unlike a concrete receiver), and ifaceNamed's own
+// candidateKey is excluded before either the fingerprint or decode path
+// runs -- ifaceNamed trivially has all of its own methods (both by
+// fingerprint and by types.Implements), so without this exclusion it would
+// always list itself as its own "implementer".
+func (r *Resolver) embeddingInterfaces(ctx context.Context, ifaceNamed *types.Named, iface *types.Interface, methodNames []string, diag *implDiag) (candidateOccurrences, error) {
+	ifaceGeneric := ifaceNamed.TypeParams().Len() > 0
+	ifaceFPs := make(map[string]uint64, len(methodNames))
+	if !ifaceGeneric {
+		for i := 0; i < iface.NumMethods(); i++ {
+			fn := iface.Method(i)
+			if sig, ok := fn.Type().(*types.Signature); ok {
+				ifaceFPs[fn.Name()] = index.MethodFingerprint(sig)
+			}
+		}
+	}
+	selfKey, haveSelfKey := selfCandidateKey(ifaceNamed)
+
+	candidates, err := r.candidatesByAllMethods(ctx, methodNames, index.KindInterface, diag)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(candidateOccurrences, len(candidates))
+	for key, byName := range candidates {
+		if haveSelfKey && key == selfKey {
+			continue
+		}
+		if !ifaceGeneric && fingerprintsConfirm(byName, methodNames, ifaceFPs) {
+			out[key] = byName
+			diag.survivors++
+			continue
+		}
+		confirmed, err := r.confirmEmbeddingCandidate(ctx, key, iface, diag)
+		if err != nil {
+			return nil, err
+		}
+		if confirmed {
+			out[key] = byName
+			diag.survivors++
+		}
+	}
+	return out, nil
+}
+
+// confirmEmbeddingCandidate decodes key's own export data and confirms it
+// via types.Implements, for a candidate embeddingInterfaces' fingerprint
+// fast path did not already confirm -- the same decode-fallback
+// implementingTypes' own loop inlines (see its doc), split out here as its
+// own function to keep embeddingInterfaces' own loop within this package's
+// complexity budget.
+func (r *Resolver) confirmEmbeddingCandidate(ctx context.Context, key candidateKey, iface *types.Interface, diag *implDiag) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	cname, _, _, err := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
+	if err != nil {
+		if !errors.Is(err, errSymbolNotFound) {
+			return false, err
+		}
+		diag.skipCandidate(key, err)
+		return false, nil
+	}
+	cpath, ok := r.pkgPathByHash[key.PkgHash]
+	if !ok {
+		diag.skipCandidate(key, errUnknownDefiningPackage)
+		return false, nil
+	}
+	cnamed, err := r.resolveNamed(ctx, cpath, cname)
+	if err != nil {
+		diag.skip(cpath, cname, err)
+		return false, nil
+	}
+	if !types.Implements(cnamed, iface) {
+		diag.fingerprintMismatch++
+		return false, nil
+	}
+	return true, nil
+}
+
+// selfCandidateKey computes named's own candidateKey, the same way facts
+// extraction's symbolID (internal/index/facts.go) computed it for named's
+// defining identifier: named's package path plus its objectpath-encoded
+// position within it (see methodFuncSymbol for the identical pattern
+// applied to a *types.Func instead of a *types.TypeName). embeddingInterfaces
+// uses this to exclude named's own type from its embedding-interface
+// candidates. ok is false when named has no package (the predeclared
+// scope), which never happens for a workspace interface reaching this call.
+func selfCandidateKey(named *types.Named) (key candidateKey, ok bool) {
+	pkg := named.Obj().Pkg()
+	if pkg == nil {
+		return candidateKey{}, false
+	}
+	enc := new(objectpath.Encoder)
+	objPath, err := enc.For(named.Obj())
+	if err != nil {
+		return candidateKey{}, false
+	}
+	pkgPath := pkg.Path()
+	return candidateKey{
+		PkgHash:          store.Hash(pkgPath),
+		TypeSymbolIDHash: store.Hash(store.BuildSymbolID(pkgPath, string(objPath))),
+	}, true
 }
 
 // methodImplementations is implementationsOfInterface's method-granular
@@ -301,7 +447,7 @@ func (r *Resolver) methodImplementations(ctx context.Context, iface *types.Named
 	if err != nil {
 		return nil, err
 	}
-	return r.locationsOfSymbols(ctx, syms), nil
+	return r.locationsOfSymbols(ctx, syms)
 }
 
 // methodImplementationSymbols is methodImplementations' resolvedSymbol
@@ -432,12 +578,17 @@ func (r *Resolver) implementingTypes(ctx context.Context, ifaceNamed *types.Name
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		cname, _, _, ok := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
-		if !ok {
+		cname, _, _, err := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
+		if err != nil {
+			if !errors.Is(err, errSymbolNotFound) {
+				return nil, err
+			}
+			diag.skipCandidate(key, err)
 			continue
 		}
 		cpath, ok := r.pkgPathByHash[key.PkgHash]
 		if !ok {
+			diag.skipCandidate(key, errUnknownDefiningPackage)
 			continue
 		}
 		cnamed, err := r.resolveNamed(ctx, cpath, cname)
@@ -526,9 +677,13 @@ func (r *Resolver) interfacesImplementedBy(ctx context.Context, named *types.Nam
 	}
 	var out []Location
 	for key := range ifaces {
-		_, _, loc, ok := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
-		if !ok {
-			continue
+		_, _, loc, err := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				diag.skipCandidate(key, err)
+				continue
+			}
+			return nil, err
 		}
 		out = append(out, loc)
 	}
@@ -549,7 +704,7 @@ func (r *Resolver) methodInterfaces(ctx context.Context, named *types.Named, met
 	if err != nil {
 		return nil, err
 	}
-	return r.locationsOfSymbols(ctx, syms), nil
+	return r.locationsOfSymbols(ctx, syms)
 }
 
 // methodInterfaceSymbols is methodInterfaces' resolvedSymbol counterpart:
@@ -626,12 +781,17 @@ func (r *Resolver) implementedInterfaces(ctx context.Context, named *types.Named
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		iname, _, _, ok := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
-		if !ok {
+		iname, _, _, err := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
+		if err != nil {
+			if !errors.Is(err, errSymbolNotFound) {
+				return nil, err
+			}
+			diag.skipCandidate(key, err)
 			continue
 		}
 		ipath, ok := r.pkgPathByHash[key.PkgHash]
 		if !ok {
+			diag.skipCandidate(key, errUnknownDefiningPackage)
 			continue
 		}
 		inamed, err := r.resolveNamed(ctx, ipath, iname)
@@ -719,19 +879,26 @@ func (r *Resolver) methodFuncSymbol(fn *types.Func) (resolvedSymbol, bool) {
 // contributing this method to it by promotion, and (b) happens to satisfy
 // the interface entirely on its own too -- so the candidate list this
 // builds from can legitimately contain two different concrete types whose
-// resolvedSymbol for methodName is nonetheless the same Func.
-func (r *Resolver) locationsOfSymbols(ctx context.Context, syms []resolvedSymbol) []Location {
+// resolvedSymbol for methodName is nonetheless the same Func. A symbolByHash
+// error other than errSymbolNotFound (i.e. ctx was canceled or timed out) is
+// never among those silently-dropped cases -- it aborts the whole call
+// instead, so a canceled query never comes back looking like a merely
+// smaller result.
+func (r *Resolver) locationsOfSymbols(ctx context.Context, syms []resolvedSymbol) ([]Location, error) {
 	var out []Location
 	for _, s := range syms {
-		_, _, loc, ok := r.symbolByHash(ctx, s.PkgHash, s.IDHash)
-		if !ok {
-			continue
+		_, _, loc, err := r.symbolByHash(ctx, s.PkgHash, s.IDHash)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				continue
+			}
+			return nil, err
 		}
 		out = append(out, loc)
 	}
 	out = dedupeLocations(out)
 	sortLocations(out)
-	return out
+	return out, nil
 }
 
 // candidatesByAllMethods returns, for every candidate of kind wantKind that
@@ -815,12 +982,27 @@ func (r *Resolver) methodEntriesOfKind(ctx context.Context, methodName string, w
 	diag.recordLookup(methodName, len(entries))
 	set := make(map[candidateKey][]store.MethodEntry, len(entries))
 	for _, e := range entries {
-		_, kind, _, ok := r.symbolByHash(ctx, e.PkgHash, e.TypeSymbolIDHash)
-		if !ok || kind != wantKind {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		_, kind, _, err := r.symbolByHash(ctx, e.PkgHash, e.TypeSymbolIDHash)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		if kind != wantKind {
 			continue
 		}
-		_, mKind, _, mOk := r.symbolByHash(ctx, e.MethodPkgHash, e.MethodIDHash)
-		if !mOk || mKind != index.KindMethod {
+		_, mKind, _, err := r.symbolByHash(ctx, e.MethodPkgHash, e.MethodIDHash)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		if mKind != index.KindMethod {
 			continue
 		}
 		k := candidateKey{PkgHash: e.PkgHash, TypeSymbolIDHash: e.TypeSymbolIDHash}
@@ -863,6 +1045,28 @@ func (d *implDiag) recordLookup(name string, count int) {
 // call this in place of the bare `continue` they used to silently take.
 func (d *implDiag) skip(pkgPath, name string, err error) {
 	d.skipped = append(d.skipped, fmt.Sprintf("%s.%s: %v", pkgPath, name, err))
+}
+
+// errUnknownDefiningPackage is skipCandidate's reason when key's own
+// r.pkgPathByHash lookup misses: normally impossible for a genuinely
+// current LookupMethod candidate (r.pkgPathByHash is built from the same
+// snapshot the facts index was built against), so this only fires for the
+// same slim raciness window applyIndexEntries's own append-only posting
+// list already tolerates elsewhere (see methodEntriesOfKind's doc).
+var errUnknownDefiningPackage = errors.New("unknown defining package")
+
+// skipCandidate records that key -- one candidate the sound name-based
+// first pass already shortlisted -- was dropped before confirmation could
+// even be attempted, because its own type-name symbol (symbolByHash) or
+// defining package (r.pkgPathByHash) could not be resolved. This is
+// implementingTypes/implementedInterfaces/confirmSupertypeCandidate/
+// confirmSubtypeCandidate's counterpart to skip above, for the resolution
+// step that comes before the one skip already covers: a decode failure
+// (skip) at least identifies WHICH package/name it was; this fires when
+// that identification itself is what failed, and so records key's raw hash
+// pair instead.
+func (d *implDiag) skipCandidate(key candidateKey, err error) {
+	d.skipped = append(d.skipped, fmt.Sprintf("pkg#%x/sym#%x: %v", key.PkgHash, key.TypeSymbolIDHash, err))
 }
 
 // logImplDiag emits diag's summary via r.logger (a no-op if unset; see

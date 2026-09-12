@@ -40,17 +40,21 @@ const maxDepCacheBytes = 512 * 1024 * 1024 // 512MiB
 // resolve through the identical depcheck.Provider instance; those are
 // treated as immutable for the life of a workspace, since any change to
 // them implies a go.mod/go.sum change, which already triggers a full
-// setWorkspace (and so a fresh depCacheHolder) via revalidateGraph.
+// setWorkspace (and so a fresh depCacheHolder) via revalidateGraph. provider
+// is that same depcheck.Provider, kept here only so invalidate can drop a
+// changed package from it too (see invalidate's doc) — it is not otherwise
+// used for resolution here, exports already wraps it for that.
 type depCacheHolder struct {
-	exports typecheck.ExportSource
+	exports  typecheck.ExportSource
+	provider *depcheck.Provider
 
 	mu    sync.Mutex
 	fset  *token.FileSet
 	cache *typecheck.Cache
 }
 
-func newDepCacheHolder(exports typecheck.ExportSource) *depCacheHolder {
-	return &depCacheHolder{exports: exports, fset: token.NewFileSet(), cache: typecheck.NewCache()}
+func newDepCacheHolder(exports typecheck.ExportSource, provider *depcheck.Provider) *depCacheHolder {
+	return &depCacheHolder{exports: exports, provider: provider, fset: token.NewFileSet(), cache: typecheck.NewCache()}
 }
 
 // importer returns a types.ImporterFrom decoding into d's current
@@ -82,10 +86,12 @@ func (d *depCacheHolder) FileSet() *token.FileSet {
 	return d.fset
 }
 
-// invalidate drops pkgPaths from the current cache, so the next recheck
-// that imports any of them re-decodes fresh export data instead of reusing
-// a now-possibly-stale *types.Package. Callers use this after a workspace
-// package's on-disk export data changes (didSave's background reindex).
+// invalidate drops pkgPaths from the current cache and from d.provider's own
+// LRU (see depcheck.Provider.Delete's doc for why a workspace package can be
+// cached there too), so the next recheck that imports any of them re-decodes
+// fresh export data instead of reusing a now-possibly-stale *types.Package.
+// Callers use this after a workspace package's on-disk export data changes
+// (didSave's background reindex).
 func (d *depCacheHolder) invalidate(pkgPaths []string) {
 	d.mu.Lock()
 	cache := d.cache
@@ -93,6 +99,7 @@ func (d *depCacheHolder) invalidate(pkgPaths []string) {
 	for _, p := range pkgPaths {
 		cache.Delete(p)
 	}
+	d.provider.Delete(pkgPaths...)
 }
 
 // depMetadataSource is a depcheck.MetadataSource whose backing
@@ -221,6 +228,28 @@ func nonRootPackageCount(snap *graph.Snapshot) int {
 		}
 	}
 	return n
+}
+
+// isExternalTestOfRoot reports whether pkg is a workspace directory's
+// external "_test"-suffixed test package: pkg.ForTest names a Root package
+// sharing pkg's own directory. Mirrors internal/index's identical
+// predicate of the same name (kept as a separate copy per package, the same
+// way this package's own ForTest exclusion already mirrors
+// internal/check.GraphSource's) and internal/xref.Resolver's own copy —
+// setWorkspace's fileToPkg build and nonWorkspacePackageForFile both use
+// this to recognize such a file as still belonging to the workspace, not a
+// GOROOT/module-cache dependency.
+//
+// The directory check excludes the rare intermediate-test-variant case
+// documented on graph.Package.ForTest: a ForTest-tagged entry whose real
+// files live in a completely different directory is not this directory's
+// own test package at all.
+func isExternalTestOfRoot(snap *graph.Snapshot, pkg *graph.Package) bool {
+	if pkg.ForTest == "" {
+		return false
+	}
+	base, ok := snap.Packages[pkg.ForTest]
+	return ok && base.Root && base.Dir == pkg.Dir
 }
 
 // changedExportSet returns every package path in snap whose cached
@@ -394,7 +423,7 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 		engine = old.engine
 	} else {
 		graphSrc = check.NewGraphSource(snap, s.overlay)
-		depCache = newDepCacheHolder(depExports)
+		depCache = newDepCacheHolder(depExports, depProvider)
 		engine = check.New(graphSrc, s.overlay, depCache.importer, check.Options{OnResult: s.publishDiagnostics})
 		// Retire, not Stop, the outgoing engine: a debounce timer already
 		// scheduled on it (e.g. by a handleDidChange that captured the old
@@ -417,19 +446,33 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	fileToPkg := make(map[string]string)
 	dirToPkg := make(map[string]string, len(snap.Packages))
 	for pkgPath, pkg := range snap.Packages {
-		// Skip a ForTest-tagged entry: a synthesized test-only node (most
-		// commonly an external "_test" package) that can share pkg.Dir
-		// with the ordinary package it tests under a different PkgPath —
-		// see internal/check.GraphSource's identical exclusion for why
-		// indexing it here too would risk misrouting a new file in that
-		// directory to an unimportable PkgPath.
-		if pkg.ForTest != "" {
+		if pkg.ForTest == "" {
+			for _, f := range pkg.GoFiles {
+				fileToPkg[f] = pkgPath
+			}
+			dirToPkg[pkg.Dir] = pkgPath
 			continue
 		}
-		for _, f := range pkg.GoFiles {
-			fileToPkg[f] = pkgPath
+		// A ForTest-tagged entry (most commonly a directory's external
+		// "_test" package) never gets a dirToPkg entry: it can share pkg.Dir
+		// with the ordinary package it tests under a different PkgPath — see
+		// internal/check.GraphSource's identical exclusion — so indexing it
+		// here too would risk misrouting a brand-new unsaved file in that
+		// directory to an unimportable PkgPath. It DOES get fileToPkg
+		// entries for its own already-known files when it is genuinely a
+		// workspace directory's own external test package (isExternalTestOfRoot,
+		// mirroring internal/index's identical predicate): those exact file
+		// paths can never collide with the base package's own GoFiles, so
+		// there is nothing to misroute, and without this a didOpen/didSave
+		// on such a file would resolve to the base package's pkgPath
+		// instead of its own — see nonWorkspacePackageForFile, which this
+		// pairs with to keep such a file routed through ws.engine rather
+		// than ws.depProvider.
+		if isExternalTestOfRoot(snap, pkg) {
+			for _, f := range pkg.GoFiles {
+				fileToPkg[f] = pkgPath
+			}
 		}
-		dirToPkg[pkg.Dir] = pkgPath
 	}
 	pkgNameIndex := buildPkgNameIndex(snap)
 
@@ -595,7 +638,14 @@ func (s *Server) handleDidChangeWatchedFiles(_ context.Context, params json.RawM
 	}
 	for _, ch := range p.Changes {
 		if isModuleFile(ch.URI.FsPath()) {
-			go s.revalidateGraph(graph.Options{Dir: ws.root, Offline: s.opts.Offline}, []string{allPackagesPattern})
+			// s.rpc.Go, not a raw goroutine: tracks this reload the same way
+			// as the server's other detached background work, so Serve's
+			// shutdown-time wg.Wait (see Stop's doc) drains it instead of
+			// letting quitting the editor right after a go.mod change race
+			// an in-flight rebuild.
+			s.rpc.Go(func(context.Context) {
+				s.revalidateGraph(graph.Options{Dir: ws.root, Offline: s.opts.Offline}, []string{allPackagesPattern})
+			})
 			return nil
 		}
 	}

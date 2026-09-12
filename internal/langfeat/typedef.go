@@ -103,10 +103,26 @@ func sameFileTypeDef(cp *check.CheckedPackage, tn *types.TypeName) (*TypeDefInfo
 // case in typeToObjects (gopls@v0.23.0's internal/golang/identifier.go) --
 // a predeclared basic type's (int, string, bool, ...) entry in
 // types.Universe, which has no *types.Named of its own to unwrap through.
+//
+// A *types.Alias (a `type X = Y` declaration's own TypeName.Type(), the
+// distinct wrapper go/types has represented this as since Go 1.23's
+// gotypesalias=1 default) resolves to its own Obj(), exactly like
+// *types.Named: this is what makes a query on the alias declaration's own
+// name self-point to that declaration, the same way a plain named type's
+// own name does, instead of falling through to nil.
+//
+// A *types.Signature -- t is obj.Type() for a func/method identifier --
+// unwraps to its single result's type, mirroring gopls's TypeDefinition on
+// such an identifier resolving to the type of the value it evaluates to.
+// Zero or multiple results have no single answer this way; gopls itself
+// reports a protocol error for those rather than degrading, so this simply
+// returns nil, matching golance's existing empty-result behavior for them.
 func typeNameOf(t types.Type) *types.TypeName {
 	for range 10 { // bound against implausibly deep nesting
 		switch tt := t.(type) {
 		case *types.Named:
+			return tt.Obj()
+		case *types.Alias:
 			return tt.Obj()
 		case *types.Basic:
 			tn, _ := types.Universe.Lookup(tt.Name()).(*types.TypeName)
@@ -121,6 +137,11 @@ func typeNameOf(t types.Type) *types.TypeName {
 			t = tt.Elem()
 		case *types.Map:
 			t = tt.Elem()
+		case *types.Signature:
+			if tt.Results().Len() != 1 {
+				return nil
+			}
+			t = tt.Results().At(0).Type()
 		default:
 			return nil
 		}

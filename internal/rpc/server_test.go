@@ -334,6 +334,57 @@ func TestCancelRequestCancelsHandlerContext(t *testing.T) {
 	})
 }
 
+// TestCancelRequestDoesNotDiscardResultTheHandlerAlreadyComputed is a
+// regression test for Finding M1: dispatchRequest used to decide
+// cancellation by re-checking reqCtx.Err() after the handler already
+// returned, so a $/cancelRequest that reached reqCtx before the handler's
+// own decision (but after the handler had already produced a valid result
+// without itself observing the cancellation) discarded that valid result.
+// The handler here deliberately waits for ctx.Done() and then still returns
+// a normal result instead of ctx.Err(), simulating work that had already
+// completed by the time the cancellation arrived; the response must be that
+// result, not "request cancelled".
+func TestCancelRequestDoesNotDiscardResultTheHandlerAlreadyComputed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newTestServer(t)
+		started := make(chan struct{})
+		s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
+		s.Handle("slow", Background, func(ctx context.Context, _ json.RawMessage) (any, error) {
+			close(started)
+			<-ctx.Done()
+			return map[string]string{"ok": "true"}, nil
+		})
+
+		in := strings.NewReader(
+			frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`) +
+				frame(t, `{"jsonrpc":"2.0","id":2,"method":"slow","params":{}}`) +
+				frame(t, `{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":2}}`),
+		)
+		var out bytes.Buffer
+		done := make(chan error, 1)
+		go func() { done <- s.Serve(context.Background(), in, &out) }()
+
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("handler never started")
+		}
+
+		if err := <-done; err != nil {
+			t.Fatalf("Serve() error = %v", err)
+		}
+		frames := readFrames(t, out.Bytes())
+		f := frameForID(t, frames, 2)
+		if f["error"] != nil {
+			t.Fatalf("frame = %v, want a result, not an error (the handler never observed the cancellation)", f)
+		}
+		result, _ := f["result"].(map[string]any)
+		if result["ok"] != "true" {
+			t.Fatalf("result = %v, want ok=true", f["result"])
+		}
+	})
+}
+
 func TestCancelRequestForUnknownIDIsNoop(t *testing.T) {
 	s := newTestServer(t)
 	// No request with id=99 was ever sent; the cancel notification must be
@@ -341,6 +392,28 @@ func TestCancelRequestForUnknownIDIsNoop(t *testing.T) {
 	in := strings.NewReader(frame(t, `{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":99}}`))
 	if err := s.Serve(context.Background(), in, &bytes.Buffer{}); err != nil {
 		t.Fatalf("Serve() error = %v", err)
+	}
+}
+
+// TestServeLogsDegenerateFrame is a regression test for Finding L4: a frame
+// with neither Method nor ID matches none of isRequest/isNotification/
+// isResponse, so Serve's dispatch switch used to silently ignore it with no
+// default case and no log line. It must now be observable.
+func TestServeLogsDegenerateFrame(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+	s := NewServer(WithLogger(logger))
+	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) { return nil, nil })
+
+	in := strings.NewReader(
+		frame(t, `{"jsonrpc":"2.0"}`) +
+			frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`),
+	)
+	if err := s.Serve(context.Background(), in, &bytes.Buffer{}); err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+	if !strings.Contains(buf.String(), "dropping frame") {
+		t.Fatalf("log output = %q, want a line about the dropped degenerate frame", buf.String())
 	}
 }
 
@@ -743,5 +816,47 @@ func TestGo_TrackedByServeShutdownDrain(t *testing.T) {
 	case <-finished:
 	default:
 		t.Fatal("Serve() returned before its own wg.Wait() drained the Go-launched goroutine")
+	}
+}
+
+// TestGo_PanicRecoveredLoggedAndDrainsOnShutdown covers Go's own panic
+// recovery: a panic in a Go-launched detached goroutine has no
+// request/notification dispatch caller left to fail gracefully by the time
+// it runs, so it must be recovered and logged with a stack trace instead of
+// crashing the whole process, and wg.Done must still run so Serve's
+// shutdown-time drain (see TestGo_TrackedByServeShutdownDrain) never hangs
+// on a goroutine that panicked.
+func TestGo_PanicRecoveredLoggedAndDrainsOnShutdown(t *testing.T) {
+	var logBuf bytes.Buffer
+	s := NewServer(WithLogger(log.New(&logBuf, "", 0)))
+	s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) {
+		s.Go(func(context.Context) {
+			panic("deliberate background panic")
+		})
+		return nil, nil
+	})
+
+	pr, pw := io.Pipe()
+	var out bytes.Buffer
+	go func() {
+		_, _ = pw.Write([]byte(frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)))
+		_ = pw.Close()
+	}()
+
+	// Serve returning at all (rather than the test process crashing) is
+	// itself part of what this test verifies; its own defer s.wg.Wait()
+	// additionally guarantees the panic was already recovered and logged by
+	// the time it returns, exactly as TestGo_TrackedByServeShutdownDrain
+	// relies on for a non-panicking fn.
+	if err := s.Serve(context.Background(), pr, &out); err != nil {
+		t.Fatalf("Serve() error = %v", err)
+	}
+
+	got := logBuf.String()
+	if !strings.Contains(got, "deliberate background panic") {
+		t.Fatalf("log output = %q, want it to contain the panic value", got)
+	}
+	if !strings.Contains(got, "goroutine") {
+		t.Fatalf("log output = %q, want a stack trace", got)
 	}
 }

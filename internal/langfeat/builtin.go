@@ -9,11 +9,13 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/tools/go/ast/astutil"
 )
@@ -40,7 +42,8 @@ var goroot = sync.OnceValue(func() string {
 // import graph (see internal/depcheck's package doc: nothing imports the
 // pseudo-package "builtin"), so it needs its own dedicated resolution
 // rather than routing through internal/depcheck.Provider's metadata-driven
-// one. Called at most once per process — see loadBuiltinFile below, which
+// one. Called once per process on success, or at most once per
+// builtinRetryInterval while failing — see loadBuiltinFile below, which
 // memoizes it.
 func parseBuiltinFile() (*ast.File, *token.FileSet, error) {
 	root := goroot()
@@ -56,28 +59,64 @@ func parseBuiltinFile() (*ast.File, *token.FileSet, error) {
 	return file, fset, nil
 }
 
-// builtinFileResult boxes parseBuiltinFile's three return values so
-// loadBuiltinFile below can memoize them with sync.OnceValue (its
-// two-value sibling sync.OnceValues cannot express a triple).
+// builtinFileResult boxes parseBuiltinFile's three return values for
+// builtinFileCache below.
 type builtinFileResult struct {
 	file *ast.File
 	fset *token.FileSet
 	err  error
 }
 
-// loadBuiltinFileOnce memoizes parseBuiltinFile for golance's lifetime:
-// builtin.go is part of the installed toolchain, immutable without a
-// golance restart, exactly like every other GOROOT source
-// internal/depcheck already treats as immutable.
-var loadBuiltinFileOnce = sync.OnceValue(func() builtinFileResult {
-	file, fset, err := parseBuiltinFile()
-	return builtinFileResult{file: file, fset: fset, err: err}
-})
+// builtinRetryInterval bounds how often a failed parseBuiltinFile is
+// retried: often enough that a transient failure (a slow/unavailable `go
+// env` at startup) self-heals within a session, rarely enough that a
+// permanently broken toolchain does not re-run `go env`/re-parse
+// builtin.go on every hover/definition keystroke.
+const builtinRetryInterval = 30 * time.Second
 
-// loadBuiltinFile returns loadBuiltinFileOnce's cached result, unboxed.
+// builtinFileCache memoizes parseBuiltinFile, but only caches success for
+// golance's lifetime; a failure (e.g. a transient `go env GOROOT` error)
+// is cached only for builtinRetryInterval so a later call retries instead
+// of leaving every builtin hover/definition/typeDefinition broken until
+// restart. Guarded by mu rather than sync.OnceValue, which has no way to
+// express "cache this outcome, but only conditionally forever".
+var builtinFileCache struct {
+	mu            sync.Mutex
+	result        builtinFileResult
+	have          bool
+	lastTry       time.Time
+	loggedFailure bool
+}
+
+// loadBuiltinFile returns builtinFileCache's memoized result, calling
+// parseBuiltinFile if there is no cached success and either no attempt has
+// been made yet or the last failed attempt is older than
+// builtinRetryInterval. Logs a failure once per newly observed error so a
+// broken GOROOT is diagnosable without spamming on every retry.
 func loadBuiltinFile() (*ast.File, *token.FileSet, error) {
-	r := loadBuiltinFileOnce()
-	return r.file, r.fset, r.err
+	builtinFileCache.mu.Lock()
+	defer builtinFileCache.mu.Unlock()
+
+	if builtinFileCache.have && builtinFileCache.result.err == nil {
+		return builtinFileCache.result.file, builtinFileCache.result.fset, nil
+	}
+	if builtinFileCache.have && time.Since(builtinFileCache.lastTry) < builtinRetryInterval {
+		return builtinFileCache.result.file, builtinFileCache.result.fset, builtinFileCache.result.err
+	}
+
+	file, fset, err := parseBuiltinFile()
+	builtinFileCache.result = builtinFileResult{file: file, fset: fset, err: err}
+	builtinFileCache.have = true
+	builtinFileCache.lastTry = time.Now()
+	if err != nil {
+		if !builtinFileCache.loggedFailure {
+			log.Printf("langfeat: %v; builtin hover/definition/typeDefinition unavailable until this succeeds", err)
+			builtinFileCache.loggedFailure = true
+		}
+	} else {
+		builtinFileCache.loggedFailure = false
+	}
+	return file, fset, err
 }
 
 // resolveBuiltinIdent resolves obj — a universe (predeclared) object or the

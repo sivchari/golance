@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -399,6 +400,14 @@ func (s *Server) revalidateIndex(ctx context.Context, root string) {
 	}
 	if idx := s.idx.Load(); idx != nil {
 		s.idx.Store(nil)
+		// Wait for every detached reindex already registered against idx
+		// (documentsync.go's beginReindex/reindexIfStillCurrent) to finish
+		// its own write before closing the database out from under it. Safe
+		// against a new registration racing this wait: beginReindex also
+		// requires s.idxMu, held here for revalidateIndex's entire body, so
+		// nothing can register between the Store(nil) above and the Close
+		// below — see reindexWG's own doc.
+		s.reindexWG.Wait()
 		if err := idx.db.Close(); err != nil {
 			s.logger.Printf("golance: close index before rebuild: %v", err)
 		}
@@ -414,9 +423,30 @@ func (s *Server) revalidateIndex(ctx context.Context, root string) {
 // fresh state as each package is repaired, rather than returning
 // index-unavailable for however long a full subprocess rebuild would take.
 // Called only from revalidateIndex, which already holds s.idxMu.
+//
+// A package s.reindex fails to repair is left exactly as stale as it was
+// before this call (reindex writes nothing on failure), same as always, but
+// unlike before this now tells the client about it via one window/
+// logMessage listing every such package, instead of only s.reindex's own
+// server-side log line: revalidateIndex's repair pass runs at most once per
+// loadWorkspaceAsync call (see its own doc) and nothing else retries a
+// package left unrepaired here until its own next independent trigger (an
+// edit, a watched-file event), so without this the only trace of a
+// deterministically-failing package was a log file most users never open —
+// see loadWorkspaceAsync's doc for the self-heal contract this reports on.
+// logMessage, not showMessage: like resolverOrWarn's own "index still
+// building" notice, this describes an expected, self-resolving gap (the
+// next edit to any of these packages repairs it) rather than a failure
+// severe enough to warrant a modal.
 func (s *Server) repairIndexPackagesLocked(ctx context.Context, ws *workspace, idx *indexState, pkgs []string) {
+	var failed []string
 	for _, pkgPath := range pkgs {
-		s.reindex(ctx, ws, idx, pkgPath)
+		if err := s.reindex(ctx, ws, idx, pkgPath); err != nil {
+			failed = append(failed, pkgPath)
+		}
+	}
+	if len(failed) > 0 {
+		s.logMessage(fmt.Sprintf("golance: %d package(s) failed to self-heal during startup index revalidation and remain stale until next edited: %s", len(failed), strings.Join(failed, ", ")))
 	}
 }
 
@@ -553,14 +583,26 @@ func (s *Server) runIndexBuild(ctx context.Context, root, dbPath string) (locked
 	}
 
 	done := make(chan struct{})
+	var statsErrors int
+	var began bool
+	var summary string
 	go func() {
 		defer close(done)
-		s.relayIndexProgress(stdout)
+		statsErrors, began, summary = s.relayIndexProgress(stdout)
 	}()
 
 	waitErr := cmd.Wait()
 	<-done
-	return s.openIndexAfterBuild(ctx, dbPath, waitErr, stderr.String())
+	// openIndexAfterBuild (which installs s.idx) runs to completion BEFORE
+	// the $/progress "end" notification goes out, not after: a client that
+	// treats "end" as "the index is now queryable" — e.g. an E2E test's own
+	// waitForIndexReady, or a real editor firing a hover the instant it
+	// sees this notification — must never observe "end" while s.idx is
+	// still nil. See notifyIndexProgressEnd's own doc for the race this
+	// closes.
+	locked = s.openIndexAfterBuild(ctx, dbPath, waitErr, stderr.String(), statsErrors)
+	s.notifyIndexProgressEnd(began, summary)
+	return locked
 }
 
 // openIndexAfterBuild opens dbPath and this session's CAS directory and
@@ -576,7 +618,19 @@ func (s *Server) runIndexBuild(ctx context.Context, root, dbPath string) (locked
 // back to. Otherwise it attempts to open dbPath anyway — success, or a
 // failure with a database already on disk from an earlier run, stale or
 // incomplete being strictly better than unavailable. stderrText is the
-// subprocess's captured stderr, included in the failure report.
+// subprocess's full captured stderr (never truncated — internal/server
+// buffers the whole thing via bytes.Buffer), included in the failure
+// report and, when non-empty on an otherwise clean exit, logged as its own
+// block (see below): per internal/index.Build's contract a non-zero exit
+// code is reserved for conditions that leave the whole build untrustworthy,
+// so a clean exit's stderr would otherwise never surface anywhere, hiding a
+// panic or unexpected diagnostic from an individual package that still
+// happened to leave the database usable overall. statsErrors is the
+// indexer's own "STATS ... errors=N" count (see indexStatsMessage), logged
+// as a visible warning whenever N > 0 regardless of exit code, since a
+// per-package parse/type-check failure never changes the exit code either
+// (see runIndexBuild) and the $/progress "end" notification's Message many
+// clients simply ignore.
 //
 // It reports locked=true when the only reason dbPath could not be opened
 // is that another live session currently holds its exclusive lock (see
@@ -587,10 +641,11 @@ func (s *Server) runIndexBuild(ctx context.Context, root, dbPath string) (locked
 // against a session-private path (see switchToPrivateIndex) instead of
 // leaving the facts index unavailable the way an ordinary open failure
 // does.
-func (s *Server) openIndexAfterBuild(ctx context.Context, dbPath string, waitErr error, stderrText string) (locked bool) {
+func (s *Server) openIndexAfterBuild(ctx context.Context, dbPath string, waitErr error, stderrText string, statsErrors int) (locked bool) {
+	stderrText = strings.TrimSpace(stderrText)
 	if waitErr != nil {
 		if _, statErr := os.Stat(dbPath); statErr != nil {
-			s.warnIndexUnavailable(fmt.Sprintf("build index: %v (%s)", waitErr, strings.TrimSpace(stderrText)))
+			s.warnIndexUnavailable(fmt.Sprintf("build index: %v (%s)", waitErr, stderrText))
 			return false
 		}
 	}
@@ -605,8 +660,13 @@ func (s *Server) openIndexAfterBuild(ctx context.Context, dbPath string, waitErr
 	}
 
 	if waitErr != nil {
-		s.logger.Printf("golance: indexer exited with an error (%v: %s); opening the existing index, which may be stale or incomplete", waitErr, strings.TrimSpace(stderrText))
+		s.logger.Printf("golance: indexer exited with an error (%v: %s); opening the existing index, which may be stale or incomplete", waitErr, stderrText)
 		s.showMessage(protocol.MessageTypeWarning, "golance: index build failed; opening the previous index, which may be stale or incomplete")
+	} else if stderrText != "" {
+		s.logIndexerStderr(stderrText)
+	}
+	if statsErrors > 0 {
+		s.logger.Printf("golance: indexer reported %d package error(s) during this build; see the indexer stderr block for detail", statsErrors)
 	}
 
 	ws := s.workspace()
@@ -633,6 +693,17 @@ func (s *Server) openIndexAfterBuild(ctx context.Context, dbPath string, waitErr
 	s.logger.Printf("golance: workspace index is now ready")
 	s.drainDirty(ctx, ws)
 	return false
+}
+
+// logIndexerStderr logs stderrText — the indexer subprocess's full captured
+// stderr — as one clearly-prefixed block, so a long stderr (a panic trace,
+// several packages' worth of parse/type-check diagnostics) reads as one
+// attributable unit rather than blending into the surrounding log as an
+// unexplained error storm. Called only for a clean exit with non-empty
+// stderr (see openIndexAfterBuild); a non-zero exit already surfaces its
+// stderr inline with the exit error itself.
+func (s *Server) logIndexerStderr(stderrText string) {
+	s.logger.Printf("golance: indexer stderr (build otherwise succeeded):\n%s", stderrText)
 }
 
 // closePrivateIndex closes and removes this session's own private facts
@@ -749,65 +820,126 @@ func progressPercent(done, total int) uint32 {
 	return uint32(p)
 }
 
+// indexProgressToken is the $/progress token relayIndexProgress and
+// notifyIndexProgressEnd report the indexer subprocess's build progress
+// under.
+const indexProgressToken = "golance/index"
+
 // relayIndexProgress reads "PROGRESS done total" lines written by the
 // indexer subprocess's stdout (see cmd/golance's indexer entry point) and
-// relays them as $/progress notifications. The subprocess's final "STATS
-// ..." summary line (see indexStatsMessage) becomes the "end" notification's
-// Message, so a client — including the E2E suite, which asserts on it
-// directly instead of on wall-clock build time — can tell how many
-// packages this build actually type-checked versus resolved via a CAS hit
-// or an unchanged-content skip.
+// relays them as $/progress "begin"/"report" notifications. It deliberately
+// does NOT send the matching "end" notification itself — see
+// notifyIndexProgressEnd, which runIndexBuild calls once openIndexAfterBuild
+// has actually installed (or failed to install) the result, and why that
+// ordering matters.
+//
+// The subprocess's final "STATS ..." summary line (see indexStatsMessage)
+// is returned as summary, to become the "end" notification's own Message
+// once notifyIndexProgressEnd sends it, so a client — including the E2E
+// suite, which asserts on it directly instead of on wall-clock build time —
+// can tell how many packages this build actually type-checked versus
+// resolved via a CAS hit or an unchanged-content skip. statsErrors is that
+// line's own errors=N count, so runIndexBuild's caller can additionally log
+// a warning many clients would otherwise never surface (see
+// openIndexAfterBuild) instead of relying solely on the "end" message,
+// which many clients ignore. began reports whether any progress was ever
+// relayed at all — notifyIndexProgressEnd's own "was there a 'begin' to
+// match" gate, since a "PROGRESS" line only appears once actual per-package
+// work starts.
 //
 // This does not implement the full window/workDoneProgress/create
 // handshake: internal/rpc.Server has no mechanism for a server-initiated
-// outbound request awaiting a client response, so the progress token below
-// is sent unsolicited rather than created first. Clients that strictly
+// outbound request awaiting a client response, so indexProgressToken is
+// sent unsolicited rather than created first. Clients that strictly
 // require a create round-trip before accepting $/progress will ignore
 // these notifications; this is a known v0.1 limitation of the transport
 // layer, not a bug in the relay itself.
-func (s *Server) relayIndexProgress(r io.Reader) {
-	const token = "golance/index"
-	began := false
-	var summary string
+func (s *Server) relayIndexProgress(r io.Reader) (statsErrors int, began bool, summary string) {
+	// maxProgressLine bounds a single line of the subprocess's stdout.
+	// "PROGRESS %d %d" and "STATS ..." lines are always a few dozen bytes;
+	// this is a generous, explicit safety margin rather than
+	// bufio.NewScanner's unstated default (bufio.MaxScanTokenSize), so a
+	// malformed or oversized line fails loudly (see the sc.Err() handling
+	// below) instead of silently relying on a package-internal constant.
+	const maxProgressLine = 1 << 20 // 1 MiB
+
 	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 4096), maxProgressLine)
 	for sc.Scan() {
 		line := sc.Text()
 		var done, total int
 		if _, err := fmt.Sscanf(line, "PROGRESS %d %d", &done, &total); err == nil {
 			if !began {
 				began = true
-				s.notifyProgress(token, &protocol.WorkDoneProgressBegin{Kind: "begin", Title: "golance: building index"})
+				s.notifyProgress(indexProgressToken, &protocol.WorkDoneProgressBegin{Kind: "begin", Title: "golance: building index"})
 			}
 			pct := progressPercent(done, total)
 			msg := fmt.Sprintf("%d/%d packages", done, total)
-			s.notifyProgress(token, &protocol.WorkDoneProgressReport{Kind: "report", Percentage: &pct, Message: &msg})
+			s.notifyProgress(indexProgressToken, &protocol.WorkDoneProgressReport{Kind: "report", Percentage: &pct, Message: &msg})
 			continue
 		}
-		if msg, ok := indexStatsMessage(line); ok {
+		if msg, errs, ok := indexStatsMessage(line); ok {
 			summary = msg
+			statsErrors = errs
 		}
 	}
-	if began {
-		end := &protocol.WorkDoneProgressEnd{Kind: "end"}
-		if summary != "" {
-			end.Message = &summary
+	if err := sc.Err(); err != nil {
+		// A read failure here means the progress stream was cut short, so
+		// summary and statsErrors reflect only what arrived before it: the
+		// build may have reported failures this relay never saw. Called out
+		// by name when the cause is a line past maxProgressLine, since that
+		// case specifically means the final STATS line — and so
+		// statsErrors's count — was likely never reached.
+		if errors.Is(err, bufio.ErrTooLong) {
+			s.logger.Printf("golance: indexer progress line exceeded %d bytes, rest of the progress stream (including the final STATS summary) was dropped", maxProgressLine)
+		} else {
+			s.logger.Printf("golance: read indexer progress: %v", err)
 		}
-		s.notifyProgress(token, end)
 	}
+	return statsErrors, began, summary
+}
+
+// notifyIndexProgressEnd sends the $/progress "end" notification matching
+// relayIndexProgress's own "begin" (a no-op if began is false — nothing to
+// end), with summary as its Message if non-empty.
+//
+// Callers must send this only once whatever this build's own progress
+// stream reported is actually true of the server's state — in practice,
+// only after openIndexAfterBuild has finished installing (or failing to
+// install) s.idx. relayIndexProgress used to send "end" itself, the instant
+// the indexer subprocess's stdout stream closed — which is always strictly
+// BEFORE openIndexAfterBuild even starts, since runIndexBuild only calls it
+// after both cmd.Wait() and the progress relay have returned. A client that
+// treats "end" as "the index is now usable" (the E2E suite's own
+// waitForIndexReady, and any real editor doing the equivalent) could then
+// issue a cross-package hover, typeDefinition, or call/type hierarchy query
+// that read s.idx while it was still nil — a successful, silently empty (or,
+// for typeDefinition/call/type hierarchy, now correctly erroring) answer for
+// a query that would have found something moments later, purely because of
+// this ordering gap.
+func (s *Server) notifyIndexProgressEnd(began bool, summary string) {
+	if !began {
+		return
+	}
+	end := &protocol.WorkDoneProgressEnd{Kind: "end"}
+	if summary != "" {
+		end.Message = &summary
+	}
+	s.notifyProgress(indexProgressToken, end)
 }
 
 // indexStatsMessage turns one "STATS processed=P skipped=S errors=E
 // typechecked=T" line (see cmd/golance's indexer entry point) into a
-// human-readable summary for the $/progress "end" notification's Message,
-// reporting ok=false for anything else relayIndexProgress reads off the
-// subprocess's stdout.
-func indexStatsMessage(line string) (msg string, ok bool) {
-	var processed, skipped, errs, typeChecked int
+// human-readable summary for the $/progress "end" notification's Message
+// plus that line's own errors=N count, reporting ok=false for anything else
+// relayIndexProgress reads off the subprocess's stdout.
+func indexStatsMessage(line string) (msg string, errs int, ok bool) {
+	var processed, skipped, typeChecked int
 	if _, err := fmt.Sscanf(line, "STATS processed=%d skipped=%d errors=%d typechecked=%d", &processed, &skipped, &errs, &typeChecked); err != nil {
-		return "", false
+		return "", 0, false
 	}
 	casHits := processed - typeChecked
-	return fmt.Sprintf("%d type-checked, %d resolved from cache, %d unchanged, %d error(s)", typeChecked, casHits, skipped, errs), true
+	return fmt.Sprintf("%d type-checked, %d resolved from cache, %d unchanged, %d error(s)", typeChecked, casHits, skipped, errs), errs, true
 }
 
 func (s *Server) notifyProgress(token string, value any) {

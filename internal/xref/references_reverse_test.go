@@ -267,9 +267,9 @@ func (b IntBox) Reset() { b.V = 0 }
 		t.Fatalf("correspondingMethodSymbols(IntBox.Reset) = %+v, want exactly 1 (Container.Reset, via the decode fallback)", syms)
 	}
 
-	_, _, loc, ok := r.symbolByHash(context.Background(), syms[0].PkgHash, syms[0].IDHash)
-	if !ok {
-		t.Fatalf("symbolByHash(%+v) not found", syms[0])
+	_, _, loc, err := r.symbolByHash(context.Background(), syms[0].PkgHash, syms[0].IDHash)
+	if err != nil {
+		t.Fatalf("symbolByHash(%+v): %v", syms[0], err)
 	}
 	wantLine, wantCol := identOccurrence(t, containerFile, "Reset")
 	if loc.File != containerFile || int(loc.Line) != wantLine || int(loc.Col) != wantCol {

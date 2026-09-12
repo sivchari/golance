@@ -128,18 +128,29 @@ type unitKeyRecord struct {
 }
 
 // keyTable resolves each root package's current unitKeyRecord, memoizing
-// lookups across one Build or Reindex run: a package processed earlier in
-// this same (topologically-ordered) run has its freshly computed record
-// available via set; a package not touched this run falls back to whatever
-// db already has recorded for it, since dependency-order processing
-// guarantees any record this run needs has already stabilized — either
-// updated moments ago by this same run, or, for a package this run leaves
+// lookups across one Build, Reindex, or Revalidate run: a package processed
+// earlier in this same (topologically-ordered) run has its freshly computed
+// record available via set; a package this run never touches at all falls
+// back to whatever db already has recorded for it, since dependency-order
+// processing guarantees any record this run needs has already stabilized —
+// either updated moments ago by this same run, or, for a package left
 // entirely untouched, unaffected and so still exactly what db already says.
+//
+// A package this run DID attempt but could not resolve is neither of those:
+// fail records that explicitly, and get must never fall back to db for it —
+// db's entry, if any, is whatever an earlier, successful run left behind,
+// stale with respect to whatever made this run's attempt fail. Folding that
+// stale ExportHash into a dependent's computeUnitKey would persist a
+// combined key mixing this run's state (the dependent's own content) with a
+// previous run's state (the failed dependency's export) as one seemingly
+// coherent snapshot — the invariant this type exists to uphold is that a
+// persisted unit key never mixes current and stale dependency state.
 type keyTable struct {
-	ctx context.Context
-	db  *store.DB
-	mu  sync.Mutex
-	m   map[string]unitKeyRecord
+	ctx    context.Context
+	db     *store.DB
+	mu     sync.Mutex
+	m      map[string]unitKeyRecord
+	failed map[string]error
 }
 
 // newKeyTable returns a keyTable for one Build, Reindex, or Revalidate run,
@@ -154,18 +165,50 @@ func (t *keyTable) set(path string, rec unitKeyRecord) {
 	t.mu.Unlock()
 }
 
-// get returns path's current unitKeyRecord. ok is false only if path has
-// never been indexed at all (no [store.UnitPointer] recorded and nothing
-// computed for it yet this run) — e.g. a dependency that itself has no Go
-// files, which is never scheduled as a job of its own (see
-// internal/index's Build/Reindex; the caller filters these out before ever
-// calling get for them).
+// fail records that path was attempted this run but could not be resolved:
+// a later get(path) must report ok=false instead of silently falling back
+// to db's possibly-stale record for it (see the type doc's invariant). The
+// caller that would otherwise have called set on success calls fail on any
+// error instead — path is never both set and failed in the same run.
+func (t *keyTable) fail(path string, err error) {
+	t.mu.Lock()
+	if t.failed == nil {
+		t.failed = make(map[string]error)
+	}
+	t.failed[path] = err
+	t.mu.Unlock()
+}
+
+// failure returns the error fail recorded for path this run, or nil if get
+// has no reason to report path unresolvable — for a caller building a
+// diagnostic that names why a dependency could not be resolved, rather than
+// just that it could not.
+func (t *keyTable) failure(path string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.failed[path]
+}
+
+// get returns path's current unitKeyRecord. ok is false when path has never
+// been indexed at all (no [store.UnitPointer] recorded and nothing computed
+// for it yet this run) — e.g. a dependency that itself has no Go files,
+// which is never scheduled as a job of its own (see internal/index's
+// Build/Reindex; the caller filters these out before ever calling get for
+// them) — or when path was attempted this run and fail recorded it as
+// unresolved (see failure and the type doc's invariant). In the latter case
+// db is never consulted, even if it holds an older, otherwise-valid-looking
+// record for path.
 func (t *keyTable) get(path string) (unitKeyRecord, bool) {
 	t.mu.Lock()
 	rec, ok := t.m[path]
-	t.mu.Unlock()
 	if ok {
+		t.mu.Unlock()
 		return rec, true
+	}
+	_, didFail := t.failed[path]
+	t.mu.Unlock()
+	if didFail {
+		return unitKeyRecord{}, false
 	}
 	p, err := t.db.GetUnit(t.ctx, store.Hash(path))
 	if err != nil {
