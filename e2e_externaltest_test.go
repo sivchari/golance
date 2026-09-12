@@ -26,10 +26,10 @@ type e2eExternalTestLocs struct {
 // hover, completion, diagnostics, inlay hints, and same-package definition
 // resolved against its own checked unit — including util's exported
 // declarations, through the ordinary dependency importer, exactly like any
-// other cross-package import. Cross-reference queries (references)
-// deliberately keep degrading to an empty result, per
-// design-adhoc-packages.md's scope guard: an external test package is
-// never indexed, the same as an ad-hoc package (see e2e_adhoc_test.go).
+// other cross-package import. Cross-reference queries work too: an
+// external test package is indexed as its own facts unit (see
+// internal/index/scheduler.go's schedulableRoot), unlike an ad-hoc package,
+// which still degrades to empty (see e2e_adhoc_test.go).
 //
 // This lives in its own file, mirroring e2e_adhoc_test.go's rationale,
 // rather than adding to e2e_test.go / e2e_repo_test.go.
@@ -59,8 +59,8 @@ func TestE2EExternalTestPackage(t *testing.T) {
 	t.Run("same_package_definition", func(t *testing.T) {
 		checkE2EExternalTestSamePackageDefinition(t, c, &locs)
 	})
-	t.Run("references_degrades_to_empty_not_error", func(t *testing.T) {
-		checkE2EExternalTestReferencesDegradeToEmpty(t, c, &locs)
+	t.Run("references_resolve_within_external_unit", func(t *testing.T) {
+		checkE2EExternalTestReferencesResolve(t, c, &locs)
 	})
 }
 
@@ -183,13 +183,12 @@ func checkE2EExternalTestSamePackageDefinition(t *testing.T, c *lspClient, locs 
 	}
 }
 
-func checkE2EExternalTestReferencesDegradeToEmpty(t *testing.T, c *lspClient, locs *e2eExternalTestLocs) {
+func checkE2EExternalTestReferencesResolve(t *testing.T, c *lspClient, locs *e2eExternalTestLocs) {
 	t.Helper()
 	// See e2e_adhoc_test.go's checkE2EAdhocReferencesDegradeToEmpty comment
 	// on callRetryIndexUnavailable: this subtest asserts on the facts
-	// index's steady-state answer for an external test package (always
-	// empty, by design), not on whether the index has finished installing
-	// yet.
+	// index's steady-state answer, not on whether the index has finished
+	// installing yet.
 	resp := c.callRetryIndexUnavailable(t, protocol.MethodTextDocumentReferences, &protocol.ReferenceParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
 			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(locs.extFile)},
@@ -198,13 +197,21 @@ func checkE2EExternalTestReferencesDegradeToEmpty(t *testing.T, c *lspClient, lo
 		Context: protocol.ReferenceContext{IncludeDeclaration: false},
 	}, e2eRequestBudget)
 	if len(resp.Error) > 0 {
-		t.Fatalf("references returned a protocol error, want a graceful empty result: %s", resp.Error)
+		t.Fatalf("references returned a protocol error, want sumExternal's use site: %s", resp.Error)
 	}
 	var got protocol.LocationSlice
 	if err := protocol.Unmarshal(resp.Result, &got); err != nil {
 		t.Fatalf("unmarshal references result: %v", err)
 	}
-	if len(got) != 0 {
-		t.Errorf("references inside an external test package = %+v, want empty (external test packages are never indexed)", got)
+	// sumExternal's one non-declaration reference is its call in
+	// localHelper — the position this query itself was made at.
+	if len(got) != 1 {
+		t.Fatalf("references inside an external test package = %+v, want exactly sumExternal's one use site (the external unit is indexed like any other root package)", got)
+	}
+	if fs := got[0].URI.FsPath(); fs != locs.extFile {
+		t.Errorf("reference URI = %s, want %s", fs, locs.extFile)
+	}
+	if got[0].Range.Start.Line != locs.helperPos.Line {
+		t.Errorf("reference line = %d, want %d (sumExternal's call in localHelper)", got[0].Range.Start.Line, locs.helperPos.Line)
 	}
 }
