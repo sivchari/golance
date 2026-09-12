@@ -150,7 +150,8 @@ func TestHandleDidSave_TestFileReindexesNewSymbol(t *testing.T) {
 		if err != nil {
 			t.Fatalf("store.OpenCAS: %v", err)
 		}
-		if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+		relative := RelativeIndexPaths(dir)
+		if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{RelativePaths: relative}); err != nil {
 			t.Fatalf("index.Build: %v", err)
 		}
 
@@ -158,7 +159,7 @@ func TestHandleDidSave_TestFileReindexesNewSymbol(t *testing.T) {
 		s := New(rpcServer, Options{Logger: newTestLogger(t)})
 		s.setWorkspace(dir, snap)
 		stopWorkspaceEngineOnCleanup(t, s)
-		s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+		s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, relative)})
 
 		openDoc(t, s, testFile, testSrc)
 
@@ -315,7 +316,8 @@ func Run(name string) string {
 	if err != nil {
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
-	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+	relative := RelativeIndexPaths(dir)
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{RelativePaths: relative}); err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}
 
@@ -323,7 +325,7 @@ func Run(name string) string {
 	s = New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(dir, snap)
 	stopWorkspaceEngineOnCleanup(t, s)
-	idx = &indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)}
+	idx = &indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, relative)}
 	s.idx.Store(idx)
 	return s, idx, midFile, topFile
 }
@@ -693,7 +695,8 @@ func TestHandleDidOpen_SelfHealsMissingFacts(t *testing.T) {
 		if err != nil {
 			t.Fatalf("store.Open: %v", err)
 		}
-		if _, err := index.Build(context.Background(), snapBeforeB, db, cas, &index.Options{}); err != nil {
+		relative := RelativeIndexPaths(dir)
+		if _, err := index.Build(context.Background(), snapBeforeB, db, cas, &index.Options{RelativePaths: relative}); err != nil {
 			t.Fatalf("index.Build: %v", err)
 		}
 		if err := db.Close(); err != nil {
@@ -717,7 +720,7 @@ func TestHandleDidOpen_SelfHealsMissingFacts(t *testing.T) {
 		s := New(rpcServer, Options{Logger: newTestLogger(t)})
 		s.setWorkspace(dir, fullSnap)
 		stopWorkspaceEngineOnCleanup(t, s)
-		s.idx.Store(&indexState{db: db2, cas: cas, resolver: xref.New(db2, cas, fullSnap, false)})
+		s.idx.Store(&indexState{db: db2, cas: cas, resolver: xref.New(db2, cas, fullSnap, relative)})
 
 		openParams := mustMarshal(t, &protocol.DidOpenTextDocumentParams{
 			TextDocument: protocol.TextDocumentItem{URI: uri.File(pkgbFile), Version: 1, Text: pkgbSrc},
@@ -766,13 +769,11 @@ func TestHandleDidOpen_NoSelfHealWhenIndexNil(t *testing.T) {
 // package facts are already up to date leaves its store.UnitPointer
 // byte-for-byte unchanged: selfHealFactsIfStale must not trigger a reindex
 // (and so not rewrite anything) for a package index.PackageChanged reports
-// unchanged. Uses its own temp module — not testdata/module, which lives
-// inside this repository's own git checkout and so would make
-// RelativeIndexPaths(root) true, while newTestServer's index.Build call
-// always stores absolute paths (Options{} default); a temp dir outside any
-// git repository keeps both consistent with each other, matching what
-// index.Build and selfHealFactsIfStale would each independently resolve
-// RelativeIndexPaths(root) to in production.
+// unchanged. Uses its own temp module, outside any git repository, so
+// RelativeIndexPaths(dir) is false — the counterpart to
+// TestHandleDidOpen_NoSelfHealForFreshHelperBuiltServer, which pins the same
+// invariant for a git-backed root (RelativeIndexPaths true), the path every
+// other newTestServer-based handler test actually exercises.
 func TestHandleDidOpen_NoSelfHealWhenFresh(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		dir := t.TempDir()
@@ -797,7 +798,8 @@ func TestHandleDidOpen_NoSelfHealWhenFresh(t *testing.T) {
 		if err != nil {
 			t.Fatalf("store.OpenCAS: %v", err)
 		}
-		if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+		relative := RelativeIndexPaths(dir)
+		if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{RelativePaths: relative}); err != nil {
 			t.Fatalf("index.Build: %v", err)
 		}
 
@@ -805,7 +807,7 @@ func TestHandleDidOpen_NoSelfHealWhenFresh(t *testing.T) {
 		s := New(rpcServer, Options{Logger: newTestLogger(t)})
 		s.setWorkspace(dir, snap)
 		stopWorkspaceEngineOnCleanup(t, s)
-		s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+		s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, relative)})
 
 		const pkgGreet = "example.com/didopenfresh/greet"
 		before, err := db.GetUnit(context.Background(), store.Hash(pkgGreet))
@@ -827,6 +829,50 @@ func TestHandleDidOpen_NoSelfHealWhenFresh(t *testing.T) {
 		}
 		if !reflect.DeepEqual(before, after) {
 			t.Errorf("UnitPointer changed after opening an unmodified file: before=%+v after=%+v (selfHealFactsIfStale must not reindex an up-to-date package)", before, after)
+		}
+	})
+}
+
+// TestHandleDidOpen_NoSelfHealForFreshHelperBuiltServer is
+// TestHandleDidOpen_NoSelfHealWhenFresh's counterpart for a server built by
+// newTestServer over testdata/module — the shared fixture every ordinary
+// handler test in this package opens files against, and, unlike the temp
+// module above, inside this repository's own git checkout, so
+// RelativeIndexPaths(root) is true here. newTestServer's index.Build and
+// xref.New calls must agree with that (see newTestServer's own doc); this
+// pins the consequence directly: opening an unmodified fixture file must
+// never make selfHealFactsIfStale see a false mismatch and dispatch a
+// reindex, leaving greet's store.UnitPointer byte-for-byte unchanged.
+func TestHandleDidOpen_NoSelfHealForFreshHelperBuiltServer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, snap, _ := newTestServer(t)
+		idx := s.idx.Load()
+		file := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+		text, err := os.ReadFile(filepath.Clean(file))
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+
+		const pkgGreet = "example.com/servermod/greet"
+		before, err := idx.db.GetUnit(context.Background(), store.Hash(pkgGreet))
+		if err != nil {
+			t.Fatalf("GetUnit(greet) before didOpen: %v", err)
+		}
+
+		openParams := mustMarshal(t, &protocol.DidOpenTextDocumentParams{
+			TextDocument: protocol.TextDocumentItem{URI: uri.File(file), Version: 1, Text: string(text)},
+		})
+		if err := s.handleDidOpen(context.Background(), openParams); err != nil {
+			t.Fatalf("handleDidOpen: %v", err)
+		}
+		synctest.Wait()
+
+		after, err := idx.db.GetUnit(context.Background(), store.Hash(pkgGreet))
+		if err != nil {
+			t.Fatalf("GetUnit(greet) after didOpen: %v", err)
+		}
+		if !reflect.DeepEqual(before, after) {
+			t.Errorf("UnitPointer changed after opening an unmodified fixture file: before=%+v after=%+v (selfHealFactsIfStale must not reindex an up-to-date package)", before, after)
 		}
 	})
 }

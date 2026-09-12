@@ -101,7 +101,8 @@ func newTestServer(t *testing.T) (*Server, *graph.Snapshot, string) {
 	if err != nil {
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
-	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+	relative := RelativeIndexPaths(root)
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{RelativePaths: relative}); err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}
 
@@ -109,7 +110,7 @@ func newTestServer(t *testing.T) (*Server, *graph.Snapshot, string) {
 	s := New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(root, snap)
 	stopWorkspaceEngineOnCleanup(t, s)
-	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, relative)})
 
 	return s, snap, root
 }

@@ -216,10 +216,11 @@ func TestReferences_TransitionsFromIndexUnavailableToResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
-	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+	relative := RelativeIndexPaths(snap.Dir())
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{RelativePaths: relative}); err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}
-	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, relative)})
 
 	result, err := s.handleReferences(context.Background(), params)
 	if err != nil {
@@ -256,10 +257,11 @@ func TestWorkspaceSymbol_TransitionsFromIndexUnavailableToResults(t *testing.T) 
 	if err != nil {
 		t.Fatalf("store.OpenCAS: %v", err)
 	}
-	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{}); err != nil {
+	relative := RelativeIndexPaths(snap.Dir())
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{RelativePaths: relative}); err != nil {
 		t.Fatalf("index.Build: %v", err)
 	}
-	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, false)})
+	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, relative)})
 
 	result, err := s.handleWorkspaceSymbol(context.Background(), params)
 	if err != nil {
