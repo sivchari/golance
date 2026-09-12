@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.3](https://github.com/sivchari/golance/compare/v0.7.2...v0.7.3) - 2026-09-12
+- fix: audit against gopls and repair silent, permanent failures by @sivchari in https://github.com/sivchari/golance/pull/104
+
 ## [v0.7.2](https://github.com/sivchari/golance/compare/v0.7.1...v0.7.2) - 2026-09-08
 - fix: self-heal missing facts index entries across worktree reloads by @sivchari in https://github.com/sivchari/golance/pull/102
 
