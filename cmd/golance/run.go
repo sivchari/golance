@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"runtime/pprof"
 	"strconv"
 	"syscall"
@@ -131,6 +132,8 @@ func runIndexer(stdout, stderr io.Writer) int {
 	// future standalone CLI use) should not be forced to know about it.
 	depCASPath := os.Getenv(server.EnvDepCAS)
 
+	applyDefaultMemLimit()
+
 	stopProfiling, ok := setupProfiling(stderr)
 	defer stopProfiling()
 	if !ok {
@@ -138,6 +141,40 @@ func runIndexer(stdout, stderr io.Writer) int {
 	}
 
 	return buildIndex(stdout, stderr, root, dbPath, casPath, depCASPath)
+}
+
+// defaultIndexerMemLimit is the GOMEMLIMIT applied to the indexer subprocess
+// when nothing else already set one (see applyDefaultMemLimit): a cold
+// index build's Go heap otherwise grows unbounded (GOGC=100, no ceiling),
+// which measured 7.4GB peak "memory footprint" (9.0GB peak RSS) type-checking
+// a ~2,500-package, 34k-file monorepo. Capping it at 4GiB cut that to a
+// measured 5.0GB peak footprint (7.9GB peak RSS) with no wall-time cost (the
+// more frequent GC this forces was, if anything, slightly faster in that
+// measurement) — small enough headroom above this that a further cut (2GiB
+// was tried) buys little more RSS reduction while making the GC thrash badly
+// (2.3x wall time), so this is deliberately conservative rather than
+// minimal. It leaves comfortable room for the LSP server process itself
+// alongside it on a 16GB machine; a caller with a reason to run tighter or
+// looser can still override it via --mem-limit/GOLANCE_MEM_LIMIT (forwarded
+// as this same process's GOMEMLIMIT — see applyDefaultMemLimit).
+const defaultIndexerMemLimit = 4 << 30
+
+// applyDefaultMemLimit sets a GOMEMLIMIT soft cap for this process via
+// debug.SetMemoryLimit, but only when nothing has already configured
+// one — the Go runtime applies a GOMEMLIMIT environment variable before
+// main() ever runs, so checking it here is exactly equivalent to checking
+// whether debug.SetMemoryLimit(-1) (a pure read) already reports something
+// other than its unset default (math.MaxInt64), without needing that
+// probe: internal/server always forwards --mem-limit/GOLANCE_MEM_LIMIT to
+// this subprocess as GOMEMLIMIT (see internal/server/indexer.go), and a
+// directly-invoked indexer (a test, or a future standalone CLI use) that set
+// GOMEMLIMIT itself gets the same deference. Only a run with neither gets
+// defaultIndexerMemLimit instead of an unbounded heap.
+func applyDefaultMemLimit() {
+	if os.Getenv("GOMEMLIMIT") != "" {
+		return
+	}
+	debug.SetMemoryLimit(defaultIndexerMemLimit)
 }
 
 // setupProfiling enables the runtime/pprof profiles requested via
