@@ -109,13 +109,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 // Exit code contract: runIndexer returns non-zero only when
 // server.EnvDB's database is not trustworthy as a whole — a failed graph
 // load, a failed database open, or index.Build itself returning an error
-// (which index.Build reserves for a canceled run or a failed write, see
-// its doc). It returns 0 even when stats.Errors is non-zero: a handful of
-// packages individually failing to parse or type-check does not make the
-// rest of the database (which this run did successfully write) any less
-// usable, and internal/server.buildIndex treats a non-zero exit as
-// "nothing usable was indexed," discarding this run's progress entirely
-// if no prior database exists to fall back to.
+// (which index.Build reserves for a canceled run only — see its doc). It
+// returns 0 even when stats.Errors is non-zero: a handful of packages
+// individually failing to parse or type-check, or a batch of them failing
+// to commit (see index.Build's own doc), does not make the rest of the
+// database (which this run did successfully write, including its build
+// fingerprint) any less usable, and internal/server.buildIndex treats a
+// non-zero exit as "nothing usable was indexed," discarding this run's
+// progress entirely if no prior database exists to fall back to.
 func runIndexer(stdout, stderr io.Writer) int {
 	root := os.Getenv(server.EnvRoot)
 	dbPath := os.Getenv(server.EnvDB)

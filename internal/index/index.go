@@ -128,11 +128,16 @@ type Stats struct {
 // memory proportional to the worker count rather than to workspace size.
 //
 // Build's returned error is reserved for conditions that leave db
-// untrustworthy as a whole: a canceled context, or a failed batch commit. A
-// package that itself fails to parse or type-check does not cause an error
-// here — it is only reflected in Stats.Errors — since one unbuildable
-// package among many otherwise-good ones must not make an indexer exit
-// non-zero and discard a mostly-successful build (see buildResults.record).
+// untrustworthy as a whole: a canceled context (see buildResults.recordFatal).
+// A package that itself fails to parse or type-check, or a batch that fails
+// to commit to db, does not cause an error here — both are only reflected
+// in Stats.Errors — since one unbuildable package (or one lost batch) among
+// many otherwise-good ones must not make an indexer exit non-zero, withhold
+// the build fingerprint (below), and so discard a mostly-successful build's
+// own trustworthiness (see buildResults.record and .flushPendingLocked): a
+// missing UnitPointer for the affected package(s) is exactly what
+// index.RevalidateStale already detects and repairs on its own, scoped to
+// just those packages, without needing the whole database rebuilt.
 func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.CAS, opts *Options) (Stats, error) {
 	// o is Build's own private, defaulted copy of *opts (withDefaults never
 	// mutates opts itself — see its own doc): every use below reads o, not
@@ -196,8 +201,12 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 		// revalidation pass (see Revalidate, used by
 		// internal/server.indexNeedsRebuild) can rule out a toolchain
 		// change with one cheap read instead of inspecting every package.
-		// Only recorded on a run with no fatal error: a failed run's db is
-		// exactly what that check must not trust.
+		// Only recorded on a run with no fatal error: a canceled run's db is
+		// exactly what that check must not trust. A non-fatal batch commit
+		// failure (buildResults.flushPendingLocked) still reaches this
+		// branch, so the fingerprint is recorded and the next revalidation
+		// pass judges only the specific packages that batch lost as stale,
+		// not the whole database.
 		if fpErr := db.PutBuildFingerprint(o.ToolchainFingerprint); fpErr != nil {
 			err = fmt.Errorf("index: record build fingerprint: %w", fpErr)
 		}

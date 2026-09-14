@@ -108,16 +108,31 @@ func (r *buildResults) flush() {
 }
 
 // flushPendingLocked commits any pending UnitEntry batch. A commit failure
-// is fatal (unlike a single package's processing error, see record): it
-// means some of what Build reported as Processed was never actually
-// persisted to db.
+// is reported the same way a single package's own processing failure is
+// (see record) — counted into Stats.Errors and logged, but never turned
+// into Build's own fatal error (r.err, see recordFatal) — rather than
+// discarding the whole run's trustworthiness: PutUnitsBatch commits batch
+// as one bbolt transaction, so a failure here can only mean these up-to-
+// batchSize packages were never persisted, not that any earlier batch
+// (already durably committed) was rolled back or that db's toolchain-level
+// identity (about to be recorded via PutBuildFingerprint) is now suspect.
+// Each lost package simply has no UnitPointer, exactly the shape
+// index.RevalidateStale already treats as one stale package needing a
+// targeted repair (see internal/server's revalidateIndex) — scoped to just
+// these packages, instead of forcing a full close-and-rebuild of a database
+// that is otherwise current, the mechanism traced back from a cold-start
+// build that reported complete progress yet was judged wholeDBStale
+// immediately afterward.
 func (r *buildResults) flushPendingLocked() {
 	if len(r.pending) == 0 {
 		return
 	}
 	batch := r.pending
 	r.pending = nil
-	r.addErrLocked(r.db.PutUnitsBatch(batch))
+	if err := r.db.PutUnitsBatch(batch); err != nil {
+		r.stats.Errors += len(batch)
+		log.Printf("index: failed to commit a batch of %d unit(s): %v", len(batch), err)
+	}
 }
 
 // flushPtrsLocked commits any pending pointer-only refresh batch. Unlike
@@ -147,10 +162,12 @@ func (r *buildResults) addErrLocked(err error) {
 }
 
 // result returns the final Stats and the run's error, if any. A non-nil
-// error here means Build's output is not trustworthy as a whole (a
-// canceled context or a batch commit failure, see recordFatal) — not that
-// any individual package failed to type-check; those are only reflected
-// in Stats.Errors. Call only after every worker has finished.
+// error here means Build's output is not trustworthy as a whole — a
+// canceled context (see recordFatal), the only remaining source of this
+// error since flushPendingLocked stopped treating a batch commit failure
+// as fatal — not that any individual package failed to type-check or
+// persist; those are only reflected in Stats.Errors. Call only after every
+// worker has finished.
 func (r *buildResults) result() (Stats, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
