@@ -680,18 +680,14 @@ func TestHandleDefinition_NoIndex_Stdlib(t *testing.T) {
 	}
 }
 
-// TestHandleDefinition_NoIndex_OtherWorkspacePackage is a regression guard
-// for a real hazard TestE2E_WorktreeSharesIndex caught: dependencyDefinition
-// must keep declining to answer for a different *workspace* (root) package
-// even from definitionFallback (the index-unavailable path), never just
-// from the index-error path. A second session (or a cold-start session
-// before its own index build finishes) treats a non-empty
-// textDocument/definition result as a signal the index is now usable, and
-// handleDidSave silently drops the reindex for any edit saved while the
-// index is still unavailable (no retry once it later opens) — so answering
-// this case via possibly-premature export data would let that race succeed
-// on stale grounds, exactly the failure TestE2E_WorktreeSharesIndex
-// reproduced. See dependencyDefinition's doc for the full mechanism.
+// TestHandleDefinition_NoIndex_OtherWorkspacePackage verifies
+// dependencyDefinition's fallback answers a cross-package *workspace*
+// (root) symbol too while the facts index is unavailable — the fix for the
+// cold-start latency gap this used to leave open (see dependencyDefinition's
+// doc): every "go to definition" into another root package used to answer
+// nothing for the whole index-build window, even though ws.depProvider can
+// source-check the target package exactly as it already does for the
+// standard library and module dependencies (TestHandleDefinition_NoIndex_Stdlib).
 func TestHandleDefinition_NoIndex_OtherWorkspacePackage(t *testing.T) {
 	s, snap := newTestServerNoIndex(t)
 	depusePkg, ok := snap.Packages["example.com/servermod/depuse"]
@@ -715,8 +711,21 @@ func TestHandleDefinition_NoIndex_OtherWorkspacePackage(t *testing.T) {
 		t.Fatalf("handleDefinition(no index, greet.Greeting): %v", err)
 	}
 	locs, ok := result.(protocol.LocationSlice)
-	if !ok || len(locs) != 0 {
-		t.Fatalf("handleDefinition(no index, greet.Greeting): result = %#v, want an empty result (never a stale root-package answer)", result)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleDefinition(no index, greet.Greeting): result = %#v, want a single location", result)
+	}
+
+	greetFile := snap.Packages["example.com/servermod/greet"].GoFiles[0]
+	if got := locs[0].URI.FsPath(); got != greetFile {
+		t.Fatalf("definition file = %q, want %q (greet.go, via ws.depProvider)", got, greetFile)
+	}
+	greetText, err := os.ReadFile(filepath.Clean(greetFile))
+	if err != nil {
+		t.Fatalf("read %s: %v", greetFile, err)
+	}
+	want := identPositionIn(t, greetFile, greetText, "Greeting", 1) // type Greeting struct declaration
+	if locs[0].Range.Start != want {
+		t.Errorf("definition start = %+v, want %+v (Greeting's declaration, exact column from source-checking)", locs[0].Range.Start, want)
 	}
 }
 
