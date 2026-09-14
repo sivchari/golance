@@ -36,26 +36,30 @@ const maxDepCacheBytes = 512 * 1024 * 1024 // 512MiB
 // independently). exports resolves external-module and stdlib export data
 // by declaration-only source-checking it (internal/depexport.Cache — see
 // its package doc for what replaced typecheck.ExportFileSource/`go list
-// -export`), shared with this same workspace's own depProvider (see
-// ensureDepProvider) so dependency navigation and dependency compilation
-// resolve through the identical depcheck.Provider instance; those are
-// treated as immutable for the life of a workspace, since any change to
-// them implies a go.mod/go.sum change, which already triggers a full
-// setWorkspace (and so a fresh depCacheHolder) via revalidateGraph. provider
-// is that same depcheck.Provider, kept here only so invalidate can drop a
-// changed package from it too (see invalidate's doc) — it is not otherwise
-// used for resolution here, exports already wraps it for that.
+// -export`); those are treated as immutable for the life of a workspace,
+// since any change to them implies a go.mod/go.sum change, which already
+// triggers a full setWorkspace (and so a fresh depCacheHolder) via
+// revalidateGraph. provider and exportProvider are this same workspace's
+// two depcheck.Provider instances (see ensureDepProvider's doc for why
+// export-data production needs its OWN, decode-disabled Provider rather
+// than sharing depProvider's), kept here only so invalidate can drop a
+// changed package from both (see its own doc) — neither is otherwise used
+// for resolution here, exports already wraps exportProvider for that.
 type depCacheHolder struct {
-	exports  typecheck.ExportSource
-	provider *depcheck.Provider
+	exports        typecheck.ExportSource
+	provider       *depcheck.Provider
+	exportProvider *depcheck.Provider
 
 	mu    sync.Mutex
 	fset  *token.FileSet
 	cache *typecheck.Cache
 }
 
-func newDepCacheHolder(exports typecheck.ExportSource, provider *depcheck.Provider) *depCacheHolder {
-	return &depCacheHolder{exports: exports, provider: provider, fset: token.NewFileSet(), cache: typecheck.NewCache()}
+func newDepCacheHolder(exports typecheck.ExportSource, provider, exportProvider *depcheck.Provider) *depCacheHolder {
+	return &depCacheHolder{
+		exports: exports, provider: provider, exportProvider: exportProvider,
+		fset: token.NewFileSet(), cache: typecheck.NewCache(),
+	}
 }
 
 // importer returns a types.ImporterFrom decoding into d's current
@@ -87,12 +91,13 @@ func (d *depCacheHolder) FileSet() *token.FileSet {
 	return d.fset
 }
 
-// invalidate drops pkgPaths from the current cache and from d.provider's own
-// LRU (see depcheck.Provider.Delete's doc for why a workspace package can be
-// cached there too), so the next recheck that imports any of them re-decodes
-// fresh export data instead of reusing a now-possibly-stale *types.Package.
-// Callers use this after a workspace package's on-disk export data changes
-// (didSave's background reindex).
+// invalidate drops pkgPaths from the current cache and from d.provider's and
+// d.exportProvider's own LRUs (see depcheck.Provider.Delete's doc for why a
+// workspace package can be cached there too — either Provider's recursive
+// import resolution can reach one), so the next recheck that imports any of
+// them re-decodes fresh export data instead of reusing a now-possibly-stale
+// *types.Package. Callers use this after a workspace package's on-disk
+// export data changes (didSave's background reindex).
 func (d *depCacheHolder) invalidate(pkgPaths []string) {
 	d.mu.Lock()
 	cache := d.cache
@@ -101,6 +106,7 @@ func (d *depCacheHolder) invalidate(pkgPaths []string) {
 		cache.Delete(p)
 	}
 	d.provider.Delete(pkgPaths...)
+	d.exportProvider.Delete(pkgPaths...)
 }
 
 // depMetadataSource is a depcheck.MetadataSource whose backing
@@ -175,46 +181,85 @@ func depsKey(snap *graph.Snapshot) string {
 	return string(h.Sum(nil))
 }
 
-// ensureDepProvider returns the depcheck.Provider and depexport.Cache
-// setWorkspace should install into the workspace it is building over snap:
-// the server's current pair, retargeted at snap, if snap's dependency set
-// (depsKey) matches the one they were built for — otherwise a fresh
-// Provider (and a fresh depMetadataSource) replacing them, with a fresh
-// depexport.Cache built over that same Provider so navigation into a
-// dependency and compiling a workspace package against it always resolve
-// through one shared, identical depcheck.Provider instance (see
-// depCacheHolder's own doc) — s.depExportCAS itself is never rebuilt: it is
-// the machine-global, cross-repository persistent store (see
-// internal/depexport's package doc), opened once for this Server's whole
-// lifetime, independent of any one workspace's dependency set.
+// ensureDepProvider returns the navigation depcheck.Provider, the export
+// depcheck.Provider, and the depexport.Cache setWorkspace should install
+// into the workspace it is building over snap: the server's current trio,
+// retargeted at snap, if snap's dependency set (depsKey) matches the one
+// they were built for — otherwise a fresh pair of Providers (and a fresh
+// depMetadataSource shared by both) replacing them, with a fresh
+// depexport.Cache built over the export Provider — s.depExportCAS itself is
+// never rebuilt: it is the machine-global, cross-repository persistent
+// store (see internal/depexport's package doc), opened once for this
+// Server's whole lifetime, independent of any one workspace's dependency
+// set.
 //
-// Reuse is sound whenever the dependency set is unchanged: depProvider
+// TWO separate Providers, not one shared instance (a prior revision of this
+// method used one): depProviderVal has SetExportSource installed, so its
+// own recursive import resolution (ctxImporter, inside check — walking a
+// checked package's own transitive imports) can decode an already-persisted
+// dependency's export data instead of a full recursive source-check — sound
+// for depProviderVal's own consumers, since none of them (langfeat.
+// DependencyDefinition navigation, and depCacheHolder's own compilation
+// importer fallback) ever re-serializes the *types.Package it returns.
+// depExportProviderVal never gets that call, since depExportsVal's own
+// checkAndPersist DOES re-serialize its result via typecheck.WriteExport
+// (gcexportdata.Write) to persist it.
+//
+// The actual corruption this guards against (confirmed by direct
+// reproduction, independent of SetExportSource either way — see
+// depexport.Cache.checkAndPersist's own doc for the mechanism and
+// internal/depexport's TestCache_UndersizedCapNeverReturnsAnUndecodableBlob)
+// is depcheck.Provider's own LRU eviction: a widely-shared dependency
+// evicted and re-checked from scratch partway through one recursive check
+// can leave the checked *types.Package referencing two non-identical
+// instances for the same import path, a graph gcexportdata.Write accepts
+// without error but gcexportdata.Read of those same bytes cannot reliably
+// decode (observed: gcimporter panics with "internal error ... invalid
+// memory address or nil pointer dereference", recovered into an opaque
+// decode error). checkAndPersist's own round-trip self-check is what
+// actually catches this — converting a would-be-corrupt blob into a clean,
+// contained error instead of ever returning or persisting it — regardless
+// of which Provider produced it. Keeping export production on its own
+// Provider, separate from depProviderVal's decode-fast-path-enabled one, is
+// an additional, narrower safety margin on top of that: it removes decode
+// output — code this package does not otherwise need to reason about for
+// correctness here — from the object graph checkAndPersist ever hands to
+// WriteExport at all. The cost is depExportProviderVal not sharing
+// depProviderVal's own warm cache for a dependency both navigation and
+// export production need — reintroducing some of the LRU thrash
+// depProviderVal's own decode fast path exists to avoid, but only for the
+// export-production path, and strictly better than the corruption it
+// guards against.
+//
+// Reuse is sound whenever the dependency set is unchanged: depProviderVal
 // exists specifically to answer navigation into the standard library and
 // module dependencies, content that does not change just because the user
 // edited a workspace file, so keeping it — and its type-check cache — warm
 // across a setWorkspace call driven by nothing but such an edit costs
 // nothing in correctness. Rebuilding it — correctly, from scratch —
 // whenever depsKey differs is what keeps that safe.
-func (s *Server) ensureDepProvider(snap *graph.Snapshot) (*depcheck.Provider, *depexport.Cache) {
+func (s *Server) ensureDepProvider(snap *graph.Snapshot) (navProvider, exportProvider *depcheck.Provider, exports *depexport.Cache) {
 	key := depsKey(snap)
 
 	s.depProviderMu.Lock()
 	defer s.depProviderMu.Unlock()
 	if s.depProviderVal == nil || key != s.depProviderKey {
 		s.depProviderSrc = &depMetadataSource{}
-		// Cap sized via depcheck.RecommendedCap, not depcheck.DefaultCap:
-		// this same Provider also backs depExportsVal, which — unlike a pure
-		// navigation caller — can need to resolve a workspace package's
-		// ENTIRE dependency closure to compile it (see depCacheHolder's
-		// doc). DefaultCap's small, navigation-sized capacity thrashes
-		// badly at that scale; see depcheck.DefaultCap's own doc for the
-		// real, measured regression this avoids. RecommendedCap itself
-		// bounds worst-case memory to a size independent of workspace size
-		// (see its own doc) rather than to snap's own non-root package
-		// count, so a large workspace's live session process cannot grow
-		// this cache without bound the way a batch indexer run used to.
-		s.depProviderVal = depcheck.NewProvider(s.depProviderSrc, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootPackageCount(snap), s.resolvedIndexJobs())})
-		s.depExportsVal = depexport.NewCache(s.depExportCAS, s.depProviderSrc, s.depProviderVal, depexport.Options{})
+		// Cap sized via depcheck.RecommendedCap, not depcheck.DefaultCap,
+		// for BOTH Providers: depExportProviderVal can need to resolve a
+		// workspace package's ENTIRE dependency closure to compile it (see
+		// depCacheHolder's doc), same as depProviderVal's own worst case.
+		// DefaultCap's small, navigation-sized capacity thrashes badly at
+		// that scale; see depcheck.DefaultCap's own doc for the real,
+		// measured regression this avoids. RecommendedCap itself bounds
+		// worst-case memory to a size independent of workspace size (see
+		// its own doc) rather than to snap's own non-root package count, so
+		// a large workspace's live session process cannot grow either cache
+		// without bound the way a batch indexer run used to.
+		providerCap := depcheck.RecommendedCap(nonRootPackageCount(snap), s.resolvedIndexJobs())
+		s.depProviderVal = depcheck.NewProvider(s.depProviderSrc, depcheck.Options{Cap: providerCap})
+		s.depExportProviderVal = depcheck.NewProvider(s.depProviderSrc, depcheck.Options{Cap: providerCap})
+		s.depExportsVal = depexport.NewCache(s.depExportCAS, s.depProviderSrc, s.depExportProviderVal, depexport.Options{})
 		// Lets depProviderVal's own recursive import resolution (ctxImporter,
 		// walking a checked package's own transitive imports) consult
 		// depExportsVal's persistent, machine-global CAS instead of always
@@ -223,12 +268,13 @@ func (s *Server) ensureDepProvider(snap *graph.Snapshot) (*depcheck.Provider, *d
 		// for the regression this fixes: a dependency closure larger than
 		// the LRU's cap used to thrash it, turning "check every distinct
 		// package once" into "recheck a widely-shared package once per
-		// importer that reaches it again".
+		// importer that reaches it again". depExportProviderVal deliberately
+		// never gets this call — see this method's own doc.
 		s.depProviderVal.SetExportSource(s.depExportsVal)
 		s.depProviderKey = key
 	}
 	s.depProviderSrc.retarget(snap)
-	return s.depProviderVal, s.depExportsVal
+	return s.depProviderVal, s.depExportProviderVal, s.depExportsVal
 }
 
 // resolvedIndexJobs returns s.opts.IndexJobs, defaulted exactly like
@@ -434,7 +480,7 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	defer s.setWorkspaceMu.Unlock()
 
 	old := s.ws.Load()
-	depProvider, depExports := s.ensureDepProvider(snap)
+	depProvider, depExportProvider, depExports := s.ensureDepProvider(snap)
 	reuse := old != nil && old.root == root && old.depProvider == depProvider
 
 	var (
@@ -450,7 +496,7 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 		engine = old.engine
 	} else {
 		graphSrc = check.NewGraphSource(snap, s.overlay)
-		depCache = newDepCacheHolder(depExports, depProvider)
+		depCache = newDepCacheHolder(depExports, depProvider, depExportProvider)
 		engine = check.New(graphSrc, s.overlay, depCache.importer, check.Options{OnResult: s.publishDiagnostics})
 		// Retire, not Stop, the outgoing engine: a debounce timer already
 		// scheduled on it (e.g. by a handleDidChange that captured the old

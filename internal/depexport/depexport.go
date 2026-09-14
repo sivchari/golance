@@ -63,6 +63,7 @@ package depexport
 import (
 	"context"
 	"fmt"
+	"go/token"
 	"hash/fnv"
 	"os"
 	"os/exec"
@@ -82,8 +83,15 @@ import (
 // schemaVersion guards the CAS key against a change in this package's own
 // digest composition or the export-data format Cache persists — bump
 // whenever either changes, so a stale, differently-shaped blob a prior
-// golance build produced is never misread as current by a newer one.
-const schemaVersion = 1
+// golance build produced is never misread as current by a newer one. Bumped
+// to 2 for the fix closing the decode-fast-path export corruption (see
+// internal/server.ensureDepProvider's doc): a machine whose CAS directory
+// already holds a blob checkAndPersist wrote before that fix may hold one
+// that gcexportdata.Write accepted but a later gcexportdata.Read cannot
+// reliably decode — this bump forces every such pre-fix entry to be treated
+// as a miss and rechecked fresh under the now-decode-disabled export
+// Provider, rather than trusting whatever content-addressed hit it finds.
+const schemaVersion = 2
 
 // GC sizing for Cache's CAS directory, passed to (*store.CAS).MaybeGCAged
 // by a caller that owns the *store.CAS itself (internal/server and
@@ -131,7 +139,7 @@ type Options struct {
 }
 
 // Cache resolves and persists export data for non-root packages, backed by
-// a machine-global store.CAS and a shared *depcheck.Provider for the
+// a machine-global store.CAS and a *depcheck.Provider for the
 // declaration-only checks a cache miss requires. Implements
 // typecheck.ExportSource. Safe for concurrent use. cas may be nil — every
 // ExportData call still resolves correctly by checking pkgPath fresh via
@@ -140,6 +148,21 @@ type Options struct {
 // digest miss also falls back to when cas.Put fails; see NewCache's own
 // doc for why this matters for a caller (e.g. a test, or a machine whose
 // cache directory could not be created) that has no CAS to give it.
+//
+// provider should not have depcheck.Provider.SetExportSource called on it:
+// checkAndPersist re-serializes provider.Package's result via
+// typecheck.WriteExport to persist it, and decode output mixed into that
+// result is one more way (on top of provider's own LRU eviction — see
+// checkAndPersist's own doc for the confirmed mechanism, independent of
+// SetExportSource either way) the resulting *types.Package graph can end up
+// inconsistent. checkAndPersist's own round-trip self-check is what
+// actually guarantees ExportData never returns or persists a blob that
+// fails to decode, regardless of provider's configuration; keeping export
+// production on its own, decode-disabled Provider (see
+// internal/server.ensureDepProvider's own doc, the only production wiring
+// where a Provider used for both navigation and export production was ever
+// a real risk) is an additional safety margin on top of that, not the
+// primary guarantee.
 type Cache struct {
 	cas      *store.CAS
 	meta     depcheck.MetadataSource
@@ -156,12 +179,9 @@ type Cache struct {
 // NewCache returns a Cache resolving non-root package metadata via meta
 // (typically depcheck.NewGraphMetadataSource over the same *graph.Snapshot
 // provider itself resolves against — see depcheck.MetadataSource),
-// declaration-only checking a cache miss via provider (sharing provider's
-// own identity, LRU, and singleflight with any other caller resolving the
-// same dependency — in particular internal/depcheck's own navigation
-// consumers, when a Cache and a depcheck.Provider a session already
-// maintains for navigation are deliberately the same instance; see
-// internal/server's ensureDepProvider), and persisting the result in cas.
+// declaration-only checking a cache miss via provider, and persisting the
+// result in cas. See Cache's own doc for provider's decode-disabled
+// invariant.
 func NewCache(cas *store.CAS, meta depcheck.MetadataSource, provider *depcheck.Provider, opts Options) *Cache {
 	goVersion := opts.GoVersion
 	if goVersion == "" {
@@ -273,6 +293,25 @@ func (c *Cache) checkAndPersist(pkgPath string, persist bool, key uint64) (expor
 	blob, err := typecheck.WriteExport(cp.Types(), c.provider.FileSet())
 	if err != nil {
 		return exportResult{}, fmt.Errorf("depexport: write export data for %s: %w", pkgPath, err)
+	}
+	// gcexportdata.Write happily serializes a *types.Package graph that
+	// contains two non-identical *types.Package instances for the same
+	// import path — c.provider's own LRU eviction can produce exactly that
+	// within a single recursive check, when a widely-shared dependency gets
+	// evicted and re-checked from scratch partway through resolving cp's own
+	// transitive imports (see depcheck.DefaultCap's own doc on why a cap
+	// too small for the closure being checked thrashes; RecommendedCap
+	// narrows but does not eliminate this for a single closure larger than
+	// its own ceiling). The resulting blob writes without error but cannot
+	// be reliably read back: gcimporter panics decoding it ("internal error
+	// ... invalid memory address or nil pointer dereference", recovered
+	// into an opaque error) — confirmed reproducible with c.provider's
+	// decode fast path OFF just as readily as with it on, so this check
+	// catches the corruption regardless of which mechanism produced it,
+	// current or future. A throwaway fset/cache keeps this self-check from
+	// touching any cache a real caller shares.
+	if _, err := typecheck.ReadExport(blob, token.NewFileSet(), pkgPath, typecheck.NewCache()); err != nil {
+		return exportResult{}, fmt.Errorf("depexport: export data for %s does not round-trip decode: %w", pkgPath, err)
 	}
 	// cp.Incomplete (see its own doc) means pkgPath's check — or a
 	// transitive import's — reported at least one error, e.g. one of its

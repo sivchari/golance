@@ -642,7 +642,7 @@ func (imp *ctxImporter) ImportFrom(path, _ string, _ types.ImportMode) (*types.P
 		return cp.Types(), nil
 	}
 	if r := imp.p.exportResolverFor(); r != nil {
-		pkg, complete, ok, err := r.resolve(imp.ctx, imp.p.fset, path)
+		pkg, complete, ok, err := r.resolve(imp.ctx, path)
 		if err != nil {
 			return nil, err
 		}

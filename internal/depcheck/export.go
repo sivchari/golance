@@ -62,10 +62,34 @@ const exportDecodeCap = 256 * 1024 * 1024 // 256MiB
 // own mutex entirely separate from lru/fullLRU's own locking, with its own
 // singleflight group so concurrent ctxImporters resolving the same
 // transitive path collapse onto one decode.
+//
+// fset is a *token.FileSet fully independent of the owning Provider's own
+// p.fset: a decoded package is never a Decl/DeclAt target (ctxImporter.
+// ImportFrom's own doc — a DIRECT Provider.Package/PackageWithBodies
+// request always source-checks into p.fset instead, byte-exact), so
+// nothing needs its positions to share p.fset's coordinate space. Sharing
+// p.fset here instead of owning a dedicated one (as this package's own
+// prior revision did) corrupted every decode it touched: p.fset is also
+// the SAME fset ExportSource's own reentrant check parses path's source
+// files into (depexport.Cache.checkAndPersist calls Provider.Package,
+// which parses into p.fset, immediately before this resolver's caller
+// hands that same p.fset to gcexportdata for the ENCODE); asking
+// gcexportdata to then DECODE that freshly-written blob back into the very
+// fset its own source positions were just parsed into registers path's
+// files into p.fset a second time and reliably crashes the unified
+// importer (observed: gcexportdata/gcimporter panics with "internal error
+// ... invalid memory address or nil pointer dereference" on almost every
+// decode against a real dependency closure). See typecheck.Cache's own
+// doc — "must discard the Cache and its fset together, never
+// independently" — and internal/server.depCacheHolder, which already
+// pairs its own dedicated fset with its typecheck.Cache for the identical
+// reason; this resolver now follows the same pattern instead of borrowing
+// p.fset.
 type exportResolver struct {
 	src ExportSource
 
 	mu       sync.Mutex
+	fset     *token.FileSet
 	cache    *typecheck.Cache
 	pkgs     map[string]*types.Package
 	complete map[string]bool
@@ -73,9 +97,14 @@ type exportResolver struct {
 	sf singleflight.Group
 }
 
-// newExportResolver returns an exportResolver decoding via src.
+// newExportResolver returns an exportResolver decoding via src into its
+// own dedicated *token.FileSet (see exportResolver's doc for why this must
+// never be the owning Provider's own p.fset).
 func newExportResolver(src ExportSource) *exportResolver {
-	return &exportResolver{src: src, cache: typecheck.NewCache(), pkgs: make(map[string]*types.Package), complete: make(map[string]bool)}
+	return &exportResolver{
+		src: src, fset: token.NewFileSet(),
+		cache: typecheck.NewCache(), pkgs: make(map[string]*types.Package), complete: make(map[string]bool),
+	}
 }
 
 // decodeResult is resolve's singleflight payload: ok is false only when
@@ -100,16 +129,18 @@ func (r *exportResolver) get(path string) (pkg *types.Package, complete, ok bool
 	return pkg, r.complete[path], true
 }
 
-// resolve decodes path via r's ExportSource into fset, sharing identity with
-// every other transitive import decoded through r for as long as r's cache
-// stays under exportDecodeCap (see the coarse reset below — a concurrent
-// decode for a DIFFERENT path racing a reset can land in the
-// about-to-be-discarded cache generation instead of the fresh one; narrow in
-// practice and accepted for the identical reason
+// resolve decodes path via r's ExportSource into r's own dedicated fset
+// (see exportResolver's doc for why this must never be the owning
+// Provider's own p.fset), sharing identity with every other transitive
+// import decoded through r for as long as r's cache stays under
+// exportDecodeCap (see the coarse reset below, which discards r.fset
+// together with r.cache — a concurrent decode for a DIFFERENT path racing
+// a reset can land in the about-to-be-discarded generation instead of the
+// fresh one; narrow in practice and accepted for the identical reason
 // internal/server.depCacheHolder.FileSet's own coarse-reset window is).
 // ok is false, with no error, when r itself is nil (no ExportSource
 // configured — see Provider.SetExportSource) or src has no data for path.
-func (r *exportResolver) resolve(ctx context.Context, fset *token.FileSet, path string) (pkg *types.Package, complete, ok bool, err error) {
+func (r *exportResolver) resolve(ctx context.Context, path string) (pkg *types.Package, complete, ok bool, err error) {
 	if r == nil || r.src == nil {
 		return nil, false, false, nil
 	}
@@ -134,10 +165,12 @@ func (r *exportResolver) resolve(ctx context.Context, fset *token.FileSet, path 
 
 		r.mu.Lock()
 		if r.cache.Bytes() > exportDecodeCap {
+			r.fset = token.NewFileSet()
 			r.cache = typecheck.NewCache()
 			r.pkgs = make(map[string]*types.Package)
 			r.complete = make(map[string]bool)
 		}
+		fset := r.fset
 		cache := r.cache
 		r.mu.Unlock()
 
