@@ -203,15 +203,34 @@ func NewCache(cas *store.CAS, meta depcheck.MetadataSource, provider *depcheck.P
 // resolution, a separate call path that never reaches ExportData at all),
 // is what upholds this precondition.
 func (c *Cache) ExportData(pkgPath string) ([]byte, bool, error) {
+	blob, _, ok, err := c.resolve(pkgPath)
+	return blob, ok, err
+}
+
+// ExportDataComplete is ExportData's richer variant, additionally reporting
+// whether the returned bytes came from a complete check (a CAS hit is
+// always complete — checkAndPersist only ever persists a blob when its own
+// check was) — see depcheck.CheckedPackage.Incomplete's identical meaning.
+// Implements depcheck.ExportSource (a structural interface depcheck itself
+// declares, so depcheck need not import this package — see its own doc):
+// depcheck.Provider's ctxImporter consumes this to propagate incompleteness
+// through its decode fast path for a TRANSITIVE import exactly the way a
+// full recursive check already does for a directly-requested one.
+func (c *Cache) ExportDataComplete(pkgPath string) (data []byte, complete, ok bool, err error) {
+	return c.resolve(pkgPath)
+}
+
+// resolve is ExportData's and ExportDataComplete's shared implementation.
+func (c *Cache) resolve(pkgPath string) (data []byte, complete, ok bool, err error) {
 	dir, _, _, ok := c.meta.Package(pkgPath)
 	if !ok {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 	persist := c.cas != nil && c.immutable(dir)
 	key := c.digest(pkgPath, dir)
 	if persist {
-		if blob, ok, err := c.cas.Get(context.Background(), key); ok || err != nil {
-			return blob, ok, err
+		if blob, hit, err := c.cas.Get(context.Background(), key); hit || err != nil {
+			return blob, true, hit, err
 		}
 	}
 
@@ -219,33 +238,41 @@ func (c *Cache) ExportData(pkgPath string) ([]byte, bool, error) {
 		return c.checkAndPersist(pkgPath, persist, key)
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
-	blob, ok := v.([]byte)
+	res, ok := v.(exportResult)
 	if !ok {
-		return nil, false, fmt.Errorf("depexport: singleflight for %s returned %T, want []byte", pkgPath, v)
+		return nil, false, false, fmt.Errorf("depexport: singleflight for %s returned %T, want exportResult", pkgPath, v)
 	}
-	return blob, true, nil
+	return res.blob, res.complete, true, nil
 }
 
-// checkAndPersist is ExportData's singleflight-guarded slow path: a CAS hit
+// exportResult is checkAndPersist's singleflight payload: the resolved blob
+// plus whether the check that produced it was complete (see
+// ExportDataComplete's doc).
+type exportResult struct {
+	blob     []byte
+	complete bool
+}
+
+// checkAndPersist is resolve's singleflight-guarded slow path: a CAS hit
 // that raced ahead of this call while it waited to run (persist only),
 // otherwise a fresh declaration-only check via c.provider, persisted to the
 // CAS when persist allows it and the check was not Incomplete (see the
 // field's own doc).
-func (c *Cache) checkAndPersist(pkgPath string, persist bool, key uint64) ([]byte, error) {
+func (c *Cache) checkAndPersist(pkgPath string, persist bool, key uint64) (exportResult, error) {
 	if persist {
 		if blob, ok, err := c.cas.Get(context.Background(), key); ok || err != nil {
-			return blob, err
+			return exportResult{blob: blob, complete: true}, err
 		}
 	}
 	cp, err := c.provider.Package(context.Background(), pkgPath)
 	if err != nil {
-		return nil, fmt.Errorf("depexport: check %s: %w", pkgPath, err)
+		return exportResult{}, fmt.Errorf("depexport: check %s: %w", pkgPath, err)
 	}
 	blob, err := typecheck.WriteExport(cp.Types(), c.provider.FileSet())
 	if err != nil {
-		return nil, fmt.Errorf("depexport: write export data for %s: %w", pkgPath, err)
+		return exportResult{}, fmt.Errorf("depexport: write export data for %s: %w", pkgPath, err)
 	}
 	// cp.Incomplete (see its own doc) means pkgPath's check — or a
 	// transitive import's — reported at least one error, e.g. one of its
@@ -256,12 +283,13 @@ func (c *Cache) checkAndPersist(pkgPath string, persist bool, key uint64) ([]byt
 	// machine-global CAS would let every repository on this machine keep
 	// being served that same degraded result for up to GCMaxAge, long
 	// after the transient condition that produced it is gone.
-	if persist && !cp.Incomplete() {
+	complete := !cp.Incomplete()
+	if persist && complete {
 		if err := c.cas.Put(key, blob); err != nil {
-			return nil, fmt.Errorf("depexport: persist export data for %s: %w", pkgPath, err)
+			return exportResult{}, fmt.Errorf("depexport: persist export data for %s: %w", pkgPath, err)
 		}
 	}
-	return blob, nil
+	return exportResult{blob: blob, complete: complete}, nil
 }
 
 // immutable reports whether dir falls under c's GOROOT or GOModCache — the

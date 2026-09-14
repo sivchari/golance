@@ -1,4 +1,13 @@
-package typecheck
+// Package typecheck_test is an external test package, not an internal one,
+// specifically so it can import internal/depcheck (for a real,
+// declaration-only ExportSource fixture — see stdlibExportSource) without an
+// import cycle: internal/depcheck itself imports internal/typecheck (for its
+// own transitive-import decode fast path, see depcheck.ExportSource's doc),
+// and an internal (same-package) test file cannot import anything that
+// imports the package under test, only an external one like this can. Every
+// symbol this file exercises is already part of typecheck's public API, so
+// nothing here needed package-private access in the first place.
+package typecheck_test
 
 import (
 	"context"
@@ -12,6 +21,7 @@ import (
 
 	"github.com/sivchari/golance/internal/depcheck"
 	"github.com/sivchari/golance/internal/graph"
+	"github.com/sivchari/golance/internal/typecheck"
 )
 
 // stdlibExportSource resolves stdlib packages the same way production now
@@ -57,7 +67,7 @@ func (s stdlibExportSource) ExportData(pkgPath string) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	blob, err := WriteExport(cp.Types(), s.provider.FileSet())
+	blob, err := typecheck.WriteExport(cp.Types(), s.provider.FileSet())
 	if err != nil {
 		return nil, false, err
 	}
@@ -89,10 +99,10 @@ func TestCheckPackage_StdlibExportFile(t *testing.T) {
 	fset := token.NewFileSet()
 	f := parseTestdata(t, fset, "dep/dep.go")
 
-	cache := NewCache()
-	imp := NewImporter(fset, nil, newStdlibExportSource(t), cache)
+	cache := typecheck.NewCache()
+	imp := typecheck.NewImporter(fset, nil, newStdlibExportSource(t), cache)
 
-	pkg, info, errs := CheckPackage(fset, []*ast.File{f}, "example.com/tcmod/dep", imp)
+	pkg, info, errs := typecheck.CheckPackage(fset, []*ast.File{f}, "example.com/tcmod/dep", imp)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected type errors: %v", errs)
 	}
@@ -112,22 +122,22 @@ func TestCheckPackage_ExportSourceDependency(t *testing.T) {
 	fset := token.NewFileSet()
 
 	depFile := parseTestdata(t, fset, "dep/dep.go")
-	cache := NewCache()
-	depImp := NewImporter(fset, nil, newStdlibExportSource(t), cache)
-	depPkg, _, errs := CheckPackage(fset, []*ast.File{depFile}, "example.com/tcmod/dep", depImp)
+	cache := typecheck.NewCache()
+	depImp := typecheck.NewImporter(fset, nil, newStdlibExportSource(t), cache)
+	depPkg, _, errs := typecheck.CheckPackage(fset, []*ast.File{depFile}, "example.com/tcmod/dep", depImp)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected type errors checking dep: %v", errs)
 	}
 
-	blob, err := WriteExport(depPkg, fset)
+	blob, err := typecheck.WriteExport(depPkg, fset)
 	if err != nil {
 		t.Fatalf("WriteExport: %v", err)
 	}
 
 	userFile := parseTestdata(t, fset, "user/user.go")
 	src := blobSource{blobs: map[string][]byte{"example.com/tcmod/dep": blob}}
-	userImp := NewImporter(fset, src, newStdlibExportSource(t), cache)
-	userPkg, _, errs := CheckPackage(fset, []*ast.File{userFile}, "example.com/tcmod/user", userImp)
+	userImp := typecheck.NewImporter(fset, src, newStdlibExportSource(t), cache)
+	userPkg, _, errs := typecheck.CheckPackage(fset, []*ast.File{userFile}, "example.com/tcmod/user", userImp)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected type errors checking user: %v", errs)
 	}
@@ -146,21 +156,21 @@ func TestCheckPackage_ExportSourceDependency(t *testing.T) {
 func TestReadExport(t *testing.T) {
 	fset := token.NewFileSet()
 	depFile := parseTestdata(t, fset, "dep/dep.go")
-	cache := NewCache()
-	imp := NewImporter(fset, nil, newStdlibExportSource(t), cache)
-	depPkg, _, errs := CheckPackage(fset, []*ast.File{depFile}, "example.com/tcmod/dep", imp)
+	cache := typecheck.NewCache()
+	imp := typecheck.NewImporter(fset, nil, newStdlibExportSource(t), cache)
+	depPkg, _, errs := typecheck.CheckPackage(fset, []*ast.File{depFile}, "example.com/tcmod/dep", imp)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected type errors: %v", errs)
 	}
 
-	blob, err := WriteExport(depPkg, fset)
+	blob, err := typecheck.WriteExport(depPkg, fset)
 	if err != nil {
 		t.Fatalf("WriteExport: %v", err)
 	}
 
 	readFset := token.NewFileSet()
-	readCache := NewCache()
-	got, err := ReadExport(blob, readFset, "example.com/tcmod/dep", readCache)
+	readCache := typecheck.NewCache()
+	got, err := typecheck.ReadExport(blob, readFset, "example.com/tcmod/dep", readCache)
 	if err != nil {
 		t.Fatalf("ReadExport: %v", err)
 	}
@@ -176,26 +186,26 @@ func TestReadExport(t *testing.T) {
 func TestReadExport_CachesSuccessWithoutRedecoding(t *testing.T) {
 	fset := token.NewFileSet()
 	depFile := parseTestdata(t, fset, "dep/dep.go")
-	writeCache := NewCache()
-	imp := NewImporter(fset, nil, newStdlibExportSource(t), writeCache)
-	depPkg, _, errs := CheckPackage(fset, []*ast.File{depFile}, "example.com/tcmod/dep", imp)
+	writeCache := typecheck.NewCache()
+	imp := typecheck.NewImporter(fset, nil, newStdlibExportSource(t), writeCache)
+	depPkg, _, errs := typecheck.CheckPackage(fset, []*ast.File{depFile}, "example.com/tcmod/dep", imp)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected type errors: %v", errs)
 	}
-	blob, err := WriteExport(depPkg, fset)
+	blob, err := typecheck.WriteExport(depPkg, fset)
 	if err != nil {
 		t.Fatalf("WriteExport: %v", err)
 	}
 
 	readFset := token.NewFileSet()
-	readCache := NewCache()
-	if _, err := ReadExport(blob, readFset, "example.com/tcmod/dep", readCache); err != nil {
+	readCache := typecheck.NewCache()
+	if _, err := typecheck.ReadExport(blob, readFset, "example.com/tcmod/dep", readCache); err != nil {
 		t.Fatalf("first ReadExport: %v", err)
 	}
 	if got := readCache.Decodes(); got != 1 {
 		t.Fatalf("Decodes() after first ReadExport = %d, want 1", got)
 	}
-	if _, err := ReadExport(blob, readFset, "example.com/tcmod/dep", readCache); err != nil {
+	if _, err := typecheck.ReadExport(blob, readFset, "example.com/tcmod/dep", readCache); err != nil {
 		t.Fatalf("second ReadExport: %v", err)
 	}
 	if got := readCache.Decodes(); got != 1 {
@@ -210,10 +220,10 @@ func TestReadExport_CachesSuccessWithoutRedecoding(t *testing.T) {
 // for a package that can never successfully decode.
 func TestReadExport_CachesFailure(t *testing.T) {
 	fset := token.NewFileSet()
-	cache := NewCache()
+	cache := typecheck.NewCache()
 	badData := []byte("not export data")
 
-	_, err1 := ReadExport(badData, fset, "example.com/broken", cache)
+	_, err1 := typecheck.ReadExport(badData, fset, "example.com/broken", cache)
 	if err1 == nil {
 		t.Fatal("ReadExport with malformed data: got nil error, want a decode error")
 	}
@@ -221,7 +231,7 @@ func TestReadExport_CachesFailure(t *testing.T) {
 		t.Fatalf("FailedLen() after first failed ReadExport = %d, want 1", got)
 	}
 
-	_, err2 := ReadExport(badData, fset, "example.com/broken", cache)
+	_, err2 := typecheck.ReadExport(badData, fset, "example.com/broken", cache)
 	if err2 == nil || err2.Error() != err1.Error() {
 		t.Errorf("second ReadExport error = %v, want the identical cached error %v", err2, err1)
 	}
@@ -237,8 +247,8 @@ func TestReadExport_CachesFailure(t *testing.T) {
 // successful decode).
 func TestCache_DeleteClearsFailure(t *testing.T) {
 	fset := token.NewFileSet()
-	cache := NewCache()
-	if _, err := ReadExport([]byte("not export data"), fset, "example.com/broken", cache); err == nil {
+	cache := typecheck.NewCache()
+	if _, err := typecheck.ReadExport([]byte("not export data"), fset, "example.com/broken", cache); err == nil {
 		t.Fatal("expected a decode error")
 	}
 	if got := cache.FailedLen(); got != 1 {
@@ -262,22 +272,22 @@ func TestCache_DeleteDecrementsBytes(t *testing.T) {
 	fset := token.NewFileSet()
 	depFile := parseTestdata(t, fset, "dep/dep.go")
 	userFile := parseTestdata(t, fset, "user/user.go")
-	cache := NewCache()
+	cache := typecheck.NewCache()
 	stdlib := newStdlibExportSource(t)
 
-	depImp := NewImporter(fset, nil, stdlib, cache)
-	depPkg, _, errs := CheckPackage(fset, []*ast.File{depFile}, "example.com/tcmod/dep", depImp)
+	depImp := typecheck.NewImporter(fset, nil, stdlib, cache)
+	depPkg, _, errs := typecheck.CheckPackage(fset, []*ast.File{depFile}, "example.com/tcmod/dep", depImp)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected type errors checking dep: %v", errs)
 	}
-	depBlob, err := WriteExport(depPkg, fset)
+	depBlob, err := typecheck.WriteExport(depPkg, fset)
 	if err != nil {
 		t.Fatalf("WriteExport: %v", err)
 	}
 	depSrc := blobSource{blobs: map[string][]byte{"example.com/tcmod/dep": depBlob}}
 
-	userImp := NewImporter(fset, depSrc, stdlib, cache)
-	_, _, errs = CheckPackage(fset, []*ast.File{userFile}, "example.com/tcmod/user", userImp)
+	userImp := typecheck.NewImporter(fset, depSrc, stdlib, cache)
+	_, _, errs = typecheck.CheckPackage(fset, []*ast.File{userFile}, "example.com/tcmod/user", userImp)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected type errors checking user: %v", errs)
 	}
@@ -294,7 +304,7 @@ func TestCache_DeleteDecrementsBytes(t *testing.T) {
 	}
 
 	decodesBefore := cache.Decodes()
-	depImp2 := NewImporter(fset, depSrc, nil, cache)
+	depImp2 := typecheck.NewImporter(fset, depSrc, nil, cache)
 	if _, err := depImp2.ImportFrom("example.com/tcmod/dep", "", 0); err != nil {
 		t.Fatalf("re-import dep after Delete: %v", err)
 	}
@@ -308,10 +318,10 @@ func TestCache_DeleteDecrementsBytes(t *testing.T) {
 func TestCheckPackage_CollectsErrors(t *testing.T) {
 	fset := token.NewFileSet()
 	f := parseTestdata(t, fset, "broken/broken.go")
-	cache := NewCache()
-	imp := NewImporter(fset, nil, newStdlibExportSource(t), cache)
+	cache := typecheck.NewCache()
+	imp := typecheck.NewImporter(fset, nil, newStdlibExportSource(t), cache)
 
-	pkg, _, errs := CheckPackage(fset, []*ast.File{f}, "example.com/tcmod/broken", imp)
+	pkg, _, errs := typecheck.CheckPackage(fset, []*ast.File{f}, "example.com/tcmod/broken", imp)
 	if len(errs) == 0 {
 		t.Fatal("expected at least one type error")
 	}
@@ -338,7 +348,7 @@ func (panicIfCalledSource) ExportData(pkgPath string) ([]byte, bool, error) {
 // end-to-end.
 func TestImportFrom_UnsafeNeverReachesExportSource(t *testing.T) {
 	fset := token.NewFileSet()
-	imp := NewImporter(fset, panicIfCalledSource{}, panicIfCalledSource{}, NewCache())
+	imp := typecheck.NewImporter(fset, panicIfCalledSource{}, panicIfCalledSource{}, typecheck.NewCache())
 
 	pkg, err := imp.ImportFrom("unsafe", "", 0)
 	if err != nil {
@@ -364,9 +374,9 @@ func TestImportFrom_UnsafeNeverReachesExportSource(t *testing.T) {
 func TestCheckPackage_DirectUnsafeImport(t *testing.T) {
 	fset := token.NewFileSet()
 	f := parseTestdata(t, fset, "unsafeuser/unsafeuser.go")
-	imp := NewImporter(fset, nil, newStdlibExportSource(t), NewCache())
+	imp := typecheck.NewImporter(fset, nil, newStdlibExportSource(t), typecheck.NewCache())
 
-	pkg, _, errs := CheckPackage(fset, []*ast.File{f}, "example.com/tcmod/unsafeuser", imp)
+	pkg, _, errs := typecheck.CheckPackage(fset, []*ast.File{f}, "example.com/tcmod/unsafeuser", imp)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected type errors: %v", errs)
 	}

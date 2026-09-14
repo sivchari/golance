@@ -270,9 +270,11 @@ type Provider struct {
 
 	mu          sync.Mutex
 	lru         *lruCache
-	fullLRU     *lruCache // full-body-checked packages (see PackageWithBodies), separate from lru so a small handful of open dependency files never evicts the much larger decl-only working set
-	checked     int64     // count of Package calls that actually ran CheckPackage (cache+singleflight misses); test/observability hook.
-	fullChecked int64     // count of PackageWithBodies calls that actually ran a fresh full-body check; test/observability hook.
+	fullLRU     *lruCache       // full-body-checked packages (see PackageWithBodies), separate from lru so a small handful of open dependency files never evicts the much larger decl-only working set
+	checked     int64           // count of Package calls that actually ran CheckPackage (cache+singleflight misses); test/observability hook.
+	fullChecked int64           // count of PackageWithBodies calls that actually ran a fresh full-body check; test/observability hook.
+	exports     *exportResolver // TRANSITIVE import resolution's decode fast path; nil until SetExportSource is called (see its doc)
+	decoded     int64           // count of ImportFrom calls served via exports instead of a full recursive check; see Decoded
 }
 
 // NewProvider returns a Provider resolving package metadata via meta,
@@ -607,14 +609,48 @@ func (imp *ctxImporter) Import(path string) (*types.Package, error) {
 // ImportFrom resolves path against the full-body LRU first, so an import of
 // a package the caller also has open (via PackageWithBodies) shares its
 // exact *types.Package identity instead of triggering a second, divergent
-// declarations-only check — see PackageWithBodies's doc.
+// declarations-only check — see PackageWithBodies's doc. Next, the
+// declarations-only LRU: an already-resident, source-checked instance is
+// always preferred over a decode, since it costs nothing further to reuse.
+// Only once both miss does this fall to imp.p's exportResolver (see its own
+// doc), decoding path from persisted export data instead of a full
+// recursive source-check — the fix for the production regression measured
+// against a dependency closure larger than the LRU's own cap: without an
+// ExportSource configured (imp.p.exportResolverFor returns nil), this falls
+// straight through to the original full-check behavior, unchanged.
+//
+// "unsafe" is special-cased before any of that, exactly like
+// Provider.Package's own identical check (and
+// typecheck.Importer.ImportFrom's): types.Unsafe has no source and
+// gcexportdata.Write panics unconditionally trying to serialize it (see
+// depexport.Cache.ExportData's doc), so the exportResolver path — which
+// would otherwise ask an ExportSource for "unsafe" bytes exactly like any
+// other transitive import — must never see it.
 func (imp *ctxImporter) ImportFrom(path, _ string, _ types.ImportMode) (*types.Package, error) {
 	if err := imp.ctx.Err(); err != nil {
 		return nil, err
 	}
+	if path == unsafePkgPath {
+		return types.Unsafe, nil
+	}
 	if cp, ok := imp.p.getFull(path); ok {
 		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
 		return cp.Types(), nil
+	}
+	if cp, ok := imp.p.get(path); ok {
+		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
+		return cp.Types(), nil
+	}
+	if r := imp.p.exportResolverFor(); r != nil {
+		pkg, complete, ok, err := r.resolve(imp.ctx, imp.p.fset, path)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			imp.importIncomplete = imp.importIncomplete || !complete
+			imp.p.recordDecoded()
+			return pkg, nil
+		}
 	}
 	cp, err := imp.p.Package(imp.ctx, path)
 	if err != nil {

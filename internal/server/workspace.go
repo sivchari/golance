@@ -215,6 +215,16 @@ func (s *Server) ensureDepProvider(snap *graph.Snapshot) (*depcheck.Provider, *d
 		// this cache without bound the way a batch indexer run used to.
 		s.depProviderVal = depcheck.NewProvider(s.depProviderSrc, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootPackageCount(snap), s.resolvedIndexJobs())})
 		s.depExportsVal = depexport.NewCache(s.depExportCAS, s.depProviderSrc, s.depProviderVal, depexport.Options{})
+		// Lets depProviderVal's own recursive import resolution (ctxImporter,
+		// walking a checked package's own transitive imports) consult
+		// depExportsVal's persistent, machine-global CAS instead of always
+		// re-parsing and re-type-checking a package evicted from its small
+		// LRU mid-closure — see depcheck.Provider.SetExportSource's own doc
+		// for the regression this fixes: a dependency closure larger than
+		// the LRU's cap used to thrash it, turning "check every distinct
+		// package once" into "recheck a widely-shared package once per
+		// importer that reaches it again".
+		s.depProviderVal.SetExportSource(s.depExportsVal)
 		s.depProviderKey = key
 	}
 	s.depProviderSrc.retarget(snap)
