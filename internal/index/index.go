@@ -154,13 +154,15 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 	// path). depExp persists each result in o.DepCAS so a dependency
 	// already checked by THIS run, an earlier one, or even a different
 	// repository's indexer never needs rechecking on this machine again.
-	// depProvider's own LRU is sized to this run's WHOLE non-root package
-	// count (depcheck.RecommendedCap), not depcheck.DefaultCap — see that
-	// constant's own doc for the real, measured thrashing regression a
-	// batch run like this one hits at DefaultCap's small, navigation-sized
-	// capacity.
+	// depProvider's own LRU is sized to o.Parallelism (depcheck.
+	// RecommendedCap), not to this run's whole non-root package count: see
+	// RecommendedCap's own doc for why holding every non-root package live
+	// for the run's entire duration — this used to do exactly that — is what
+	// drove a large workspace's peak RSS past its safety cap, and for the
+	// real, measured thrashing regression a batch run like this one still
+	// risks at DefaultCap's much smaller, navigation-sized capacity.
 	depMeta := depcheck.NewGraphMetadataSource(snap)
-	depProvider := depcheck.NewProvider(depMeta, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootCount(snap))})
+	depProvider := depcheck.NewProvider(depMeta, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootCount(snap), o.Parallelism)})
 	depExp := depexport.NewCache(o.DepCAS, depMeta, depProvider, depexport.Options{BuildFlagsFingerprint: o.BuildFlagsFingerprint})
 	imp := typecheck.NewImporter(fset, exp, depExp, cache)
 	sem := semaphore.NewWeighted(int64(o.Parallelism))

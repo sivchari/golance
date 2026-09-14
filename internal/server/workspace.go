@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"go/types"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -201,20 +202,36 @@ func (s *Server) ensureDepProvider(snap *graph.Snapshot) (*depcheck.Provider, *d
 	defer s.depProviderMu.Unlock()
 	if s.depProviderVal == nil || key != s.depProviderKey {
 		s.depProviderSrc = &depMetadataSource{}
-		// Cap sized to snap's own non-root package count
-		// (depcheck.RecommendedCap), not depcheck.DefaultCap: this same
-		// Provider also backs depExportsVal, which — unlike a pure
+		// Cap sized via depcheck.RecommendedCap, not depcheck.DefaultCap:
+		// this same Provider also backs depExportsVal, which — unlike a pure
 		// navigation caller — can need to resolve a workspace package's
 		// ENTIRE dependency closure to compile it (see depCacheHolder's
 		// doc). DefaultCap's small, navigation-sized capacity thrashes
 		// badly at that scale; see depcheck.DefaultCap's own doc for the
-		// real, measured regression this avoids.
-		s.depProviderVal = depcheck.NewProvider(s.depProviderSrc, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootPackageCount(snap))})
+		// real, measured regression this avoids. RecommendedCap itself
+		// bounds worst-case memory to a size independent of workspace size
+		// (see its own doc) rather than to snap's own non-root package
+		// count, so a large workspace's live session process cannot grow
+		// this cache without bound the way a batch indexer run used to.
+		s.depProviderVal = depcheck.NewProvider(s.depProviderSrc, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootPackageCount(snap), s.resolvedIndexJobs())})
 		s.depExportsVal = depexport.NewCache(s.depExportCAS, s.depProviderSrc, s.depProviderVal, depexport.Options{})
 		s.depProviderKey = key
 	}
 	s.depProviderSrc.retarget(snap)
 	return s.depProviderVal, s.depExportsVal
+}
+
+// resolvedIndexJobs returns s.opts.IndexJobs, defaulted exactly like
+// index.Options.Parallelism (index.Options.withDefaults' own identical
+// formula) when it is <= 0 ("automatic") — the concurrency input
+// ensureDepProvider's depcheck.RecommendedCap call sizes its cap from, for
+// consistency with the indexer subprocess's own sizing even though this
+// depProvider serves the live session, not a batch build.
+func (s *Server) resolvedIndexJobs() int {
+	if s.opts.IndexJobs > 0 {
+		return s.opts.IndexJobs
+	}
+	return max(1, runtime.NumCPU()/2)
 }
 
 // nonRootPackageCount returns the number of non-root (stdlib/module-cache)

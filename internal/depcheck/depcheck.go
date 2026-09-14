@@ -155,25 +155,61 @@ func (cp *CheckedPackage) Incomplete() bool { return cp.incomplete }
 // dependencies — see RecommendedCap's own doc).
 const DefaultCap = 64
 
+// batchCapPerWorker is RecommendedCap's per-Parallelism budget: how many
+// non-root CheckedPackage entries (full AST plus *types.Package/*types.Info
+// — see CheckedPackage's own doc, and note the parser always parses full
+// function bodies regardless of IgnoreFuncBodies) one concurrent batch
+// worker's own working set is allowed to keep the LRU holding at once.
+// Chosen empirically against a real, protobuf-heavy corpus (see
+// RecommendedCap's doc): at Parallelism=7 (this machine's default —
+// max(1, runtime.NumCPU()/2)), a cap below ~400 measurably thrashed worse on
+// BOTH wall time and peak RSS than a larger one (an evicted, still-in-demand
+// package being re-checked from scratch costs more allocation churn than the
+// larger cap it displaces saves), while a cap of 448 (7 * 64) tracked the
+// best of the caps tried on both axes. 64 keeps that ratio while still
+// bounding worst-case memory to a small, constant multiple of Parallelism
+// instead of to total workspace size.
+const batchCapPerWorker = 64
+
 // RecommendedCap returns the LRU capacity a Provider dedicated to BATCH
 // export-data production (internal/depexport's use — not interactive
-// navigation, which should keep DefaultCap) should be constructed with,
-// given nonRootCount: the number of non-root (stdlib/module-cache)
-// packages the run may need to resolve, transitively. Sized to hold every
-// one of them live for the run's whole duration — never DefaultCap, which
-// exists for an entirely different, much smaller-locality workload (see
-// DefaultCap's own doc) and thrashes badly at this scale: a real
-// measurement against a synthetic ~370-package dependency closure went
-// from ~7s/~300MB (a correctly-sized cap) to ~72s/~7GB (DefaultCap) purely
-// from LRU eviction forcing the same widely-shared packages to be
-// rechecked from scratch over and over. DefaultCap is still used as a
-// floor for a tiny workspace's few dependencies, matching Provider's own
-// existing default for that case.
-func RecommendedCap(nonRootCount int) int {
-	if nonRootCount < DefaultCap {
-		return DefaultCap
+// navigation, which should keep DefaultCap) should be constructed with.
+// parallelism is the caller's own concurrent-worker budget (Options.
+// Parallelism); nonRootCount is the number of non-root (stdlib/module-cache)
+// packages the run may need to resolve, transitively.
+//
+// This used to size the cap to hold nonRootCount packages live for the
+// run's ENTIRE duration — correct only for a small workspace, and the
+// direct cause of an indexer run against a large, protobuf-heavy monorepo
+// (~2,500 root packages) driving peak RSS well past a 12 GB safety cap: the
+// cap scaled with total workspace size instead of with concurrent work in
+// flight, so the LRU never actually evicted anything for the length of the
+// run (see internal/index.scheduler's reference-counted eviction, which
+// this Provider's own separate, unrelated cache sat outside of entirely).
+// A single dependency closure larger than a small cap DOES thrash it badly
+// — check's own recursive import resolution (ctxImporter.ImportFrom) walks
+// the full transitive closure through this same Provider, bypassing
+// internal/depexport's persistent, CAS-backed cache entirely (that cache
+// only ever intercepts a TOP-LEVEL request — a root package's own direct
+// import — never a recursive one; see depexport.Cache.ExportData's doc) —
+// a real, measured regression against a synthetic ~370-package dependency
+// closure went from ~7s/~300MB (a correctly-sized cap) to ~72s/~7GB
+// (DefaultCap) purely from LRU eviction forcing the same widely-shared
+// packages (fmt, context, sync, ...) to be rechecked from scratch over and
+// over. Scaling the cap with parallelism instead of with nonRootCount
+// keeps that headroom (concurrent workers each get their own working-set
+// budget — see batchCapPerWorker) while bounding worst-case resident
+// memory to a size independent of workspace size, matching this package's
+// own DefaultCap's identical bounding argument for the navigation case.
+// nonRootCount is still respected as an upper bound: a workspace whose
+// entire non-root closure is smaller than the parallelism-scaled budget
+// gains nothing from a larger cap.
+func RecommendedCap(nonRootCount, parallelism int) int {
+	ceiling := max(DefaultCap, parallelism*batchCapPerWorker)
+	if nonRootCount < ceiling {
+		return max(nonRootCount, DefaultCap)
 	}
-	return nonRootCount
+	return ceiling
 }
 
 // FullBodyDefaultCap is the full-body LRU's default entry capacity
