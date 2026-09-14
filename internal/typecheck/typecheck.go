@@ -142,6 +142,21 @@ func (imp *Importer) Import(path string) (*types.Package, error) {
 	return imp.ImportFrom(path, "", 0)
 }
 
+// unsafePkgPath is the predeclared "unsafe" pseudo-package. go/types has no
+// built-in handling for it (see go/types.Checker.importPackage: it calls
+// Config.Importer.ImportFrom("unsafe", ...) exactly like any other import
+// path) — every Importer implementation is expected to special-case it
+// itself, which is why go/internal/gcimporter.Import,
+// x/tools/internal/gcimporter.Import, and gcexportdata.NewImporter's own
+// ImportFrom all check path == "unsafe" and return types.Unsafe directly,
+// before ever touching their own decode machinery. types.Unsafe is not
+// decodable/encodable export data at all — gcexportdata.Write (called via
+// WriteExport, e.g. by internal/depexport when a workspace package that
+// imports "unsafe" reached this Importer's fallback tier) panics
+// unconditionally trying to serialize it (iexporter.pushDecl: "cannot
+// export package unsafe").
+const unsafePkgPath = "unsafe"
+
 // ImportFrom implements types.ImporterFrom. dir and mode are accepted for
 // interface compliance but unused: export data resolution here is keyed
 // purely by import path.
@@ -154,6 +169,9 @@ func (imp *Importer) Import(path string) (*types.Package, error) {
 // singleflight collapses concurrent callers for the same uncached path onto
 // a single resolve instead of each repeating the work.
 func (imp *Importer) ImportFrom(path, _ string, _ types.ImportMode) (*types.Package, error) {
+	if path == unsafePkgPath {
+		return types.Unsafe, nil
+	}
 	if pkg, ok := imp.cacheGet(path); ok {
 		return pkg, nil
 	}

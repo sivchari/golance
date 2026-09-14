@@ -73,6 +73,41 @@ func TestCache_ExportDataRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCache_ExportDataDependencyImportingUnsafe verifies ExportData for a
+// real dependency that directly imports "unsafe" ("reflect", transitively
+// reachable here through dep.go's own "fmt" import — fmt uses reflect
+// internally) round-trips cleanly: unlike ExportData("unsafe") itself
+// (types.Unsafe has no source and cannot be gcexportdata-encoded at all —
+// see internal/typecheck.Importer.ImportFrom's own doc), a package that
+// merely IMPORTS "unsafe" exports fine, because unsafe.Pointer is one of
+// go/types' predeclared Basic types, referenced by a fixed index rather
+// than encoded as a declaration — depcheck.Provider.Package's own
+// "unsafe" => types.Unsafe special case (used while resolving reflect's own
+// recursive import of "unsafe" during its check) already handles the only
+// part of this that needs special handling.
+func TestCache_ExportDataDependencyImportingUnsafe(t *testing.T) {
+	meta := loadTestGraph(t)
+	provider := depcheck.NewProvider(meta, depcheck.Options{})
+	cache := NewCache(newTestCAS(t), meta, provider, Options{})
+
+	data, ok, err := cache.ExportData("reflect")
+	if err != nil {
+		t.Fatalf("ExportData(reflect): %v", err)
+	}
+	if !ok {
+		t.Fatal("ExportData(reflect): ok = false, want true")
+	}
+
+	fset := token.NewFileSet()
+	pkg, err := typecheck.ReadExport(data, fset, "reflect", typecheck.NewCache())
+	if err != nil {
+		t.Fatalf("ReadExport: %v", err)
+	}
+	if obj := pkg.Scope().Lookup("TypeOf"); obj == nil {
+		t.Error("decoded reflect package has no TypeOf in scope")
+	}
+}
+
 // TestCache_UnknownPackage verifies ExportData reports ok=false, no error,
 // for a pkgPath the MetadataSource does not know at all — mirroring
 // typecheck.ExportSource's documented "no data for pkgPath" contract, which

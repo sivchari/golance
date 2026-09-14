@@ -2,9 +2,11 @@ package typecheck
 
 import (
 	"context"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"path/filepath"
 	"testing"
 
@@ -315,5 +317,63 @@ func TestCheckPackage_CollectsErrors(t *testing.T) {
 	}
 	if pkg == nil {
 		t.Fatal("expected a non-nil package even with type errors")
+	}
+}
+
+// panicIfCalledSource is an ExportSource whose ExportData panics if ever
+// invoked — a poison pill for TestImportFrom_UnsafeNeverReachesExportSource,
+// proving ImportFrom("unsafe") short-circuits to types.Unsafe before
+// consulting either configured ExportSource tier at all.
+type panicIfCalledSource struct{}
+
+func (panicIfCalledSource) ExportData(pkgPath string) ([]byte, bool, error) {
+	panic(fmt.Sprintf("ExportData(%s) called: ImportFrom(\"unsafe\") should never reach an ExportSource", pkgPath))
+}
+
+// TestImportFrom_UnsafeNeverReachesExportSource verifies ImportFrom("unsafe")
+// returns types.Unsafe directly, without asking either configured
+// ExportSource for it: a real ExportSource (internal/depexport.Cache) that
+// tried would panic trying to gcexportdata.Write(types.Unsafe) — see
+// TestCheckPackage_DirectUnsafeImport for that failure mode reproduced
+// end-to-end.
+func TestImportFrom_UnsafeNeverReachesExportSource(t *testing.T) {
+	fset := token.NewFileSet()
+	imp := NewImporter(fset, panicIfCalledSource{}, panicIfCalledSource{}, NewCache())
+
+	pkg, err := imp.ImportFrom("unsafe", "", 0)
+	if err != nil {
+		t.Fatalf("ImportFrom(unsafe): %v", err)
+	}
+	if pkg != types.Unsafe {
+		t.Errorf("ImportFrom(unsafe) = %v, want types.Unsafe", pkg)
+	}
+}
+
+// TestCheckPackage_DirectUnsafeImport checks unsafeuser.go, a workspace
+// package that directly imports "unsafe" (mirroring the shape
+// protoc-gen-go emits), through the same ExportSource shape
+// internal/depexport.Cache uses (declaration-only check via
+// internal/depcheck, then WriteExport — see stdlibExportSource.ExportData).
+// Before ImportFrom special-cased "unsafe" (see its own doc), CheckPackage
+// asking the fallback tier to resolve "unsafe" as an ordinary import
+// reached WriteExport(types.Unsafe, ...), which panics unconditionally
+// (gcexportdata's iexporter.pushDecl: "cannot export package unsafe") —
+// this is the exact panic internal/index's own recover wrapper reported in
+// production as "index: panic processing package ...: cannot export
+// package unsafe" for any workspace package that imports "unsafe" directly.
+func TestCheckPackage_DirectUnsafeImport(t *testing.T) {
+	fset := token.NewFileSet()
+	f := parseTestdata(t, fset, "unsafeuser/unsafeuser.go")
+	imp := NewImporter(fset, nil, newStdlibExportSource(t), NewCache())
+
+	pkg, _, errs := CheckPackage(fset, []*ast.File{f}, "example.com/tcmod/unsafeuser", imp)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected type errors: %v", errs)
+	}
+	if pkg == nil || !pkg.Complete() {
+		t.Fatalf("expected a complete package, got %v", pkg)
+	}
+	if pkg.Scope().Lookup("AsPointer") == nil {
+		t.Error("unsafeuser.AsPointer not found in package scope")
 	}
 }

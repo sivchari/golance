@@ -191,8 +191,17 @@ func NewCache(cas *store.CAS, meta depcheck.MetadataSource, provider *depcheck.P
 // all). ok is false only when pkgPath is not known to c's MetadataSource —
 // should not happen for anything an Importer actually asks for, since it
 // only ever asks for a package the same *graph.Snapshot already reported
-// as a real import edge; "unsafe" is resolved by depcheck.Provider itself
-// and never reaches here (see depcheck.Provider.Package's own handling).
+// as a real import edge.
+//
+// pkgPath must never be "unsafe": types.Unsafe has no source of its own and
+// gcexportdata.Write (via WriteExport, below) panics unconditionally trying
+// to serialize it. typecheck.Importer.ImportFrom special-cases "unsafe"
+// before ever reaching an ExportSource (see its own doc) — this Cache's
+// only current caller — so this method never actually sees it; that
+// special case, not anything in this package or in depcheck.Provider
+// (which only special-cases "unsafe" for ITS OWN recursive import
+// resolution, a separate call path that never reaches ExportData at all),
+// is what upholds this precondition.
 func (c *Cache) ExportData(pkgPath string) ([]byte, bool, error) {
 	dir, _, _, ok := c.meta.Package(pkgPath)
 	if !ok {
