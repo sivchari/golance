@@ -84,6 +84,18 @@ func (o *Overlay) Get(u uri.URI) (text []byte, version int32, hash [sha256.Size]
 	return doc.text, doc.version, doc.hash, true
 }
 
+// IsOpen reports whether path is currently open in the editor. Used by
+// internal/check's per-file disk-content cache to bypass memoization for an
+// open document: its overlay content can change (DidChange) without its
+// on-disk mtime moving, so caching it by disk stat would risk serving stale
+// content after an unsaved edit.
+func (o *Overlay) IsOpen(path string) bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	_, ok := o.docs[uri.File(path)]
+	return ok
+}
+
 // OpenFilesInDir returns the filesystem paths of every currently open
 // document whose directory is dir, in no particular order. Used to publish
 // an empty textDocument/publishDiagnostics for a file that has no

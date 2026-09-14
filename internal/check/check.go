@@ -26,6 +26,12 @@ import (
 const (
 	defaultMaxLRU        = 6
 	defaultDebounceDelay = 200 * time.Millisecond
+
+	// maxFileCache bounds Engine.fc, the per-file disk-content cache (see
+	// Engine.readFile): large enough to hold every file of the biggest
+	// packages a session is likely to touch without materializing an
+	// entire workspace's source in memory.
+	maxFileCache = 4096
 )
 
 // SnapshotSource resolves the package a source file belongs to. It is
@@ -199,6 +205,14 @@ type Engine struct {
 	jobs    map[unitKey]*dirState
 	flights map[unitKey]*flight
 
+	// fcMu guards fc, the per-file disk-content cache backing readFile. A
+	// separate lock from mu: readFile is called from inside a recheck
+	// (parseFiles, contentHash), which never holds mu, and giving it its
+	// own lock keeps a slow disk read from contending with Get's own
+	// bookkeeping on unrelated directories.
+	fcMu sync.Mutex
+	fc   map[string]fileCacheEntry
+
 	// pendingWG counts every recheck that has been armed or started but not
 	// yet resolved: debounce-triggered ones (armDebounceLocked Adds under
 	// e.mu, fireRecheck Dones via defer) and request-driven flights alike
@@ -235,6 +249,7 @@ func New(snap SnapshotSource, reader overlay.FileReader, imp Importer, opts Opti
 		cache:       make(map[unitKey]*cacheEntry),
 		jobs:        make(map[unitKey]*dirState),
 		flights:     make(map[unitKey]*flight),
+		fc:          make(map[string]fileCacheEntry),
 	}
 }
 
@@ -304,7 +319,7 @@ func (e *Engine) Get(ctx context.Context, filePath string) (*CheckedPackage, err
 	if err != nil {
 		return nil, err
 	}
-	hash, err := contentHash(e.reader, files)
+	hash, err := e.contentHash(files)
 	if err != nil {
 		return nil, err
 	}
