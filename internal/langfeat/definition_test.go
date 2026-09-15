@@ -657,3 +657,271 @@ func TestDependencyDefinition_Generics_GoplsParity(t *testing.T) {
 		})
 	}
 }
+
+// TestPackageNameDefinition_PlainImport covers "Go to Definition" on a
+// plain, unaliased package-qualifier identifier ("fmt" in "fmt.Println"):
+// before PackageNameDefinition existed, both SamePackageDefinition and
+// DependencyDefinition declined this case outright (a *types.PkgName's
+// Pkg() reports the importing package, so both mistook it for a
+// same-package identifier, then failed to find an *ast.Ident at the
+// PkgName's own Pos() -- the unaliased import's quoted path string
+// literal, not an identifier -- and silently returned nil, nil). The
+// result should land on the whole quoted path string in the import spec,
+// matching gopls@v0.23.0 (verified manually; see
+// TestPackageNameDefinition_GoplsParity for an automated check).
+func TestPackageNameDefinition_PlainImport(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "packagename", "packagename.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "fmt.Println(")
+
+	got, err := langfeat.PackageNameDefinition(cp, path, offset)
+	if err != nil {
+		t.Fatalf("PackageNameDefinition: %v", err)
+	}
+	if got == nil {
+		t.Fatal("PackageNameDefinition returned nil, want the \"fmt\" import spec")
+	}
+	if got.File != path {
+		t.Errorf("File = %q, want %q", got.File, path)
+	}
+	wantStart := mustIndex(t, text, `"fmt"`)
+	wantEnd := wantStart + len(`"fmt"`)
+	if got.Range.StartOffset != wantStart || got.Range.EndOffset != wantEnd {
+		t.Errorf("Range = [%d,%d), want [%d,%d) (the quoted \"fmt\" path literal)", got.Range.StartOffset, got.Range.EndOffset, wantStart, wantEnd)
+	}
+}
+
+// TestPackageNameDefinition_AliasedImport covers the explicitly-aliased
+// case ("str" in "str.ToUpper", importing "strings" as "str"): here
+// PkgName.Pos() is the alias identifier's own position, which IS an
+// *ast.Ident, so this case happened to already work via
+// SamePackageDefinition before PackageNameDefinition existed -- this pins
+// it still resolves correctly now that PackageNameDefinition runs first.
+func TestPackageNameDefinition_AliasedImport(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "packagename", "packagename.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "str.ToUpper(")
+
+	got, err := langfeat.PackageNameDefinition(cp, path, offset)
+	if err != nil {
+		t.Fatalf("PackageNameDefinition: %v", err)
+	}
+	if got == nil {
+		t.Fatal("PackageNameDefinition returned nil, want the aliased \"str\" import spec")
+	}
+	wantStart := mustIndex(t, text, `str "strings"`)
+	wantEnd := wantStart + len("str")
+	if got.Range.StartOffset != wantStart || got.Range.EndOffset != wantEnd {
+		t.Errorf("Range = [%d,%d), want [%d,%d) (the \"str\" alias identifier)", got.Range.StartOffset, got.Range.EndOffset, wantStart, wantEnd)
+	}
+}
+
+// TestPackageNameDefinition_SelectorReturnsNil guards against regressing
+// the already-working selector-after-the-dot path: PackageNameDefinition
+// must decline (nil, nil) when the cursor is on "Println" itself, not its
+// "fmt" qualifier, leaving definitionFallback's existing
+// DependencyDefinition call the one to answer it.
+func TestPackageNameDefinition_SelectorReturnsNil(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "packagename", "packagename.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "fmt.Println(") + len("fmt.")
+
+	got, err := langfeat.PackageNameDefinition(cp, path, offset)
+	if err != nil {
+		t.Fatalf("PackageNameDefinition: %v", err)
+	}
+	if got != nil {
+		t.Errorf("PackageNameDefinition = %+v, want nil (cursor is on the selector, not the package qualifier)", got)
+	}
+}
+
+// TestPackageNameDefinition_GoplsParity checks golance's own result for a
+// plain and an aliased package-qualifier query against gopls v0.23.0's
+// ("definition" CLI subcommand) resolution of the identical query.
+// Skipped if gopls is not on PATH (e.g. CI).
+func TestPackageNameDefinition_GoplsParity(t *testing.T) {
+	goplsPath, err := exec.LookPath("gopls")
+	if err != nil {
+		t.Skip("gopls not on PATH")
+	}
+
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "packagename", "packagename.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	moduleRoot, err := filepath.Abs(filepath.Join("testdata", "module"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	gocache := t.TempDir()
+
+	tests := []struct {
+		name   string
+		substr string
+	}{
+		{name: "plain", substr: "fmt.Println("},
+		{name: "aliased", substr: "str.ToUpper("},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			offset := mustIndex(t, text, tt.substr)
+
+			got, err := langfeat.PackageNameDefinition(cp, path, offset)
+			if err != nil {
+				t.Fatalf("PackageNameDefinition: %v", err)
+			}
+			if got == nil {
+				t.Fatal("PackageNameDefinition returned nil, want a result")
+			}
+
+			line, col := lineCol(text, offset)
+			target := "packagename/packagename.go:" + strconv.Itoa(line) + ":" + strconv.Itoa(col)
+			cmd := exec.Command(goplsPath, "definition", target)
+			cmd.Dir = moduleRoot
+			cmd.Env = append(os.Environ(), "GOCACHE="+gocache)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("gopls definition %s: %v\n%s", target, err, out)
+			}
+			_, wantLine, wantCol := parseGoplsDefinition(t, string(out))
+
+			gotLine, gotCol := lineCol(text, got.Range.StartOffset)
+			if gotLine != wantLine || gotCol != wantCol {
+				t.Errorf("position = %d:%d, gopls resolved %d:%d", gotLine, gotCol, wantLine, wantCol)
+			}
+		})
+	}
+}
+
+// TestPackageNameReferences_PlainImportIncludeDecl covers references on a
+// plain, unaliased package-qualifier identifier used twice in the same
+// file, with the import spec's own declaration included: the same gap
+// PackageNameDefinition closes on the definition side (the facts index
+// never records a *types.PkgName as an indexable symbol at all), scoped to
+// the current file (see PackageNameReferences' doc for why file-local is
+// the chosen scope).
+func TestPackageNameReferences_PlainImportIncludeDecl(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "packagename", "packagename.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "fmt.Println(")
+
+	got, err := langfeat.PackageNameReferences(cp, path, offset, true)
+	if err != nil {
+		t.Fatalf("PackageNameReferences: %v", err)
+	}
+
+	declStart := mustIndex(t, text, `"fmt"`)
+	printlnStart := mustIndex(t, text, "fmt.Println(")
+	sprintfStart := mustIndex(t, text, "fmt.Sprintf(")
+	want := []int{declStart, printlnStart, sprintfStart}
+
+	if len(got) != len(want) {
+		t.Fatalf("PackageNameReferences returned %d ranges, want %d: %+v", len(got), len(want), got)
+	}
+	for i, r := range got {
+		if r.StartOffset != want[i] {
+			t.Errorf("ranges[%d].StartOffset = %d, want %d", i, r.StartOffset, want[i])
+		}
+	}
+}
+
+// TestPackageNameReferences_PlainImportExcludeDecl is
+// TestPackageNameReferences_PlainImportIncludeDecl with includeDecl=false:
+// only the two qualifier uses, not the import spec itself.
+func TestPackageNameReferences_PlainImportExcludeDecl(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "packagename", "packagename.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "fmt.Sprintf(")
+
+	got, err := langfeat.PackageNameReferences(cp, path, offset, false)
+	if err != nil {
+		t.Fatalf("PackageNameReferences: %v", err)
+	}
+
+	printlnStart := mustIndex(t, text, "fmt.Println(")
+	sprintfStart := mustIndex(t, text, "fmt.Sprintf(")
+	want := []int{printlnStart, sprintfStart}
+
+	if len(got) != len(want) {
+		t.Fatalf("PackageNameReferences returned %d ranges, want %d: %+v", len(got), len(want), got)
+	}
+	for i, r := range got {
+		if r.StartOffset != want[i] {
+			t.Errorf("ranges[%d].StartOffset = %d, want %d", i, r.StartOffset, want[i])
+		}
+	}
+}
+
+// TestPackageNameReferences_AliasedImport covers the aliased case: the
+// declaration range is the alias identifier itself, not the quoted path.
+func TestPackageNameReferences_AliasedImport(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "packagename", "packagename.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "str.ToUpper(")
+
+	got, err := langfeat.PackageNameReferences(cp, path, offset, true)
+	if err != nil {
+		t.Fatalf("PackageNameReferences: %v", err)
+	}
+
+	declStart := mustIndex(t, text, `str "strings"`)
+	useStart := mustIndex(t, text, "str.ToUpper(")
+	want := []int{declStart, useStart}
+
+	if len(got) != len(want) {
+		t.Fatalf("PackageNameReferences returned %d ranges, want %d: %+v", len(got), len(want), got)
+	}
+	for i, r := range got {
+		if r.StartOffset != want[i] {
+			t.Errorf("ranges[%d].StartOffset = %d, want %d", i, r.StartOffset, want[i])
+		}
+	}
+}
+
+// TestPackageNameReferences_SelectorReturnsNil guards against regressing
+// the already-working selector-after-the-dot references path: the cursor
+// on "Println" itself (not its "fmt" qualifier) must return (nil, nil), not
+// a wrong result.
+func TestPackageNameReferences_SelectorReturnsNil(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "packagename", "packagename.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "fmt.Println(") + len("fmt.")
+
+	got, err := langfeat.PackageNameReferences(cp, path, offset, true)
+	if err != nil {
+		t.Fatalf("PackageNameReferences: %v", err)
+	}
+	if got != nil {
+		t.Errorf("PackageNameReferences = %+v, want nil (cursor is on the selector, not the package qualifier)", got)
+	}
+}

@@ -3,6 +3,7 @@ package langfeat
 import (
 	"context"
 	"go/ast"
+	"go/token"
 	"go/types"
 	"strconv"
 
@@ -239,4 +240,119 @@ func DependencyDefinition(ctx context.Context, cp *check.CheckedPackage, dp *dep
 		Col:      start.Column,
 		EndCol:   end.Column,
 	}, nil
+}
+
+// PackageNameDefinition resolves the identifier at offset (a byte offset
+// from the start of file) to the import spec that declares it, for the
+// case where offset lands on a package-QUALIFIER identifier -- the "os" in
+// "os.Getenv(...)" -- rather than the selector after the dot.
+// SamePackageDefinition and DependencyDefinition both decline this case:
+// a *types.PkgName's Pkg() reports the IMPORTING package (cp's own, since
+// the qualifier is a file-scoped name, not a member of the imported
+// package), so both take it for a same-package identifier and try to find
+// an *ast.Ident at the PkgName's own Pos() -- which, for a plain,
+// unaliased import ("\"os\""), is the position of the quoted path string
+// literal, not an identifier at all, so identAt finds nothing and both
+// silently decline. It returns (nil, nil) if offset is not on an
+// identifier or the identifier does not resolve to a *types.PkgName.
+//
+// The returned span matches gopls's own choice of target for the same
+// query (verified against gopls@v0.23.0): for an explicitly aliased
+// import ("f \"pkg\""), the alias identifier; for a plain import, the
+// whole quoted path string literal -- exactly go/types' own
+// PkgName.Pos()/End() for each case, so this needs no position arithmetic
+// beyond locating the import spec that declared the resolved PkgName (see
+// packageNameDeclRange).
+func PackageNameDefinition(cp *check.CheckedPackage, file string, offset int) (*SamePackageDefInfo, error) {
+	astFile, pos, tf, err := locate(cp, file, offset)
+	if err != nil {
+		return nil, err
+	}
+	path, _ := astutil.PathEnclosingInterval(astFile, pos, pos)
+	id := identAt(path)
+	if id == nil {
+		return nil, nil
+	}
+	pn, ok := cp.Info().ObjectOf(id).(*types.PkgName)
+	if !ok {
+		return nil, nil
+	}
+	rg, ok := packageNameDeclRange(cp, astFile, tf, pn)
+	if !ok {
+		return nil, nil
+	}
+	return &SamePackageDefInfo{File: tf.Name(), Range: rg}, nil
+}
+
+// PackageNameReferences resolves the identifier at offset (a byte offset
+// from the start of file) to every use of the same *types.PkgName within
+// file -- every "os." qualifier in a file importing "os", for example --
+// for handleReferences' file-local fallback when the workspace facts index
+// has nothing for a package-qualifier identifier (facts extraction never
+// records a *types.PkgName as an indexable symbol; see
+// PackageNameDefinition's doc for the identical gap on the definition
+// side). includeDecl additionally includes the import spec's own span
+// (PackageNameDefinition's target). It returns (nil, nil) if offset is not
+// on an identifier or the identifier does not resolve to a *types.PkgName.
+//
+// This only searches file itself, not the whole workspace: a package
+// qualifier is local to the importing file by construction (Go has no
+// cross-file "using" declaration for an import), so every reference to it
+// is already in file -- closing the scope a user expects clicking a
+// qualifier without needing the facts index, which does not track this
+// symbol kind at all, to answer.
+func PackageNameReferences(cp *check.CheckedPackage, file string, offset int, includeDecl bool) ([]Range, error) {
+	astFile, pos, tf, err := locate(cp, file, offset)
+	if err != nil {
+		return nil, err
+	}
+	path, _ := astutil.PathEnclosingInterval(astFile, pos, pos)
+	id := identAt(path)
+	if id == nil {
+		return nil, nil
+	}
+	pn, ok := cp.Info().ObjectOf(id).(*types.PkgName)
+	if !ok {
+		return nil, nil
+	}
+	var ranges []Range
+	if includeDecl {
+		if declRange, ok := packageNameDeclRange(cp, astFile, tf, pn); ok {
+			ranges = append(ranges, declRange)
+		}
+	}
+	ast.Inspect(astFile, func(n ast.Node) bool {
+		ident, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if cp.Info().Uses[ident] == pn {
+			ranges = append(ranges, rangeOf(tf, ident.Pos(), ident.End()))
+		}
+		return true
+	})
+	return ranges, nil
+}
+
+// packageNameDeclRange returns the span PackageNameDefinition/
+// PackageNameReferences point a *types.PkgName's declaration at: among
+// astFile's own imports, the one that declared pn -- matched by identity
+// against cp.Info()'s Defs (an explicit alias) or Implicits (a plain,
+// unaliased import; see go/types' own documented use of Implicits for an
+// ImportSpec's implicit PkgName) -- rather than by re-deriving obj.Pos()'s
+// enclosing node, since either map lookup already pins the exact
+// *ast.ImportSpec responsible without a second AST walk.
+func packageNameDeclRange(cp *check.CheckedPackage, astFile *ast.File, tf *token.File, pn *types.PkgName) (Range, bool) {
+	for _, imp := range astFile.Imports {
+		if imp.Name != nil {
+			if cp.Info().Defs[imp.Name] == pn {
+				return rangeOf(tf, imp.Name.Pos(), imp.Name.End()), true
+			}
+			continue
+		}
+		if cp.Info().Implicits[imp] == pn {
+			return rangeOf(tf, imp.Path.Pos(), imp.Path.End()), true
+		}
+	}
+	return Range{}, false
 }

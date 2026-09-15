@@ -162,14 +162,18 @@ func (s *Server) handleDefinition(ctx context.Context, params json.RawMessage) (
 // type-checked package's own AST/types.Info/FileSet, for whenever the
 // workspace facts index cannot answer: it has not finished building yet
 // (resolverOrWarn's ok=false), a store query against it failed, or it
-// legitimately has no entry for this position. An identifier declared in
-// cp's own package resolves via langfeat.SamePackageDefinition, exact down
-// to the column, needing no index at all; a standard library or module
-// dependency identifier resolves through dependencyDefinition's
-// depcheck.Provider path instead, exact to the column as well (see
-// internal/depcheck's package doc). A different *workspace* (root)
-// package's identifier is deliberately left unanswered here — see
-// dependencyDefinition's doc for why.
+// legitimately has no entry for this position. A package-QUALIFIER
+// identifier (the "os" in "os.Getenv") resolves via
+// langfeat.PackageNameDefinition to its import spec, tried before
+// SamePackageDefinition since a *types.PkgName's Pkg() reports the
+// importing package and would otherwise be mistaken for one (see
+// PackageNameDefinition's doc). An identifier declared in cp's own package
+// resolves via langfeat.SamePackageDefinition, exact down to the column,
+// needing no index at all; a standard library or module dependency
+// identifier resolves through dependencyDefinition's depcheck.Provider path
+// instead, exact to the column as well (see internal/depcheck's package
+// doc). A different *workspace* (root) package's identifier is deliberately
+// left unanswered here — see dependencyDefinition's doc for why.
 func (s *Server) definitionFallback(ctx context.Context, u uri.URI, pos protocol.Position) protocol.LocationSlice {
 	cf := s.checkedFile(ctx, u, pos)
 	if !cf.ok {
@@ -180,6 +184,11 @@ func (s *Server) definitionFallback(ctx context.Context, u uri.URI, pos protocol
 	}
 	if loc, ok := s.builtinDefinition(cf); ok {
 		return s.toLSPLocations([]xref.Location{loc})
+	}
+	if info, err := langfeat.PackageNameDefinition(cf.cp, cf.path, cf.offset); err != nil {
+		s.logger.Printf("server: package name definition %s: %v", cf.path, err)
+	} else if info != nil {
+		return s.samePackageDefinitionLocation(info)
 	}
 	info, err := langfeat.SamePackageDefinition(cf.cp, cf.path, cf.offset)
 	if err != nil {
@@ -379,6 +388,9 @@ func (s *Server) handleReferences(ctx context.Context, params json.RawMessage) (
 	}
 	resolver, ok := s.resolverOrWarn()
 	if !ok {
+		if locs, ok := s.packageNameReferencesFallback(ctx, p.TextDocument.URI, p.Position, p.Context.IncludeDeclaration); ok {
+			return locs, nil
+		}
 		return nil, s.indexUnavailableError("references")
 	}
 	path := p.TextDocument.URI.FsPath()
@@ -393,11 +405,66 @@ func (s *Server) handleReferences(ctx context.Context, params json.RawMessage) (
 	if err != nil {
 		// See handleDefinition's comment: most errors here are an ordinary
 		// "no symbol at this position" miss, but log it anyway so a
-		// genuine facts-read failure does not vanish silently.
+		// genuine facts-read failure does not vanish silently. A
+		// package-qualifier identifier is exactly such a miss -- the facts
+		// index never records a *types.PkgName as an indexable symbol (see
+		// packageNameReferencesFallback's doc) -- so try that fallback
+		// before giving up.
 		s.logger.Printf("server: references at %s:%d:%d: %v", path, line, col, err)
+		if locs, ok := s.packageNameReferencesFallback(ctx, p.TextDocument.URI, p.Position, p.Context.IncludeDeclaration); ok {
+			return locs, nil
+		}
 		return protocol.LocationSlice(nil), nil
 	}
+	if len(locs) == 0 {
+		if fb, ok := s.packageNameReferencesFallback(ctx, p.TextDocument.URI, p.Position, p.Context.IncludeDeclaration); ok {
+			return fb, nil
+		}
+	}
 	return s.toLSPLocations(locs), nil
+}
+
+// packageNameReferencesFallback answers handleReferences' file-local
+// fallback for a package-QUALIFIER identifier (the "os" in "os.Getenv"):
+// the workspace facts index never records a *types.PkgName as an indexable
+// symbol (it names an import, not a workspace declaration), so
+// resolver.References either errors ("no symbol at this position") or,
+// once the index does answer for some other reason, still cannot have
+// found anything for this position -- either way this tries
+// langfeat.PackageNameReferences against the type-checked file directly,
+// mirroring definitionFallback's identical index-independent path on the
+// definition side (see langfeat.PackageNameDefinition's doc for the same
+// root cause). Scope is deliberately file-local, not workspace-wide: a
+// package qualifier is local to the importing file by construction (see
+// PackageNameReferences' doc), so this already closes the gap a user
+// expects clicking a qualifier without needing the facts index at all. ok
+// is false if offset is not on a *types.PkgName identifier, or nothing
+// resolved.
+func (s *Server) packageNameReferencesFallback(ctx context.Context, u uri.URI, pos protocol.Position, includeDecl bool) (protocol.LocationSlice, bool) {
+	cf := s.checkedFile(ctx, u, pos)
+	if !cf.ok {
+		return nil, false
+	}
+	ranges, err := langfeat.PackageNameReferences(cf.cp, cf.path, cf.offset, includeDecl)
+	if err != nil {
+		s.logger.Printf("server: package name references %s: %v", cf.path, err)
+		return nil, false
+	}
+	if len(ranges) == 0 {
+		return nil, false
+	}
+	out := make(protocol.LocationSlice, 0, len(ranges))
+	for _, rg := range ranges {
+		lspRange, ok := offsetRangeToLSP(cf.text, rg.StartOffset, rg.EndOffset)
+		if !ok {
+			continue
+		}
+		out = append(out, protocol.Location{URI: uri.File(cf.path), Range: lspRange})
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
 }
 
 func (s *Server) handleImplementation(ctx context.Context, params json.RawMessage) (any, error) {
