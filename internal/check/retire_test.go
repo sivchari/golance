@@ -25,12 +25,12 @@ func TestEngine_Retire_LetsInFlightGetFinish(t *testing.T) {
 		release := make(chan struct{})
 		var once sync.Once
 		hook := func(imp Importer) Importer {
-			return func() types.ImporterFrom {
+			return func(ctx context.Context) types.ImporterFrom {
 				once.Do(func() {
 					close(started)
 					<-release
 				})
-				return imp()
+				return imp(ctx)
 			}
 		}
 		e, root := newTestEngineWithImporterHook(t, overlay.New(), Options{}, hook)
@@ -81,12 +81,12 @@ func TestEngine_Retire_SuppressesOnResult(t *testing.T) {
 		release := make(chan struct{})
 		var once sync.Once
 		hook := func(imp Importer) Importer {
-			return func() types.ImporterFrom {
+			return func(ctx context.Context) types.ImporterFrom {
 				once.Do(func() {
 					close(started)
 					<-release
 				})
-				return imp()
+				return imp(ctx)
 			}
 		}
 		var onResultCalls int64

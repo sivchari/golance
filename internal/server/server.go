@@ -66,7 +66,16 @@ type workspace struct {
 	// it is sound.
 	graphSrc *check.GraphSource
 	engine   *check.Engine
-	depCache *depCacheHolder
+	// rootFallback is a second, small check.Engine dedicated to resolving a
+	// root-package import engineImporter's decodeRoot tier could not answer
+	// (no facts-index data yet, an open/dirty file, or a stale blob) — never
+	// engine itself, whose own cache exists to serve this session's actually
+	// open files. See setWorkspace's own construction of it for why sharing
+	// engine's cache with root-import resolution risked growing it to
+	// workspace scale. Reused or rebuilt in lockstep with engine across a
+	// setWorkspace call — see setWorkspace's reuse branch.
+	rootFallback *check.Engine
+	depCache     *depCacheHolder
 	// depProvider resolves non-workspace (standard library, module
 	// dependency, test-only) packages by type-checking their own real
 	// source on demand (internal/depcheck), for navigation consumers that
@@ -137,19 +146,27 @@ type Server struct {
 	codeLenses atomic.Pointer[map[codeLensSource]bool]
 
 	// depProviderMu guards depProviderKey/depProviderSrc/depProviderVal/
-	// depExportsVal — the server-lifetime depcheck.Provider and
-	// depexport.Cache pair setWorkspace installs into each new workspace's
-	// own depProvider field (see ensureDepProvider). Kept here, not
-	// per-workspace, precisely so they can OUTLIVE a workspace: their whole
-	// reason to exist is surviving a setWorkspace swap that leaves the
-	// dependency set (see depsKey) unchanged.
+	// depExportProviderVal/depExportsVal — the server-lifetime depcheck.
+	// Provider(s) and depexport.Cache pair setWorkspace installs into each
+	// new workspace's own depProvider field (see ensureDepProvider). Kept
+	// here, not per-workspace, precisely so they can OUTLIVE a workspace:
+	// their whole reason to exist is surviving a setWorkspace swap that
+	// leaves the dependency set (see depsKey) unchanged.
 	depProviderMu  sync.Mutex
 	depProviderKey string
 	depProviderSrc *depMetadataSource
 	depProviderVal *depcheck.Provider
-	// depExportsVal shares depProviderVal/depProviderSrc's identity exactly
-	// (rebuilt alongside them, never independently — see ensureDepProvider),
-	// backed by depExportCAS below for cross-session persistence.
+	// depExportProviderVal is a SEPARATE depcheck.Provider dedicated to
+	// depExportsVal's own checks — never given SetExportSource, unlike
+	// depProviderVal. See ensureDepProvider's doc for why export-data
+	// production must never resolve a transitive import via the decode fast
+	// path depProviderVal itself uses for navigation: doing so writes an
+	// export-data blob gcexportdata.Write accepts but a later
+	// gcexportdata.Read of the same bytes cannot reliably decode.
+	depExportProviderVal *depcheck.Provider
+	// depExportsVal is checked via depExportProviderVal (rebuilt alongside
+	// it, never independently — see ensureDepProvider), backed by
+	// depExportCAS below for cross-session persistence.
 	depExportsVal *depexport.Cache
 	// depExportCAS is the machine-global, content-addressed store
 	// internal/depexport persists checked non-root dependency export data

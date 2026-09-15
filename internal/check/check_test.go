@@ -206,7 +206,7 @@ func TestEngine_DependencyDecodeCachedAcrossRechecks(t *testing.T) {
 	src := NewGraphSource(snap, ov)
 	depMeta := depcheck.NewGraphMetadataSource(snap)
 	depExp := depexport.NewCache(nil, depMeta, depcheck.NewProvider(depMeta, depcheck.Options{}), depexport.Options{})
-	imp := func() types.ImporterFrom {
+	imp := func(context.Context) types.ImporterFrom {
 		return typecheck.NewImporter(depFset, nil, depExp, depCache)
 	}
 

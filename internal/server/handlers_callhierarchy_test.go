@@ -317,17 +317,27 @@ func TestHandlePrepareOutgoingCalls_WorkWithoutIndex(t *testing.T) {
 	}
 }
 
-// TestHandleOutgoingCalls_NoIndex_RootPackageCallee is a regression test for
-// Finding H5: crossPackageFuncLocation used to answer a root-package callee
-// it could not yet resolve (the facts index still building) by silently
-// dropping just that one outgoing call, indistinguishable from a callee
-// that genuinely has no locatable declaration — the same PR #30 shape
-// dependencyDefinition (plain "Go to Definition") already guards against.
-// Describe calls callhdep.Double, a different *workspace* (root) package
-// only the facts index can resolve (dependencyFuncDeclaration always
-// declines a root package, see its own doc), so this must fail the whole
-// request with indexUnavailableError rather than silently returning the
-// other two, unaffected callees.
+// TestHandleOutgoingCalls_NoIndex_RootPackageCallee verifies outgoingCalls
+// degrades gracefully — no error, no panic, and no answer for the
+// root-package callee itself — for Describe's call to callhdep.Double: a
+// different *workspace* (root) package's directory is never immutable (see
+// internal/depexport's own "Cache identity" doc), so it can never be
+// resolved through a persisted CAS hit either, meaning
+// depCacheHolder.importer's cold-index-build gate (internal/server/
+// workspace.go) leaves it unresolved for the ENTIRE cold-build window on
+// every machine, every run — unlike Describe's OTHER callees (fmt.Sprintf/
+// fmt.Sprint), which this assertion deliberately does not pin one way or
+// the other: the machine-global dependency export cache (depExportCASDir)
+// this test's Server shares with every other test in this process may
+// already hold "fmt" from an earlier, warm test, in which case those two
+// calls resolve exactly as before; asserting on their presence would make
+// this test's outcome depend on unrelated test execution history. An
+// EARLIER revision of this test asserted a distinct indexUnavailableError
+// instead (Finding H5, back when crossPackageFuncLocation's own location
+// lookup — not check.Engine's type-checking itself — was the only thing
+// gated on the index); trading that distinct error for a merely-
+// incomplete-but-non-crashing result during the cold-build window is the
+// accepted cost of bounding the server's own memory during it.
 func TestHandleOutgoingCalls_NoIndex_RootPackageCallee(t *testing.T) {
 	s, snap := newTestServerNoIndex(t)
 	file := snap.Packages["example.com/servermod/callh"].GoFiles[0]
@@ -339,9 +349,17 @@ func TestHandleOutgoingCalls_NoIndex_RootPackageCallee(t *testing.T) {
 	}
 
 	result, err := s.handleOutgoingCalls(context.Background(), mustMarshal(t, &protocol.CallHierarchyOutgoingCallsParams{Item: item}))
-	checkIndexUnavailableError(t, "outgoingCalls(no index, callhdep.Double)", err)
-	if result != nil {
-		t.Errorf("outgoingCalls(no index, callhdep.Double): result = %#v, want nil", result)
+	if err != nil {
+		t.Fatalf("outgoingCalls(no index, callhdep.Double): unexpected error: %v", err)
+	}
+	calls, ok := result.([]protocol.CallHierarchyOutgoingCall)
+	if !ok {
+		t.Fatalf("outgoingCalls(no index, callhdep.Double): result = %#v, want []protocol.CallHierarchyOutgoingCall", result)
+	}
+	for _, c := range calls {
+		if c.To.Name == "Double" {
+			t.Errorf("outgoingCalls(no index, callhdep.Double): got a Double callee, want it unresolved during a cold build (callhdep is a root package, never CAS-cached)")
+		}
 	}
 }
 

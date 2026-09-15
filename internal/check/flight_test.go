@@ -22,9 +22,9 @@ import (
 // depcheck.TestProvider_Singleflight's countingMetadataSource.
 func countingImporterHook(checks *int64) func(Importer) Importer {
 	return func(imp Importer) Importer {
-		return func() types.ImporterFrom {
+		return func(ctx context.Context) types.ImporterFrom {
 			atomic.AddInt64(checks, 1)
-			return imp()
+			return imp(ctx)
 		}
 	}
 }
@@ -82,13 +82,13 @@ func TestEngine_Get_CanceledWaiterDoesNotKillFlight(t *testing.T) {
 		release := make(chan struct{})
 		var once sync.Once
 		hook := func(imp Importer) Importer {
-			return func() types.ImporterFrom {
+			return func(ctx context.Context) types.ImporterFrom {
 				atomic.AddInt64(&checks, 1)
 				once.Do(func() {
 					close(started)
 					<-release
 				})
-				return imp()
+				return imp(ctx)
 			}
 		}
 		e, root := newTestEngineWithImporterHook(t, overlay.New(), Options{}, hook)
@@ -145,7 +145,7 @@ func TestEngine_Get_EditMidFlightStartsFreshFlight(t *testing.T) {
 		release := make(chan struct{})
 		var gated int32
 		hook := func(imp Importer) Importer {
-			return func() types.ImporterFrom {
+			return func(ctx context.Context) types.ImporterFrom {
 				// CAS, not sync.Once: the second flight's own call into this
 				// hook must proceed immediately rather than blocking behind the
 				// first flight's still-running gate (sync.Once.Do blocks
@@ -156,7 +156,7 @@ func TestEngine_Get_EditMidFlightStartsFreshFlight(t *testing.T) {
 					close(started)
 					<-release
 				}
-				return imp()
+				return imp(ctx)
 			}
 		}
 		ov := overlay.New()
@@ -235,12 +235,12 @@ func TestEngine_Stop_CancelsInFlightFlight(t *testing.T) {
 		release := make(chan struct{})
 		var once sync.Once
 		hook := func(imp Importer) Importer {
-			return func() types.ImporterFrom {
+			return func(ctx context.Context) types.ImporterFrom {
 				once.Do(func() {
 					close(started)
 					<-release
 				})
-				return imp()
+				return imp(ctx)
 			}
 		}
 		e, root := newTestEngineWithImporterHook(t, overlay.New(), Options{}, hook)
@@ -284,12 +284,12 @@ func TestEngine_Wait_BlocksUntilInFlightFlightFinishes(t *testing.T) {
 		release := make(chan struct{})
 		var once sync.Once
 		hook := func(imp Importer) Importer {
-			return func() types.ImporterFrom {
+			return func(ctx context.Context) types.ImporterFrom {
 				once.Do(func() {
 					close(started)
 					<-release
 				})
-				return imp()
+				return imp(ctx)
 			}
 		}
 		e, root := newTestEngineWithImporterHook(t, overlay.New(), Options{}, hook)

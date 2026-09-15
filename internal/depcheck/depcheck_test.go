@@ -645,3 +645,51 @@ func TestProvider_Check_UncanceledClosureStillCompletes(t *testing.T) {
 		t.Errorf("MetadataSource.Package called %d times, want exactly %d (the whole chain, since nothing was canceled)", got, chainFixtureLen)
 	}
 }
+
+// TestRecommendedCap pins the fix for the indexer driving peak RSS past its
+// safety cap on a large, protobuf-heavy workspace: RecommendedCap used to
+// return nonRootCount unconditionally once it exceeded DefaultCap — sizing
+// the LRU to hold every non-root package a workspace's root packages
+// transitively import, LIVE, for the run's entire duration, regardless of
+// how large that count grew. It must now bound the cap to a size that scales
+// with parallelism (concurrent work actually in flight), never with
+// nonRootCount alone, while still never exceeding nonRootCount itself (a
+// small workspace gains nothing from a cap larger than its own closure) and
+// never dropping below DefaultCap (see its own doc for that floor's
+// reasoning).
+func TestRecommendedCap(t *testing.T) {
+	tests := []struct {
+		name          string
+		nonRootCount  int
+		parallelism   int
+		want          int
+		wantBelowFull bool // RecommendedCap must return less than nonRootCount
+	}{
+		{name: "tiny workspace floors at DefaultCap", nonRootCount: 5, parallelism: 4, want: DefaultCap},
+		{name: "small workspace returns its own count", nonRootCount: 100, parallelism: 4, want: 100},
+		{
+			name:         "large workspace is capped, not sized to nonRootCount",
+			nonRootCount: 50_000, parallelism: 7,
+			want: max(DefaultCap, 7*batchCapPerWorker), wantBelowFull: true,
+		},
+		{
+			name:         "cap scales with parallelism",
+			nonRootCount: 50_000, parallelism: 32,
+			want: 32 * batchCapPerWorker, wantBelowFull: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RecommendedCap(tt.nonRootCount, tt.parallelism)
+			if got != tt.want {
+				t.Errorf("RecommendedCap(%d, %d) = %d, want %d", tt.nonRootCount, tt.parallelism, got, tt.want)
+			}
+			if tt.wantBelowFull && got >= tt.nonRootCount {
+				t.Errorf("RecommendedCap(%d, %d) = %d, want strictly less than nonRootCount (the bug this pins: the cap must not scale with workspace size)", tt.nonRootCount, tt.parallelism, got)
+			}
+			if got < DefaultCap {
+				t.Errorf("RecommendedCap(%d, %d) = %d, want >= DefaultCap (%d)", tt.nonRootCount, tt.parallelism, got, DefaultCap)
+			}
+		})
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"runtime/pprof"
 	"strconv"
 	"syscall"
@@ -66,6 +67,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	logger := log.New(logOut, "", log.LstdFlags)
 
+	applyDefaultMemLimit(defaultServerMemLimit)
+
 	rpcServer := rpc.NewServer(rpc.WithLogger(logger))
 	srv := server.New(rpcServer, server.Options{
 		Logger:        logger,
@@ -108,13 +111,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 // Exit code contract: runIndexer returns non-zero only when
 // server.EnvDB's database is not trustworthy as a whole — a failed graph
 // load, a failed database open, or index.Build itself returning an error
-// (which index.Build reserves for a canceled run or a failed write, see
-// its doc). It returns 0 even when stats.Errors is non-zero: a handful of
-// packages individually failing to parse or type-check does not make the
-// rest of the database (which this run did successfully write) any less
-// usable, and internal/server.buildIndex treats a non-zero exit as
-// "nothing usable was indexed," discarding this run's progress entirely
-// if no prior database exists to fall back to.
+// (which index.Build reserves for a canceled run only — see its doc). It
+// returns 0 even when stats.Errors is non-zero: a handful of packages
+// individually failing to parse or type-check, or a batch of them failing
+// to commit (see index.Build's own doc), does not make the rest of the
+// database (which this run did successfully write, including its build
+// fingerprint) any less usable, and internal/server.buildIndex treats a
+// non-zero exit as "nothing usable was indexed," discarding this run's
+// progress entirely if no prior database exists to fall back to.
 func runIndexer(stdout, stderr io.Writer) int {
 	root := os.Getenv(server.EnvRoot)
 	dbPath := os.Getenv(server.EnvDB)
@@ -131,6 +135,8 @@ func runIndexer(stdout, stderr io.Writer) int {
 	// future standalone CLI use) should not be forced to know about it.
 	depCASPath := os.Getenv(server.EnvDepCAS)
 
+	applyDefaultMemLimit(defaultIndexerMemLimit)
+
 	stopProfiling, ok := setupProfiling(stderr)
 	defer stopProfiling()
 	if !ok {
@@ -138,6 +144,63 @@ func runIndexer(stdout, stderr io.Writer) int {
 	}
 
 	return buildIndex(stdout, stderr, root, dbPath, casPath, depCASPath)
+}
+
+// defaultIndexerMemLimit is the GOMEMLIMIT applied to the indexer subprocess
+// when nothing else already set one (see applyDefaultMemLimit): a cold
+// index build's Go heap otherwise grows unbounded (GOGC=100, no ceiling),
+// which measured 7.4GB peak "memory footprint" (9.0GB peak RSS) type-checking
+// a ~2,500-package, 34k-file monorepo. Capping it at 4GiB cut that to a
+// measured 5.0GB peak footprint (7.9GB peak RSS) with no wall-time cost (the
+// more frequent GC this forces was, if anything, slightly faster in that
+// measurement) — small enough headroom above this that a further cut (2GiB
+// was tried) buys little more RSS reduction while making the GC thrash badly
+// (2.3x wall time), so this is deliberately conservative rather than
+// minimal. It leaves comfortable room for the LSP server process itself
+// alongside it on a 16GB machine; a caller with a reason to run tighter or
+// looser can still override it via --mem-limit/GOLANCE_MEM_LIMIT (forwarded
+// as this same process's GOMEMLIMIT — see applyDefaultMemLimit).
+const defaultIndexerMemLimit = 4 << 30
+
+// defaultServerMemLimit is the GOMEMLIMIT soft cap applied to the SERVER
+// (leader) process itself — a backstop, not the primary fix, for the
+// cold-start recursive dependency-closure re-check depCacheHolder.importer's
+// cold-index-build gate (internal/server/workspace.go) already closes off:
+// this exists in case some OTHER path still lets the server's heap grow
+// unbounded, now or in the future, the same way defaultIndexerMemLimit backstops
+// the indexer subprocess (whose own 4GiB default this constant is sized
+// relative to, not duplicated — see that constant's own doc for the
+// measurement behind ITS value). 8GiB leaves the indexer subprocess's own
+// 4GiB cap room to run alongside the server on the same 16GB machine
+// defaultIndexerMemLimit's own doc already targets, plus headroom for the
+// editor and OS: 4+8=12GiB of the 16GB total, both caps being soft (the Go
+// runtime runs GC more aggressively as either process nears its own limit
+// rather than being OOM-killed outright), so briefly exceeding one is
+// tolerated rather than fatal. Applied in-process via debug.SetMemoryLimit,
+// never as an env var: cmd.Env for the indexer subprocess (see
+// internal/server/indexer.go) starts from THIS process's os.Environ(), so a
+// real GOMEMLIMIT env var set here would leak into and override the
+// indexer's own deliberately-sized default; debug.SetMemoryLimit affects
+// only the calling process's own runtime, never the environment, so no such
+// override can happen.
+const defaultServerMemLimit = 8 << 30
+
+// applyDefaultMemLimit sets a GOMEMLIMIT soft cap of limit for this process
+// via debug.SetMemoryLimit, but only when nothing has already configured
+// one — the Go runtime applies a GOMEMLIMIT environment variable before
+// main() ever runs, so checking it here is exactly equivalent to checking
+// whether debug.SetMemoryLimit(-1) (a pure read) already reports something
+// other than its unset default (math.MaxInt64), without needing that
+// probe: internal/server always forwards --mem-limit/GOLANCE_MEM_LIMIT to
+// the indexer subprocess as GOMEMLIMIT (see internal/server/indexer.go), and
+// a directly-invoked indexer (a test, or a future standalone CLI use) or
+// server process that set GOMEMLIMIT itself gets the same deference. Only a
+// run with neither gets limit instead of an unbounded heap.
+func applyDefaultMemLimit(limit int64) {
+	if os.Getenv("GOMEMLIMIT") != "" {
+		return
+	}
+	debug.SetMemoryLimit(limit)
 }
 
 // setupProfiling enables the runtime/pprof profiles requested via

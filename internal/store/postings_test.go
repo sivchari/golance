@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 )
 
 // sortRecordsBySrc returns recs sorted by SrcPkgHash, so assertions do not
@@ -259,5 +260,58 @@ func TestDBPutUnitPointersBatchLeavesPostingsUntouched(t *testing.T) {
 	recs, err := db.PostingsFor(context.Background(), targetPkg, targetID)
 	if err != nil || len(recs) != 1 {
 		t.Fatalf("PostingsFor() after PutUnitPointersBatch = %+v, %v, want the original posting untouched", recs, err)
+	}
+}
+
+// TestApplyPostingsManyTargetsCompletesQuickly pins appendManifestEntry's
+// fix: applyPostings used to rebuild srcPkgHash's whole manifest from
+// scratch (make + copy the entire growing list) on every single target it
+// wrote, an O(targets²) cost — real, measured against a package with a few
+// thousand distinct referenced symbols (a large generated file is well
+// within that range) as gigabytes of copying and seconds of wall time for
+// ONE package's own facts write. A single srcPkgHash with a large,
+// generated-file-scale number of distinct targets must still commit in
+// comfortably sub-second time; the pre-fix implementation does not (see this
+// test's own red-then-green verification in the fix's commit).
+func TestApplyPostingsManyTargetsCompletesQuickly(t *testing.T) {
+	db := openTestDB(t)
+	const (
+		srcPkg     = 1
+		numTargets = 150_000
+	)
+	postings := make([]PostingEntry, numTargets)
+	for i := range postings {
+		postings[i] = PostingEntry{
+			TargetPkgHash: uint64(i),
+			TargetIDHash:  uint64(i),
+			File:          "generated.go",
+			Line:          testUint32(uint64(i + 1)),
+			Col:           1,
+			EndCol:        2,
+		}
+	}
+
+	start := time.Now()
+	err := db.PutUnit(&UnitEntry{
+		PkgHash: srcPkg,
+		Pointer: UnitPointer{BlobKey: 1, ContentHash: 1},
+		Index:   PackageIndexEntries{Postings: postings},
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("PutUnit() error = %v", err)
+	}
+	const budget = 5 * time.Second
+	if elapsed > budget {
+		t.Errorf("PutUnit() with %d distinct posting targets took %s, want under %s (O(targets²) manifest growth regression)", numTargets, elapsed, budget)
+	}
+
+	recs, err := db.PostingsFor(context.Background(), 0, 0)
+	if err != nil || len(recs) != 1 || len(recs[0].Locations) != 1 {
+		t.Fatalf("PostingsFor(first target) = %+v, %v, want exactly one location", recs, err)
+	}
+	recs, err = db.PostingsFor(context.Background(), numTargets-1, numTargets-1)
+	if err != nil || len(recs) != 1 || len(recs[0].Locations) != 1 {
+		t.Fatalf("PostingsFor(last target) = %+v, %v, want exactly one location", recs, err)
 	}
 }

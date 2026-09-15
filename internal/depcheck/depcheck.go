@@ -155,25 +155,61 @@ func (cp *CheckedPackage) Incomplete() bool { return cp.incomplete }
 // dependencies — see RecommendedCap's own doc).
 const DefaultCap = 64
 
+// batchCapPerWorker is RecommendedCap's per-Parallelism budget: how many
+// non-root CheckedPackage entries (full AST plus *types.Package/*types.Info
+// — see CheckedPackage's own doc, and note the parser always parses full
+// function bodies regardless of IgnoreFuncBodies) one concurrent batch
+// worker's own working set is allowed to keep the LRU holding at once.
+// Chosen empirically against a real, protobuf-heavy corpus (see
+// RecommendedCap's doc): at Parallelism=7 (this machine's default —
+// max(1, runtime.NumCPU()/2)), a cap below ~400 measurably thrashed worse on
+// BOTH wall time and peak RSS than a larger one (an evicted, still-in-demand
+// package being re-checked from scratch costs more allocation churn than the
+// larger cap it displaces saves), while a cap of 448 (7 * 64) tracked the
+// best of the caps tried on both axes. 64 keeps that ratio while still
+// bounding worst-case memory to a small, constant multiple of Parallelism
+// instead of to total workspace size.
+const batchCapPerWorker = 64
+
 // RecommendedCap returns the LRU capacity a Provider dedicated to BATCH
 // export-data production (internal/depexport's use — not interactive
-// navigation, which should keep DefaultCap) should be constructed with,
-// given nonRootCount: the number of non-root (stdlib/module-cache)
-// packages the run may need to resolve, transitively. Sized to hold every
-// one of them live for the run's whole duration — never DefaultCap, which
-// exists for an entirely different, much smaller-locality workload (see
-// DefaultCap's own doc) and thrashes badly at this scale: a real
-// measurement against a synthetic ~370-package dependency closure went
-// from ~7s/~300MB (a correctly-sized cap) to ~72s/~7GB (DefaultCap) purely
-// from LRU eviction forcing the same widely-shared packages to be
-// rechecked from scratch over and over. DefaultCap is still used as a
-// floor for a tiny workspace's few dependencies, matching Provider's own
-// existing default for that case.
-func RecommendedCap(nonRootCount int) int {
-	if nonRootCount < DefaultCap {
-		return DefaultCap
+// navigation, which should keep DefaultCap) should be constructed with.
+// parallelism is the caller's own concurrent-worker budget (Options.
+// Parallelism); nonRootCount is the number of non-root (stdlib/module-cache)
+// packages the run may need to resolve, transitively.
+//
+// This used to size the cap to hold nonRootCount packages live for the
+// run's ENTIRE duration — correct only for a small workspace, and the
+// direct cause of an indexer run against a large, protobuf-heavy monorepo
+// (~2,500 root packages) driving peak RSS well past a 12 GB safety cap: the
+// cap scaled with total workspace size instead of with concurrent work in
+// flight, so the LRU never actually evicted anything for the length of the
+// run (see internal/index.scheduler's reference-counted eviction, which
+// this Provider's own separate, unrelated cache sat outside of entirely).
+// A single dependency closure larger than a small cap DOES thrash it badly
+// — check's own recursive import resolution (ctxImporter.ImportFrom) walks
+// the full transitive closure through this same Provider, bypassing
+// internal/depexport's persistent, CAS-backed cache entirely (that cache
+// only ever intercepts a TOP-LEVEL request — a root package's own direct
+// import — never a recursive one; see depexport.Cache.ExportData's doc) —
+// a real, measured regression against a synthetic ~370-package dependency
+// closure went from ~7s/~300MB (a correctly-sized cap) to ~72s/~7GB
+// (DefaultCap) purely from LRU eviction forcing the same widely-shared
+// packages (fmt, context, sync, ...) to be rechecked from scratch over and
+// over. Scaling the cap with parallelism instead of with nonRootCount
+// keeps that headroom (concurrent workers each get their own working-set
+// budget — see batchCapPerWorker) while bounding worst-case resident
+// memory to a size independent of workspace size, matching this package's
+// own DefaultCap's identical bounding argument for the navigation case.
+// nonRootCount is still respected as an upper bound: a workspace whose
+// entire non-root closure is smaller than the parallelism-scaled budget
+// gains nothing from a larger cap.
+func RecommendedCap(nonRootCount, parallelism int) int {
+	ceiling := max(DefaultCap, parallelism*batchCapPerWorker)
+	if nonRootCount < ceiling {
+		return max(nonRootCount, DefaultCap)
 	}
-	return nonRootCount
+	return ceiling
 }
 
 // FullBodyDefaultCap is the full-body LRU's default entry capacity
@@ -234,9 +270,11 @@ type Provider struct {
 
 	mu          sync.Mutex
 	lru         *lruCache
-	fullLRU     *lruCache // full-body-checked packages (see PackageWithBodies), separate from lru so a small handful of open dependency files never evicts the much larger decl-only working set
-	checked     int64     // count of Package calls that actually ran CheckPackage (cache+singleflight misses); test/observability hook.
-	fullChecked int64     // count of PackageWithBodies calls that actually ran a fresh full-body check; test/observability hook.
+	fullLRU     *lruCache       // full-body-checked packages (see PackageWithBodies), separate from lru so a small handful of open dependency files never evicts the much larger decl-only working set
+	checked     int64           // count of Package calls that actually ran CheckPackage (cache+singleflight misses); test/observability hook.
+	fullChecked int64           // count of PackageWithBodies calls that actually ran a fresh full-body check; test/observability hook.
+	exports     *exportResolver // TRANSITIVE import resolution's decode fast path; nil until SetExportSource is called (see its doc)
+	decoded     int64           // count of ImportFrom calls served via exports instead of a full recursive check; see Decoded
 }
 
 // NewProvider returns a Provider resolving package metadata via meta,
@@ -571,14 +609,48 @@ func (imp *ctxImporter) Import(path string) (*types.Package, error) {
 // ImportFrom resolves path against the full-body LRU first, so an import of
 // a package the caller also has open (via PackageWithBodies) shares its
 // exact *types.Package identity instead of triggering a second, divergent
-// declarations-only check — see PackageWithBodies's doc.
+// declarations-only check — see PackageWithBodies's doc. Next, the
+// declarations-only LRU: an already-resident, source-checked instance is
+// always preferred over a decode, since it costs nothing further to reuse.
+// Only once both miss does this fall to imp.p's exportResolver (see its own
+// doc), decoding path from persisted export data instead of a full
+// recursive source-check — the fix for the production regression measured
+// against a dependency closure larger than the LRU's own cap: without an
+// ExportSource configured (imp.p.exportResolverFor returns nil), this falls
+// straight through to the original full-check behavior, unchanged.
+//
+// "unsafe" is special-cased before any of that, exactly like
+// Provider.Package's own identical check (and
+// typecheck.Importer.ImportFrom's): types.Unsafe has no source and
+// gcexportdata.Write panics unconditionally trying to serialize it (see
+// depexport.Cache.ExportData's doc), so the exportResolver path — which
+// would otherwise ask an ExportSource for "unsafe" bytes exactly like any
+// other transitive import — must never see it.
 func (imp *ctxImporter) ImportFrom(path, _ string, _ types.ImportMode) (*types.Package, error) {
 	if err := imp.ctx.Err(); err != nil {
 		return nil, err
 	}
+	if path == unsafePkgPath {
+		return types.Unsafe, nil
+	}
 	if cp, ok := imp.p.getFull(path); ok {
 		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
 		return cp.Types(), nil
+	}
+	if cp, ok := imp.p.get(path); ok {
+		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
+		return cp.Types(), nil
+	}
+	if r := imp.p.exportResolverFor(); r != nil {
+		pkg, complete, ok, err := r.resolve(imp.ctx, path)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			imp.importIncomplete = imp.importIncomplete || !complete
+			imp.p.recordDecoded()
+			return pkg, nil
+		}
 	}
 	cp, err := imp.p.Package(imp.ctx, path)
 	if err != nil {

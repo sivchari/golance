@@ -53,12 +53,13 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 	keys := newKeyTable(ctx, db)
 	exp := newCASExportSource(ctx, cas, keys)
 	// See Build's identical comments: depExp replaces the removed
-	// graph.Snapshot.ExportFile path for non-root dependency resolution,
-	// and depProvider's cap must be sized to the full non-root package
-	// count (depcheck.RecommendedCap) to avoid LRU thrashing across a
-	// closure walk that can touch many packages in one Reindex call.
+	// graph.Snapshot.ExportFile path for non-root dependency resolution, and
+	// depProvider's cap is sized via depcheck.RecommendedCap to bound worst-
+	// case memory independent of workspace size, while still giving a
+	// closure walk that touches many packages in one Reindex call enough
+	// headroom to avoid LRU thrashing.
 	depMeta := depcheck.NewGraphMetadataSource(snap)
-	depProvider := depcheck.NewProvider(depMeta, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootCount(snap))})
+	depProvider := depcheck.NewProvider(depMeta, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootCount(snap), o.Parallelism)})
 	depExp := depexport.NewCache(o.DepCAS, depMeta, depProvider, depexport.Options{BuildFlagsFingerprint: o.BuildFlagsFingerprint})
 	imp := typecheck.NewImporter(fset, exp, depExp, typecheck.NewCache())
 

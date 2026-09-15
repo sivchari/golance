@@ -25,9 +25,9 @@ import (
 // external test — see resolveFiles), parses them, resolves dependencies via
 // e.newImporter, and type-checks the result. A file declaring the external
 // test package imports its base package (if at all) by its ordinary,
-// real import path — resolved through the exact same e.newImporter() chain
-// as any other cross-package import (export data, not source), same as
-// every dependency; nothing here treats it specially. On success the
+// real import path — resolved through the exact same e.newImporter(ctx)
+// chain as any other cross-package import, same as every dependency;
+// nothing here treats it specially. On success the
 // CheckedPackage is committed (see Engine.commit) — cached and, if
 // configured, published via Options.OnResult, unless a newer-generation
 // recheck for key has already committed. ctx.Err() is checked before and
@@ -55,7 +55,7 @@ func (e *Engine) runRecheck(ctx context.Context, key unitKey) (*CheckedPackage, 
 	if err != nil {
 		return nil, err
 	}
-	hash, err := contentHash(e.reader, files)
+	hash, err := e.contentHash(files)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +71,7 @@ func (e *Engine) runRecheck(ctx context.Context, key unitKey) (*CheckedPackage, 
 		return nil, err
 	}
 
-	imp := e.newImporter()
+	imp := e.newImporter(ctx)
 	pkg, info, typeErrs := typecheck.CheckPackage(fset, astFiles, pi.pkgPath, imp)
 
 	if err := ctx.Err(); err != nil {
@@ -183,7 +183,7 @@ func (e *Engine) canonicalPackageName(pi pkgInfo, candidates []string) (string, 
 // the file. ok is false if the file cannot be read or has no parseable
 // package clause.
 func (e *Engine) packageClauseName(path string) (string, bool) {
-	src, err := e.reader.ReadFile(path)
+	src, err := e.readFile(path)
 	if err != nil {
 		return "", false
 	}
@@ -192,6 +192,91 @@ func (e *Engine) packageClauseName(path string) (string, bool) {
 		return "", false
 	}
 	return f.Name.Name, true
+}
+
+// fileCacheEntry is one readFile memoization: path's content as of modTime
+// and size, both read straight from the same os.Stat call that validates
+// it.
+type fileCacheEntry struct {
+	modTime  time.Time
+	size     int64
+	data     []byte
+	lastUsed time.Time
+}
+
+// openChecker is an optional capability of an Engine's reader: if it can
+// report whether a single path is currently open in the editor (as
+// *overlay.Overlay does), readFile never memoizes it — an open document's
+// content can change (DidChange) without its on-disk mtime moving, so
+// caching it by disk stat would risk serving stale content after an unsaved
+// edit. A reader without this capability is never memoized at all, which is
+// always correct, just slower.
+type openChecker interface {
+	IsOpen(path string) bool
+}
+
+// readFile returns path's content through e.reader (overlay-aware), the
+// same as calling e.reader.ReadFile directly, except a path the reader
+// reports as not open (see openChecker) is memoized by disk (mtime, size)
+// in e.fc. Both resolveFiles' package-clause filter (packageClauseName) and
+// contentHash read every candidate file of a package on every single Get —
+// including a Get that ends up being an unchanged-content cache hit, since
+// contentHash's result is what Get compares against the cache to know that.
+// Without this, a package of N files pays N full reads-and-parses plus N
+// full reads-and-hashes on every request that touches it, even when
+// nothing has changed since the last one; with it, an unchanged disk file
+// costs one os.Stat both times it is asked for; readFile is measurably the
+// dominant cost of a warm, repeated hover otherwise (see
+// TestEngine_Get_RepeatedGetOnUnchangedPackageAvoidsDiskRereads).
+func (e *Engine) readFile(path string) ([]byte, error) {
+	if oc, ok := e.reader.(openChecker); ok && oc.IsOpen(path) {
+		return e.reader.ReadFile(path)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return e.reader.ReadFile(path)
+	}
+
+	now := time.Now()
+	e.fcMu.Lock()
+	if entry, ok := e.fc[path]; ok && entry.modTime.Equal(info.ModTime()) && entry.size == info.Size() {
+		entry.lastUsed = now
+		e.fc[path] = entry
+		data := entry.data
+		e.fcMu.Unlock()
+		return data, nil
+	}
+	e.fcMu.Unlock()
+
+	data, err := e.reader.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	e.fcMu.Lock()
+	if _, exists := e.fc[path]; !exists && len(e.fc) >= maxFileCache {
+		e.evictFileCacheLocked()
+	}
+	e.fc[path] = fileCacheEntry{modTime: info.ModTime(), size: info.Size(), data: data, lastUsed: now}
+	e.fcMu.Unlock()
+	return data, nil
+}
+
+// evictFileCacheLocked removes the least recently used entry from e.fc, if
+// any. Callers must hold e.fcMu.
+func (e *Engine) evictFileCacheLocked() {
+	var oldestPath string
+	var oldestTime time.Time
+	found := false
+	for path, entry := range e.fc {
+		if !found || entry.lastUsed.Before(oldestTime) {
+			oldestPath, oldestTime = path, entry.lastUsed
+			found = true
+		}
+	}
+	if found {
+		delete(e.fc, oldestPath)
+	}
 }
 
 // dirLister is an optional capability of an Engine's reader: if it can
@@ -276,12 +361,13 @@ func parseFiles(fset *token.FileSet, reader overlay.FileReader, files []string) 
 	return out, texts, errs
 }
 
-// contentHash hashes files' content (overlay-aware, via reader) together
-// with their paths, so both edits and additions/removals change the hash.
-func contentHash(reader overlay.FileReader, files []string) (string, error) {
+// contentHash hashes files' content (overlay-aware and, for an unchanged
+// disk file, memoized — see readFile) together with their paths, so both
+// edits and additions/removals change the hash.
+func (e *Engine) contentHash(files []string) (string, error) {
 	h := sha256.New()
 	for _, path := range files {
-		data, err := reader.ReadFile(path)
+		data, err := e.readFile(path)
 		if err != nil {
 			return "", fmt.Errorf("check: read %s: %w", path, err)
 		}

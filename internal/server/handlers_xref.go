@@ -252,18 +252,31 @@ func builtinDefLocation(logger *log.Logger, info *langfeat.BuiltinDefInfo) (xref
 	return xref.Location{File: info.Filename, Line: uint32(info.Line), Col: uint32(info.Col), EndCol: uint32(info.EndCol)}, true
 }
 
-// dependencyDefinition is definitionFallback's path for a symbol the
-// workspace facts index has no answer for and that is not declared in cf's
-// own package: the facts index only ever covers root (workspace) packages
-// (see internal/index/scheduler.go's doc), so a definition query on an
-// identifier from the standard library or a module dependency always
-// misses there. This resolves it instead through the type-checked
-// package's own Uses/Defs, mapped into a source-type-checked copy of the
-// target dependency package via ws.depProvider (internal/depcheck) —
-// exact to the column, and able to see unexported dependency types (see
-// internal/langfeat.DependencyDefinition, internal/depcheck's package doc)
-// — rather than the line-only, exported-only positions
-// gcexportdata/depCache offer.
+// dependencyDefinition is definitionFallback's path for a symbol not
+// declared in cf's own package and not yet (or not ever) answerable from
+// the workspace facts index: the standard library, a module dependency, or
+// another workspace (root) package while the facts index is still building
+// or legitimately has no entry for this position (see
+// internal/index/scheduler.go's doc — an individual package can end up with
+// none). This resolves it instead through the type-checked package's own
+// Uses/Defs, mapped into a source-type-checked copy of the target package
+// via ws.depProvider (internal/depcheck) — exact to the column, and able to
+// see unexported types (see internal/langfeat.DependencyDefinition,
+// internal/depcheck's package doc) — rather than the line-only,
+// exported-only positions gcexportdata/depCache offer.
+//
+// A root-package target used to be excluded here entirely, to avoid a
+// stale-data race TestE2E_WorktreeSharesIndex once pinned: a save landing
+// while the facts index was still unavailable used to be silently dropped,
+// with no retry once the index later opened, so an early answer risked
+// masking that loss. handleDidSave's markDirty/drainDirty (documentsync.go)
+// closed that gap — a save made during the index-build window is always
+// reindexed once the index opens, whether or not this path already
+// answered a query for it — so the exclusion no longer protects against
+// anything, and cost every cross-package "go to definition" the whole
+// cold-start index build's duration (minutes, on a large workspace) for no
+// benefit: a healthy facts index still always wins once built, since
+// handleDefinition consults it before ever reaching this fallback.
 func (s *Server) dependencyDefinition(ctx context.Context, cf checkedFileResult) (xref.Location, bool) {
 	ws := s.workspace()
 	if ws == nil {
@@ -276,27 +289,6 @@ func (s *Server) dependencyDefinition(ctx context.Context, cf checkedFileResult)
 		return xref.Location{}, false
 	}
 	if info == nil {
-		return xref.Location{}, false
-	}
-	// A root (workspace) package's export data is never offered as a
-	// substitute for the facts index's own answer, even from
-	// definitionFallback (the index-unavailable path): TestE2E_WorktreeSharesIndex
-	// pinned a real hazard this used to create. A second session (or a
-	// cold-start session, before its own index build finishes) treats a
-	// non-empty textDocument/definition result as a signal that the index
-	// is now usable — e.g. the E2E suite's waitForNonEmptyLocations, and a
-	// real editor racing a request right after the index-build progress
-	// notification fires — and, per handleDidSave, an edit saved while
-	// s.idx is still nil never gets incrementally reindexed at all (no
-	// retry once the index later opens). Answering a workspace package's
-	// position via export data here would let that race succeed on stale
-	// grounds — the index build might complete moments later with the
-	// authoritative, exact-column answer — silently dropping the
-	// reindex-after-save the caller would otherwise still be waiting for.
-	// The standard library and module dependencies carry no such risk
-	// (nothing in this workspace ever reindexes them), so only this case is
-	// excluded.
-	if pkg, ok := ws.snap.Packages[info.PkgPath]; ok && pkg.Root {
 		return xref.Location{}, false
 	}
 	if _, err := os.Stat(info.Filename); err != nil {

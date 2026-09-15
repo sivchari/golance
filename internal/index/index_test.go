@@ -227,6 +227,44 @@ func Use(t *defpkg.T) string {
 	}
 }
 
+// TestBuild_DirectUnsafeImportIndexesSuccessfully verifies a workspace
+// package that directly imports "unsafe" (mirroring generated protobuf
+// code, e.g. protoc-gen-go's "for linkname" import) indexes with
+// Stats.Errors == 0. go/types calls the type-checker's Importer for
+// "unsafe" exactly like any other import path (see
+// internal/typecheck.Importer.ImportFrom's own doc): before that special
+// case existed, checking such a package here panicked ("cannot export
+// package unsafe") every single time, recovered by processUnitRecovered
+// into a permanent per-package Stats.Errors entry — the production symptom
+// this guards against for any protobuf-heavy monorepo, where that import is
+// near-universal.
+func TestBuild_DirectUnsafeImportIndexesSuccessfully(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "go.mod", "module example.com/unsafemod\n\ngo 1.23\n")
+	writeFile(t, dir, "unsafeuser/unsafeuser.go", `package unsafeuser
+
+import "unsafe"
+
+func AsPointer(v *int) unsafe.Pointer {
+	return unsafe.Pointer(v)
+}
+`)
+
+	snap := loadSnapshot(t, dir)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+
+	stats, err := Build(context.Background(), snap, db, cas, &Options{})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if stats.Errors != 0 {
+		t.Errorf("Errors = %d, want 0", stats.Errors)
+	}
+
+	findSymbolByName(t, db, cas, "example.com/unsafemod/unsafeuser", "AsPointer")
+}
+
 // writeFile writes content to rel under dir, creating parent directories as
 // needed.
 func writeFile(t *testing.T, dir, rel, content string) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +57,59 @@ func TestRunIndexerRequiresEnv(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "GOLANCE_ROOT") {
 		t.Fatalf("runIndexer() stderr = %q, want it to mention GOLANCE_ROOT", stderr.String())
+	}
+}
+
+// TestApplyDefaultMemLimit_SetsLimitWhenUnset verifies that a GOMEMLIMIT-less
+// environment gets defaultIndexerMemLimit — the case a production launch
+// with neither --mem-limit nor GOLANCE_MEM_LIMIT configured hits, which
+// otherwise leaves the indexer subprocess's heap unbounded (see
+// defaultIndexerMemLimit's own doc for the measured peak-RSS cost of that).
+func TestApplyDefaultMemLimit_SetsLimitWhenUnset(t *testing.T) {
+	t.Setenv("GOMEMLIMIT", "")
+	orig := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(orig) })
+
+	applyDefaultMemLimit(defaultIndexerMemLimit)
+
+	if got := debug.SetMemoryLimit(-1); got != defaultIndexerMemLimit {
+		t.Fatalf("SetMemoryLimit(-1) = %d, want %d", got, defaultIndexerMemLimit)
+	}
+}
+
+// TestApplyDefaultMemLimit_ServerLimit verifies the SERVER path's own call
+// (run, not runIndexer) applies defaultServerMemLimit — the backstop
+// documented on that constant — via the identical, generalized
+// applyDefaultMemLimit helper.
+func TestApplyDefaultMemLimit_ServerLimit(t *testing.T) {
+	t.Setenv("GOMEMLIMIT", "")
+	orig := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(orig) })
+
+	applyDefaultMemLimit(defaultServerMemLimit)
+
+	if got := debug.SetMemoryLimit(-1); got != defaultServerMemLimit {
+		t.Fatalf("SetMemoryLimit(-1) = %d, want %d", got, defaultServerMemLimit)
+	}
+}
+
+// TestApplyDefaultMemLimit_LeavesExistingLimitAlone verifies that a
+// GOMEMLIMIT already present in the environment (set by internal/server
+// forwarding --mem-limit/GOLANCE_MEM_LIMIT, or by a caller directly) is left
+// untouched: applyDefaultMemLimit must never override a limit the runtime
+// already applied from GOMEMLIMIT at process start.
+func TestApplyDefaultMemLimit_LeavesExistingLimitAlone(t *testing.T) {
+	t.Setenv("GOMEMLIMIT", "8GiB")
+	orig := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(orig) })
+
+	const sentinel = 123456789
+	debug.SetMemoryLimit(sentinel)
+
+	applyDefaultMemLimit(defaultIndexerMemLimit)
+
+	if got := debug.SetMemoryLimit(-1); got != sentinel {
+		t.Fatalf("SetMemoryLimit(-1) = %d, want sentinel %d left unchanged", got, sentinel)
 	}
 }
 

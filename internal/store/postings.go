@@ -163,13 +163,20 @@ func decodePostingLocations(b []byte) ([]PostingLocation, error) {
 
 // appendManifestEntry appends one (targetPkgHash, targetIDHash) pair to
 // list, the fixed-16-byte-per-entry encoding of a srcPkgHash's posting
-// manifest (see applyPostings).
+// manifest (see applyPostings). Unlike appendUint64/appendMethodEntry/
+// appendStringList — which must defensively copy because their own list
+// argument is frequently a slice bbolt itself owns (a prior Bucket.Get,
+// still live inside the same read-write transaction — see their own call
+// sites in applyIndexEntries) and so cannot be grown via append without
+// risking an in-place write into bbolt's mmap'd page — list here is always
+// applyPostings' own purely local variable, rebuilt from scratch on every
+// call, so plain append's amortized growth is safe: its only caller
+// (applyPostings) never passes it anything bbolt owns.
 func appendManifestEntry(list []byte, k postingGroupKey) []byte {
-	out := make([]byte, len(list)+16)
-	copy(out, list)
-	binary.LittleEndian.PutUint64(out[len(list):], k.TargetPkgHash)
-	binary.LittleEndian.PutUint64(out[len(list)+8:], k.TargetIDHash)
-	return out
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[0:8], k.TargetPkgHash)
+	binary.LittleEndian.PutUint64(buf[8:16], k.TargetIDHash)
+	return append(list, buf[:]...)
 }
 
 // decodeManifest decodes a srcPkgHash's posting manifest, the list of
@@ -228,7 +235,7 @@ func applyPostings(tx *bbolt.Tx, srcPkgHash uint64, postings []PostingEntry) err
 		return targets[i].TargetIDHash < targets[j].TargetIDHash
 	})
 
-	var manifest []byte
+	manifest := make([]byte, 0, len(targets)*16)
 	for _, k := range targets {
 		if err := postB.Put(postingKey(k.TargetPkgHash, k.TargetIDHash, srcPkgHash), encodePostingLocations(groups[k])); err != nil {
 			return err

@@ -128,11 +128,16 @@ type Stats struct {
 // memory proportional to the worker count rather than to workspace size.
 //
 // Build's returned error is reserved for conditions that leave db
-// untrustworthy as a whole: a canceled context, or a failed batch commit. A
-// package that itself fails to parse or type-check does not cause an error
-// here — it is only reflected in Stats.Errors — since one unbuildable
-// package among many otherwise-good ones must not make an indexer exit
-// non-zero and discard a mostly-successful build (see buildResults.record).
+// untrustworthy as a whole: a canceled context (see buildResults.recordFatal).
+// A package that itself fails to parse or type-check, or a batch that fails
+// to commit to db, does not cause an error here — both are only reflected
+// in Stats.Errors — since one unbuildable package (or one lost batch) among
+// many otherwise-good ones must not make an indexer exit non-zero, withhold
+// the build fingerprint (below), and so discard a mostly-successful build's
+// own trustworthiness (see buildResults.record and .flushPendingLocked): a
+// missing UnitPointer for the affected package(s) is exactly what
+// index.RevalidateStale already detects and repairs on its own, scoped to
+// just those packages, without needing the whole database rebuilt.
 func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.CAS, opts *Options) (Stats, error) {
 	// o is Build's own private, defaulted copy of *opts (withDefaults never
 	// mutates opts itself — see its own doc): every use below reads o, not
@@ -154,13 +159,15 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 	// path). depExp persists each result in o.DepCAS so a dependency
 	// already checked by THIS run, an earlier one, or even a different
 	// repository's indexer never needs rechecking on this machine again.
-	// depProvider's own LRU is sized to this run's WHOLE non-root package
-	// count (depcheck.RecommendedCap), not depcheck.DefaultCap — see that
-	// constant's own doc for the real, measured thrashing regression a
-	// batch run like this one hits at DefaultCap's small, navigation-sized
-	// capacity.
+	// depProvider's own LRU is sized to o.Parallelism (depcheck.
+	// RecommendedCap), not to this run's whole non-root package count: see
+	// RecommendedCap's own doc for why holding every non-root package live
+	// for the run's entire duration — this used to do exactly that — is what
+	// drove a large workspace's peak RSS past its safety cap, and for the
+	// real, measured thrashing regression a batch run like this one still
+	// risks at DefaultCap's much smaller, navigation-sized capacity.
 	depMeta := depcheck.NewGraphMetadataSource(snap)
-	depProvider := depcheck.NewProvider(depMeta, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootCount(snap))})
+	depProvider := depcheck.NewProvider(depMeta, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootCount(snap), o.Parallelism)})
 	depExp := depexport.NewCache(o.DepCAS, depMeta, depProvider, depexport.Options{BuildFlagsFingerprint: o.BuildFlagsFingerprint})
 	imp := typecheck.NewImporter(fset, exp, depExp, cache)
 	sem := semaphore.NewWeighted(int64(o.Parallelism))
@@ -194,8 +201,12 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 		// revalidation pass (see Revalidate, used by
 		// internal/server.indexNeedsRebuild) can rule out a toolchain
 		// change with one cheap read instead of inspecting every package.
-		// Only recorded on a run with no fatal error: a failed run's db is
-		// exactly what that check must not trust.
+		// Only recorded on a run with no fatal error: a canceled run's db is
+		// exactly what that check must not trust. A non-fatal batch commit
+		// failure (buildResults.flushPendingLocked) still reaches this
+		// branch, so the fingerprint is recorded and the next revalidation
+		// pass judges only the specific packages that batch lost as stale,
+		// not the whole database.
 		if fpErr := db.PutBuildFingerprint(o.ToolchainFingerprint); fpErr != nil {
 			err = fmt.Errorf("index: record build fingerprint: %w", fpErr)
 		}
