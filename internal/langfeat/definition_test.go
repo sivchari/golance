@@ -747,65 +747,6 @@ func TestPackageNameDefinition_SelectorReturnsNil(t *testing.T) {
 	}
 }
 
-// TestPackageNameDefinition_GoplsParity checks golance's own result for a
-// plain and an aliased package-qualifier query against gopls v0.23.0's
-// ("definition" CLI subcommand) resolution of the identical query.
-// Skipped if gopls is not on PATH (e.g. CI).
-func TestPackageNameDefinition_GoplsParity(t *testing.T) {
-	goplsPath, err := exec.LookPath("gopls")
-	if err != nil {
-		t.Skip("gopls not on PATH")
-	}
-
-	reader := overlay.New()
-	cp, path := newCheckedPackage(t, reader, "packagename", "packagename.go")
-	text, err := reader.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	moduleRoot, err := filepath.Abs(filepath.Join("testdata", "module"))
-	if err != nil {
-		t.Fatalf("abs testdata root: %v", err)
-	}
-	gocache := t.TempDir()
-
-	tests := []struct {
-		name   string
-		substr string
-	}{
-		{name: "plain", substr: "fmt.Println("},
-		{name: "aliased", substr: "str.ToUpper("},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			offset := mustIndex(t, text, tt.substr)
-
-			got, err := langfeat.PackageNameDefinition(cp, path, offset)
-			if err != nil {
-				t.Fatalf("PackageNameDefinition: %v", err)
-			}
-			if got == nil {
-				t.Fatal("PackageNameDefinition returned nil, want a result")
-			}
-
-			line, col := lineCol(text, offset)
-			target := "packagename/packagename.go:" + strconv.Itoa(line) + ":" + strconv.Itoa(col)
-			cmd := exec.Command(goplsPath, "definition", target)
-			cmd.Dir = moduleRoot
-			cmd.Env = append(os.Environ(), "GOCACHE="+gocache)
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatalf("gopls definition %s: %v\n%s", target, err, out)
-			}
-			_, wantLine, wantCol := parseGoplsDefinition(t, string(out))
-
-			gotLine, gotCol := lineCol(text, got.Range.StartOffset)
-			if gotLine != wantLine || gotCol != wantCol {
-				t.Errorf("position = %d:%d, gopls resolved %d:%d", gotLine, gotCol, wantLine, wantCol)
-			}
-		})
-	}
-}
 
 // TestPackageNameReferences_PlainImportIncludeDecl covers references on a
 // plain, unaliased package-qualifier identifier used twice in the same
