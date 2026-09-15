@@ -680,6 +680,235 @@ func TestHandleDefinition_NoIndex_Stdlib(t *testing.T) {
 	}
 }
 
+// substrPosition returns the LSP Position of substr's first byte-offset
+// occurrence in data, the same overlay.UTF16PositionForByteOffset
+// conversion identPositionIn uses for an *ast.Ident-based position, but for
+// a target with no Ident node of its own — an import spec's quoted path
+// string literal, e.g. — where an AST-based search cannot find it.
+func substrPosition(t *testing.T, data []byte, substr string) protocol.Position {
+	t.Helper()
+	i := bytes.Index(data, []byte(substr))
+	if i < 0 {
+		t.Fatalf("substring %q not found in:\n%s", substr, data)
+	}
+	pos, ok := overlay.UTF16PositionForByteOffset(data, i)
+	if !ok {
+		t.Fatalf("offset %d out of range", i)
+	}
+	return pos
+}
+
+// TestHandleDefinition_NoIndex_PackageName covers "Go to Definition" on a
+// package-QUALIFIER identifier (the "fmt" in "fmt.Sprintf") with the
+// workspace facts index entirely unavailable. Before
+// langfeat.PackageNameDefinition existed, both SamePackageDefinition and
+// DependencyDefinition declined this case outright: a *types.PkgName's
+// Pkg() reports the IMPORTING package, so both mistook it for a
+// same-package identifier and then failed to find an *ast.Ident at the
+// PkgName's own Pos() -- for a plain, unaliased import, the quoted path
+// string literal, not an identifier -- so definitionFallback answered
+// nothing at all. Per gopls, the result lands on depuse.go's own "fmt"
+// import spec, not inside GOROOT -- contrast
+// TestHandleDefinition_NoIndex_Stdlib, which queries the SELECTOR
+// "Sprintf" (after the dot) instead and already resolved into
+// fmt/print.go before this fix.
+func TestHandleDefinition_NoIndex_PackageName(t *testing.T) {
+	s, snap := newTestServerNoIndex(t)
+	pkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(pkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	file := pkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	pos := identPositionIn(t, file, data, "fmt", 1) // the "fmt" qualifier in fmt.Sprintf
+
+	result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleDefinition(no index, fmt qualifier): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleDefinition(no index, fmt qualifier): result = %#v, want a single location", result)
+	}
+	if got := locs[0].URI.FsPath(); got != file {
+		t.Errorf("definition file = %q, want %q (the current file's own import spec)", got, file)
+	}
+	want := substrPosition(t, data, `"fmt"`)
+	if locs[0].Range.Start != want {
+		t.Errorf("definition start = %+v, want %+v (the quoted \"fmt\" path literal)", locs[0].Range.Start, want)
+	}
+}
+
+// TestHandleDefinition_PackageName is
+// TestHandleDefinition_NoIndex_PackageName's counterpart with a built
+// facts index available: the index never records a *types.PkgName as an
+// indexable symbol (it names an import, not a workspace declaration), so
+// resolver.Definition errors and handleDefinition falls through to
+// definitionFallback exactly as it does with no index at all -- this pins
+// that the fallback still runs, and still answers correctly, once the
+// index is ready.
+func TestHandleDefinition_PackageName(t *testing.T) {
+	s, snap, _ := newTestServer(t)
+	pkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(pkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	file := pkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	pos := identPositionIn(t, file, data, "fmt", 1) // the "fmt" qualifier in fmt.Sprintf
+
+	result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleDefinition(fmt qualifier): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleDefinition(fmt qualifier): result = %#v, want a single location", result)
+	}
+	if got := locs[0].URI.FsPath(); got != file {
+		t.Errorf("definition file = %q, want %q (the current file's own import spec)", got, file)
+	}
+	want := substrPosition(t, data, `"fmt"`)
+	if locs[0].Range.Start != want {
+		t.Errorf("definition start = %+v, want %+v (the quoted \"fmt\" path literal)", locs[0].Range.Start, want)
+	}
+}
+
+// TestHandleDefinition_NoIndex_PackageName_SelectorUnaffected guards
+// against regressing the already-working selector-after-the-dot path
+// alongside the package-qualifier fix: a query on "Sprintf" itself (not
+// its "fmt" qualifier) must still resolve into GOROOT via
+// dependencyDefinition, exactly like TestHandleDefinition_NoIndex_Stdlib.
+func TestHandleDefinition_NoIndex_PackageName_SelectorUnaffected(t *testing.T) {
+	s, snap := newTestServerNoIndex(t)
+	pkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(pkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	file := pkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	pos := identPositionIn(t, file, data, "Sprintf", 1)
+
+	result, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("handleDefinition(no index, fmt.Sprintf selector): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleDefinition(no index, fmt.Sprintf selector): result = %#v, want a single location", result)
+	}
+	target := locs[0].URI.FsPath()
+	if !strings.HasSuffix(target, filepath.FromSlash("fmt/print.go")) {
+		t.Errorf("definition file = %q, want it to end with fmt/print.go (inside GOROOT)", target)
+	}
+}
+
+// TestHandleReferences_NoIndex_PackageName covers references on a
+// package-QUALIFIER identifier with the workspace facts index entirely
+// unavailable: resolver.References is never even reached (resolverOrWarn's
+// ok=false short-circuits to indexUnavailableError), so this exercises
+// packageNameReferencesFallback's ok=false branch specifically. depuse.go
+// uses the "fmt" qualifier exactly once (fmt.Sprintf), so with
+// IncludeDeclaration the result is the import spec plus that one use.
+func TestHandleReferences_NoIndex_PackageName(t *testing.T) {
+	s, snap := newTestServerNoIndex(t)
+	pkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(pkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	file := pkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	pos := identPositionIn(t, file, data, "fmt", 1)
+
+	result, err := s.handleReferences(context.Background(), mustMarshal(t, &protocol.ReferenceParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+		Context: protocol.ReferenceContext{IncludeDeclaration: true},
+	}))
+	if err != nil {
+		t.Fatalf("handleReferences(no index, fmt qualifier): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 2 {
+		t.Fatalf("handleReferences(no index, fmt qualifier): result = %#v, want 2 locations (import spec + one use)", result)
+	}
+	declPos := substrPosition(t, data, `"fmt"`)
+	usePos := identPositionIn(t, file, data, "fmt", 1)
+	gotStarts := map[protocol.Position]bool{locs[0].Range.Start: true, locs[1].Range.Start: true}
+	if !gotStarts[declPos] || !gotStarts[usePos] {
+		t.Errorf("reference starts = %+v, want {%+v, %+v}", []protocol.Position{locs[0].Range.Start, locs[1].Range.Start}, declPos, usePos)
+	}
+}
+
+// TestHandleReferences_PackageName is
+// TestHandleReferences_NoIndex_PackageName's counterpart with a built
+// facts index available: the facts index never records a *types.PkgName as
+// an indexable symbol, so resolver.References errors (or, if it somehow
+// answered for an unrelated reason, would still find nothing for this
+// position), and handleReferences falls through to
+// packageNameReferencesFallback exactly as it does with no index at all.
+func TestHandleReferences_PackageName(t *testing.T) {
+	s, snap, _ := newTestServer(t)
+	pkg, ok := snap.Packages["example.com/servermod/depuse"]
+	if !ok || len(pkg.GoFiles) == 0 {
+		t.Fatal("depuse package not found in test workspace")
+	}
+	file := pkg.GoFiles[0]
+	data, err := os.ReadFile(filepath.Clean(file))
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	pos := identPositionIn(t, file, data, "fmt", 1)
+
+	result, err := s.handleReferences(context.Background(), mustMarshal(t, &protocol.ReferenceParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(file)},
+			Position:     pos,
+		},
+		Context: protocol.ReferenceContext{IncludeDeclaration: false},
+	}))
+	if err != nil {
+		t.Fatalf("handleReferences(fmt qualifier): %v", err)
+	}
+	locs, ok := result.(protocol.LocationSlice)
+	if !ok || len(locs) != 1 {
+		t.Fatalf("handleReferences(fmt qualifier): result = %#v, want 1 location (the one use, declaration excluded)", result)
+	}
+	usePos := identPositionIn(t, file, data, "fmt", 1)
+	if locs[0].Range.Start != usePos {
+		t.Errorf("reference start = %+v, want %+v", locs[0].Range.Start, usePos)
+	}
+}
+
 // TestHandleDefinition_NoIndex_OtherWorkspacePackage verifies
 // handleDefinition degrades gracefully — no error, no panic, empty result —
 // for depuse.go's reference to greet.Greeting, a type declared in a
