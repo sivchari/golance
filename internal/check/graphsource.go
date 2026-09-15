@@ -214,6 +214,37 @@ func (g *GraphSource) packageClauseName(path string) (string, bool) {
 	return f.Name.Name, true
 }
 
+// PackageDir implements SnapshotSource: it resolves pkgPath directly, by
+// import path, rather than PackageForFile's by-file lookup — used to
+// resolve a package another root package imports (see Engine.GetPackage)
+// without needing any of its files' paths first.
+func (g *GraphSource) PackageDir(pkgPath string) (dir string, goFiles []string, ok bool) {
+	idx := g.idx.Load()
+	pkg, ok := idx.snap.Package(pkgPath)
+	if !ok {
+		return "", nil, false
+	}
+	return pkg.Dir, pkg.GoFiles, true
+}
+
+// IsRoot implements SnapshotSource, reporting whether pkgPath is one of the
+// snapshot's Root (workspace) packages.
+func (g *GraphSource) IsRoot(pkgPath string) bool {
+	idx := g.idx.Load()
+	pkg, ok := idx.snap.Package(pkgPath)
+	return ok && pkg.Root
+}
+
+// Snapshot returns g's current *graph.Snapshot — whatever NewGraphSource or
+// the most recent Retarget installed. Used by a caller that needs more of a
+// package's graph data than PackageForFile/PackageDir/IsRoot expose (e.g.
+// internal/server's rootExportSource, which calls index.PackageChanged
+// against it) without duplicating GraphSource's own retargetable snapshot
+// pointer.
+func (g *GraphSource) Snapshot() *graph.Snapshot {
+	return g.idx.Load().snap
+}
+
 // adhocPackageForFile is PackageForFile's final fallback; see its doc.
 func (g *GraphSource) adhocPackageForFile(path string) (pkgPath, dir string, goFiles []string, ok bool) {
 	if _, ok := g.packageClauseName(path); !ok {

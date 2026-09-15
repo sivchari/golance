@@ -41,6 +41,14 @@ func TestHandleHover_GenericWrapperFieldThroughExportProduction(t *testing.T) {
 	s := New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(root, snap)
 	stopWorkspaceEngineOnCleanup(t, s)
+	// Mark the facts index ready: this test is pinning the export-
+	// production decode-corruption fix (see its own doc), orthogonal to
+	// depCacheHolder.importer's cold-index-build gate (workspace.go), which
+	// otherwise leaves box/payload — non-root but freshly, never-before-
+	// resolved in this test's own throwaway CAS — unresolved while s.idx is
+	// nil, making hover answer nil for a reason unrelated to what this test
+	// exists to guard against.
+	s.idx.Store(&indexState{})
 
 	consumerFile := filepath.Join(root, "consumer", "consumer.go")
 	data, err := os.ReadFile(consumerFile)

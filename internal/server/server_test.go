@@ -47,19 +47,24 @@ func newTestLogger(t *testing.T) *log.Logger {
 // index.Build runs in-process here, the same way internal/index's and
 // internal/xref's own tests build a facts database.
 // stopWorkspaceEngineOnCleanup registers a t.Cleanup that stops s's
-// current workspace's check engine: no test helper otherwise ends a
-// workspace's debounce timers, so a didChange/didSave-armed recheck can
-// fire after the test function returns and log through a logger the test
-// framework has already torn down, panicking with "Log in goroutine after
-// Test... has completed". Reads s.workspace() at cleanup time, not a
-// captured pointer, since a later setWorkspace call in the same test may
-// have swapped it.
+// current workspace's check engine, and its rootFallback engine
+// (engineImporter's own small, separate root-import-resolution Engine —
+// see setWorkspace's own construction of it): no test helper otherwise ends
+// a workspace's debounce timers or in-flight GetPackage flights, so a
+// didChange/didSave-armed recheck, or a still-running root-import
+// resolution, can fire after the test function returns and log through a
+// logger the test framework has already torn down, panicking with "Log in
+// goroutine after Test... has completed". Reads s.workspace() at cleanup
+// time, not a captured pointer, since a later setWorkspace call in the same
+// test may have swapped it.
 func stopWorkspaceEngineOnCleanup(t *testing.T, s *Server) {
 	t.Helper()
 	t.Cleanup(func() {
 		if ws := s.workspace(); ws != nil {
 			ws.engine.Stop()
 			ws.engine.Wait()
+			ws.rootFallback.Stop()
+			ws.rootFallback.Wait()
 		}
 		// Detached reindexes a handler started (didOpen's facts self-heal,
 		// a didSave reindex) are drained by Serve in production; a test

@@ -28,18 +28,40 @@ type ExportSource interface {
 	ExportDataComplete(pkgPath string) (data []byte, complete, ok bool, err error)
 }
 
-// exportDecodeCap bounds exportResolver's byte estimate (typecheck.Cache's
-// own Bytes, see decode) before its decode cache is discarded and replaced
-// with an empty one — a coarse, whole-cache reset rather than a per-package
-// LRU, mirroring internal/server.maxDepCacheBytes's identical tradeoff for
-// the same reason: a decoded *types.Package is far cheaper per entry than a
-// full CheckedPackage (no AST, no statement-level Info — see
+// exportDecodeCap bounds exportResolver's decode cache, measured by
+// typecheck.Cache's own Bytes (see decode) — a serialized-blob byte sum,
+// not the live *types.Package object graph those blobs decode into (see
+// Bytes's own doc). Once past it, r's decode cache is discarded and
+// replaced with an empty one — a coarse, whole-cache reset rather than a
+// per-package LRU, mirroring internal/server.maxDepCacheBytes's identical
+// tradeoff for the same reason: a decoded *types.Package is far cheaper per
+// entry than a full CheckedPackage (no AST, no statement-level Info — see
 // CheckedPackage's own doc), so bounding by total decoded bytes lets this
 // cache hold many more distinct packages than lru's own entry-count cap
 // (DefaultCap/RecommendedCap) before paying any reset cost, while keeping
 // worst-case memory bounded independent of workspace size — the same goal
 // lru's own cap already serves for full CheckedPackage entries.
-const exportDecodeCap = 256 * 1024 * 1024 // 256MiB
+//
+// This must stay a generous, blob-byte cap rather than a heap-scaled one: a
+// single resolve() call's caller needs every package the transitive
+// closure it is decoding depends on to stay resident and identity-stable
+// simultaneously (see the doc above r.pkgs/r.cache's use as gcexportdata's
+// shared imports map). Scaling the comparison up (as an earlier revision
+// briefly did, comparing Bytes()*10 against this same cap) shrinks the
+// effective threshold to a fraction of what its own name promises; for any
+// dependency closure whose blob bytes exceed that shrunk threshold — e.g.
+// connect-go's generated + grpc + protobuf closure — the eviction fires
+// again on every subsequent decode inside the same resolution, wiping
+// r.pkgs (and so every already-decoded package's *types.Package identity)
+// before it can finish, so the resolution never converges: an unbounded
+// decode-discard-redecode loop instead of the one-time cache reset this cap
+// is meant to be (confirmed by reproducing the hang against the connect
+// generic-field regression this cap change was meant to fix, then reverting
+// it). The cold-start server-RSS blowup that motivated scaling by a
+// decoded-heap multiplier in the first place is bounded by the cold-index
+// gate (see depCacheHolder.importer's coldGateSource), not by shrinking
+// this cache's cap.
+const exportDecodeCap = 256 * 1024 * 1024 // 256MiB blob-byte cap
 
 // exportResolver decodes an ExportSource's persisted bytes into a shared
 // *token.FileSet, giving ctxImporter a cheap alternative to a full recursive

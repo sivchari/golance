@@ -25,9 +25,9 @@ import (
 // external test — see resolveFiles), parses them, resolves dependencies via
 // e.newImporter, and type-checks the result. A file declaring the external
 // test package imports its base package (if at all) by its ordinary,
-// real import path — resolved through the exact same e.newImporter() chain
-// as any other cross-package import (export data, not source), same as
-// every dependency; nothing here treats it specially. On success the
+// real import path — resolved through the exact same e.newImporter(ctx)
+// chain as any other cross-package import, same as every dependency;
+// nothing here treats it specially. On success the
 // CheckedPackage is committed (see Engine.commit) — cached and, if
 // configured, published via Options.OnResult, unless a newer-generation
 // recheck for key has already committed. ctx.Err() is checked before and
@@ -71,7 +71,7 @@ func (e *Engine) runRecheck(ctx context.Context, key unitKey) (*CheckedPackage, 
 		return nil, err
 	}
 
-	imp := e.newImporter()
+	imp := e.newImporter(ctx)
 	pkg, info, typeErrs := typecheck.CheckPackage(fset, astFiles, pi.pkgPath, imp)
 
 	if err := ctx.Err(); err != nil {

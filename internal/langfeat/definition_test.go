@@ -46,7 +46,7 @@ func newCheckedPackageWithProvider(t *testing.T, reader overlay.FileReader, pkgD
 	depMeta := depcheck.NewGraphMetadataSource(snap)
 	dp = depcheck.NewProvider(depMeta, depcheck.Options{})
 	depExp := depexport.NewCache(nil, depMeta, dp, depexport.Options{})
-	imp := func() types.ImporterFrom {
+	imp := func(context.Context) types.ImporterFrom {
 		return typecheck.NewImporter(depFset, nil, depExp, depCache)
 	}
 	engine := check.New(src, reader, imp, check.Options{})

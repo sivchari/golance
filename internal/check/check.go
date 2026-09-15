@@ -34,26 +34,45 @@ const (
 	maxFileCache = 4096
 )
 
-// SnapshotSource resolves the package a source file belongs to. It is
-// satisfied by GraphSource, an adapter over *graph.Snapshot.
+// SnapshotSource resolves the package a source file belongs to, or a
+// package directly by its import path. It is satisfied by GraphSource, an
+// adapter over *graph.Snapshot.
 type SnapshotSource interface {
 	// PackageForFile returns the import path, directory, and known non-test
 	// Go files of the package containing path. ok is false if path is not
 	// part of any known package.
 	PackageForFile(path string) (pkgPath string, dir string, goFiles []string, ok bool)
+
+	// PackageDir returns pkgPath's directory and known non-test Go files,
+	// resolving it directly by import path rather than by one of its files
+	// — see GetPackage, its only caller. ok is false if pkgPath is unknown.
+	PackageDir(pkgPath string) (dir string, goFiles []string, ok bool)
+
+	// IsRoot reports whether pkgPath is one of the workspace's own (root)
+	// packages, as opposed to a standard library or module-cache
+	// dependency. Used by a caller that wants to resolve a root package's
+	// import through GetPackage rather than a separate, export-data-based
+	// path — see internal/server's rootAwareImporter, its only caller.
+	IsRoot(pkgPath string) bool
 }
 
 // Importer returns a types.ImporterFrom for resolving a recheck's
-// dependencies. Engine calls it once per recheck. Unlike the package being
-// checked (parsed into a fresh *token.FileSet every recheck, since its
-// content changes), the returned importer is expected to be a shared,
-// long-lived value backed by its own persistent *token.FileSet and
-// typecheck.Cache: gcexportdata.Read ties a decoded *types.Package's
-// position data to whichever fset was active at decode time, so an
-// implementation that wants decode work cached across rechecks must keep
-// resolving into the same fset for as long as it keeps that cache. See
-// typecheck.Cache's doc for the invalidation contract this implies.
-type Importer func() types.ImporterFrom
+// dependencies, given the context the recheck itself is running under (the
+// engine's own lifecycle ctx for a request-driven flight, or a debounce
+// job's own derived ctx for a background recheck — see runRecheck's own
+// call). Engine calls it once per recheck. Unlike the package being checked
+// (parsed into a fresh *token.FileSet every recheck, since its content
+// changes), the returned importer is expected to be a shared, long-lived
+// value backed by its own persistent *token.FileSet and typecheck.Cache:
+// gcexportdata.Read ties a decoded *types.Package's position data to
+// whichever fset was active at decode time, so an implementation that wants
+// decode work cached across rechecks must keep resolving into the same fset
+// for as long as it keeps that cache. See typecheck.Cache's doc for the
+// invalidation contract this implies. ctx lets an implementation recurse
+// back into Engine (GetPackage) under this same recheck's own cancellation
+// semantics, to resolve a root package's import through Engine's own cache
+// instead of a separate path — see GetPackage's doc.
+type Importer func(ctx context.Context) types.ImporterFrom
 
 // Options configures an Engine. The zero value is valid: MaxLRU and
 // DebounceDelay fall back to their defaults, and a nil OnResult simply
@@ -308,9 +327,44 @@ func (e *Engine) Get(ctx context.Context, filePath string) (*CheckedPackage, err
 	if !ok {
 		return nil, fmt.Errorf("check: %s is not part of a known package", filePath)
 	}
-	key := unitKeyFor(pkgPath, dir)
-	pi := pkgInfo{pkgPath: pkgPath, goFiles: goFiles}
+	return e.getUnit(ctx, unitKeyFor(pkgPath, dir), pkgInfo{pkgPath: pkgPath, goFiles: goFiles}, dir)
+}
 
+// GetPackage is Get's counterpart for a caller that already knows the
+// package it wants by import path rather than by one of its files — used to
+// resolve a ROOT package another root package imports through this same
+// Get/commit cache (see SnapshotSource.PackageDir and
+// internal/server's rootAwareImporter, its only caller) instead of a
+// separate, export-data-based path that has no persistent cache for a root
+// package and so re-source-checks its whole transitive closure on every
+// query — the cause of a warm cross-package hover/definition hang this
+// exists to fix. Semantics otherwise match Get exactly: dedup, detachment,
+// and caching all go through the identical unitKey/flight machinery, since
+// both ultimately just name a unit to check.
+//
+// A caller invoking this from inside its own recheck's Importer (the
+// intended use) does so safely: Go forbids import cycles, so the package
+// graph reachable this way is always a DAG, and this never holds e.mu across
+// its own blocking wait (see getUnit) — it only ever joins or starts a
+// flight for a DIFFERENT unitKey than the one already running, on its own
+// goroutine, exactly like any other Get.
+func (e *Engine) GetPackage(ctx context.Context, pkgPath string) (*CheckedPackage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	dir, goFiles, ok := e.snap.PackageDir(pkgPath)
+	if !ok {
+		return nil, fmt.Errorf("check: %s is not a known package", pkgPath)
+	}
+	return e.getUnit(ctx, unitKeyFor(pkgPath, dir), pkgInfo{pkgPath: pkgPath, goFiles: goFiles}, dir)
+}
+
+// getUnit is Get's and GetPackage's shared implementation: it records pi
+// under key, resolves and hashes key's current files, serves an unchanged
+// cache hit directly, and otherwise joins or starts key's flight and waits
+// for it (or ctx) — see Get's own doc for the full deduplication/detachment
+// contract this implements.
+func (e *Engine) getUnit(ctx context.Context, key unitKey, pi pkgInfo, dir string) (*CheckedPackage, error) {
 	e.mu.Lock()
 	e.dirs[key] = pi
 	e.mu.Unlock()

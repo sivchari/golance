@@ -1,6 +1,7 @@
 package check
 
 import (
+	"context"
 	"go/token"
 	"go/types"
 	"path/filepath"
@@ -41,7 +42,7 @@ func newTestEngineWithImporterHook(t *testing.T, reader overlay.FileReader, opts
 	depCache := typecheck.NewCache()
 	depMeta := depcheck.NewGraphMetadataSource(snap)
 	depExp := depexport.NewCache(nil, depMeta, depcheck.NewProvider(depMeta, depcheck.Options{}), depexport.Options{})
-	imp := Importer(func() types.ImporterFrom {
+	imp := Importer(func(context.Context) types.ImporterFrom {
 		return typecheck.NewImporter(depFset, nil, depExp, depCache)
 	})
 	if hook != nil {

@@ -67,6 +67,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	logger := log.New(logOut, "", log.LstdFlags)
 
+	applyDefaultMemLimit(defaultServerMemLimit)
+
 	rpcServer := rpc.NewServer(rpc.WithLogger(logger))
 	srv := server.New(rpcServer, server.Options{
 		Logger:        logger,
@@ -133,7 +135,7 @@ func runIndexer(stdout, stderr io.Writer) int {
 	// future standalone CLI use) should not be forced to know about it.
 	depCASPath := os.Getenv(server.EnvDepCAS)
 
-	applyDefaultMemLimit()
+	applyDefaultMemLimit(defaultIndexerMemLimit)
 
 	stopProfiling, ok := setupProfiling(stderr)
 	defer stopProfiling()
@@ -160,22 +162,45 @@ func runIndexer(stdout, stderr io.Writer) int {
 // as this same process's GOMEMLIMIT — see applyDefaultMemLimit).
 const defaultIndexerMemLimit = 4 << 30
 
-// applyDefaultMemLimit sets a GOMEMLIMIT soft cap for this process via
-// debug.SetMemoryLimit, but only when nothing has already configured
+// defaultServerMemLimit is the GOMEMLIMIT soft cap applied to the SERVER
+// (leader) process itself — a backstop, not the primary fix, for the
+// cold-start recursive dependency-closure re-check depCacheHolder.importer's
+// cold-index-build gate (internal/server/workspace.go) already closes off:
+// this exists in case some OTHER path still lets the server's heap grow
+// unbounded, now or in the future, the same way defaultIndexerMemLimit backstops
+// the indexer subprocess (whose own 4GiB default this constant is sized
+// relative to, not duplicated — see that constant's own doc for the
+// measurement behind ITS value). 8GiB leaves the indexer subprocess's own
+// 4GiB cap room to run alongside the server on the same 16GB machine
+// defaultIndexerMemLimit's own doc already targets, plus headroom for the
+// editor and OS: 4+8=12GiB of the 16GB total, both caps being soft (the Go
+// runtime runs GC more aggressively as either process nears its own limit
+// rather than being OOM-killed outright), so briefly exceeding one is
+// tolerated rather than fatal. Applied in-process via debug.SetMemoryLimit,
+// never as an env var: cmd.Env for the indexer subprocess (see
+// internal/server/indexer.go) starts from THIS process's os.Environ(), so a
+// real GOMEMLIMIT env var set here would leak into and override the
+// indexer's own deliberately-sized default; debug.SetMemoryLimit affects
+// only the calling process's own runtime, never the environment, so no such
+// override can happen.
+const defaultServerMemLimit = 8 << 30
+
+// applyDefaultMemLimit sets a GOMEMLIMIT soft cap of limit for this process
+// via debug.SetMemoryLimit, but only when nothing has already configured
 // one — the Go runtime applies a GOMEMLIMIT environment variable before
 // main() ever runs, so checking it here is exactly equivalent to checking
 // whether debug.SetMemoryLimit(-1) (a pure read) already reports something
 // other than its unset default (math.MaxInt64), without needing that
 // probe: internal/server always forwards --mem-limit/GOLANCE_MEM_LIMIT to
-// this subprocess as GOMEMLIMIT (see internal/server/indexer.go), and a
-// directly-invoked indexer (a test, or a future standalone CLI use) that set
-// GOMEMLIMIT itself gets the same deference. Only a run with neither gets
-// defaultIndexerMemLimit instead of an unbounded heap.
-func applyDefaultMemLimit() {
+// the indexer subprocess as GOMEMLIMIT (see internal/server/indexer.go), and
+// a directly-invoked indexer (a test, or a future standalone CLI use) or
+// server process that set GOMEMLIMIT itself gets the same deference. Only a
+// run with neither gets limit instead of an unbounded heap.
+func applyDefaultMemLimit(limit int64) {
 	if os.Getenv("GOMEMLIMIT") != "" {
 		return
 	}
-	debug.SetMemoryLimit(defaultIndexerMemLimit)
+	debug.SetMemoryLimit(limit)
 }
 
 // setupProfiling enables the runtime/pprof profiles requested via

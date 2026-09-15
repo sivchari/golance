@@ -22,12 +22,33 @@ import (
 	"github.com/sivchari/golance/internal/typecheck"
 )
 
-// maxDepCacheBytes bounds depCache's naive byte estimate (the sum of
-// decoded export-data blob sizes, see typecheck.Cache.Bytes) before it is
-// discarded and replaced with an empty one. v0.1 has no precise heap
-// accounting for decoded *types.Package values, so this is deliberately a
-// coarse, whole-cache eviction rather than a per-package LRU.
-const maxDepCacheBytes = 512 * 1024 * 1024 // 512MiB
+// maxDepCacheBytes bounds depCache's decode cache, measured by
+// typecheck.Cache's own naive byte estimate (the sum of serialized
+// export-data blob sizes, see typecheck.Cache.Bytes) before it is discarded
+// and replaced with an empty one. v0.1 has no precise heap accounting for
+// decoded *types.Package values, so this is deliberately a coarse,
+// whole-cache eviction rather than a per-package LRU.
+//
+// This must stay a generous, blob-byte cap: scaling the comparison up to
+// approximate the larger live *types.Package heap those blobs decode into
+// (as an earlier revision briefly did) shrinks the effective threshold to a
+// fraction of what maxDepCacheBytes's own name promises, evicting mid-check
+// and forcing every subsequent recheck to redecode a dependency closure that
+// would otherwise stay resident — see exportDecodeCap's identical tradeoff
+// in internal/depcheck/export.go, whose own doc has the full reasoning
+// (this holder's eviction only ever fires between checks, at importer()'s
+// own call boundary, so it cannot corrupt a single check's own in-flight
+// resolution the way exportResolver's per-decode eviction could; it is
+// still wasteful thrashing to shrink the cap here for the same reason). The
+// cold-start server-RSS blowup that motivated scaling by a decoded-heap
+// multiplier in the first place is bounded by the cold-index gate (see
+// importer's coldGateSource), not by shrinking this cache's cap.
+// A var, not a const, purely as a test seam: TestDepCacheHolder_Importer_
+// EvictsWholeCacheOncePastByteCap (workspace_test.go) lowers it for the
+// length of one test rather than generating fixture export data anywhere
+// near the real 512MiB default, which no production code path ever
+// mutates.
+var maxDepCacheBytes int64 = 512 * 1024 * 1024 // 512MiB blob-byte cap
 
 // depCacheHolder owns the persistent typecheck.Cache the check engine's
 // dependency importer decodes into across many rechecks, plus the single
@@ -49,22 +70,72 @@ type depCacheHolder struct {
 	exports        typecheck.ExportSource
 	provider       *depcheck.Provider
 	exportProvider *depcheck.Provider
+	// indexReady reports whether the facts index is currently open — false
+	// for the whole span of a cold index build (see importer's own doc for
+	// why this gates which ExportSource tier importer resolves through).
+	// Always non-nil in production (setWorkspace supplies s.idx.Load()!=nil);
+	// a nil value would panic on the first importer() call, exactly like any
+	// other unset required constructor argument.
+	indexReady func() bool
 
 	mu    sync.Mutex
 	fset  *token.FileSet
 	cache *typecheck.Cache
 }
 
-func newDepCacheHolder(exports typecheck.ExportSource, provider, exportProvider *depcheck.Provider) *depCacheHolder {
+func newDepCacheHolder(exports typecheck.ExportSource, provider, exportProvider *depcheck.Provider, indexReady func() bool) *depCacheHolder {
 	return &depCacheHolder{
-		exports: exports, provider: provider, exportProvider: exportProvider,
+		exports: exports, provider: provider, exportProvider: exportProvider, indexReady: indexReady,
 		fset: token.NewFileSet(), cache: typecheck.NewCache(),
 	}
 }
 
+// coldExportSource is the additional capability internal/depexport.Cache
+// offers beyond typecheck.ExportSource: resolving a pkgPath from ONLY
+// already-persisted data, reporting ok=false rather than ever running an
+// expensive, recursive from-source check when nothing is cached yet (see
+// depexport.Cache.ExportDataFromCache's own doc). importer's cold-build gate
+// type-asserts d.exports against this rather than requiring it structurally,
+// the same optional-capability idiom internal/check.openChecker/dirLister
+// already use: a depCacheHolder built in a test with a plain ExportSource
+// stub that does not implement it simply never gates, resolving through
+// exports directly regardless of indexReady — unchanged pre-gate behavior.
+type coldExportSource interface {
+	ExportDataFromCache(pkgPath string) (data []byte, ok bool, err error)
+}
+
+// coldGateSource adapts a coldExportSource into a typecheck.ExportSource
+// that answers only from already-persisted data, standing in for the
+// ordinary, possibly-source-checking exports value while a cold index build
+// is in progress (see importer's own doc).
+type coldGateSource struct{ src coldExportSource }
+
+func (g coldGateSource) ExportData(pkgPath string) ([]byte, bool, error) {
+	return g.src.ExportDataFromCache(pkgPath)
+}
+
 // importer returns a types.ImporterFrom decoding into d's current
 // (fset, cache) pair, first swapping in a fresh, empty pair if the current
-// one has grown past maxDepCacheBytes.
+// one has grown past maxDepCacheBytes (see its own doc).
+//
+// While the facts index is not yet ready (d.indexReady() is false — a cold
+// index build still running, the same window the indexer subprocess is
+// already type-checking this workspace's entire dependency closure in),
+// the returned importer resolves an uncached import through
+// coldGateSource instead of d.exports directly: a CAS hit still answers
+// immediately, but a miss reports "no data" rather than falling through to
+// depexport.Cache.checkAndPersist's from-source check, which recursively
+// re-type-checks pkgPath's whole transitive closure — duplicating, IN THE
+// SERVER PROCESS, work the indexer subprocess already does, and the
+// confirmed cause of a multi-GB server heap on a large monorepo's cold
+// start (see this package's own cold-start RSS investigation notes). go/
+// types tolerates an ImporterFrom reporting an import as unresolved: it
+// records a "could not import" error for that identifier and keeps
+// checking the rest of the file, so a package with an unresolved dependency
+// during a cold build still gets a usable (if partial) CheckedPackage —
+// same-package/local definitions are unaffected. Once d.indexReady()
+// reports true, the very next importer() call (the next recheck) resolves
+// every import fully again, exactly as before this gate existed.
 func (d *depCacheHolder) importer() types.ImporterFrom {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -72,7 +143,13 @@ func (d *depCacheHolder) importer() types.ImporterFrom {
 		d.fset = token.NewFileSet()
 		d.cache = typecheck.NewCache()
 	}
-	return typecheck.NewImporter(d.fset, nil, d.exports, d.cache)
+	exports := d.exports
+	if !d.indexReady() {
+		if cold, ok := exports.(coldExportSource); ok {
+			exports = coldGateSource{cold}
+		}
+	}
+	return typecheck.NewImporter(d.fset, nil, exports, d.cache)
 }
 
 // FileSet returns the *token.FileSet dependency export data is currently
@@ -89,6 +166,26 @@ func (d *depCacheHolder) FileSet() *token.FileSet {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.fset
+}
+
+// decodeExport decodes data — pkgPath's already-persisted export data,
+// resolved by a caller such as rootExportSource — into d's current
+// (fset, cache) pair, via typecheck.ReadExport. Used by engineImporter.
+// decodeRoot, whose own doc explains why this must land in d's pair rather
+// than a separate one: it is the identical pair d's importer() return value
+// resolves every non-root import in the very same recheck against, so a
+// package reachable both ways keeps one consistent identity. Reads d.fset
+// and d.cache under d.mu but calls typecheck.ReadExport outside it (that
+// call takes cache's own internal lock instead): subject to the same
+// narrow, accepted pair-swap race FileSet's own doc describes, since a
+// concurrent recheck exceeding maxDepCacheBytes could swap in a fresh pair
+// between this read and importer()'s own for the SAME recheck — the same
+// tradeoff, not a new one.
+func (d *depCacheHolder) decodeExport(pkgPath string, data []byte) (*types.Package, error) {
+	d.mu.Lock()
+	fset, cache := d.fset, d.cache
+	d.mu.Unlock()
+	return typecheck.ReadExport(data, fset, pkgPath, cache)
 }
 
 // invalidate drops pkgPaths from the current cache and from d.provider's and
@@ -253,9 +350,16 @@ func (s *Server) ensureDepProvider(snap *graph.Snapshot) (navProvider, exportPro
 		// that scale; see depcheck.DefaultCap's own doc for the real,
 		// measured regression this avoids. RecommendedCap itself bounds
 		// worst-case memory to a size independent of workspace size (see
-		// its own doc) rather than to snap's own non-root package count, so
-		// a large workspace's live session process cannot grow either cache
-		// without bound the way a batch indexer run used to.
+		// its own doc) rather than to snap's own package count.
+		//
+		// The count fed in is non-root only: a ROOT pkgPath reaches
+		// depExportProviderVal via depexport.Cache.resolve's own
+		// checkAndPersist(persist=false) path only in the rare case neither
+		// decodeRoot nor rootFallback's own small cache could answer (see
+		// rootAwareImporter's doc) — engineImporter's two faster tiers are
+		// what keep that path rare, not this cap, so sizing it any larger
+		// than depProviderVal's own non-root-only worst case would just cost
+		// memory without fixing a real thrashing case in practice.
 		providerCap := depcheck.RecommendedCap(nonRootPackageCount(snap), s.resolvedIndexJobs())
 		s.depProviderVal = depcheck.NewProvider(s.depProviderSrc, depcheck.Options{Cap: providerCap})
 		s.depExportProviderVal = depcheck.NewProvider(s.depProviderSrc, depcheck.Options{Cap: providerCap})
@@ -484,9 +588,10 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	reuse := old != nil && old.root == root && old.depProvider == depProvider
 
 	var (
-		graphSrc *check.GraphSource
-		depCache *depCacheHolder
-		engine   *check.Engine
+		graphSrc     *check.GraphSource
+		depCache     *depCacheHolder
+		engine       *check.Engine
+		rootFallback *check.Engine
 	)
 	if reuse {
 		graphSrc = old.graphSrc
@@ -494,10 +599,65 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 		depCache = old.depCache
 		depCache.invalidate(changedExportSet(old.snap, snap))
 		engine = old.engine
+		rootFallback = old.rootFallback
 	} else {
 		graphSrc = check.NewGraphSource(snap, s.overlay)
-		depCache = newDepCacheHolder(depExports, depProvider, depExportProvider)
-		engine = check.New(graphSrc, s.overlay, depCache.importer, check.Options{OnResult: s.publishDiagnostics})
+		depCache = newDepCacheHolder(depExports, depProvider, depExportProvider, func() bool { return s.idx.Load() != nil })
+		// rootExport resolves a ROOT package's already-persisted export data
+		// straight from the facts index (see its own doc): built once here,
+		// bound to graphSrc and to a closure reading s.idx live, so it stays
+		// correct across every later setWorkspace reuse and index (re)open
+		// without needing its own retargeting — see newRootExportSource's
+		// doc for why.
+		rootExport := newRootExportSource(graphSrc, s.overlay, func() *indexState { return s.idx.Load() }, RelativeIndexPaths(root))
+		// engine's own dependency Importer is engineImporter, not
+		// depCache.importer directly: it resolves a ROOT-package import
+		// through the facts index's own persisted export data first
+		// (decodeRoot), falling back to rootFallback's own small Get/commit
+		// cache only for whatever decodeRoot could not answer — never to
+		// engine's own cache (see rootFallback's own doc just below for
+		// why). ei.fallback is set right after check.New(rootFallback's
+		// constructor call) returns, since check.New needs ei.importer
+		// before the Engine it feeds exists; check.New never calls it
+		// synchronously, only later during an actual recheck, so this
+		// two-phase ordering is safe — mirrors engine's own identical
+		// bootstrap just below.
+		ei := &engineImporter{depCache: depCache, graphSrc: graphSrc, rootExport: rootExport}
+		engine = check.New(graphSrc, s.overlay, ei.importer, check.Options{OnResult: s.publishDiagnostics})
+		// rootFallback is a SEPARATE, small Engine dedicated to resolving a
+		// root import decodeRoot could not answer (no index yet for it, an
+		// open/dirty file, or a stale blob) — deliberately never engine
+		// itself. engine's own cache exists to serve the files THIS
+		// session's user actually has open; sharing it with root-import
+		// resolution would let an editor-driven cross-package query evict
+		// those entries, and — as an earlier revision of this method did —
+		// tempt sizing its cap to the workspace's own root-package count to
+		// avoid thrashing a large closure, which grows a check.CheckedPackage
+		// cache (full AST plus *types.Info per entry, tens of MB apiece for
+		// a generated protobuf package) to workspace scale: ~400-500 entries
+		// measured at 10-25GB server RSS on a large monorepo (see this
+		// package's own cold-start RSS investigation notes) — the exact
+		// unbounded-memory regression this split undoes.
+		//
+		// rootFallback is left at check.Engine's own small, editor-session
+		// default (MaxLRU 6, same as engine's own unset default) rather than
+		// scaled to workspace size: decodeRoot already serves the common
+		// case (any root package the facts index has current data for,
+		// which is most of the workspace once warm), so rootFallback only
+		// ever needs to hold the small, session-scale set of packages
+		// currently stale or dirty at once. This accepts some LRU thrashing
+		// under a closure with many SIMULTANEOUSLY stale root packages (see
+		// TestEngine_Get_RootImportCacheThrashingIsACacheSizingProblem in
+		// internal/check) in exchange for memory bounded independent of
+		// workspace size — the same tradeoff depcheck.DefaultCap's own doc
+		// makes for interactive non-root navigation. rootFallback shares
+		// ei.importer as its OWN dependency Importer too, so a package it
+		// checks that itself imports another stale root package recurses
+		// back into rootFallback (see check.Engine.GetPackage's own doc for
+		// why that recursion is safe) rather than into engine or into
+		// depCache's non-persistent depexport path.
+		rootFallback = check.New(graphSrc, s.overlay, ei.importer, check.Options{})
+		ei.fallback = rootFallback
 		// Retire, not Stop, the outgoing engine: a debounce timer already
 		// scheduled on it (e.g. by a handleDidChange that captured the old
 		// workspace microseconds before this swap), or a background
@@ -510,9 +670,14 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 		// progress against the old engine (e.g. a hover the user
 		// triggered microseconds before this reload) keeps running to
 		// completion and its waiter gets the real result instead of
-		// ctx.Err().
+		// ctx.Err(). The outgoing rootFallback gets the identical Retire
+		// treatment: it never publishes (its own Options.OnResult is nil,
+		// so Retire's publish suppression is a no-op for it), but a
+		// GetPackage flight already in flight against it deserves the same
+		// run-to-completion guarantee engine's own in-flight Get gets.
 		if old != nil {
 			old.engine.Retire()
+			old.rootFallback.Retire()
 		}
 	}
 
@@ -550,7 +715,7 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	pkgNameIndex := buildPkgNameIndex(snap)
 
 	newWS := &workspace{
-		root: root, snap: snap, graphSrc: graphSrc, engine: engine, fileToPkg: fileToPkg, dirToPkg: dirToPkg,
+		root: root, snap: snap, graphSrc: graphSrc, engine: engine, rootFallback: rootFallback, fileToPkg: fileToPkg, dirToPkg: dirToPkg,
 		depCache: depCache, depProvider: depProvider, pkgNameIndex: pkgNameIndex,
 	}
 	s.ws.Store(newWS)

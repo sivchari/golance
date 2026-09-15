@@ -66,7 +66,16 @@ type workspace struct {
 	// it is sound.
 	graphSrc *check.GraphSource
 	engine   *check.Engine
-	depCache *depCacheHolder
+	// rootFallback is a second, small check.Engine dedicated to resolving a
+	// root-package import engineImporter's decodeRoot tier could not answer
+	// (no facts-index data yet, an open/dirty file, or a stale blob) — never
+	// engine itself, whose own cache exists to serve this session's actually
+	// open files. See setWorkspace's own construction of it for why sharing
+	// engine's cache with root-import resolution risked growing it to
+	// workspace scale. Reused or rebuilt in lockstep with engine across a
+	// setWorkspace call — see setWorkspace's reuse branch.
+	rootFallback *check.Engine
+	depCache     *depCacheHolder
 	// depProvider resolves non-workspace (standard library, module
 	// dependency, test-only) packages by type-checking their own real
 	// source on demand (internal/depcheck), for navigation consumers that

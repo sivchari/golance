@@ -70,10 +70,26 @@ func TestApplyDefaultMemLimit_SetsLimitWhenUnset(t *testing.T) {
 	orig := debug.SetMemoryLimit(-1)
 	t.Cleanup(func() { debug.SetMemoryLimit(orig) })
 
-	applyDefaultMemLimit()
+	applyDefaultMemLimit(defaultIndexerMemLimit)
 
 	if got := debug.SetMemoryLimit(-1); got != defaultIndexerMemLimit {
 		t.Fatalf("SetMemoryLimit(-1) = %d, want %d", got, defaultIndexerMemLimit)
+	}
+}
+
+// TestApplyDefaultMemLimit_ServerLimit verifies the SERVER path's own call
+// (run, not runIndexer) applies defaultServerMemLimit — the backstop
+// documented on that constant — via the identical, generalized
+// applyDefaultMemLimit helper.
+func TestApplyDefaultMemLimit_ServerLimit(t *testing.T) {
+	t.Setenv("GOMEMLIMIT", "")
+	orig := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(orig) })
+
+	applyDefaultMemLimit(defaultServerMemLimit)
+
+	if got := debug.SetMemoryLimit(-1); got != defaultServerMemLimit {
+		t.Fatalf("SetMemoryLimit(-1) = %d, want %d", got, defaultServerMemLimit)
 	}
 }
 
@@ -90,7 +106,7 @@ func TestApplyDefaultMemLimit_LeavesExistingLimitAlone(t *testing.T) {
 	const sentinel = 123456789
 	debug.SetMemoryLimit(sentinel)
 
-	applyDefaultMemLimit()
+	applyDefaultMemLimit(defaultIndexerMemLimit)
 
 	if got := debug.SetMemoryLimit(-1); got != sentinel {
 		t.Fatalf("SetMemoryLimit(-1) = %d, want sentinel %d left unchanged", got, sentinel)

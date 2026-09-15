@@ -240,6 +240,38 @@ func (c *Cache) ExportDataComplete(pkgPath string) (data []byte, complete, ok bo
 	return c.resolve(pkgPath)
 }
 
+// ExportDataFromCache resolves pkgPath's export data ONLY from the
+// persistent CAS, never falling through to checkAndPersist's from-source
+// check on a miss — unlike ExportData/ExportDataComplete, which always do.
+// ok is false whenever no CAS entry already exists for pkgPath: because
+// pkgPath's directory is not one Cache ever persists to at all (see the
+// package doc's "Cache identity" section — a local `replace`-directive
+// dependency, most commonly), because the CAS itself is nil (see NewCache's
+// own doc), or because it is simply not there yet. Used by a caller that
+// must never let a single query trigger an unbounded, recursive from-source
+// check of pkgPath's whole transitive closure — see
+// internal/server.depCacheHolder.importer's cold-index-build gate, the only
+// current caller: while the facts index is still building, the closure this
+// package's own indexer subprocess is already checking would otherwise be
+// checked a second time, in-process, by the server itself (the field
+// symptom this exists to fix — see internal/server's own doc on the
+// gate for the full chain).
+func (c *Cache) ExportDataFromCache(pkgPath string) (data []byte, ok bool, err error) {
+	if c.cas == nil {
+		return nil, false, nil
+	}
+	dir, _, _, mok := c.meta.Package(pkgPath)
+	if !mok || !c.immutable(dir) {
+		return nil, false, nil
+	}
+	key := c.digest(pkgPath, dir)
+	blob, hit, err := c.cas.Get(context.Background(), key)
+	if err != nil {
+		return nil, false, err
+	}
+	return blob, hit, nil
+}
+
 // resolve is ExportData's and ExportDataComplete's shared implementation.
 func (c *Cache) resolve(pkgPath string) (data []byte, complete, ok bool, err error) {
 	dir, _, _, ok := c.meta.Package(pkgPath)

@@ -403,6 +403,94 @@ func TestCache_ContextBackground(t *testing.T) {
 	_ = context.Background()
 }
 
+// TestCache_ExportDataFromCache_MissNeverChecks verifies that, unlike
+// ExportData, ExportDataFromCache never falls through to a from-source
+// check on a CAS miss: it reports ok=false and leaves provider.Checked() at
+// 0 — the property depCacheHolder.importer's cold-index-build gate
+// (internal/server) relies on to stop the recursive closure re-check a cold
+// start's own didOpen used to trigger.
+func TestCache_ExportDataFromCache_MissNeverChecks(t *testing.T) {
+	meta := loadTestGraph(t)
+	provider := depcheck.NewProvider(meta, depcheck.Options{})
+	cache := NewCache(newTestCAS(t), meta, provider, Options{})
+
+	data, ok, err := cache.ExportDataFromCache("strings")
+	if err != nil {
+		t.Fatalf("ExportDataFromCache(strings): unexpected error: %v", err)
+	}
+	if ok {
+		t.Error("ExportDataFromCache(strings): ok = true on a CAS miss, want false")
+	}
+	if data != nil {
+		t.Errorf("ExportDataFromCache(strings): data = %v, want nil on a miss", data)
+	}
+	if got := provider.Checked(); got != 0 {
+		t.Errorf("provider.Checked() = %d, want 0 (a CAS miss must never trigger a from-source check)", got)
+	}
+}
+
+// TestCache_ExportDataFromCache_HitSkipsCheck verifies that once a
+// package's export data is already persisted (by an earlier ExportData
+// call, mirroring TestCache_WarmCASSkipsCheck), ExportDataFromCache answers
+// it from a fresh, cold provider without ever invoking that provider's
+// checker.
+func TestCache_ExportDataFromCache_HitSkipsCheck(t *testing.T) {
+	meta := loadTestGraph(t)
+	cas := newTestCAS(t)
+
+	warmProvider := depcheck.NewProvider(meta, depcheck.Options{})
+	warmCache := NewCache(cas, meta, warmProvider, Options{})
+	if _, ok, err := warmCache.ExportData("strings"); err != nil || !ok {
+		t.Fatalf("warm ExportData(strings): ok=%v err=%v", ok, err)
+	}
+
+	coldProvider := depcheck.NewProvider(meta, depcheck.Options{})
+	coldCache := NewCache(cas, meta, coldProvider, Options{})
+	data, ok, err := coldCache.ExportDataFromCache("strings")
+	if err != nil {
+		t.Fatalf("ExportDataFromCache(strings): %v", err)
+	}
+	if !ok {
+		t.Fatal("ExportDataFromCache(strings): ok = false, want true after a prior ExportData persisted it")
+	}
+	if len(data) == 0 {
+		t.Error("ExportDataFromCache(strings): empty data")
+	}
+	if got := coldProvider.Checked(); got != 0 {
+		t.Errorf("coldProvider.Checked() = %d, want 0 (a CAS hit must never invoke the checker)", got)
+	}
+}
+
+// TestCache_ExportDataFromCache_NeverPersistedNeverHits verifies a package
+// Cache never persists at all (a local `replace`-directive dependency
+// outside GOROOT/GOModCache — see TestCache_DoesNotPersistOutsideImmutableDirs)
+// stays unresolvable via ExportDataFromCache even after an ordinary
+// ExportData call already resolved it once: there is no CAS entry to ever
+// find for such a package, cold-build or not.
+func TestCache_ExportDataFromCache_NeverPersistedNeverHits(t *testing.T) {
+	dir, goFile := writeLocalPackage(t)
+	const pkgPath = "example.com/local"
+	meta := fakeMetadataSource{pkgPath: pkgPath, dir: dir, goFiles: []string{goFile}}
+	provider := depcheck.NewProvider(meta, depcheck.Options{})
+	cas := newTestCAS(t)
+	cache := NewCache(cas, meta, provider, Options{})
+
+	if _, ok, err := cache.ExportData(pkgPath); err != nil || !ok {
+		t.Fatalf("ExportData(%s): ok=%v err=%v", pkgPath, ok, err)
+	}
+
+	data, ok, err := cache.ExportDataFromCache(pkgPath)
+	if err != nil {
+		t.Fatalf("ExportDataFromCache(%s): unexpected error: %v", pkgPath, err)
+	}
+	if ok {
+		t.Error("ExportDataFromCache: ok = true for a package never persisted to the CAS, want false")
+	}
+	if data != nil {
+		t.Errorf("ExportDataFromCache: data = %v, want nil", data)
+	}
+}
+
 // TestCache_DigestFoldsGoVersionAndBuildFlags verifies two Caches
 // configured with different GoVersion/BuildFlagsFingerprint values never
 // collide on the same CAS key for the same package — the exact isolation
