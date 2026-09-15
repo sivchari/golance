@@ -264,10 +264,28 @@ func (r *Resolver) resolveAt(ctx context.Context, file string, line, col uint32)
 }
 
 // resolveRefTarget looks up ref's target symbol's kind and name from its
-// defining package's facts.
+// defining package's facts. When the defining package itself has no facts
+// recorded — always the case for a standard-library or module dependency
+// symbol, since the facts index only ever covers root (workspace) packages
+// (see New's fileToPkg doc), and occasionally a root package whose own
+// facts build has not happened yet — this still returns ref's own
+// (PkgHash, IDHash) rather than failing outright: that pair is exactly what
+// addRef (internal/index/facts.go) already wrote into the reverse posting
+// index for every workspace call site referencing it, over in the source
+// package's own facts, regardless of whether the target's defining package
+// was ever itself indexed. Kind and Name are left at their zero values in
+// this case (Kind's zero, KindFunc, is never index.KindMethod, so
+// References' corresponding-method lookup is safely skipped for a target
+// whose real kind is unknown here — see References' own doc). A caller
+// that specifically needs the target's own name or declaration (Definition,
+// Rename) still fails for such a target exactly as before, since it must
+// call symbolByHash again for (PkgHash, IDHash) to get that.
 func (r *Resolver) resolveRefTarget(ctx context.Context, ref store.Ref) (resolvedSymbol, error) {
 	name, kind, _, err := r.symbolByHash(ctx, ref.ToPkgHash(), ref.ToSymbolIDHash())
 	if err != nil {
+		if errors.Is(err, errSymbolNotFound) {
+			return resolvedSymbol{PkgHash: ref.ToPkgHash(), IDHash: ref.ToSymbolIDHash()}, nil
+		}
 		return resolvedSymbol{}, err
 	}
 	return resolvedSymbol{PkgHash: ref.ToPkgHash(), IDHash: ref.ToSymbolIDHash(), Kind: kind, Name: name}, nil

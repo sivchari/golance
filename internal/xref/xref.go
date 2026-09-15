@@ -115,12 +115,22 @@ func (r *Resolver) References(ctx context.Context, file string, line, col int, i
 	if includeDecl {
 		_, _, loc, err := r.symbolByHash(ctx, target.PkgHash, target.IDHash)
 		if err != nil {
-			if errors.Is(err, errSymbolNotFound) {
-				return nil, fmt.Errorf("xref: definition of %s not found in its own package facts", target.Name)
+			if !errors.Is(err, errSymbolNotFound) {
+				return nil, err
 			}
-			return nil, err
+			// target's own declaration is not itself indexed — always the
+			// case for a standard-library or module dependency symbol,
+			// since the facts index only ever covers root (workspace)
+			// packages (see resolveRefTarget's doc). The declaration
+			// location genuinely cannot be answered from the facts index
+			// here; proceed with the reference search below rather than
+			// failing the whole call over a part it was never going to be
+			// able to answer (a caller that specifically needs the
+			// declaration itself, e.g. Definition, resolves it through a
+			// different, decode-based path instead).
+		} else {
+			out = append(out, loc)
 		}
-		out = append(out, loc)
 	}
 
 	enterPhase(ctx, "closureWalk")
