@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.6](https://github.com/sivchari/golance/compare/v0.7.5...v0.7.6) - 2026-09-15
+- fix: resolve find-references on dependency and stdlib symbols by @sivchari in https://github.com/sivchari/golance/pull/111
+
 ## [v0.7.5](https://github.com/sivchari/golance/compare/v0.7.4...v0.7.5) - 2026-09-15
 - fix: index legal test-only import cycles + post-release review findings by @sivchari in https://github.com/sivchari/golance/pull/108
 - feat: go-to-definition and references on package-name identifiers by @sivchari in https://github.com/sivchari/golance/pull/110
