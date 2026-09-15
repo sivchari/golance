@@ -747,7 +747,6 @@ func TestPackageNameDefinition_SelectorReturnsNil(t *testing.T) {
 	}
 }
 
-
 // TestPackageNameReferences_PlainImportIncludeDecl covers references on a
 // plain, unaliased package-qualifier identifier used twice in the same
 // file, with the import spec's own declaration included: the same gap
