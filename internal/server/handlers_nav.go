@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"go.lsp.dev/protocol"
@@ -494,13 +495,21 @@ func (s *Server) handleDocumentLink(ctx context.Context, params json.RawMessage)
 
 // documentLinkTarget resolves pkgPath to a link target: a local workspace
 // file (its first Go file) if pkgPath's directory is inside ws.root,
-// otherwise its pkg.go.dev page.
+// otherwise its pkg.go.dev page. "Inside" is a real path-component
+// containment check (filepath.Rel), not a string prefix: a naive
+// strings.HasPrefix(pkg.Dir, ws.root) would also match a sibling directory
+// that merely shares ws.root as a string prefix (e.g. ws.root "/proj" and
+// pkg.Dir "/proj-archive/pkg"), wrongly linking to a file:// URI for a
+// package outside the workspace entirely. Mirrors the identical containment
+// check in internal/xref/paths.go and internal/index/paths.go.
 func documentLinkTarget(ws *workspace, pkgPath string) (uri.URI, bool) {
 	pkg, ok := ws.snap.Package(pkgPath)
 	if !ok {
 		return "", false
 	}
-	if strings.HasPrefix(pkg.Dir, ws.root) {
+	rel, err := filepath.Rel(ws.root, pkg.Dir)
+	inside := err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	if inside {
 		if len(pkg.GoFiles) == 0 {
 			return "", false
 		}

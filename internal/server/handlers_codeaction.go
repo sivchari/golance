@@ -70,6 +70,16 @@ func kindRequested(only []protocol.CodeActionKind, kind protocol.CodeActionKind)
 
 // quickFixActions returns one protocol.CodeAction per fixable diagnostic
 // in diags.
+//
+// Known limitation: diags' Range positions are resolved against text, read
+// fresh from the overlay/disk at request time, not against whatever content
+// was current when the client's diagnostic was originally published. If the
+// user edits the file between publishDiagnostics and this codeAction
+// request with a same-length change, byteOffsetForPosition can silently
+// resolve to the wrong symbol. This is a narrow window bounded by an
+// LSP-protocol structural limit — protocol.Diagnostic carries no document
+// version — so a proper fix needs a Diagnostic.Data round-trip; out of
+// scope here.
 func (s *Server) quickFixActions(path string, text []byte, diags []protocol.Diagnostic) []protocol.CodeAction {
 	var out []protocol.CodeAction
 	for i := range diags {

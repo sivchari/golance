@@ -123,6 +123,12 @@ type Snapshot struct {
 	// file.
 	revDeps map[string][]string
 
+	// pos maps an import path to its index in Order, for Before — computed
+	// once here rather than by every caller that used to derive its own
+	// copy from Order (see Before's own doc for why a single shared
+	// definition of "positioned before" matters).
+	pos map[string]int
+
 	// buildFlagsFP is set by Load from the build configuration
 	// packages.Load actually resolved this Snapshot's packages under (see
 	// buildFlagsFingerprint and BuildFlagsFingerprint).
@@ -404,16 +410,19 @@ func newSnapshot(pkgs map[string]*Package, dir string) *Snapshot {
 	for _, importers := range revDeps {
 		sort.Strings(importers)
 	}
-	return &Snapshot{Packages: pkgs, Order: order, dir: dir, revDeps: revDeps}
+	pos := make(map[string]int, len(order))
+	for i, p := range order {
+		pos[p] = i
+	}
+	return &Snapshot{Packages: pkgs, Order: order, dir: dir, revDeps: revDeps, pos: pos}
 }
 
 // topoOrder returns the import paths of pkgs in Kahn topological order,
 // dependencies before dependents, respecting both Package.Imports and
 // Package.TestImports edges — internal/index's directDepExports folds both
 // into a package's own combined key, so a package reachable from another
-// only through the latter still needs to be processed first. Import paths
-// outside pkgs (external to the loaded graph) are treated as already
-// satisfied. Ties are broken lexicographically for a deterministic order.
+// only through the latter still needs to be processed first. Ties are
+// broken lexicographically for a deterministic order.
 //
 // Imports alone is always guaranteed acyclic — go/packages.Load itself
 // rejects a real production import cycle before this ever runs — but
@@ -424,41 +433,77 @@ func newSnapshot(pkgs map[string]*Package, dir string) *Snapshot {
 // own "p [p.test]"/"p" split treats that as two distinct compilation units,
 // so it is not a real build-graph cycle even though it looks like one once
 // TestImports edges are added to a single graph here. When that leaves some
-// packages permanently unready, the ordinary walk below stalls before
+// packages permanently unready, the primary kahnPass below stalls before
 // covering every package; rather than fail the whole graph load over a
-// legal Go pattern, every package still unplaced at that point is appended
-// in a fixed (lexicographic) order instead — every acyclic edge, including
-// every OTHER TestImports edge not itself part of the cycle, is still
-// respected; only the cycle-closing edge(s) end up unordered between each
-// other. This makes topoOrder unable to fail today, unlike before
-// TestImports edges were added to its graph.
+// legal Go pattern, every package still unplaced at that point is instead
+// re-ordered by a second kahnPass restricted to Imports alone (guaranteed
+// to place every one of them, by the same acyclic guarantee, since a
+// subgraph of a DAG induced on any node subset is itself always a DAG) —
+// this respects every ordinary production edge among the unplaced set too
+// (e.g. a package that merely depends on one half of a test-only cycle
+// still lands after it), leaving only the cycle-closing TestImports edge(s)
+// themselves genuinely unordered between their own two endpoints, tie-
+// broken lexicographically like any other. This makes topoOrder unable to
+// fail today, unlike before TestImports edges were added to its graph.
 func topoOrder(pkgs map[string]*Package) []string {
-	indegree := make(map[string]int, len(pkgs))
-	dependents := make(map[string][]string, len(pkgs))
-	addEdges := func(path string, imports []string) {
-		for _, imp := range imports {
-			if _, ok := pkgs[imp]; !ok {
+	all := make(map[string]bool, len(pkgs))
+	for path := range pkgs {
+		all[path] = true
+	}
+	order, placed := kahnPass(all, func(path string) []string {
+		pkg := pkgs[path]
+		return append(append([]string(nil), pkg.Imports...), pkg.TestImports...)
+	})
+	if len(order) == len(pkgs) {
+		return order
+	}
+
+	remaining := make(map[string]bool, len(pkgs)-len(order))
+	for path := range pkgs {
+		if !placed[path] {
+			remaining[path] = true
+		}
+	}
+	rest, _ := kahnPass(remaining, func(path string) []string {
+		return pkgs[path].Imports
+	})
+	return append(order, rest...)
+}
+
+// kahnPass runs one Kahn's-algorithm topological sort over scope's members,
+// considering only an edgesOf(path) target also present in scope (any
+// other target — outside scope entirely, or filtered out by the caller's
+// own edgesOf — is treated as already satisfied). Ties among
+// simultaneously-ready nodes are broken lexicographically for a
+// deterministic order. order holds every member kahnPass managed to place,
+// in dependency order; placed reports exactly which those were, for a
+// caller whose own edge set might not be acyclic (topoOrder's primary pass)
+// to identify what is left over. A caller whose edgesOf is known acyclic
+// over scope (topoOrder's second, Imports-only pass) always gets
+// len(order) == len(scope).
+func kahnPass(scope map[string]bool, edgesOf func(path string) []string) (order []string, placed map[string]bool) {
+	indegree := make(map[string]int, len(scope))
+	dependents := make(map[string][]string, len(scope))
+	for path := range scope {
+		for _, dep := range edgesOf(path) {
+			if !scope[dep] {
 				continue
 			}
 			indegree[path]++
-			dependents[imp] = append(dependents[imp], path)
+			dependents[dep] = append(dependents[dep], path)
 		}
 	}
-	for path, pkg := range pkgs {
-		addEdges(path, pkg.Imports)
-		addEdges(path, pkg.TestImports)
-	}
 
-	ready := make([]string, 0, len(pkgs))
-	for path := range pkgs {
+	ready := make([]string, 0, len(scope))
+	for path := range scope {
 		if indegree[path] == 0 {
 			ready = append(ready, path)
 		}
 	}
 	sort.Strings(ready)
 
-	placed := make(map[string]bool, len(pkgs))
-	order := make([]string, 0, len(pkgs))
+	placed = make(map[string]bool, len(scope))
+	order = make([]string, 0, len(scope))
 	for len(ready) > 0 {
 		path := ready[0]
 		ready = ready[1:]
@@ -476,18 +521,37 @@ func topoOrder(pkgs map[string]*Package) []string {
 			sort.Strings(ready)
 		}
 	}
+	return order, placed
+}
 
-	if len(order) != len(pkgs) {
-		remaining := make([]string, 0, len(pkgs)-len(order))
-		for path := range pkgs {
-			if !placed[path] {
-				remaining = append(remaining, path)
-			}
-		}
-		sort.Strings(remaining)
-		order = append(order, remaining...)
+// Before reports whether a is guaranteed to finish processing strictly
+// before b in the dependency-ordered walk both Build's scheduler
+// (schedulableDepsOf) and Reindex's closure walk (orderedReverseClosure)
+// derive from Order — the single shared definition of "safely
+// processed-before" every caller that needs to know whether it may rely on
+// b's result while processing a should use, instead of each deriving its
+// own copy of Order's position map (as internal/index's scheduler and
+// directDepImports both used to, independently, before this existed).
+//
+// False whenever that guarantee does not hold: either path absent from
+// Order (e.g. not part of this Snapshot at all), or a >= b's own position —
+// which includes every pair topoOrder's own rare test-only-cycle fallback
+// could not fully order (see its doc): within that fallback's fixed,
+// lexicographic tail, relative position no longer reflects a real
+// dependency edge, so treating it as "before" would be exactly the false
+// promise that made a dependent ask for a not-yet-processed dependency's
+// key ("processed out of order?" — see internal/index/unit.go's
+// directDepExports and its own doc for this method's motivating bug).
+func (s *Snapshot) Before(a, b string) bool {
+	pa, ok := s.pos[a]
+	if !ok {
+		return false
 	}
-	return order
+	pb, ok := s.pos[b]
+	if !ok {
+		return false
+	}
+	return pa < pb
 }
 
 // Package returns the graph node for path, if present.

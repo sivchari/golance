@@ -152,6 +152,26 @@ func (d *depCacheHolder) importer() types.ImporterFrom {
 	return typecheck.NewImporter(d.fset, nil, exports, d.cache)
 }
 
+// reset unconditionally swaps in a fresh, empty (fset, cache) pair, the same
+// swap importer() itself performs once d.cache grows past maxDepCacheBytes,
+// discarding every decoded *types.Package (and cached decode failure) d
+// currently holds. Unlike invalidate, which drops a known set of import
+// paths, this is for a caller that cannot name which paths went stale — see
+// (*Server).discardStaleDepCache's own doc for the one such caller
+// (openIndexAfterBuild's rebuild path, via runIndexBuild). Safe to call
+// concurrently with importer()/decodeExport/invalidate: all four take d.mu.
+// Mutates d in place rather than replacing it, so every existing holder of
+// *d (engineImporter.depCache, baked into ws.engine's and ws.rootFallback's
+// own Importer closures at setWorkspace construction time) observes the
+// fresh pair on its very next call without needing ws itself to be
+// reinstalled.
+func (d *depCacheHolder) reset() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.fset = token.NewFileSet()
+	d.cache = typecheck.NewCache()
+}
+
 // FileSet returns the *token.FileSet dependency export data is currently
 // decoded into (see importer). Its positions are only meaningful against a
 // *types.Package decoded by the same (fset, cache) pair still current when
@@ -204,6 +224,25 @@ func (d *depCacheHolder) invalidate(pkgPaths []string) {
 	}
 	d.provider.Delete(pkgPaths...)
 	d.exportProvider.Delete(pkgPaths...)
+}
+
+// discardStaleDepCache drops every decoded *types.Package the current
+// workspace's depCache holds (depCacheHolder.reset), for a caller — only
+// runIndexBuild, gated by shouldDiscardDepCache — that just installed a
+// freshly rebuilt facts index without any way to name which root packages'
+// export data actually changed: unlike the targeted-repair path
+// (repairIndexPackagesLocked's own per-package reindex calls, each ending
+// in depCache.invalidate(changed)) and the setWorkspace graph-reload path
+// (changedExportSet's GoFiles-diff), a full index rebuild's indexer
+// subprocess reports only PROGRESS/STATS on stdout, never a changed-package
+// list (see indexer.go's own build contract) — so there is no narrower
+// invalidation possible here, only this coarse, whole-cache discard. A
+// no-op if no workspace is installed (Stop raced this, or this session
+// never got past its initial graph load).
+func (s *Server) discardStaleDepCache() {
+	if ws := s.workspace(); ws != nil {
+		ws.depCache.reset()
+	}
 }
 
 // depMetadataSource is a depcheck.MetadataSource whose backing
@@ -736,11 +775,39 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 	// nothing is pending here again once it is not.
 	s.drainPendingOpens(newWS)
 
-	if idx := s.idx.Load(); idx != nil {
-		s.idx.Store(&indexState{db: idx.db, cas: idx.cas, resolver: s.newResolver(idx.db, idx.cas, snap, RelativeIndexPaths(root))})
-	}
+	s.refreshIndexResolver(root, snap, s.idx.Load())
 
 	s.refreshOnWorkspaceReady()
+}
+
+// refreshIndexResolver rebuilds cur's Resolver against root/snap and
+// installs the result via a compare-and-swap keyed on cur itself — the
+// *indexState setWorkspace's own s.idx.Load() (its only caller) just read —
+// rather than an unconditional Store, because revalidateIndex's full-rebuild
+// branch (indexer.go) can discard and Close cur's db concurrently, guarded
+// only by s.idxMu, entirely independent of setWorkspaceMu (setWorkspace's
+// own lock, held for this whole call): an unconditional Store here could
+// otherwise install a Resolver wrapping a *store.DB that rebuild has already
+// Close()d, if this read cur before that rebuild's own Store(nil) but this
+// call's Store still lost the race to run after it — transiently
+// resurrecting a closed-db indexState until the rebuild's own later
+// Store(&indexState{...}) overwrites it, during which any query reaching
+// s.idx sees "database not open" instead of either the old or new index.
+//
+// A CAS failure means s.idx already moved on (to nil, mid-rebuild, or to
+// the rebuild's own freshly installed indexState) since cur was read; either
+// way there is nothing stale left here to refresh — the rebuild's own
+// indexState already reflects snap (setWorkspace's caller, revalidateGraph,
+// always runs revalidateIndex right after installing this same snap; see
+// its own doc), so silently doing nothing is correct, not a bug. cur == nil
+// (no facts index open yet) is also a no-op, the same as the pre-CAS
+// unconditional-Store version's own nil guard.
+func (s *Server) refreshIndexResolver(root string, snap *graph.Snapshot, cur *indexState) {
+	if cur == nil {
+		return
+	}
+	fresh := &indexState{db: cur.db, cas: cur.cas, resolver: s.newResolver(cur.db, cur.cas, snap, RelativeIndexPaths(root))}
+	s.idx.CompareAndSwap(cur, fresh)
 }
 
 // buildPkgNameIndex indexes every package in snap by its declared name, for

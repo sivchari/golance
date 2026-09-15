@@ -412,7 +412,13 @@ func (s *Server) revalidateIndex(ctx context.Context, root string) {
 			s.logger.Printf("golance: close index before rebuild: %v", err)
 		}
 	}
-	s.buildIndexLocked(ctx, root)
+	// rebuild=true: unlike buildIndex's cold-start call (no warm-opened
+	// index existed to distrust), this branch is discarding one that was
+	// actually open a moment ago, so runIndexBuild must also discard the
+	// workspace's depCache once the rebuild installs its replacement — see
+	// shouldDiscardDepCache's own doc for why a full rebuild needs this and
+	// a targeted repair (the branch just above, in the caller) does not.
+	s.buildIndexLocked(ctx, root, true)
 }
 
 // repairIndexPackagesLocked reindexes each of pkgs in place, via the same
@@ -509,7 +515,10 @@ func spawnIndexer(ctx context.Context, exe string) *exec.Cmd {
 func (s *Server) buildIndex(ctx context.Context, root string) {
 	s.idxMu.Lock()
 	defer s.idxMu.Unlock()
-	s.buildIndexLocked(ctx, root)
+	// rebuild=false: a cold start has no warm-opened index (and so no
+	// depCache decode resting on one) to distrust — see
+	// shouldDiscardDepCache's own doc.
+	s.buildIndexLocked(ctx, root, false)
 }
 
 // buildIndexLocked runs one indexer subprocess build against s.dbPath(root)
@@ -522,13 +531,22 @@ func (s *Server) buildIndex(ctx context.Context, root string) {
 // already resolves to the private path on this very first call) but also
 // two sessions racing a cold start against the same not-yet-existing shared
 // database at once, which tryWarmOpen alone cannot catch (see its doc).
-func (s *Server) buildIndexLocked(ctx context.Context, root string) {
+//
+// rebuild distinguishes this call's two callers for shouldDiscardDepCache's
+// benefit (see its own doc): true from revalidateIndex's full-rebuild
+// branch, discarding a warm-opened index that was actually open a moment
+// ago; false from buildIndex's cold-start entry, where there was never a
+// prior index for the workspace's depCache to have decoded anything
+// against. Passed through unchanged to both runIndexBuild attempts (the
+// private-path retry is still the same rebuild-or-not operation, only
+// against a different dbPath).
+func (s *Server) buildIndexLocked(ctx context.Context, root string, rebuild bool) {
 	dbPath := s.dbPath(root)
-	if !s.runIndexBuild(ctx, root, dbPath) {
+	if !s.runIndexBuild(ctx, root, dbPath, rebuild) {
 		return
 	}
 	s.switchToPrivateIndex()
-	s.runIndexBuild(ctx, root, s.dbPath(root))
+	s.runIndexBuild(ctx, root, s.dbPath(root), rebuild)
 }
 
 // runIndexBuild launches the indexer subprocess targeting dbPath, relays
@@ -537,7 +555,7 @@ func (s *Server) buildIndexLocked(ctx context.Context, root string) {
 // held by another live session — the only outcome buildIndexLocked's retry
 // reacts to; every other failure (reported via warnIndexUnavailable inside)
 // is left as-is; there is nothing a different path would fix.
-func (s *Server) runIndexBuild(ctx context.Context, root, dbPath string) (locked bool) {
+func (s *Server) runIndexBuild(ctx context.Context, root, dbPath string, rebuild bool) (locked bool) {
 	cas := casDir(root)
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
 		s.warnIndexUnavailable(fmt.Sprintf("create index directory: %v", err))
@@ -601,8 +619,28 @@ func (s *Server) runIndexBuild(ctx context.Context, root, dbPath string) (locked
 	// still nil. See notifyIndexProgressEnd's own doc for the race this
 	// closes.
 	locked = s.openIndexAfterBuild(ctx, dbPath, waitErr, stderr.String(), statsErrors)
+	if shouldDiscardDepCache(rebuild, locked, s.idx.Load()) {
+		s.discardStaleDepCache()
+	}
 	s.notifyIndexProgressEnd(began, summary)
 	return locked
+}
+
+// shouldDiscardDepCache reports whether runIndexBuild, having just called
+// openIndexAfterBuild, must also discard the workspace's depCache (see
+// discardStaleDepCache). Only true for a FULL rebuild (rebuild=true — see
+// buildIndexLocked's own parameter, distinguishing this from buildIndex's
+// cold-start call) that actually installed a fresh index (idx != nil)
+// rather than one about to be retried against a locked path (locked=true,
+// this attempt's own result already discarded) or one that left the facts
+// index unavailable (idx == nil, e.g. warnIndexUnavailable's
+// no-database-at-all case, where nothing actually changed for depCache to
+// distrust). Split out from runIndexBuild so this decision can be
+// unit-tested without spawning the real indexer subprocess, the same
+// "test the decision, not the dispatch" split chooseIndexRevalidateAction
+// and workspaceReadyRefreshes use for the identical reason.
+func shouldDiscardDepCache(rebuild, locked bool, idx *indexState) bool {
+	return rebuild && !locked && idx != nil
 }
 
 // openIndexAfterBuild opens dbPath and this session's CAS directory and

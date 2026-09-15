@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sivchari/golance/internal/graph"
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 )
@@ -80,5 +81,58 @@ func TestHandleCompletionResolve_UnimportedSelectorDoc(t *testing.T) {
 	doc, ok := got.Documentation.(protocol.String)
 	if !ok || !strings.Contains(string(doc), "Sprintf formats") {
 		t.Errorf("Documentation = %+v, want it to contain fmt.Sprintf's doc comment (\"Sprintf formats...\")", got.Documentation)
+	}
+}
+
+// TestDocumentLinkTarget_SiblingDirectorySharingRootPrefix is a regression
+// test for documentLinkTarget's own containment check: a package whose
+// directory merely shares ws.root as a string prefix without actually being
+// inside it (e.g. root "/proj" and a package under "/proj-archive") used to
+// wrongly resolve to a file:// link into that sibling directory instead of
+// its pkg.go.dev page.
+func TestDocumentLinkTarget_SiblingDirectorySharingRootPrefix(t *testing.T) {
+	ws := &workspace{
+		root: "/proj",
+		snap: &graph.Snapshot{Packages: map[string]*graph.Package{
+			"example.com/sibling": {
+				ImportPath: "example.com/sibling",
+				Dir:        "/proj-archive/sibling",
+				GoFiles:    []string{"/proj-archive/sibling/sibling.go"},
+			},
+		}},
+	}
+
+	target, ok := documentLinkTarget(ws, "example.com/sibling")
+	if !ok {
+		t.Fatal("documentLinkTarget() ok = false, want true")
+	}
+	want := uri.URI("https://pkg.go.dev/example.com/sibling")
+	if target != want {
+		t.Errorf("documentLinkTarget() = %q, want %q (a sibling directory sharing root's string prefix must not resolve to a file:// link)", target, want)
+	}
+}
+
+// TestDocumentLinkTarget_GenuineWorkspacePackage is the converse of
+// TestDocumentLinkTarget_SiblingDirectorySharingRootPrefix: a package
+// actually inside ws.root still resolves to a local file:// link.
+func TestDocumentLinkTarget_GenuineWorkspacePackage(t *testing.T) {
+	ws := &workspace{
+		root: "/proj",
+		snap: &graph.Snapshot{Packages: map[string]*graph.Package{
+			"example.com/proj/pkg": {
+				ImportPath: "example.com/proj/pkg",
+				Dir:        "/proj/pkg",
+				GoFiles:    []string{"/proj/pkg/pkg.go"},
+			},
+		}},
+	}
+
+	target, ok := documentLinkTarget(ws, "example.com/proj/pkg")
+	if !ok {
+		t.Fatal("documentLinkTarget() ok = false, want true")
+	}
+	want := uri.File("/proj/pkg/pkg.go")
+	if target != want {
+		t.Errorf("documentLinkTarget() = %q, want %q", target, want)
 	}
 }
