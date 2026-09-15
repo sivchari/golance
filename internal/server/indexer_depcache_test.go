@@ -92,7 +92,7 @@ func TestServer_DiscardStaleDepCache(t *testing.T) {
 		}
 	})
 
-	t.Run("no-op when no workspace is installed", func(t *testing.T) {
+	t.Run("no-op when no workspace is installed", func(*testing.T) {
 		s := &Server{}
 		s.discardStaleDepCache() // must not panic
 	})
