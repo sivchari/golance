@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.4](https://github.com/sivchari/golance/compare/v0.7.3...v0.7.4) - 2026-09-15
+- fix: bound server memory and make external-symbol navigation fast via persisted export data by @sivchari in https://github.com/sivchari/golance/pull/106
+
 ## [v0.7.3](https://github.com/sivchari/golance/compare/v0.7.2...v0.7.3) - 2026-09-12
 - fix: audit against gopls and repair silent, permanent failures by @sivchari in https://github.com/sivchari/golance/pull/104
 
