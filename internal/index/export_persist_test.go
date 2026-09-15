@@ -70,6 +70,15 @@ func TestBuild_PersistsDeclarationOnlyExportBlobForRootPackage(t *testing.T) {
 	if pkg.Scope().Lookup("Greeting") == nil {
 		t.Error(`decoded leaf export data has no "Greeting" declaration`)
 	}
+
+	_, midExport := rootExportBlob(t, db, cas, pkgMid)
+	midPkg, err := typecheck.ReadExport(midExport, token.NewFileSet(), pkgMid, typecheck.NewCache())
+	if err != nil {
+		t.Fatalf("decode mid's persisted export data: %v", err)
+	}
+	if midPkg.Scope().Lookup("Shout") == nil {
+		t.Error(`decoded mid export data has no "Shout" declaration`)
+	}
 }
 
 // TestBuild_CASRestoredPackageWritesNoFreshExportBlob verifies the other

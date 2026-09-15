@@ -17,12 +17,12 @@ import (
 	"github.com/sivchari/golance/internal/xref"
 )
 
-// TestHandleDefinitionAndHover_GenericFieldWithRootTypeArgument is the
-// regression test for a generic wrapper field (mirroring
-// connectrpc.com/connect's Request[T].Msg) instantiated with a ROOT
-// (workspace) type argument: testdata/rootgenericfield/wrapper.Box[T] is a
-// NON-root dependency of the ROOT consumer package, instantiated with
-// payload.Data — also a ROOT package, unlike testdata/genericclosure's
+// newRootGenericFieldServer builds the regression workspace for a generic
+// wrapper field (mirroring connectrpc.com/connect's Request[T].Msg)
+// instantiated with a ROOT (workspace) type argument:
+// testdata/rootgenericfield/wrapper.Box[T] is a NON-root dependency of the
+// ROOT consumer package, instantiated with payload.Data — also a ROOT
+// package, unlike testdata/genericclosure's
 // TestHandleHover_GenericWrapperFieldThroughExportProduction, where both the
 // wrapper AND its type argument are non-root. That fixture alone left
 // engineImporter's root-import tiers (decodeRoot/getRoot — see
@@ -32,7 +32,13 @@ import (
 // protobuf message type, always a ROOT package) once engineImporter began
 // routing root imports through the facts index's persisted export data
 // instead of check.Engine's own decode-only importer.
-func TestHandleDefinitionAndHover_GenericFieldWithRootTypeArgument(t *testing.T) {
+//
+// It returns the server plus the consumer file and the position of r.Msg's
+// use inside it, with the consumer package already checked (diagnostics
+// clean) and payload's ROOT import confirmed to have resolved via the facts
+// index decode fast path.
+func newRootGenericFieldServer(t *testing.T) (s *Server, consumerFile string, pos protocol.Position) {
+	t.Helper()
 	root, err := filepath.Abs(filepath.Join("testdata", "rootgenericfield"))
 	if err != nil {
 		t.Fatalf("abs testdata root: %v", err)
@@ -65,13 +71,13 @@ func TestHandleDefinitionAndHover_GenericFieldWithRootTypeArgument(t *testing.T)
 	}
 
 	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
-	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	s = New(rpcServer, Options{Logger: newTestLogger(t)})
 	s.setWorkspace(root, snap)
 	stopWorkspaceEngineOnCleanup(t, s)
 	s.idx.Store(&indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, relative)})
 
 	ws := s.workspace()
-	consumerFile := filepath.Join(root, "consumer", "consumer.go")
+	consumerFile = filepath.Join(root, "consumer", "consumer.go")
 
 	cp, err := ws.engine.Get(context.Background(), consumerFile)
 	if err != nil {
@@ -95,7 +101,14 @@ func TestHandleDefinitionAndHover_GenericFieldWithRootTypeArgument(t *testing.T)
 	if err != nil {
 		t.Fatalf("read consumer.go: %v", err)
 	}
-	pos := identPositionIn(t, consumerFile, data, "Msg", 1) // r.Msg's use in ExtractField
+	pos = identPositionIn(t, consumerFile, data, "Msg", 1) // r.Msg's use in ExtractField
+	return s, consumerFile, pos
+}
+
+// TestHandleDefinition_GenericFieldWithRootTypeArgument pins go-to-definition
+// on the generic wrapper field described on newRootGenericFieldServer.
+func TestHandleDefinition_GenericFieldWithRootTypeArgument(t *testing.T) {
+	s, consumerFile, pos := newRootGenericFieldServer(t)
 
 	defResult, err := s.handleDefinition(context.Background(), mustMarshal(t, &protocol.DefinitionParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
@@ -113,6 +126,12 @@ func TestHandleDefinitionAndHover_GenericFieldWithRootTypeArgument(t *testing.T)
 	if got := locs[0].URI.FsPath(); filepath.Base(got) != "wrapper.go" {
 		t.Errorf("handleDefinition(r.Msg) resolved to %s, want wrapper/wrapper.go", got)
 	}
+}
+
+// TestHandleHover_GenericFieldWithRootTypeArgument pins hover on the same
+// position TestHandleDefinition_GenericFieldWithRootTypeArgument resolves.
+func TestHandleHover_GenericFieldWithRootTypeArgument(t *testing.T) {
+	s, consumerFile, pos := newRootGenericFieldServer(t)
 
 	hovResult, err := s.handleHover(context.Background(), mustMarshal(t, &protocol.HoverParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
