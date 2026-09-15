@@ -29,7 +29,6 @@ type scheduler struct {
 	nonRootRemaining map[string]*int32 // fan-in counters for direct non-root imports, see computeNonRootFanIn
 	pendingDeps      map[string]*int32 // unfinished direct dependency counters, drive scheduling
 	dependents       map[string][]string
-	pos              map[string]int // import path -> index in snap.Order, see schedulableDepsOf
 	ready            chan string
 	left             int32
 }
@@ -52,8 +51,7 @@ func schedulableRoot(snap *graph.Snapshot, pkg *graph.Package) bool {
 // number of packages to process; a scheduler for total == 0 has nothing to
 // do.
 func newScheduler(snap *graph.Snapshot, cache *typecheck.Cache, onEvicted func(string, int)) (*scheduler, int) {
-	pos := orderPositions(snap.Order)
-	fanIn, dependents := computeFanIn(snap, pos)
+	fanIn, dependents := computeFanIn(snap)
 
 	var total int
 	pendingDeps := make(map[string]*int32, len(snap.Packages))
@@ -63,7 +61,7 @@ func newScheduler(snap *graph.Snapshot, cache *typecheck.Cache, onEvicted func(s
 		}
 		total++
 		var n int32
-		for range schedulableDepsOf(snap, path, pkg, pos) {
+		for range schedulableDepsOf(snap, path, pkg) {
 			n++
 		}
 		v := n
@@ -91,7 +89,6 @@ func newScheduler(snap *graph.Snapshot, cache *typecheck.Cache, onEvicted func(s
 		nonRootRemaining: nonRootRemaining,
 		pendingDeps:      pendingDeps,
 		dependents:       dependents,
-		pos:              pos,
 		ready:            make(chan string, total),
 		left:             int32(total),
 	}
@@ -112,7 +109,7 @@ func newScheduler(snap *graph.Snapshot, cache *typecheck.Cache, onEvicted func(s
 // pushes any dependent whose last pending dependency was path onto ready.
 // Call exactly once per package received from ready.
 func (s *scheduler) finish(path string) {
-	for _, dep := range schedulableDepsOf(s.snap, path, s.snap.Packages[path], s.pos) {
+	for _, dep := range schedulableDepsOf(s.snap, path, s.snap.Packages[path]) {
 		ctr, ok := s.remaining[dep]
 		if !ok {
 			continue
@@ -149,32 +146,23 @@ func (s *scheduler) finish(path string) {
 	}
 }
 
-// orderPositions returns each import path's index in order — snap.Order,
-// see graph.Snapshot's own doc — for schedulableDepsOf to filter out an
-// edge topoOrder's own rare cycle fallback could not fully satisfy before
-// this scheduler ever tries to wait on it (see that function's doc).
-func orderPositions(order []string) map[string]int {
-	pos := make(map[string]int, len(order))
-	for i, p := range order {
-		pos[p] = i
-	}
-	return pos
-}
-
 // schedulableDepsOf returns pkg's direct workspace (root) dependencies
 // eligible for scheduling: every entry in pkg.Imports and pkg.TestImports
 // (an in-package test file's own extra imports — see its doc, and
 // directDepImports' identical fold for [computeUnitKey]) naming a root
-// package genuinely positioned before path in pos. An ordinary Imports edge
-// always qualifies — Imports alone is guaranteed acyclic, so
-// graph.Snapshot.Order always places it correctly — but a TestImports edge
-// caught in the rare legal test-only cycle topoOrder's own fallback could
-// not fully order is silently dropped here instead: counting it would make
-// newScheduler's pendingDeps/remaining bookkeeping wait forever on a
-// dependency that will never signal "finished" through this ordering,
-// deadlocking Build entirely rather than merely reporting one package's own
-// combined-key resolution as this run's error (see directDepImports' doc).
-func schedulableDepsOf(snap *graph.Snapshot, path string, pkg *graph.Package, pos map[string]int) []string {
+// package snap.Before reports as genuinely positioned before path. An
+// ordinary Imports edge always qualifies — Imports alone is guaranteed
+// acyclic, so graph.Snapshot.Order always places it correctly — but a
+// TestImports edge caught in the rare legal test-only cycle topoOrder's own
+// fallback could not fully order is silently dropped here instead: counting
+// it would make newScheduler's pendingDeps/remaining bookkeeping wait
+// forever on a dependency that will never signal "finished" through this
+// ordering, deadlocking Build entirely. directDepImports applies this exact
+// same snap.Before filter for its own, different reason (see its doc), so a
+// dropped edge here is also never required for [computeUnitKey] — dropping
+// it never surfaces as this run's error the way it used to before that
+// filter existed there too.
+func schedulableDepsOf(snap *graph.Snapshot, path string, pkg *graph.Package) []string {
 	var out []string
 	for _, imports := range [][]string{pkg.Imports, pkg.TestImports} {
 		for _, dep := range imports {
@@ -182,7 +170,7 @@ func schedulableDepsOf(snap *graph.Snapshot, path string, pkg *graph.Package, po
 			if !ok || !d.Root {
 				continue
 			}
-			if pos[dep] >= pos[path] {
+			if !snap.Before(dep, path) {
 				continue
 			}
 			out = append(out, dep)
@@ -200,14 +188,14 @@ func schedulableDepsOf(snap *graph.Snapshot, path string, pkg *graph.Package, po
 // warm in the shared typecheck.Cache until the external test unit has also
 // finished with it, and what makes the external test unit itself become
 // ready once its base package finishes (see finish).
-func computeFanIn(snap *graph.Snapshot, pos map[string]int) (fanIn map[string]int32, dependents map[string][]string) {
+func computeFanIn(snap *graph.Snapshot) (fanIn map[string]int32, dependents map[string][]string) {
 	fanIn = make(map[string]int32, len(snap.Packages))
 	dependents = make(map[string][]string, len(snap.Packages))
 	for path, pkg := range snap.Packages {
 		if !schedulableRoot(snap, pkg) {
 			continue
 		}
-		for _, dep := range schedulableDepsOf(snap, path, pkg, pos) {
+		for _, dep := range schedulableDepsOf(snap, path, pkg) {
 			fanIn[dep]++
 			dependents[dep] = append(dependents[dep], path)
 		}

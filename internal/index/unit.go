@@ -245,11 +245,12 @@ func checkAndStoreOutcome(fset *token.FileSet, imp *typecheck.Importer, cas *sto
 // before it has itself finished this run — resolved and stable in db (if
 // left untouched), freshly resolved (if touched), or, if it was touched but
 // failed to resolve, explicitly recorded as such via keys.fail (see
-// keyTable's own doc for why get must not fall back to db in that case). So
-// the only way keys.get reports a direct dependency unresolvable here is
-// that last case, and pkg must then also be reported as this run's own
-// error rather than silently keyed against that dependency's stale prior
-// state.
+// keyTable's own doc for why get must not fall back to db in that case).
+// directDepImports already excludes any edge not itself covered by that
+// guarantee (see its own doc), so the only way keys.get still reports a
+// direct dependency unresolvable here is the failed-this-run case, and pkg
+// must then also be reported as this run's own error rather than silently
+// keyed against that dependency's stale prior state.
 func directDepExports(snap *graph.Snapshot, keys *keyTable, pkg *graph.Package) ([]depExportEntry, error) {
 	var deps []depExportEntry
 	for _, imp := range directDepImports(snap, pkg) {
@@ -274,6 +275,23 @@ func directDepExports(snap *graph.Snapshot, keys *keyTable, pkg *graph.Package) 
 // recognize a dependency pkg reaches only through its own _test.go file
 // (see graph.Snapshot.ClosureUnits' identical fold, the reverse direction
 // of this same relationship).
+//
+// An edge snap.Before(imp, pkg.ImportPath) does not confirm — a TestImports
+// edge caught in the rare legal test-only import cycle topoOrder's own
+// fallback could not fully order (see its doc), e.g. two layers whose
+// in-package tests import each other (a domain-usecase/infrastructure-style
+// split) — is excluded here too, mirroring exactly which edges
+// schedulableDepsOf treats as safe to wait on for scheduling. Without this,
+// directDepExports could ask keys.get for a dependency the scheduler never
+// guaranteed would be processed first, surfacing as a spurious "has no
+// recorded blob key (processed out of order?)" error for both sides of the
+// cycle even though neither package's own indexing is actually broken (see
+// the package's fix history for the bug this closed). The cost is narrow
+// and identical in kind to the scheduler's own: that one excluded
+// dependency's export data never contributes to pkg's key, so an API change
+// on the far side of such a cycle edge alone will not force pkg's
+// reprocessing — a soundness gap already accepted for scheduling, now
+// shared by key computation instead of contradicting it.
 func directDepImports(snap *graph.Snapshot, pkg *graph.Package) []string {
 	var out []string
 	for _, imports := range [][]string{pkg.Imports, pkg.TestImports} {
@@ -281,6 +299,9 @@ func directDepImports(snap *graph.Snapshot, pkg *graph.Package) []string {
 			d, ok := snap.Packages[imp]
 			if !ok || !d.Root || len(d.GoFiles) == 0 {
 				continue // non-workspace or empty dependency: excluded from the key, see computeUnitKey's doc.
+			}
+			if !snap.Before(imp, pkg.ImportPath) {
+				continue // see this function's own doc: an edge the scheduler itself would not wait on.
 			}
 			out = append(out, imp)
 		}
