@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"testing"
 
 	"github.com/sivchari/golance/internal/store"
@@ -23,7 +22,7 @@ func TestRevalidate_NothingChanged(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	changed, err := Revalidate(ctx, snap, db, runtime.Version(), "", false)
+	changed, err := Revalidate(ctx, snap, db, DefaultToolchainFingerprint(), "", false)
 	if err != nil {
 		t.Fatalf("Revalidate: %v", err)
 	}
@@ -56,7 +55,7 @@ func TestRevalidate_ContentChangeDetectedWithoutWriting(t *testing.T) {
 		t.Fatalf("edit leaf.go: %v", err)
 	}
 
-	changed, err := Revalidate(ctx, snap, db, runtime.Version(), "", false)
+	changed, err := Revalidate(ctx, snap, db, DefaultToolchainFingerprint(), "", false)
 	if err != nil {
 		t.Fatalf("Revalidate: %v", err)
 	}
@@ -87,7 +86,7 @@ func TestRevalidate_ToolchainMismatchShortCircuits(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	changed, err := Revalidate(ctx, snap, db, runtime.Version(), "", false)
+	changed, err := Revalidate(ctx, snap, db, DefaultToolchainFingerprint(), "", false)
 	if err != nil {
 		t.Fatalf("Revalidate: %v", err)
 	}
@@ -118,7 +117,7 @@ func TestRevalidate_NothingChangedWithInPackageTestFile(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	changed, err := Revalidate(ctx, snap, db, runtime.Version(), "", false)
+	changed, err := Revalidate(ctx, snap, db, DefaultToolchainFingerprint(), "", false)
 	if err != nil {
 		t.Fatalf("Revalidate: %v", err)
 	}
@@ -152,7 +151,7 @@ func TestRevalidate_InPackageTestFileContentChangeDetected(t *testing.T) {
 		t.Fatalf("edit pkg_test.go: %v", err)
 	}
 
-	changed, err := Revalidate(ctx, snap, db, runtime.Version(), "", false)
+	changed, err := Revalidate(ctx, snap, db, DefaultToolchainFingerprint(), "", false)
 	if err != nil {
 		t.Fatalf("Revalidate: %v", err)
 	}
@@ -168,7 +167,7 @@ func TestRevalidate_NewPackageNotYetInDB(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	changed, err := Revalidate(ctx, snap, db, runtime.Version(), "", false)
+	changed, err := Revalidate(ctx, snap, db, DefaultToolchainFingerprint(), "", false)
 	if err != nil {
 		t.Fatalf("Revalidate: %v", err)
 	}
@@ -202,7 +201,7 @@ func TestRevalidateStale_ListsOnlyStalePackages(t *testing.T) {
 		t.Fatalf("PutUnitPointersBatch: %v", err)
 	}
 
-	pkgs, wholeDBStale, err := RevalidateStale(ctx, snap, db, runtime.Version(), "", false)
+	pkgs, wholeDBStale, err := RevalidateStale(ctx, snap, db, DefaultToolchainFingerprint(), "", false)
 	if err != nil {
 		t.Fatalf("RevalidateStale: %v", err)
 	}
@@ -227,7 +226,7 @@ func TestRevalidateStale_MismatchedFingerprintReportsWholeDBStale(t *testing.T) 
 		t.Fatalf("Build: %v", err)
 	}
 
-	pkgs, wholeDBStale, err := RevalidateStale(ctx, snap, db, runtime.Version(), "", false)
+	pkgs, wholeDBStale, err := RevalidateStale(ctx, snap, db, DefaultToolchainFingerprint(), "", false)
 	if err != nil {
 		t.Fatalf("RevalidateStale: %v", err)
 	}
@@ -258,7 +257,7 @@ func TestPackageChanged_MissingUnitPointer(t *testing.T) {
 	snap = loadSnapshot(t, dir)
 
 	const pkgExtra = "example.com/idxmod/extra"
-	changed, err := PackageChanged(ctx, snap, db, pkgExtra, runtime.Version(), "", false)
+	changed, err := PackageChanged(ctx, snap, db, pkgExtra, DefaultToolchainFingerprint(), "", false)
 	if err != nil {
 		t.Fatalf("PackageChanged: %v", err)
 	}
@@ -280,7 +279,7 @@ func TestPackageChanged_Unchanged(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	changed, err := PackageChanged(ctx, snap, db, pkgLeaf, runtime.Version(), "", false)
+	changed, err := PackageChanged(ctx, snap, db, pkgLeaf, DefaultToolchainFingerprint(), "", false)
 	if err != nil {
 		t.Fatalf("PackageChanged: %v", err)
 	}
@@ -302,7 +301,32 @@ func TestPackageChanged_UnknownPackage(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 
-	if _, err := PackageChanged(ctx, snap, db, "example.com/idxmod/nonexistent", runtime.Version(), "", false); err == nil {
+	if _, err := PackageChanged(ctx, snap, db, "example.com/idxmod/nonexistent", DefaultToolchainFingerprint(), "", false); err == nil {
 		t.Error("PackageChanged() error = nil, want an error for an unknown package path")
+	}
+}
+
+// TestRevalidateStale_GolanceUpgradeInvalidatesWholeDB pins the reason
+// DefaultToolchainFingerprint folds in golance's own version: an index
+// written by a DIFFERENT golance version (here simulated with an explicit
+// old fingerprint) must be judged wholeDBStale by the current binary, since
+// the facts it holds are a product of the old indexer's code — including
+// any extraction bugs fixed since.
+func TestRevalidateStale_GolanceUpgradeInvalidatesWholeDB(t *testing.T) {
+	snap := loadTestSnapshot(t)
+	db := openTestDB(t)
+	cas := openTestCAS(t)
+	ctx := context.Background()
+
+	if _, err := Build(ctx, snap, db, cas, &Options{ToolchainFingerprint: "go1.99.0 golance/0.0.1"}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	_, wholeDBStale, err := RevalidateStale(ctx, snap, db, DefaultToolchainFingerprint(), "", false)
+	if err != nil {
+		t.Fatalf("RevalidateStale: %v", err)
+	}
+	if !wholeDBStale {
+		t.Error("RevalidateStale() wholeDBStale = false for an index built by a different golance version, want true")
 	}
 }

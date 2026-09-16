@@ -473,7 +473,7 @@ func (s *Server) staleIndexPackages(ctx context.Context) (pkgs []string, wholeDB
 	if ws == nil {
 		return nil, false
 	}
-	pkgs, wholeDBStale, err := index.RevalidateStale(ctx, ws.snap, idx.db, runtime.Version(), "", RelativeIndexPaths(ws.root))
+	pkgs, wholeDBStale, err := index.RevalidateStale(ctx, ws.snap, idx.db, index.DefaultToolchainFingerprint(), "", RelativeIndexPaths(ws.root))
 	if err != nil {
 		s.logger.Printf("golance: revalidate index: %v", err)
 		return nil, false

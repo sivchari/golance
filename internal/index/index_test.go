@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/sivchari/golance/internal/graph"
@@ -374,8 +373,8 @@ func TestBuild_EmptyPackageIsSkippedNotFatal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildFingerprint: %v", err)
 	}
-	if fp != runtime.Version() {
-		t.Errorf("BuildFingerprint = %q, want %q", fp, runtime.Version())
+	if fp != DefaultToolchainFingerprint() {
+		t.Errorf("BuildFingerprint = %q, want %q", fp, DefaultToolchainFingerprint())
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/sync/semaphore"
 
+	"github.com/sivchari/golance"
 	"github.com/sivchari/golance/internal/depcheck"
 	"github.com/sivchari/golance/internal/depexport"
 	"github.com/sivchari/golance/internal/graph"
@@ -29,7 +30,11 @@ type Options struct {
 	BatchSize int
 	// ToolchainFingerprint is recorded in each package's UnitPointer and
 	// compared on a later Build to force a full revalidation pass after a
-	// toolchain upgrade. Defaults to runtime.Version().
+	// toolchain upgrade. Defaults to DefaultToolchainFingerprint(), which
+	// folds in golance's own version: what the indexer extracts depends on
+	// its own code, so an index built by an older golance (e.g. one whose
+	// facts were incomplete due to a since-fixed bug) must not be trusted
+	// by a newer binary.
 	ToolchainFingerprint string
 	// BuildFlagsFingerprint is folded into each package's content hash so
 	// a build-flags change (e.g. -tags, GOOS/GOARCH, CGO_ENABLED)
@@ -86,9 +91,21 @@ func (o *Options) withDefaults() Options {
 		d.BatchSize = 50
 	}
 	if d.ToolchainFingerprint == "" {
-		d.ToolchainFingerprint = runtime.Version()
+		d.ToolchainFingerprint = DefaultToolchainFingerprint()
 	}
 	return d
+}
+
+// DefaultToolchainFingerprint returns the fingerprint Build records (and
+// Revalidate/PackageChanged callers must compare against) when
+// Options.ToolchainFingerprint is unset: the Go toolchain version plus
+// golance's own version. Including golance's version forces a full rebuild
+// on upgrade — the facts an index holds are a product of the indexer's own
+// code, not just the toolchain, so an index written by an older golance
+// (including one whose extraction was incomplete due to a since-fixed bug)
+// must not be warm-opened as current by a newer binary.
+func DefaultToolchainFingerprint() string {
+	return runtime.Version() + " golance/" + golance.Version
 }
 
 // Stats summarizes a completed Build or Reindex run.

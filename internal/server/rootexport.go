@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"crypto/sha256"
-	"runtime"
 
 	"go.lsp.dev/uri"
 
@@ -72,7 +71,7 @@ func (r *rootExportSource) blob(ctx context.Context, pkgPath string) (data []byt
 	if !pok || len(goFiles) == 0 || r.dirty(goFiles) {
 		return nil, false
 	}
-	changed, err := index.PackageChanged(ctx, r.graphSrc.Snapshot(), idx.db, pkgPath, runtime.Version(), "", r.relative)
+	changed, err := index.PackageChanged(ctx, r.graphSrc.Snapshot(), idx.db, pkgPath, index.DefaultToolchainFingerprint(), "", r.relative)
 	if err != nil || changed {
 		return nil, false
 	}
