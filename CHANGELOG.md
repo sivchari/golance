@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.8](https://github.com/sivchari/golance/compare/v0.7.7...v0.7.8) - 2026-09-16
+- fix: fold golance's own version into the index build fingerprint by @sivchari in https://github.com/sivchari/golance/pull/117
+
 ## [v0.7.7](https://github.com/sivchari/golance/compare/v0.7.6...v0.7.7) - 2026-09-16
 - fix: implementation fallback and cold-start diagnostics UX by @sivchari in https://github.com/sivchari/golance/pull/113
 - fix: fast facts-index declaration path and visible per-package check failures by @sivchari in https://github.com/sivchari/golance/pull/115
