@@ -345,7 +345,24 @@ func (p *Provider) CheckedWithBodies() int64 {
 // PackageWithBodies), that CheckedPackage is returned instead of running a
 // second, redundant declarations-only check — sharing identity between the
 // two call sites is exactly the point (see PackageWithBodies's doc).
+//
+// Every package pkgPath's own transitive closure resolves through during
+// this one call is pinned in a fresh closureScope for the call's entire
+// duration (see its own doc): p's shared LRU may still evict any of them to
+// make room for a different, concurrently in-flight closure, but THIS call
+// will never itself see two different generations of the same import path
+// as a result.
 func (p *Provider) Package(ctx context.Context, pkgPath string) (*CheckedPackage, error) {
+	return p.packageScoped(ctx, pkgPath, newClosureScope())
+}
+
+// packageScoped is Package's own implementation, additionally threading
+// scope through every nested resolution this call triggers (see
+// closureScope's own doc and ctxImporter.scope).
+func (p *Provider) packageScoped(ctx context.Context, pkgPath string, scope *closureScope) (*CheckedPackage, error) {
+	if cp, ok := scope.get(pkgPath); ok {
+		return cp, nil
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -353,9 +370,11 @@ func (p *Provider) Package(ctx context.Context, pkgPath string) (*CheckedPackage
 		return unsafePackage(), nil
 	}
 	if cp, ok := p.getFull(pkgPath); ok {
+		scope.put(pkgPath, cp)
 		return cp, nil
 	}
 	if cp, ok := p.get(pkgPath); ok {
+		scope.put(pkgPath, cp)
 		return cp, nil
 	}
 
@@ -366,7 +385,7 @@ func (p *Provider) Package(ctx context.Context, pkgPath string) (*CheckedPackage
 		if cp, ok := p.get(pkgPath); ok {
 			return cp, nil
 		}
-		cp, err := p.check(ctx, pkgPath, false)
+		cp, err := p.check(ctx, pkgPath, false, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -380,6 +399,7 @@ func (p *Provider) Package(ctx context.Context, pkgPath string) (*CheckedPackage
 	if !ok {
 		return nil, fmt.Errorf("depcheck: singleflight for %s returned %T, want *CheckedPackage", pkgPath, v)
 	}
+	scope.put(pkgPath, cp)
 	return cp, nil
 }
 
@@ -406,6 +426,16 @@ func (p *Provider) Package(ctx context.Context, pkgPath string) (*CheckedPackage
 // divergence is an accepted tradeoff rather than something golance's
 // on-demand identity needs to solve for.
 func (p *Provider) PackageWithBodies(ctx context.Context, pkgPath string) (*CheckedPackage, error) {
+	return p.packageWithBodiesScoped(ctx, pkgPath, newClosureScope())
+}
+
+// packageWithBodiesScoped is PackageWithBodies's own implementation,
+// additionally threading scope through every nested resolution this call
+// triggers — see packageScoped's identical doc.
+func (p *Provider) packageWithBodiesScoped(ctx context.Context, pkgPath string, scope *closureScope) (*CheckedPackage, error) {
+	if cp, ok := scope.get(pkgPath); ok {
+		return cp, nil
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -413,6 +443,7 @@ func (p *Provider) PackageWithBodies(ctx context.Context, pkgPath string) (*Chec
 		return unsafePackage(), nil
 	}
 	if cp, ok := p.getFull(pkgPath); ok {
+		scope.put(pkgPath, cp)
 		return cp, nil
 	}
 
@@ -420,7 +451,7 @@ func (p *Provider) PackageWithBodies(ctx context.Context, pkgPath string) (*Chec
 		if cp, ok := p.getFull(pkgPath); ok {
 			return cp, nil
 		}
-		cp, err := p.check(ctx, pkgPath, true)
+		cp, err := p.check(ctx, pkgPath, true, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -434,6 +465,7 @@ func (p *Provider) PackageWithBodies(ctx context.Context, pkgPath string) (*Chec
 	if !ok {
 		return nil, fmt.Errorf("depcheck: singleflight for %s returned %T, want *CheckedPackage", pkgPath, v)
 	}
+	scope.put(pkgPath, cp)
 	return cp, nil
 }
 
@@ -512,7 +544,13 @@ func unsafePackage() *CheckedPackage {
 // Package's own true (declarations only, the common case for resolving a
 // jump target's signature/doc); doc comments come from parser.ParseComments
 // regardless of that setting.
-func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool) (*CheckedPackage, error) {
+//
+// scope is the calling packageScoped/packageWithBodiesScoped's own
+// closureScope, carried into the ctxImporter this check builds so pkgPath's
+// entire transitive closure — however deep the recursion goes — pins every
+// distinct import path it touches to one *CheckedPackage for scope's whole
+// lifetime (see closureScope's own doc).
+func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool, scope *closureScope) (*CheckedPackage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -542,7 +580,7 @@ func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool) (
 		Instances:  make(map[*ast.Ident]types.Instance),
 		Implicits:  make(map[ast.Node]types.Object),
 	}
-	imp := &ctxImporter{p: p, ctx: ctx}
+	imp := &ctxImporter{p: p, ctx: ctx, scope: scope}
 	var hadErr bool
 	conf := types.Config{
 		Importer:         imp,
@@ -588,8 +626,9 @@ func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool) (
 // this only makes that check happen sooner, so an abandoned closure check
 // stops burning CPU promptly instead of only at the very end.
 type ctxImporter struct {
-	p   *Provider
-	ctx context.Context
+	p     *Provider
+	ctx   context.Context
+	scope *closureScope
 
 	// importIncomplete is set once ImportFrom resolves an import that is
 	// itself Incomplete, so the check currently underway inherits that —
@@ -602,22 +641,101 @@ type ctxImporter struct {
 	importIncomplete bool
 }
 
+// closureScope pins every distinct import path one top-level
+// Provider.Package/PackageWithBodies call's own recursive resolution has
+// already resolved, to the exact *CheckedPackage it first got back, for
+// that one call's entire duration.
+//
+// Without this, p's shared declarations-only LRU (sized for cross-closure
+// reuse, not for holding one closure's full working set — see DefaultCap/
+// RecommendedCap's own docs, which already acknowledge "a single dependency
+// closure larger than a small cap DOES thrash it") can evict a widely-shared
+// package in the middle of resolving ONE closure, to make room for a
+// different, concurrently in-flight one: a later ImportFrom within that same
+// closure for the same import path then falls through to check it a SECOND
+// time from scratch, producing a distinct *types.Package for what is
+// declaration-for-declaration identical source. go/types compares named
+// types (and satisfies generic instantiations) by object identity, not
+// structural shape, so two non-identical instances of the same package
+// feeding into one Checker.Check call make an otherwise valid generic
+// instantiation fail an interface-satisfaction check that would pass under
+// `go build` — this is exactly the "widely-shared dependency gets evicted
+// and re-checked from scratch partway through resolving cp's own transitive
+// imports" mechanism internal/depexport's own checkAndPersist doc already
+// names, confirmed reproducible without any export-data round trip at all
+// (see internal/depcheck's own genericsplit_test.go).
+//
+// A closureScope is created fresh for every top-level Package/
+// PackageWithBodies call and discarded once it returns — it never persists
+// across calls, so it adds no reuse across DIFFERENT closures (p's own LRU
+// still owns that) and no bound on how many DIFFERENT generations distinct
+// closures may separately observe for the same import path over the
+// Provider's lifetime; see internal/depcheck's own
+// TestGenericSplit_SurvivesIndependentBlobProduction for why that is sound:
+// gcexportdata's shared-imports-map decode already converges independently-
+// produced-but-structurally-identical blobs by qualified name regardless of
+// which generation produced each one, so only identity WITHIN one closure's
+// own live (never-serialized) *types.Package graph needs pinning here.
+//
+// Deliberately does not extend to imp.p's exportResolver (the decode fast
+// path — see its own doc): a decoded package there lives in its own
+// dedicated fset/cache, is never a Decl/DeclAt target, and never mixes with
+// a p.fset-based CheckedPackage in the first place, so it needs no
+// closure-local pinning of its own; exportDecodeCap's coarse whole-cache
+// reset is that path's own, pre-existing, separately-documented answer to
+// the identical problem, left untouched here.
+type closureScope struct {
+	mu   sync.Mutex
+	pkgs map[string]*CheckedPackage
+}
+
+// newClosureScope returns an empty closureScope.
+func newClosureScope() *closureScope {
+	return &closureScope{pkgs: make(map[string]*CheckedPackage)}
+}
+
+// get returns pkgPath's pinned CheckedPackage, if s already holds one.
+func (s *closureScope) get(pkgPath string) (*CheckedPackage, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp, ok := s.pkgs[pkgPath]
+	return cp, ok
+}
+
+// put pins cp under pkgPath for the rest of s's lifetime. Never overwrites
+// an existing entry with a different value: every caller either already
+// checked get first, or resolves pkgPath via the same singleflight-guarded
+// path that makes every concurrent caller for one pkgPath observe the
+// identical cp regardless of which of them calls put first.
+func (s *closureScope) put(pkgPath string, cp *CheckedPackage) {
+	s.mu.Lock()
+	if _, ok := s.pkgs[pkgPath]; !ok {
+		s.pkgs[pkgPath] = cp
+	}
+	s.mu.Unlock()
+}
+
 func (imp *ctxImporter) Import(path string) (*types.Package, error) {
 	return imp.ImportFrom(path, "", 0)
 }
 
-// ImportFrom resolves path against the full-body LRU first, so an import of
-// a package the caller also has open (via PackageWithBodies) shares its
-// exact *types.Package identity instead of triggering a second, divergent
-// declarations-only check — see PackageWithBodies's doc. Next, the
-// declarations-only LRU: an already-resident, source-checked instance is
-// always preferred over a decode, since it costs nothing further to reuse.
-// Only once both miss does this fall to imp.p's exportResolver (see its own
-// doc), decoding path from persisted export data instead of a full
-// recursive source-check — the fix for the production regression measured
-// against a dependency closure larger than the LRU's own cap: without an
-// ExportSource configured (imp.p.exportResolverFor returns nil), this falls
-// straight through to the original full-check behavior, unchanged.
+// ImportFrom resolves path against imp's own closureScope first (see its
+// doc), so a path already resolved earlier in THIS SAME top-level check's
+// transitive closure always reuses that exact instance regardless of
+// whether p's shared LRU has since evicted it for an unrelated, concurrently
+// in-flight closure. Only on a scope miss does this fall to the full-body
+// LRU next, so an import of a package the caller also has open (via
+// PackageWithBodies) shares its exact *types.Package identity instead of
+// triggering a second, divergent declarations-only check — see
+// PackageWithBodies's doc. Next, the declarations-only LRU: an
+// already-resident, source-checked instance is always preferred over a
+// decode, since it costs nothing further to reuse. Only once all three miss
+// does this fall to imp.p's exportResolver (see its own doc), decoding path
+// from persisted export data instead of a full recursive source-check — the
+// fix for the production regression measured against a dependency closure
+// larger than the LRU's own cap: without an ExportSource configured
+// (imp.p.exportResolverFor returns nil), this falls straight through to the
+// original full-check behavior, unchanged.
 //
 // "unsafe" is special-cased before any of that, exactly like
 // Provider.Package's own identical check (and
@@ -633,12 +751,18 @@ func (imp *ctxImporter) ImportFrom(path, _ string, _ types.ImportMode) (*types.P
 	if path == unsafePkgPath {
 		return types.Unsafe, nil
 	}
+	if cp, ok := imp.scope.get(path); ok {
+		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
+		return cp.Types(), nil
+	}
 	if cp, ok := imp.p.getFull(path); ok {
 		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
+		imp.scope.put(path, cp)
 		return cp.Types(), nil
 	}
 	if cp, ok := imp.p.get(path); ok {
 		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
+		imp.scope.put(path, cp)
 		return cp.Types(), nil
 	}
 	if r := imp.p.exportResolverFor(); r != nil {
@@ -652,7 +776,7 @@ func (imp *ctxImporter) ImportFrom(path, _ string, _ types.ImportMode) (*types.P
 			return pkg, nil
 		}
 	}
-	cp, err := imp.p.Package(imp.ctx, path)
+	cp, err := imp.p.packageScoped(imp.ctx, path, imp.scope)
 	if err != nil {
 		return nil, err
 	}

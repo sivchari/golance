@@ -232,12 +232,21 @@ func writeStarFixture(t *testing.T, dir string, numLeaves, numFat, nDeclsPerFat,
 // measured against a real dependency closure (textDocument/definition on a
 // heavy package: 3m0.9s, dominant_phase=engine.Get at 2m46s) with a
 // synthetic one: a closure of numLeaves+numFat+1 distinct packages, only a
-// handful of which (the fat ones) are big, every leaf sharing them. With a
-// declarations-only LRU capacity smaller than the closure, ctxImporter's
-// recursive resolution (see its own doc) evicts and re-parses/re-checks a
-// fat package from scratch on nearly every leaf that reaches it again —
-// unless a Provider.SetExportSource ExportSource is configured, in which
-// case a miss decodes cheaply instead (see exportResolver's own doc).
+// handful of which (the fat ones) are big, every leaf sharing them. A
+// declarations-only LRU capacity smaller than the closure lets p.lru evict a
+// fat package after an early leaf finishes with it, so a later leaf's own
+// ImportFrom("fat...") call misses the LRU — but closureScope (see
+// ctxImporter's own doc) still resolves it to the exact SAME *CheckedPackage
+// the earlier leaf got, because THIS one Package(root) call's own recursive
+// resolution already pinned it: eviction only affects a DIFFERENT,
+// concurrently in-flight closure's ability to reuse it, never this one's own
+// identity or its own repeat-check cost. Before closureScope existed, a
+// later leaf's miss forced a genuine re-parse/re-check from scratch — this
+// test now pins that closureScope eliminates that thrash on its own, with or
+// without a Provider.SetExportSource ExportSource configured (which remains
+// a second, independent mechanism — see exportResolver's own doc — for the
+// case a single closure's own width exceeds even what one Package call
+// should pin, e.g. reused across many separate top-level calls).
 func TestProvider_TransitiveThrash(t *testing.T) {
 	const (
 		numLeaves      = 200
@@ -266,7 +275,7 @@ func TestProvider_TransitiveThrash(t *testing.T) {
 		}
 	})
 
-	t.Run("cap smaller than closure, no ExportSource: thrashes", func(t *testing.T) {
+	t.Run("cap smaller than closure, no ExportSource: closureScope still eliminates thrash", func(t *testing.T) {
 		p := NewProvider(meta, Options{Cap: 8})
 		start := time.Now()
 		if _, err := p.Package(ctx, starRootPkgPath); err != nil {
@@ -274,14 +283,11 @@ func TestProvider_TransitiveThrash(t *testing.T) {
 		}
 		elapsed := time.Since(start)
 		extra := p.Checked() - distinct
-		// Maximal thrash re-checks each fat package on every leaf after the
-		// first (the first leaf's checks are the one legitimate, non-thrash
-		// check each fat package needs). A generous half of that bound is
-		// still overwhelming evidence of real thrash, not noise.
-		wantAtLeastExtra := int64(numFat*(numLeaves-1)) / 2
-		t.Logf("checked=%d distinct=%d extra=%d elapsed=%s (no ExportSource configured — this is the pre-fix code path, still reachable today as the default)", p.Checked(), distinct, extra, elapsed)
-		if extra < wantAtLeastExtra {
-			t.Errorf("Checked() - distinct = %d, want >= %d (a small cap should force the shared fat packages to be repeatedly re-checked as each leaf evicts them)", extra, wantAtLeastExtra)
+		t.Logf("checked=%d distinct=%d extra=%d elapsed=%s (no ExportSource configured)", p.Checked(), distinct, extra, elapsed)
+		if extra != 0 {
+			t.Errorf("Checked() - distinct = %d, want 0 (closureScope pins every package this one Package(root) call's own "+
+				"transitive resolution touches, so p.lru evicting a fat package for an unrelated closure must never force "+
+				"THIS closure's own later leaf to re-check it)", extra)
 		}
 	})
 
