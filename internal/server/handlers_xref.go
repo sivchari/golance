@@ -834,7 +834,11 @@ func (s *Server) liveSymbolLocation(ws *workspace, idx *indexState, pkgHash, idH
 	if RelativeIndexPaths(ws.root) && !filepath.IsAbs(storedPath) {
 		file = filepath.Join(ws.root, storedPath)
 	}
-	loc := xref.Location{File: file, Line: sym.Line(), Col: sym.Col(), EndCol: sym.Col() + uint32(len(sym.Name()))}
+	nameLen := len(sym.Name())
+	if nameLen < 0 || int64(nameLen) > int64(math.MaxUint32-sym.Col()) {
+		return protocol.Location{}, false
+	}
+	loc := xref.Location{File: file, Line: sym.Line(), Col: sym.Col(), EndCol: sym.Col() + uint32(nameLen)}
 	return s.correctResultLocation(loc)
 }
 
