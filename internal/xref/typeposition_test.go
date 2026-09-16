@@ -42,10 +42,10 @@ func (u *U) Call() string {
 func writeTypePosFile(t *testing.T, dir, rel, content string) {
 	t.Helper()
 	path := filepath.Join(dir, rel)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
 }
@@ -82,7 +82,7 @@ func TestDefinition_StructFieldTypeReference(t *testing.T) {
 	}
 	found := false
 	for _, l := range refs {
-		if l.File == usecaseFile && l.Line == uint32(fieldTypeLine) {
+		if l.File == usecaseFile && int(l.Line) == fieldTypeLine {
 			found = true
 		}
 	}
