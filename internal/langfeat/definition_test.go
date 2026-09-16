@@ -229,6 +229,52 @@ func TestDependencyDefinition_SamePackageReturnsNil(t *testing.T) {
 	}
 }
 
+// TestDependencyDefinitionTarget_Stdlib verifies DependencyDefinitionTarget
+// returns the same package path DependencyDefinition itself resolves, plus
+// an objectpath that decodes back to a real Object in strings' export data
+// -- the (package path, objectpath) pair a caller uses to check the facts
+// index before ever calling DependencyDefinition's own, far slower
+// depcheck.Provider.Decl path.
+func TestDependencyDefinitionTarget_Stdlib(t *testing.T) {
+	reader := overlay.New()
+	cp, path, _ := newCheckedPackageWithProvider(t, reader, "depuse", "depuse.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "strings.Builder") + len("strings.")
+
+	pkgPath, objPath, ok := langfeat.DependencyDefinitionTarget(cp, path, offset)
+	if !ok {
+		t.Fatal("DependencyDefinitionTarget = false, want true")
+	}
+	if pkgPath != "strings" {
+		t.Errorf("PkgPath = %q, want %q", pkgPath, "strings")
+	}
+	if objPath == "" {
+		t.Error("ObjPath = \"\", want a non-empty objectpath")
+	}
+}
+
+// TestDependencyDefinitionTarget_SamePackageReturnsFalse mirrors
+// TestDependencyDefinition_SamePackageReturnsNil: an identifier declared in
+// cp's own package is not a dependency reference at all, so
+// DependencyDefinitionTarget declines exactly like DependencyDefinition
+// does.
+func TestDependencyDefinitionTarget_SamePackageReturnsFalse(t *testing.T) {
+	reader := overlay.New()
+	cp, path, _ := newCheckedPackageWithProvider(t, reader, "depuse", "depuse.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "func UseStdlib") + len("func ")
+
+	if _, _, ok := langfeat.DependencyDefinitionTarget(cp, path, offset); ok {
+		t.Error("DependencyDefinitionTarget = true, want false (declared in cp's own package)")
+	}
+}
+
 // TestSamePackageDefinition_ResolvesLocalIdentifier verifies
 // SamePackageDefinition's positive case: an identifier declared in cp's
 // own package resolves to its exact declaring identifier, using only cp's

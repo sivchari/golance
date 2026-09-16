@@ -286,10 +286,24 @@ func builtinDefLocation(logger *log.Logger, info *langfeat.BuiltinDefInfo) (xref
 // cold-start index build's duration (minutes, on a large workspace) for no
 // benefit: a healthy facts index still always wins once built, since
 // handleDefinition consults it before ever reaching this fallback.
+//
+// Before falling all the way to depcheck.Decl's source-check, this first
+// tries resolving the same target through the on-disk facts index (an O(1)
+// DB read) via facts-index-declaration below: the identical fast path
+// typeDefinitionCrossPackage already takes for textDocument/typeDefinition.
+// This matters most for a ROOT package target the facts index actually has
+// an entry for but resolveAt's own reverse-postings lookup missed (a stale
+// or as-yet-unindexed reference) — depcheck.Decl would otherwise
+// source-type-check that whole root package from scratch just to answer a
+// query the index could resolve in a DB read, the dominant cost behind a
+// slow "go to definition" on a large workspace.
 func (s *Server) dependencyDefinition(ctx context.Context, cf checkedFileResult) (xref.Location, bool) {
 	ws := s.workspace()
 	if ws == nil {
 		return xref.Location{}, false
+	}
+	if loc, ok := s.factsIndexDeclaration(ctx, cf); ok {
+		return loc, true
 	}
 	phaseTimerFrom(ctx).enter("depcheck.Decl")
 	info, err := langfeat.DependencyDefinition(ctx, cf.cp, ws.depProvider, cf.path, cf.offset)
@@ -310,6 +324,28 @@ func (s *Server) dependencyDefinition(ctx context.Context, cf checkedFileResult)
 		return xref.Location{}, false
 	}
 	return xref.Location{File: info.Filename, Line: uint32(info.Line), Col: uint32(info.Col), EndCol: uint32(info.EndCol)}, true
+}
+
+// factsIndexDeclaration is dependencyDefinition's fast pre-check: it
+// resolves cf's cursor identifier to (package path, objectpath) via
+// langfeat.DependencyDefinitionTarget — the same identity computation
+// internal/index's facts extraction uses — and looks that up directly in
+// the on-disk facts index via Resolver.TypeDeclaration, an O(1) DB read.
+// ok is false whenever that lookup cannot answer (the resolver is not yet
+// available, the identifier is not a dependency reference, or the target's
+// package has no facts recorded), leaving dependencyDefinition to fall back
+// to depcheck.Decl exactly as before.
+func (s *Server) factsIndexDeclaration(ctx context.Context, cf checkedFileResult) (xref.Location, bool) {
+	resolver, ok := s.resolverOrWarn()
+	if !ok {
+		return xref.Location{}, false
+	}
+	pkgPath, objPath, ok := langfeat.DependencyDefinitionTarget(cf.cp, cf.path, cf.offset)
+	if !ok {
+		return xref.Location{}, false
+	}
+	phaseTimerFrom(ctx).enter("facts.Decl")
+	return resolver.TypeDeclaration(ctx, pkgPath, objPath)
 }
 
 // importDefinition is definitionFallback's path for the cursor being inside

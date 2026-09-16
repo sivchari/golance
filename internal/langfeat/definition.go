@@ -10,6 +10,7 @@ import (
 	"github.com/sivchari/golance/internal/check"
 	"github.com/sivchari/golance/internal/depcheck"
 	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/go/types/objectpath"
 )
 
 // ImportPathDefinition resolves offset (a byte offset from the start of
@@ -214,18 +215,9 @@ type DependencyDefinitionInfo struct {
 // (see internal/xref's workspace facts index, or SamePackageDefinition) and
 // should prefer it.
 func DependencyDefinition(ctx context.Context, cp *check.CheckedPackage, dp *depcheck.Provider, file string, offset int) (*DependencyDefinitionInfo, error) {
-	astFile, pos, _, err := locate(cp, file, offset)
-	if err != nil {
+	obj, err := dependencyDefinitionObject(cp, file, offset)
+	if err != nil || obj == nil {
 		return nil, err
-	}
-	path, _ := astutil.PathEnclosingInterval(astFile, pos, pos)
-	id := identAt(path)
-	if id == nil {
-		return nil, nil
-	}
-	obj := embeddedFieldTarget(cp.Info(), id, cp.Info().ObjectOf(id))
-	if obj == nil || obj.Pkg() == nil || obj.Pkg() == cp.Package() {
-		return nil, nil
 	}
 	declID, fset, err := dp.Decl(ctx, obj.Pkg().Path(), obj)
 	if err != nil {
@@ -240,6 +232,50 @@ func DependencyDefinition(ctx context.Context, cp *check.CheckedPackage, dp *dep
 		Col:      start.Column,
 		EndCol:   end.Column,
 	}, nil
+}
+
+// dependencyDefinitionObject resolves the identifier at offset to the
+// types.Object DependencyDefinition and DependencyDefinitionTarget both
+// need, sharing its "not a dependency identifier" declines: nil (with a nil
+// error) if offset is not on an identifier, the identifier resolves to no
+// object, the object is predeclared (no Pkg()), or it is declared in cp's
+// own package.
+func dependencyDefinitionObject(cp *check.CheckedPackage, file string, offset int) (types.Object, error) {
+	astFile, pos, _, err := locate(cp, file, offset)
+	if err != nil {
+		return nil, err
+	}
+	path, _ := astutil.PathEnclosingInterval(astFile, pos, pos)
+	id := identAt(path)
+	if id == nil {
+		return nil, nil
+	}
+	obj := embeddedFieldTarget(cp.Info(), id, cp.Info().ObjectOf(id))
+	if obj == nil || obj.Pkg() == nil || obj.Pkg() == cp.Package() {
+		return nil, nil
+	}
+	return obj, nil
+}
+
+// DependencyDefinitionTarget resolves the identifier at offset to the
+// (package path, objectpath) pair internal/index's facts extraction would
+// have recorded for it -- the same [objectpath.For] plus
+// [depcheck.OriginObject] computation facts.go's symbolID uses -- so a
+// caller can check the on-disk facts index (an O(1) DB read, via
+// [internal/xref.Resolver.TypeDeclaration]) before falling back to
+// DependencyDefinition's much slower source-checking Decl path. ok is false
+// under the same conditions DependencyDefinition declines on, plus obj not
+// being reachable via objectpath (e.g. a function-local declaration).
+func DependencyDefinitionTarget(cp *check.CheckedPackage, file string, offset int) (pkgPath, objPath string, ok bool) {
+	obj, err := dependencyDefinitionObject(cp, file, offset)
+	if err != nil || obj == nil {
+		return "", "", false
+	}
+	op, err := objectpath.For(depcheck.OriginObject(obj))
+	if err != nil {
+		return "", "", false
+	}
+	return obj.Pkg().Path(), string(op), true
 }
 
 // PackageNameDefinition resolves the identifier at offset (a byte offset

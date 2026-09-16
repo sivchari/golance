@@ -25,6 +25,7 @@ type unitOutcome struct {
 	pkgHash    uint64
 	entry      *store.UnitEntry   // blob key changed (CAS hit or a fresh type-check): write via PutUnitsBatch
 	ptrRefresh *store.UnitPointer // key unchanged but the stat snapshot needs refreshing: write via PutUnitPointersBatch
+	incomplete bool               // a fresh type-check produced this entry with real errors (see checkResult.Incomplete); never set for a CAS hit or a stat-only refresh
 }
 
 // processUnit resolves path's current combined blob key against snap and
@@ -228,7 +229,7 @@ func checkAndStoreOutcome(fset *token.FileSet, imp *typecheck.Importer, cas *sto
 	eh := hashExport(result.Export)
 	keys.set(path, unitKeyRecord{blobKey: combined, exportHash: eh})
 	pointer := store.UnitPointer{BlobKey: combined, ContentHash: ownHash, ExportHash: eh, ToolchainFingerprint: opts.ToolchainFingerprint, Files: files}
-	return &unitOutcome{pkgHash: pkgHash, entry: &store.UnitEntry{PkgHash: pkgHash, Pointer: pointer, Index: result.Index}}, nil
+	return &unitOutcome{pkgHash: pkgHash, entry: &store.UnitEntry{PkgHash: pkgHash, Pointer: pointer, Index: result.Index}, incomplete: result.Incomplete}, nil
 }
 
 // directDepExports returns pkg's direct workspace (root) dependencies'
@@ -314,6 +315,13 @@ type checkResult struct {
 	Facts  []byte
 	Export []byte
 	Index  store.PackageIndexEntries
+	// Incomplete reports whether either type-check pass below (the
+	// export-producing one, or the facts one when testFiles is non-empty)
+	// reported at least one go/types error -- see checkOnePackage's own
+	// doc for why an error here does not fail the whole package outright,
+	// and Stats.Incomplete's doc for what an Incomplete package's facts
+	// can and cannot be trusted for.
+	Incomplete bool
 }
 
 // checkOnePackage parses goFiles (via readFile), type-checks them as
@@ -342,13 +350,31 @@ type checkResult struct {
 // is for the caller to fold into a [store.UnitBlob]. root and relative
 // control whether the facts blob's file table stores paths relative to root
 // (see Options.RelativePaths).
+//
+// Every error [typecheck.CheckPackage] reports for either pass is folded
+// into checkResult.Incomplete rather than failing pkgPath outright: a
+// dependency resolved through this run's Importer can itself be wrong for
+// reasons outside pkgPath's own source (see internal/depcheck's package doc
+// on why a non-root dependency is only ever declaration-checked, never
+// compiler-verified), and go/types' own error recovery continues checking
+// the rest of the file regardless -- so a handful of real errors, however
+// their root cause, degrades to a still-mostly-usable facts/export pair
+// rather than losing the package's index entry entirely. The cost of that
+// leniency is real, though: go/types' recovery from an error can leave
+// SPECIFIC expressions elsewhere in the very same file unresolved (no
+// info.Uses entry at all, not merely a Typ[Invalid] one) — silently
+// dropping the [store.Ref]s extractFacts would otherwise have recorded for
+// them, with no per-position signal distinguishing "genuinely never
+// referenced" from "this one specific reference was lost to error
+// recovery." Incomplete is the closest signal available short of a full
+// store-schema change to record which positions those were.
 func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath string, goFiles, testFiles []string, readFile func(string) ([]byte, error), root string, relative bool) (checkResult, error) {
 	files, fileList := parseGoFiles(fset, goFiles, readFile)
 	if len(files) == 0 {
 		return checkResult{}, fmt.Errorf("index: no parseable files for %s", pkgPath)
 	}
 
-	tpkg, info, _ := typecheck.CheckPackage(fset, files, pkgPath, imp)
+	tpkg, info, errs := typecheck.CheckPackage(fset, files, pkgPath, imp)
 	if tpkg == nil {
 		return checkResult{}, fmt.Errorf("index: type-check %s produced no package", pkgPath)
 	}
@@ -359,15 +385,17 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 
 	factsTpkg, factsInfo := tpkg, info
 	factsFiles, factsFileList := files, fileList
+	incomplete := len(errs) > 0
 	if len(testFiles) > 0 {
 		testASTs, testFileList := parseGoFiles(fset, testFiles, readFile)
 		factsFiles = append(append([]*ast.File(nil), files...), testASTs...)
 		factsFileList = append(append([]string(nil), fileList...), testFileList...)
-		ftpkg, finfo, _ := typecheck.CheckPackage(fset, factsFiles, pkgPath, imp)
+		ftpkg, finfo, testErrs := typecheck.CheckPackage(fset, factsFiles, pkgPath, imp)
 		if ftpkg == nil {
 			return checkResult{}, fmt.Errorf("index: type-check %s (with test files) produced no package", pkgPath)
 		}
 		factsTpkg, factsInfo = ftpkg, finfo
+		incomplete = incomplete || len(testErrs) > 0
 	}
 
 	pkgHash := store.Hash(pkgPath)
@@ -378,7 +406,7 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 		return checkResult{}, fmt.Errorf("index: build facts blob for %s: %w", pkgPath, err)
 	}
 
-	return checkResult{Facts: factsBlob, Export: exportBlob, Index: idx}, nil
+	return checkResult{Facts: factsBlob, Export: exportBlob, Index: idx, Incomplete: incomplete}, nil
 }
 
 // parseGoFiles parses every file in goFiles (via readFile), skipping any
