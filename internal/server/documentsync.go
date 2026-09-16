@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
-	"runtime"
 
 	bolterrors "go.etcd.io/bbolt/errors"
 	"go.lsp.dev/protocol"
@@ -90,7 +89,7 @@ func (s *Server) selfHealFactsIfStale(ctx context.Context, ws *workspace, path s
 	if !ok {
 		return
 	}
-	changed, err := index.PackageChanged(ctx, ws.snap, idx.db, pkgPath, runtime.Version(), "", RelativeIndexPaths(ws.root))
+	changed, err := index.PackageChanged(ctx, ws.snap, idx.db, pkgPath, index.DefaultToolchainFingerprint(), "", RelativeIndexPaths(ws.root))
 	if err != nil {
 		s.logger.Printf("golance: check facts for %s: %v", pkgPath, err)
 		return

@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -75,7 +74,7 @@ func TestRevalidate_RelativePaths_UnchangedAcrossRoots(t *testing.T) {
 	rootB := mutableTestModule(t) // an independent, byte-identical copy under a different root
 	snapB := loadSnapshot(t, rootB)
 
-	changed, err := Revalidate(ctx, snapB, db, runtime.Version(), "", true)
+	changed, err := Revalidate(ctx, snapB, db, DefaultToolchainFingerprint(), "", true)
 	if err != nil {
 		t.Fatalf("Revalidate: %v", err)
 	}
@@ -89,7 +88,7 @@ func TestRevalidate_RelativePaths_UnchangedAcrossRoots(t *testing.T) {
 		t.Fatalf("edit rootB leaf.go: %v", err)
 	}
 
-	changed, err = Revalidate(ctx, snapB, db, runtime.Version(), "", true)
+	changed, err = Revalidate(ctx, snapB, db, DefaultToolchainFingerprint(), "", true)
 	if err != nil {
 		t.Fatalf("Revalidate: %v", err)
 	}
@@ -98,7 +97,7 @@ func TestRevalidate_RelativePaths_UnchangedAcrossRoots(t *testing.T) {
 	}
 
 	// rootA, untouched, must still report no changes of its own.
-	changed, err = Revalidate(ctx, snapA, db, runtime.Version(), "", true)
+	changed, err = Revalidate(ctx, snapA, db, DefaultToolchainFingerprint(), "", true)
 	if err != nil {
 		t.Fatalf("Revalidate: %v", err)
 	}

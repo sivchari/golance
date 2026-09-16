@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"testing"
 
 	"github.com/sivchari/golance/internal/graph"
@@ -49,7 +48,7 @@ func TestProcessUnit_DanglingBlobKeyIsReprocessed(t *testing.T) {
 	assertPackageChanged(ctx, t, snap, db, true,
 		"PackageChanged() = false, want true for a BlobKey whose blob is missing from the CAS")
 
-	pkgs, wholeDBStale, err := RevalidateStale(ctx, snap, db, runtime.Version(), "", false)
+	pkgs, wholeDBStale, err := RevalidateStale(ctx, snap, db, DefaultToolchainFingerprint(), "", false)
 	if err != nil {
 		t.Fatalf("RevalidateStale: %v", err)
 	}
@@ -104,7 +103,7 @@ func dropLeafBlob(ctx context.Context, t *testing.T, snap *graph.Snapshot, db *s
 func assertPackageChanged(ctx context.Context, t *testing.T, snap *graph.Snapshot, db *store.DB, want bool, msg string) {
 	t.Helper()
 
-	changed, err := PackageChanged(ctx, snap, db, pkgLeaf, runtime.Version(), "", false)
+	changed, err := PackageChanged(ctx, snap, db, pkgLeaf, DefaultToolchainFingerprint(), "", false)
 	if err != nil {
 		t.Fatalf("PackageChanged: %v", err)
 	}
