@@ -108,6 +108,74 @@ func TestProvider_ClosureScope_PreventsGenericTypeIdentitySplit(t *testing.T) {
 	}
 }
 
+// TestProvider_LRU_PreventsCrossCallGenericTypeIdentitySplit is the
+// cross-call counterpart to TestProvider_ClosureScope_PreventsGenericTypeIdentitySplit:
+// closureScope only protects a single top-level Package/PackageWithBodies
+// call's own in-flight resolutions (#116). Once that call returns, "shared"
+// has no protection left except the LRU's own dependency-based pin (see
+// lru.go's put doc) that modspkg's own cached entry holds on it for as long
+// as modspkg itself stays cached. Delete exercises that pin directly and
+// deterministically: it shares evictOldest's exact pin-checking code (see
+// lruCache.delete), so a pinned entry surviving a Delete call proves the
+// same invariant a capacity-driven eviction would need, without depending
+// on incidental LRU ordering to force one.
+func TestProvider_LRU_PreventsCrossCallGenericTypeIdentitySplit(t *testing.T) {
+	meta := loadGenericSplitGraph(t)
+	p := NewProvider(meta, Options{Cap: 10})
+	ctx := context.Background()
+
+	const (
+		sharedPkgPath  = "example.com/genericsplit/shared"
+		modspkgPkgPath = "example.com/genericsplit/modspkg"
+		outerPkgPath   = "example.com/genericsplit/outer"
+	)
+
+	if _, err := p.Package(ctx, modspkgPkgPath); err != nil {
+		t.Fatalf("Package(%s): %v", modspkgPkgPath, err)
+	}
+	checkedAfterModspkg := p.Checked()
+
+	p.Delete(sharedPkgPath)
+	if _, ok := p.lru.get(sharedPkgPath); !ok {
+		t.Fatal("Delete(shared) removed a pinned entry: modspkg's own cached-lifetime dependency claim on shared should have deferred this")
+	}
+
+	cp, err := p.Package(ctx, outerPkgPath)
+	if err != nil {
+		t.Fatalf("Package(%s): %v", outerPkgPath, err)
+	}
+	if cp.Incomplete() {
+		t.Fatalf("Package(%s).Incomplete() = true, want false: outer.go compiles under the real toolchain; "+
+			"an Incomplete result here means the LRU's dependency-based pin failed to prevent a cross-call identity split", outerPkgPath)
+	}
+
+	// +2, not +4: outer and bobpkg are freshly checked (never cached before),
+	// but shared and modspkg must be served from cache, not re-checked.
+	if got, want := p.Checked(), checkedAfterModspkg+2; got != want {
+		t.Errorf("Checked() = %d after resolving outer, want %d: shared and modspkg should both have been served from cache, not re-checked", got, want)
+	}
+
+	lhsType, rhsType := genericSplitVarDeclTypes(t, cp)
+	lhsNamed, ok := lhsType.(*types.Named)
+	if !ok || lhsNamed.TypeArgs().Len() != 1 {
+		t.Fatalf("LHS type %v is not an instantiated named type with one type argument", lhsType)
+	}
+	rhsPtr, ok := rhsType.(*types.Pointer)
+	if !ok {
+		t.Fatalf("RHS type %v is not a pointer type", rhsType)
+	}
+	rhsNamed, ok := rhsPtr.Elem().(*types.Named)
+	if !ok || rhsNamed.TypeArgs().Len() != 1 {
+		t.Fatalf("RHS pointer elem %v is not an instantiated named type with one type argument", rhsPtr.Elem())
+	}
+	lhsC, rhsC := lhsNamed.TypeArgs().At(0), rhsNamed.TypeArgs().At(0)
+	if lhsC != rhsC {
+		t.Errorf("LHS bobpkg.Mod[shared.C] type-arg shared.C = %p, RHS modspkg.Set[shared.C] type-arg shared.C = %p: "+
+			"want the identical object (the LRU's dependency-based pin should have reused modspkg's own shared resolution across this second, separate call)",
+			lhsC, rhsC)
+	}
+}
+
 // genericSplitVarDeclTypes returns the LHS declared type and RHS value type
 // of outer.go's single `var _ bobpkg.Mod[shared.C] = modspkg.MakeDefault()`
 // declaration.

@@ -38,6 +38,27 @@ func loadTestGraph(t *testing.T) MetadataSource {
 	return NewGraphMetadataSource(snap)
 }
 
+// loadManyLeafGraph loads testdata/manyleaf, a fixture of N independent,
+// import-free packages (leaf0..leaf11) used by
+// TestProvider_LRUEviction_BoundsMemory: with zero imports, each package's
+// own transitive closure is itself alone, so nothing beyond its own brief
+// in-flight pin (released once its own Package call returns) keeps it
+// cached — unlike a real stdlib package, whose own transitive closure
+// pulls in dozens of shared support packages that would otherwise dominate
+// Len() and make "did eviction actually bound memory" unmeasurable.
+func loadManyLeafGraph(t *testing.T) MetadataSource {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("testdata", "manyleaf"))
+	if err != nil {
+		t.Fatalf("abs testdata root: %v", err)
+	}
+	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+	return NewGraphMetadataSource(snap)
+}
+
 // declIdentInFile returns the (line, column) of name's top-level declaring
 // identifier in path, parsed independently of any Provider — the
 // ground-truth position TestProvider_StdlibExactPosition checks the
@@ -321,11 +342,17 @@ func TestProvider_Decl_Generics(t *testing.T) {
 	}
 }
 
-// TestProvider_LRUEviction verifies that, with the LRU capacity set to 1,
-// only the most recently checked package stays resident: an older entry is
-// evicted and, if requested again, freshly re-checked rather than served
-// from a stale cache slot. This is the "entries are released" bound on
-// memory the LRU exists to enforce.
+// TestProvider_LRUEviction verifies the LRU's own post-invariant behavior
+// at Cap=1: capacity is now a TARGET, not a hard ceiling (see lruCache's
+// own doc) — an entry whose own dependencies (or an in-flight closureScope)
+// still pin it survives regardless of capacity pressure, so Len() can
+// exceed Cap while a package's own transitive closure is still referenced.
+// What Cap=1 still guarantees is the property that actually matters: a
+// package still referenced is NEVER incorrectly evicted out from under a
+// repeated request (a cache hit stays a cache hit), and once NOTHING
+// references an entry anymore, it does eventually become evictable again
+// (see TestProvider_LRUEviction_BoundsMemory for the fixture-scale version
+// of that second half).
 func TestProvider_LRUEviction(t *testing.T) {
 	meta := loadTestGraph(t)
 	p := NewProvider(meta, Options{Cap: 1})
@@ -334,11 +361,14 @@ func TestProvider_LRUEviction(t *testing.T) {
 	if _, err := p.Package(ctx, "errors"); err != nil {
 		t.Fatalf("Package(errors): %v", err)
 	}
-	if got := p.Len(); got > 1 {
-		t.Errorf("Len() = %d after checking one package with Cap=1, want <= 1", got)
+	if got := p.Len(); got < 1 {
+		t.Errorf("Len() = %d after checking one package, want >= 1", got)
 	}
 	checkedAfterFirst := p.Checked()
 
+	// Cap=1 must never evict something still referenced: a repeated
+	// request for the SAME package, immediately after, stays a cache hit
+	// regardless of how small Cap is.
 	if _, err := p.Package(ctx, "errors"); err != nil {
 		t.Fatalf("Package(errors) again: %v", err)
 	}
@@ -349,15 +379,66 @@ func TestProvider_LRUEviction(t *testing.T) {
 	if _, err := p.Package(ctx, "strings"); err != nil {
 		t.Fatalf("Package(strings): %v", err)
 	}
-	if got := p.Len(); got > 1 {
-		t.Errorf("Len() = %d after checking a second package with Cap=1, want <= 1", got)
-	}
 
+	// "errors" is no longer referenced by anything (its own in-flight
+	// closureScope already closed, and nothing else cached depends on it),
+	// so it is now eligible for eviction — a later request for it may
+	// re-check from scratch, unlike the guaranteed-hit case above.
 	if _, err := p.Package(ctx, "errors"); err != nil {
 		t.Fatalf("Package(errors) a third time: %v", err)
 	}
 	if got := p.Checked(); got <= checkedAfterFirst {
-		t.Errorf("Checked() = %d, want > %d (errors should have been evicted by checking strings, and re-checked here)", got, checkedAfterFirst)
+		t.Errorf("Checked() = %d, want > %d (errors should have become evictable once nothing referenced it anymore, and re-checked here)", got, checkedAfterFirst)
+	}
+}
+
+// TestProvider_LRUEviction_BoundsMemory is the fixture-scale confirmation
+// that the pin invariant (see lru.go's put doc) still bounds memory: a
+// package pinned only for as long as SOMETHING still cached references it
+// is not the same as a package pinned forever. Checking far more stdlib
+// packages than Cap, one at a time (each call's own in-flight closureScope
+// pin releasing before the next starts), must still leave old, now
+// unreferenced entries evictable — Len() stays well below the total number
+// of distinct packages ever resolved, and the very first package checked
+// becomes a fresh re-check again once nothing pins it anymore.
+func TestProvider_LRUEviction_BoundsMemory(t *testing.T) {
+	meta := loadManyLeafGraph(t)
+	const capN = 3
+	p := NewProvider(meta, Options{Cap: capN})
+	ctx := context.Background()
+
+	pkgPaths := []string{
+		"example.com/manyleaf/leaf0", "example.com/manyleaf/leaf1", "example.com/manyleaf/leaf2",
+		"example.com/manyleaf/leaf3", "example.com/manyleaf/leaf4", "example.com/manyleaf/leaf5",
+		"example.com/manyleaf/leaf6", "example.com/manyleaf/leaf7", "example.com/manyleaf/leaf8",
+		"example.com/manyleaf/leaf9", "example.com/manyleaf/leaf10", "example.com/manyleaf/leaf11",
+	}
+
+	if _, err := p.Package(ctx, pkgPaths[0]); err != nil {
+		t.Fatalf("Package(%s): %v", pkgPaths[0], err)
+	}
+	checkedAfterFirst := p.Checked()
+
+	for _, pkgPath := range pkgPaths[1:] {
+		if _, err := p.Package(ctx, pkgPath); err != nil {
+			t.Fatalf("Package(%s): %v", pkgPath, err)
+		}
+	}
+
+	if got, total := p.Len(), len(pkgPaths); got >= total {
+		t.Errorf("Len() = %d after checking %d distinct packages one at a time, want < %d: old, unreferenced entries should have become evictable, not retained forever", got, total, total)
+	}
+
+	// pkgPaths[0]'s own in-flight closureScope pin (and any transitive
+	// dependency pin a later package might briefly have placed on it)
+	// released long ago; nothing still cached depends on it, so it must be
+	// evictable again by now, and a repeat request re-checks it from
+	// scratch.
+	if _, err := p.Package(ctx, pkgPaths[0]); err != nil {
+		t.Fatalf("Package(%s) again: %v", pkgPaths[0], err)
+	}
+	if got := p.Checked(); got <= checkedAfterFirst {
+		t.Errorf("Checked() = %d, want > %d (%s should have become evictable once nothing referenced it anymore, and re-checked here)", got, checkedAfterFirst, pkgPaths[0])
 	}
 }
 

@@ -148,6 +148,16 @@ type Stats struct {
 	// downstream caches (e.g. a decoded *types.Package cache) against
 	// instead of the whole closure Reindex walked to determine that.
 	Changed []string
+	// DecodeSelfHeals is the number of times this run's shared
+	// typecheck.Cache self-healed a gcexportdata.Read failure (see
+	// (*typecheck.Importer).decode's own doc): a stale, unpinned entry left
+	// over from an earlier, unrelated decode made an otherwise-valid export
+	// blob fail to decode; the cache discarded every unpinned entry and the
+	// decode was retried once, successfully, into the cleaned generation. A
+	// nonzero count here is expected background noise on a large run, not a
+	// failure signal by itself — Stats.Errors/Incomplete already cover what
+	// a self-heal could not recover from (the retry's own, second failure).
+	DecodeSelfHeals int
 }
 
 // Build resolves every root (workspace) package in snap against db and cas,
@@ -227,6 +237,10 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 	results.flush()
 	stats, err := results.result()
 	stats.Elapsed = time.Since(start)
+	stats.DecodeSelfHeals = int(cache.Resets())
+	if stats.DecodeSelfHeals > 0 {
+		log.Printf("index: shared type cache self-healed %d decode failure(s) this run (see Stats.DecodeSelfHeals)", stats.DecodeSelfHeals)
+	}
 	if err == nil {
 		// Record the toolchain this run checked db against, so a later
 		// revalidation pass (see Revalidate, used by

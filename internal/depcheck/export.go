@@ -115,6 +115,7 @@ type exportResolver struct {
 	cache    *typecheck.Cache
 	pkgs     map[string]*types.Package
 	complete map[string]bool
+	resets   int64 // count of resetLocked calls triggered by a decode failure; see Provider.ExportResolverResets
 
 	sf singleflight.Group
 }
@@ -127,6 +128,20 @@ func newExportResolver(src ExportSource) *exportResolver {
 		src: src, fset: token.NewFileSet(),
 		cache: typecheck.NewCache(), pkgs: make(map[string]*types.Package), complete: make(map[string]bool),
 	}
+}
+
+// resetLocked discards r's entire decode generation (fset, cache, pkgs,
+// complete) and replaces it with a fresh, empty one — the same coarse,
+// whole-generation reset exportDecodeCap's own byte-cap trigger already
+// performs inline in resolve (see its own doc for the concurrent-decode
+// caveat this shares), factored out so resolve's decode-failure path below
+// can reuse it identically. r.mu must already be held.
+func (r *exportResolver) resetLocked() {
+	r.fset = token.NewFileSet()
+	r.cache = typecheck.NewCache()
+	r.pkgs = make(map[string]*types.Package)
+	r.complete = make(map[string]bool)
+	r.resets++
 }
 
 // decodeResult is resolve's singleflight payload: ok is false only when
@@ -187,10 +202,7 @@ func (r *exportResolver) resolve(ctx context.Context, path string) (pkg *types.P
 
 		r.mu.Lock()
 		if r.cache.Bytes() > exportDecodeCap {
-			r.fset = token.NewFileSet()
-			r.cache = typecheck.NewCache()
-			r.pkgs = make(map[string]*types.Package)
-			r.complete = make(map[string]bool)
+			r.resetLocked()
 		}
 		fset := r.fset
 		cache := r.cache
@@ -198,7 +210,38 @@ func (r *exportResolver) resolve(ctx context.Context, path string) (pkg *types.P
 
 		pkg, err := typecheck.ReadExport(data, fset, path, cache)
 		if err != nil {
-			return nil, err
+			// data itself already round-tripped cleanly in isolation before
+			// ever reaching r (see internal/depexport.checkAndPersist's own
+			// self-check) — a failure here means r's own decode generation,
+			// shared across every transitive import resolve has ever
+			// decoded, currently holds an entry data's own blob references
+			// that violates gcexportdata.Read's contract ("imports[path]
+			// does not exist, or exists but is incomplete" — see ReadExport's
+			// doc), the identical staleness typecheck.Importer.decode's own
+			// self-heal guards against. Nothing ever pins an entry in r's
+			// own generation (closureScope deliberately never extends here —
+			// see exportResolver's own doc), so resetLocked's discard-
+			// everything behavior needs no pin-awareness: every concurrent
+			// resolve racing this one either already captured its own
+			// fset/cache pair above (and keeps decoding into the
+			// about-to-be-discarded generation, the same narrow, accepted
+			// window resolve's own doc already names for the byte-cap
+			// trigger) or has not yet, and lands in the fresh one instead —
+			// no live *types.Package graph anywhere depends on r's own
+			// generation staying stable the way a live CheckScope does for
+			// typecheck.Cache, so this cannot split identity for any
+			// concurrent resolve the way a reset mid-CheckPackage-call
+			// could.
+			r.mu.Lock()
+			r.resetLocked()
+			fset = r.fset
+			cache = r.cache
+			r.mu.Unlock()
+
+			pkg, err = typecheck.ReadExport(data, fset, path, cache)
+			if err != nil {
+				return nil, err
+			}
 		}
 
 		r.mu.Lock()
@@ -268,4 +311,21 @@ func (p *Provider) Decoded() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.decoded
+}
+
+// ExportResolverResets returns the number of times p's exportResolver
+// self-healed a gcexportdata.Read failure by discarding its entire decode
+// generation and retrying (see exportResolver.resolve's own doc). Zero if
+// SetExportSource was never called (no exportResolver exists at all).
+// Test-observability hook, mirroring Decoded.
+func (p *Provider) ExportResolverResets() int64 {
+	p.mu.Lock()
+	r := p.exports
+	p.mu.Unlock()
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.resets
 }

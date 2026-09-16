@@ -5,6 +5,7 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sivchari/golance/internal/depcheck"
@@ -67,6 +68,9 @@ func TestCache_UndersizedCapNeverReturnsAnUndecodableBlob(t *testing.T) {
 	blob, ok, err := cache.ExportData(target)
 	if err != nil {
 		t.Logf("ExportData correctly refused an undecodable blob instead of returning corrupt bytes: %v", err)
+		if !strings.Contains(err.Error(), "declaration-only check reported") {
+			t.Errorf("error message is missing the declaration-only check's own first-error diagnostic: %v", err)
+		}
 		return
 	}
 	if !ok {

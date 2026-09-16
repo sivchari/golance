@@ -65,8 +65,26 @@ func NewGraphMetadataSource(snap *graph.Snapshot) GraphMetadataSource {
 }
 
 // Package implements MetadataSource.
+//
+// A miss on pkgPath falls back to "vendor/" + pkgPath: cmd/go vendors
+// several golang.org/x/{net,crypto,text,...} packages into GOROOT/src/vendor
+// for the standard library's own internal use (net/http, crypto/tls, and
+// friends import them as, e.g., "golang.org/x/net/http/httpguts" in their
+// own literal source text — go/packages.Load's own reported import graph
+// reflects cmd/go's resolution of that reference, which is the
+// "vendor/"-prefixed path, not the literal one written in the importing
+// file). Without this fallback, EVERY standard-library package reachable
+// through net/http, crypto/tls, or crypto/ecdsa (a large fraction of any
+// real dependency closure) reports "not known to the import graph" for a
+// package that IS actually present, degrading to Incomplete for a reason
+// with nothing to do with any real type-identity problem. A miss on both
+// the bare and vendor-prefixed path is a genuine "not known to the import
+// graph" — unchanged.
 func (g GraphMetadataSource) Package(pkgPath string) (dir string, goFiles, imports []string, ok bool) {
 	pkg, ok := g.snap.Package(pkgPath)
+	if !ok {
+		pkg, ok = g.snap.Package("vendor/" + pkgPath)
+	}
 	if !ok {
 		return "", nil, nil, false
 	}
@@ -92,7 +110,8 @@ type CheckedPackage struct {
 	files      []*ast.File
 	pkg        *types.Package
 	info       *types.Info
-	incomplete bool // see Incomplete's doc
+	incomplete bool   // see Incomplete's doc
+	firstError string // see FirstError's doc
 }
 
 // PkgPath returns the package's import path.
@@ -129,6 +148,17 @@ func (cp *CheckedPackage) Info() *types.Info { return cp.info }
 // machine-global CAS) can tell the difference, without that best-effort
 // fallback itself changing for interactive navigation callers.
 func (cp *CheckedPackage) Incomplete() bool { return cp.incomplete }
+
+// FirstError returns the message of the first error check's own Error
+// callback recorded for cp's own files — "" when Incomplete is false, or
+// when Incomplete is true only because an import cp resolved was itself
+// already Incomplete (see Incomplete's own doc on that transitive case: no
+// types.Error ever fires directly against cp's own files then, so there is
+// nothing to report here beyond what that import's own CheckedPackage
+// exposes). A diagnostic sample only, mirroring internal/index's identical
+// checkResult.FirstError — not persisted, not part of CheckedPackage's own
+// cache identity.
+func (cp *CheckedPackage) FirstError() string { return cp.firstError }
 
 // DefaultCap is the LRU's default entry capacity (Options.Cap's zero
 // value): small and deliberately so — dependency navigation is bursty and
@@ -275,6 +305,17 @@ type Provider struct {
 	fullChecked int64           // count of PackageWithBodies calls that actually ran a fresh full-body check; test/observability hook.
 	exports     *exportResolver // TRANSITIVE import resolution's decode fast path; nil until SetExportSource is called (see its doc)
 	decoded     int64           // count of ImportFrom calls served via exports instead of a full recursive check; see Decoded
+
+	// waiters/fullWaiters count, per pkgPath, how many callers are currently
+	// between enterWait and their own exitWait/exitWaitAndPin call for a
+	// singleflight-guarded miss (see enterWait's own doc) — the birth-pin
+	// mechanism that closes the gap a plain "check the LRU, then pin it in a
+	// later, separate locked section" would otherwise leave open between
+	// put/putFull inserting a fresh entry and every caller collapsed onto
+	// that same check (leader and singleflight-followers alike) getting its
+	// own durable pin recorded.
+	waiters     map[string]int32
+	fullWaiters map[string]int32
 }
 
 // NewProvider returns a Provider resolving package metadata via meta,
@@ -293,6 +334,7 @@ func NewProvider(meta MetadataSource, opts Options) *Provider {
 	return &Provider{
 		meta: meta, capacity: capacity, fullCapacity: fullCapacity,
 		fset: token.NewFileSet(), lru: newLRUCache(capacity), fullLRU: newLRUCache(fullCapacity),
+		waiters: make(map[string]int32), fullWaiters: make(map[string]int32),
 	}
 }
 
@@ -347,18 +389,28 @@ func (p *Provider) CheckedWithBodies() int64 {
 // two call sites is exactly the point (see PackageWithBodies's doc).
 //
 // Every package pkgPath's own transitive closure resolves through during
-// this one call is pinned in a fresh closureScope for the call's entire
-// duration (see its own doc): p's shared LRU may still evict any of them to
-// make room for a different, concurrently in-flight closure, but THIS call
-// will never itself see two different generations of the same import path
-// as a result.
+// this one call is pinned — IN-FLIGHT, in a fresh closureScope for the
+// call's entire duration, released once this call returns — AND, for
+// whichever of them get freshly cached by this call (or already were,
+// CACHED-LIFETIME, for as long as they stay cached (see closureScope's own
+// doc for how these two pin sources compose): p's shared LRU can safely
+// evict any of them to make room for a different, concurrently in-flight
+// closure only once nothing — no longer-in-flight closure, no other
+// still-cached entry — depends on it anymore, so this call will never
+// itself see two different generations of the same import path as a
+// result, and neither will any OTHER closure reusing what this one cached.
 func (p *Provider) Package(ctx context.Context, pkgPath string) (*CheckedPackage, error) {
-	return p.packageScoped(ctx, pkgPath, newClosureScope())
+	scope := newClosureScope()
+	defer scope.close(p)
+	return p.packageScoped(ctx, pkgPath, scope)
 }
 
 // packageScoped is Package's own implementation, additionally threading
 // scope through every nested resolution this call triggers (see
-// closureScope's own doc and ctxImporter.scope).
+// closureScope's own doc and ctxImporter.scope). Callers other than
+// Package itself (i.e. recursive calls from within a check already holding
+// a scope) do not need — and must not add — their own scope.close, since
+// the top-level call that created scope owns releasing it.
 func (p *Provider) packageScoped(ctx context.Context, pkgPath string, scope *closureScope) (*CheckedPackage, error) {
 	if cp, ok := scope.get(pkgPath); ok {
 		return cp, nil
@@ -369,15 +421,14 @@ func (p *Provider) packageScoped(ctx context.Context, pkgPath string, scope *clo
 	if pkgPath == unsafePkgPath {
 		return unsafePackage(), nil
 	}
-	if cp, ok := p.getFull(pkgPath); ok {
-		scope.put(pkgPath, cp)
+	if cp, ok := p.tryPinFull(pkgPath, scope); ok {
 		return cp, nil
 	}
-	if cp, ok := p.get(pkgPath); ok {
-		scope.put(pkgPath, cp)
+	if cp, ok := p.tryPin(pkgPath, scope); ok {
 		return cp, nil
 	}
 
+	p.enterWait(pkgPath)
 	v, err, _ := p.sf.Do(pkgPath, func() (any, error) {
 		if cp, ok := p.getFull(pkgPath); ok {
 			return cp, nil
@@ -393,13 +444,15 @@ func (p *Provider) packageScoped(ctx context.Context, pkgPath string, scope *clo
 		return cp, nil
 	})
 	if err != nil {
+		p.exitWait(pkgPath)
 		return nil, err
 	}
 	cp, ok := v.(*CheckedPackage)
 	if !ok {
+		p.exitWait(pkgPath)
 		return nil, fmt.Errorf("depcheck: singleflight for %s returned %T, want *CheckedPackage", pkgPath, v)
 	}
-	scope.put(pkgPath, cp)
+	p.exitWaitAndPin(pkgPath, cp, scope)
 	return cp, nil
 }
 
@@ -426,12 +479,15 @@ func (p *Provider) packageScoped(ctx context.Context, pkgPath string, scope *clo
 // divergence is an accepted tradeoff rather than something golance's
 // on-demand identity needs to solve for.
 func (p *Provider) PackageWithBodies(ctx context.Context, pkgPath string) (*CheckedPackage, error) {
-	return p.packageWithBodiesScoped(ctx, pkgPath, newClosureScope())
+	scope := newClosureScope()
+	defer scope.close(p)
+	return p.packageWithBodiesScoped(ctx, pkgPath, scope)
 }
 
 // packageWithBodiesScoped is PackageWithBodies's own implementation,
 // additionally threading scope through every nested resolution this call
-// triggers — see packageScoped's identical doc.
+// triggers — see packageScoped's identical doc, including for why nested
+// callers must not add their own scope.close.
 func (p *Provider) packageWithBodiesScoped(ctx context.Context, pkgPath string, scope *closureScope) (*CheckedPackage, error) {
 	if cp, ok := scope.get(pkgPath); ok {
 		return cp, nil
@@ -442,11 +498,11 @@ func (p *Provider) packageWithBodiesScoped(ctx context.Context, pkgPath string, 
 	if pkgPath == unsafePkgPath {
 		return unsafePackage(), nil
 	}
-	if cp, ok := p.getFull(pkgPath); ok {
-		scope.put(pkgPath, cp)
+	if cp, ok := p.tryPinFull(pkgPath, scope); ok {
 		return cp, nil
 	}
 
+	p.enterWaitFull(pkgPath)
 	v, err, _ := p.fullSF.Do(pkgPath, func() (any, error) {
 		if cp, ok := p.getFull(pkgPath); ok {
 			return cp, nil
@@ -459,50 +515,188 @@ func (p *Provider) packageWithBodiesScoped(ctx context.Context, pkgPath string, 
 		return cp, nil
 	})
 	if err != nil {
+		p.exitWaitFull(pkgPath)
 		return nil, err
 	}
 	cp, ok := v.(*CheckedPackage)
 	if !ok {
+		p.exitWaitFull(pkgPath)
 		return nil, fmt.Errorf("depcheck: singleflight for %s returned %T, want *CheckedPackage", pkgPath, v)
 	}
-	scope.put(pkgPath, cp)
+	p.exitWaitFullAndPin(pkgPath, cp, scope)
 	return cp, nil
 }
 
 // get returns pkgPath's cached declarations-only CheckedPackage, if the LRU
-// currently holds one, bumping its recency.
+// currently holds one, bumping its recency. Only used inside the
+// singleflight closure's own double-check (packageScoped's own miss path):
+// every OTHER caller uses tryPin/tryPinFull or exitWaitAndPin/
+// exitWaitFullAndPin instead, which look up AND pin atomically — see
+// tryPin's own doc for why a separate get-then-pin here would reopen the
+// exact eviction race those exist to close.
 func (p *Provider) get(pkgPath string) (*CheckedPackage, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.lru.get(pkgPath)
 }
 
-// put stores cp in the declarations-only LRU under pkgPath, evicting the
-// least recently used entry first if the LRU is at capacity, and records
-// that a fresh check happened (see Checked).
+// put stores cp in the declarations-only LRU under pkgPath (see
+// lruCache.put's own doc), records that a fresh check happened (see
+// Checked), and — if any caller is currently registered as a waiter for
+// pkgPath (see enterWait) — gives the fresh entry a birth pin that keeps it
+// alive until every registered waiter has retired via exitWait/
+// exitWaitAndPin. Without this, the entry would sit unpinned in the LRU for
+// the entire window between here and each singleflight-collapsed caller's
+// own, separately-locked pin call, during which any unrelated concurrent
+// put's own evictOldest could remove it.
 func (p *Provider) put(pkgPath string, cp *CheckedPackage) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.checked++
 	p.lru.put(pkgPath, cp)
+	if p.waiters[pkgPath] > 0 {
+		p.lru.pin(pkgPath)
+	}
 }
 
 // getFull returns pkgPath's cached full-body CheckedPackage, if the
-// full-body LRU currently holds one, bumping its recency.
+// full-body LRU currently holds one, bumping its recency — see get's own
+// doc for why every caller besides the singleflight closure's own
+// double-check uses an atomic tryPinFull/exitWaitFullAndPin instead.
 func (p *Provider) getFull(pkgPath string) (*CheckedPackage, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.fullLRU.get(pkgPath)
 }
 
-// putFull stores cp in the full-body LRU under pkgPath, evicting the least
-// recently used entry first if the LRU is at capacity, and records that a
-// fresh full-body check happened (see CheckedWithBodies).
+// putFull stores cp in the full-body LRU under pkgPath and records that a
+// fresh full-body check happened (see CheckedWithBodies) — see put's own
+// doc for the birth-pin mechanism this mirrors, keyed against fullWaiters.
 func (p *Provider) putFull(pkgPath string, cp *CheckedPackage) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.fullChecked++
 	p.fullLRU.put(pkgPath, cp)
+	if p.fullWaiters[pkgPath] > 0 {
+		p.fullLRU.pin(pkgPath)
+	}
+}
+
+// tryPinFull looks up pkgPath in the full-body LRU and, if present, pins it
+// and records it into scope — atomically, under one lock acquisition. This
+// must not be split into a separate lookup-then-pin pair of calls: between
+// them, an unrelated concurrent put/putFull's own evictOldest could remove
+// the very entry just "found," since nothing yet protects it in that gap
+// (the bug TestProvider_LRU_PreventsCrossCallGenericTypeIdentitySplit and
+// the real-GOMODCACHE Cap=8 regression this closes both reproduced once
+// concurrency was high enough to make that gap land routinely rather than
+// rarely).
+func (p *Provider) tryPinFull(pkgPath string, scope *closureScope) (*CheckedPackage, bool) {
+	p.mu.Lock()
+	cp, ok := p.fullLRU.get(pkgPath)
+	if !ok {
+		p.mu.Unlock()
+		return nil, false
+	}
+	p.fullLRU.pin(pkgPath)
+	p.mu.Unlock()
+	scope.put(pkgPath, cp, p.fullLRU)
+	return cp, true
+}
+
+// tryPin looks up pkgPath in the declarations-only LRU and, if present,
+// pins it and records it into scope — atomically; see tryPinFull's own doc
+// for why this must not be split across two locked sections.
+func (p *Provider) tryPin(pkgPath string, scope *closureScope) (*CheckedPackage, bool) {
+	p.mu.Lock()
+	cp, ok := p.lru.get(pkgPath)
+	if !ok {
+		p.mu.Unlock()
+		return nil, false
+	}
+	p.lru.pin(pkgPath)
+	p.mu.Unlock()
+	scope.put(pkgPath, cp, p.lru)
+	return cp, true
+}
+
+// enterWait registers the calling goroutine as a pending waiter for
+// pkgPath's declarations-only singleflight check — called before entering
+// p.sf.Do, by every caller (the eventual leader and every follower
+// singleflight collapses onto it alike), so put (see its own doc) knows to
+// give the entry it is about to insert a birth pin. Every enterWait call
+// must be matched by exactly one later exitWait (on failure) or
+// exitWaitAndPin (on success) call, from the same goroutine, after its own
+// p.sf.Do call returns.
+func (p *Provider) enterWait(pkgPath string) {
+	p.mu.Lock()
+	p.waiters[pkgPath]++
+	p.mu.Unlock()
+}
+
+// exitWait retires this waiter's registration (see enterWait) without
+// pinning — the check failed, so put never ran and no entry exists to
+// protect.
+func (p *Provider) exitWait(pkgPath string) {
+	p.mu.Lock()
+	p.retireWaiterLocked(pkgPath)
+	p.mu.Unlock()
+}
+
+// exitWaitAndPin retires this waiter's registration and pins pkgPath into
+// scope on this waiter's own behalf, atomically in one locked section — so
+// the entry is never left unpinned between "put gave it a birth pin" and
+// "every waiter has recorded its own durable pin." Releases the birth pin
+// once the last registered waiter retires (see retireWaiterLocked).
+func (p *Provider) exitWaitAndPin(pkgPath string, cp *CheckedPackage, scope *closureScope) {
+	p.mu.Lock()
+	p.lru.pin(pkgPath)
+	p.retireWaiterLocked(pkgPath)
+	p.mu.Unlock()
+	scope.put(pkgPath, cp, p.lru)
+}
+
+// retireWaiterLocked decrements waiters[pkgPath], releasing the birth pin
+// put gave the entry once the count reaches zero (no registered waiter
+// remains that still needs it protected). p.mu must be held.
+func (p *Provider) retireWaiterLocked(pkgPath string) {
+	if n := p.waiters[pkgPath] - 1; n > 0 {
+		p.waiters[pkgPath] = n
+		return
+	}
+	delete(p.waiters, pkgPath)
+	p.lru.unpin(pkgPath)
+}
+
+// enterWaitFull, exitWaitFull, and exitWaitFullAndPin mirror enterWait/
+// exitWait/exitWaitAndPin for the full-body LRU/fullSF — see their docs.
+func (p *Provider) enterWaitFull(pkgPath string) {
+	p.mu.Lock()
+	p.fullWaiters[pkgPath]++
+	p.mu.Unlock()
+}
+
+func (p *Provider) exitWaitFull(pkgPath string) {
+	p.mu.Lock()
+	p.retireWaiterFullLocked(pkgPath)
+	p.mu.Unlock()
+}
+
+func (p *Provider) exitWaitFullAndPin(pkgPath string, cp *CheckedPackage, scope *closureScope) {
+	p.mu.Lock()
+	p.fullLRU.pin(pkgPath)
+	p.retireWaiterFullLocked(pkgPath)
+	p.mu.Unlock()
+	scope.put(pkgPath, cp, p.fullLRU)
+}
+
+func (p *Provider) retireWaiterFullLocked(pkgPath string) {
+	if n := p.fullWaiters[pkgPath] - 1; n > 0 {
+		p.fullWaiters[pkgPath] = n
+		return
+	}
+	delete(p.fullWaiters, pkgPath)
+	p.fullLRU.unpin(pkgPath)
 }
 
 // Delete drops each of pkgPaths from both the declarations-only and
@@ -582,6 +776,7 @@ func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool, s
 	}
 	imp := &ctxImporter{p: p, ctx: ctx, scope: scope}
 	var hadErr bool
+	var firstErr string
 	conf := types.Config{
 		Importer:         imp,
 		IgnoreFuncBodies: !withBodies,
@@ -591,14 +786,20 @@ func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool, s
 		// the whole check. hadErr — folded into the returned
 		// CheckedPackage.Incomplete — lets a caller that must not persist a
 		// degraded result (internal/depexport) refuse to, without this
-		// best-effort fallback itself changing.
-		Error: func(error) { hadErr = true },
+		// best-effort fallback itself changing. firstErr is a diagnostic
+		// sample only (see CheckedPackage.FirstError's own doc).
+		Error: func(err error) {
+			hadErr = true
+			if firstErr == "" {
+				firstErr = err.Error()
+			}
+		},
 	}
 	pkg, _ := conf.Check(pkgPath, p.fset, files, info)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &CheckedPackage{pkgPath: pkgPath, dir: dir, files: files, pkg: pkg, info: info, incomplete: hadErr || imp.importIncomplete}, nil
+	return &CheckedPackage{pkgPath: pkgPath, dir: dir, files: files, pkg: pkg, info: info, incomplete: hadErr || imp.importIncomplete, firstError: firstErr}, nil
 }
 
 // ctxImporter implements types.ImporterFrom by resolving each import back
@@ -642,40 +843,69 @@ type ctxImporter struct {
 }
 
 // closureScope pins every distinct import path one top-level
-// Provider.Package/PackageWithBodies call's own recursive resolution has
-// already resolved, to the exact *CheckedPackage it first got back, for
-// that one call's entire duration.
+// Provider.Package/PackageWithBodies call's own recursive resolution
+// resolves, to the exact *CheckedPackage it first got back, for TWO
+// overlapping durations:
 //
-// Without this, p's shared declarations-only LRU (sized for cross-closure
-// reuse, not for holding one closure's full working set — see DefaultCap/
-// RecommendedCap's own docs, which already acknowledge "a single dependency
-// closure larger than a small cap DOES thrash it") can evict a widely-shared
-// package in the middle of resolving ONE closure, to make room for a
-// different, concurrently in-flight one: a later ImportFrom within that same
-// closure for the same import path then falls through to check it a SECOND
-// time from scratch, producing a distinct *types.Package for what is
-// declaration-for-declaration identical source. go/types compares named
-// types (and satisfies generic instantiations) by object identity, not
-// structural shape, so two non-identical instances of the same package
+//   - IN-FLIGHT, for this one call's own entire duration (released by
+//     close, called once packageScoped/packageWithBodiesScoped returns):
+//     protects whatever this closure is actively resolving right now, even
+//     before anything else has cached a reference to it.
+//   - CACHED-LIFETIME, for as long as whichever entry FIRST cached each
+//     resolved package stays in p's own LRU (see Provider.get/put's own
+//     doc, and lruCache.put's — pinned atomically with the lookup/insert
+//     that produced it, in the identical *Provider.mu critical section, so
+//     no separate, later pin call ever leaves a race window open): protects
+//     a dependency for as long as some OTHER, already-finished closure's
+//     own cached result still embeds it, well past this closure's own
+//     lifetime.
+//
+// Both pin sources contribute to the identical lruCache.pins refcount (see
+// lruCache's own doc), so an entry survives as long as either one still
+// needs it — this is the fix for the KNOWN GAP an earlier revision of this
+// doc described: a cache HIT (p.get/p.getFull) handing closure B an
+// already-cached CheckedPackage P that closure A produced, whose own live
+// *types.Package graph embeds a reference to some dependency D, used to
+// leave D free to be evicted and re-checked (a different generation)
+// before B asked for D directly — confirmed reproducible
+// (github.com/aws/aws-sdk-go-v2/internal/auth/smithy and
+// .../service/s3/internal/customizations, against a real, GOMODCACHE-
+// resident dependency graph, under Cap sized far below the closure's own
+// size) as a genuine go/types interface-satisfaction error ("does not
+// implement ... wrong type for method ..."). P's own cached-lifetime pin on
+// D (established the moment P was first cached, not merely while some
+// closure is actively resolving it) now keeps D alive for exactly as long
+// as P itself stays cached, regardless of whether the closure that first
+// produced P has long since returned.
+//
+// Without EITHER half, p's shared declarations-only LRU (sized for
+// cross-closure reuse, not for holding one closure's full working set — see
+// DefaultCap/RecommendedCap's own docs, which already acknowledge "a single
+// dependency closure larger than a small cap DOES thrash it") can evict a
+// widely-shared package mid-resolution, so a later ImportFrom for the
+// identical import path — within the SAME closure (the in-flight case), or
+// from a DIFFERENT one reusing an already-cached result that embeds it (the
+// cached-lifetime case) — decodes a second, non-identical *types.Package
+// for what is declaration-for-declaration identical source. go/types
+// compares named types (and satisfies generic instantiations) by object
+// identity, not structural shape, so the two non-identical instances
 // feeding into one Checker.Check call make an otherwise valid generic
 // instantiation fail an interface-satisfaction check that would pass under
-// `go build` — this is exactly the "widely-shared dependency gets evicted
-// and re-checked from scratch partway through resolving cp's own transitive
-// imports" mechanism internal/depexport's own checkAndPersist doc already
-// names, confirmed reproducible without any export-data round trip at all
-// (see internal/depcheck's own genericsplit_test.go).
+// `go build` — the "widely-shared dependency gets evicted and re-checked
+// from scratch partway through resolving cp's own transitive imports"
+// mechanism internal/depexport's own checkAndPersist doc already names,
+// confirmed reproducible without any export-data round trip at all (see
+// internal/depcheck's own genericsplit_test.go).
 //
 // A closureScope is created fresh for every top-level Package/
-// PackageWithBodies call and discarded once it returns — it never persists
-// across calls, so it adds no reuse across DIFFERENT closures (p's own LRU
-// still owns that) and no bound on how many DIFFERENT generations distinct
-// closures may separately observe for the same import path over the
-// Provider's lifetime; see internal/depcheck's own
-// TestGenericSplit_SurvivesIndependentBlobProduction for why that is sound:
-// gcexportdata's shared-imports-map decode already converges independently-
-// produced-but-structurally-identical blobs by qualified name regardless of
-// which generation produced each one, so only identity WITHIN one closure's
-// own live (never-serialized) *types.Package graph needs pinning here.
+// PackageWithBodies call; its own IN-FLIGHT pins are released once that
+// call returns (see close), but its CACHED-LIFETIME pins (established via
+// Provider.put/putFull, not by the closureScope itself) persist for as long
+// as the entry they protect stays in p's own LRU — chaining one level of
+// direct pins per cached entry (an entry pins its own cp.Types().Imports(),
+// which themselves pin THEIR OWN Imports() for as long as THEY stay cached,
+// and so on) is sufficient to protect a package's full transitive closure
+// without any entry needing to compute or store it.
 //
 // Deliberately does not extend to imp.p's exportResolver (the decode fast
 // path — see its own doc): a decoded package there lives in its own
@@ -687,11 +917,17 @@ type ctxImporter struct {
 type closureScope struct {
 	mu   sync.Mutex
 	pkgs map[string]*CheckedPackage
+	// pins records, per resolved path, which lruCache its IN-FLIGHT pin
+	// (see Provider.get/getFull/put/putFull's own atomic pinning) lives in
+	// — nil for "unsafe" (see unsafePackage's own doc), the one
+	// CheckedPackage this scope never actually resolves through either LRU
+	// at all, so there is nothing to release for it.
+	pins map[string]*lruCache
 }
 
 // newClosureScope returns an empty closureScope.
 func newClosureScope() *closureScope {
-	return &closureScope{pkgs: make(map[string]*CheckedPackage)}
+	return &closureScope{pkgs: make(map[string]*CheckedPackage), pins: make(map[string]*lruCache)}
 }
 
 // get returns pkgPath's pinned CheckedPackage, if s already holds one.
@@ -702,17 +938,42 @@ func (s *closureScope) get(pkgPath string) (*CheckedPackage, bool) {
 	return cp, ok
 }
 
-// put pins cp under pkgPath for the rest of s's lifetime. Never overwrites
-// an existing entry with a different value: every caller either already
-// checked get first, or resolves pkgPath via the same singleflight-guarded
-// path that makes every concurrent caller for one pkgPath observe the
-// identical cp regardless of which of them calls put first.
-func (s *closureScope) put(pkgPath string, cp *CheckedPackage) {
+// put records cp under pkgPath for the rest of s's lifetime, along with
+// which lruCache pkgPath's own IN-FLIGHT pin (already established
+// atomically by whichever Provider.get/getFull/put/putFull call actually
+// produced cp — see their own docs) lives in, for close to release later.
+// Never overwrites an existing entry: every caller either already checked
+// get first, or resolves pkgPath via the same singleflight-guarded path
+// that makes every concurrent caller for one pkgPath observe the identical
+// cp regardless of which of them calls put first — lru is nil for
+// "unsafe" (see unsafePackage's own doc).
+func (s *closureScope) put(pkgPath string, cp *CheckedPackage, lru *lruCache) {
 	s.mu.Lock()
-	if _, ok := s.pkgs[pkgPath]; !ok {
-		s.pkgs[pkgPath] = cp
+	defer s.mu.Unlock()
+	if _, ok := s.pkgs[pkgPath]; ok {
+		return
 	}
+	s.pkgs[pkgPath] = cp
+	s.pins[pkgPath] = lru
+}
+
+// close releases every IN-FLIGHT pin s acquired over its lifetime (see
+// closureScope's own doc — this does NOT touch any CACHED-LIFETIME pin
+// Provider.put/putFull established; those live and die with whichever
+// cache entry they protect, independent of any one closureScope). Call
+// exactly once, after the top-level Package/PackageWithBodies call s was
+// created for has returned. p.mu must not be held by the caller.
+func (s *closureScope) close(p *Provider) {
+	s.mu.Lock()
+	pins := s.pins
 	s.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for path, lru := range pins {
+		if lru != nil {
+			lru.unpin(path)
+		}
+	}
 }
 
 func (imp *ctxImporter) Import(path string) (*types.Package, error) {
@@ -755,14 +1016,12 @@ func (imp *ctxImporter) ImportFrom(path, _ string, _ types.ImportMode) (*types.P
 		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
 		return cp.Types(), nil
 	}
-	if cp, ok := imp.p.getFull(path); ok {
+	if cp, ok := imp.p.tryPinFull(path, imp.scope); ok {
 		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
-		imp.scope.put(path, cp)
 		return cp.Types(), nil
 	}
-	if cp, ok := imp.p.get(path); ok {
+	if cp, ok := imp.p.tryPin(path, imp.scope); ok {
 		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
-		imp.scope.put(path, cp)
 		return cp.Types(), nil
 	}
 	if r := imp.p.exportResolverFor(); r != nil {
