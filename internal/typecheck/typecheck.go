@@ -188,13 +188,6 @@ func (c *Cache) unpinLocked(pkgPath string) {
 	}
 }
 
-// unpin releases one pin on pkgPath (see unpinLocked).
-func (c *Cache) unpin(pkgPath string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.unpinLocked(pkgPath)
-}
-
 // unpinN releases n pins on pkgPath in one locked call (see unpinLocked) —
 // CheckScope's own batch release for a path its own resolution pinned more
 // than once (see CheckScope.touched's doc).

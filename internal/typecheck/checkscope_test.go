@@ -178,8 +178,7 @@ func TestCheckScope_PreventsMidCheckEvictionSplit(t *testing.T) {
 			"this scope's own direct shared resolution = %p — want the identical object", sharedViaModspkg, sharedDirect)
 	}
 
-	bobpkgPkg, err := scope.ImportFrom(genericSplitBobpkgPath, "", 0)
-	if err != nil {
+	if _, err := scope.ImportFrom(genericSplitBobpkgPath, "", 0); err != nil {
 		t.Fatalf("ImportFrom(bobpkg): %v", err)
 	}
 
@@ -188,7 +187,7 @@ func TestCheckScope_PreventsMidCheckEvictionSplit(t *testing.T) {
 	// on both sides — mirroring
 	// TestProvider_ClosureScope_PreventsGenericTypeIdentitySplit's own
 	// stronger, pointer-identity assertion (not just "no error").
-	consumerPkg, lhsC, rhsC := checkGenericSplitConsumer(t, fset, scope, modspkgPkg, bobpkgPkg, sharedDirect)
+	consumerPkg, lhsC, rhsC := checkGenericSplitConsumer(t, fset, scope)
 	if consumerPkg == nil {
 		t.Fatal("check(consumer) produced no package")
 	}
@@ -230,7 +229,7 @@ func TestCheckScope_PreventsMidCheckEvictionSplit(t *testing.T) {
 // instances already pinned above) and returns the checked package plus the
 // LHS (bobpkg.Mod[shared.C]) and RHS (modspkg.MakeDefault()'s result)
 // declarations' own shared.C type arguments.
-func checkGenericSplitConsumer(t *testing.T, fset *token.FileSet, scope *typecheck.CheckScope, modspkgPkg, bobpkgPkg, sharedPkg *types.Package) (pkg *types.Package, lhsC, rhsC types.Type) {
+func checkGenericSplitConsumer(t *testing.T, fset *token.FileSet, scope *typecheck.CheckScope) (pkg *types.Package, lhsC, rhsC types.Type) {
 	t.Helper()
 	f, err := parser.ParseFile(fset, "consumer.go", genericSplitConsumerSrc, parser.ParseComments)
 	if err != nil {
