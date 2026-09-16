@@ -87,25 +87,7 @@ func TestProvider_ClosureScope_PreventsGenericTypeIdentitySplit(t *testing.T) {
 	// *types.Named object -- not merely types.Identical, but pointer-equal,
 	// since closureScope's whole point is that this closure's SECOND request
 	// for "shared" reuses its FIRST resolution rather than re-checking it.
-	file := cp.Files()[0]
-	var rhsType, lhsType types.Type
-	for _, decl := range file.Decls {
-		gd, ok := decl.(*ast.GenDecl)
-		if !ok || gd.Tok != token.VAR {
-			continue
-		}
-		for _, spec := range gd.Specs {
-			vs, ok := spec.(*ast.ValueSpec)
-			if !ok || len(vs.Values) != 1 {
-				continue
-			}
-			lhsType = cp.Info().Types[vs.Type].Type
-			rhsType = cp.Info().Types[vs.Values[0]].Type
-		}
-	}
-	if lhsType == nil || rhsType == nil {
-		t.Fatal("could not locate outer.go's var decl in cp.Info().Types")
-	}
+	lhsType, rhsType := genericSplitVarDeclTypes(t, cp)
 	lhsNamed, ok := lhsType.(*types.Named)
 	if !ok || lhsNamed.TypeArgs().Len() != 1 {
 		t.Fatalf("LHS type %v is not an instantiated named type with one type argument", lhsType)
@@ -124,4 +106,30 @@ func TestProvider_ClosureScope_PreventsGenericTypeIdentitySplit(t *testing.T) {
 			"want the identical object (closureScope should have reused one shared.C resolution for this whole closure)",
 			lhsC, rhsC)
 	}
+}
+
+// genericSplitVarDeclTypes returns the LHS declared type and RHS value type
+// of outer.go's single `var _ bobpkg.Mod[shared.C] = modspkg.MakeDefault()`
+// declaration.
+func genericSplitVarDeclTypes(t *testing.T, cp *CheckedPackage) (lhs, rhs types.Type) {
+	t.Helper()
+	file := cp.Files()[0]
+	for _, decl := range file.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok || len(vs.Values) != 1 {
+				continue
+			}
+			lhs = cp.Info().Types[vs.Type].Type
+			rhs = cp.Info().Types[vs.Values[0]].Type
+		}
+	}
+	if lhs == nil || rhs == nil {
+		t.Fatal("could not locate outer.go's var decl in cp.Info().Types")
+	}
+	return lhs, rhs
 }
