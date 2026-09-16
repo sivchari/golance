@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.7.7](https://github.com/sivchari/golance/compare/v0.7.6...v0.7.7) - 2026-09-16
+- fix: implementation fallback and cold-start diagnostics UX by @sivchari in https://github.com/sivchari/golance/pull/113
+- fix: fast facts-index declaration path and visible per-package check failures by @sivchari in https://github.com/sivchari/golance/pull/115
+- fix: pin a resolution closure's packages against mid-closure LRU eviction by @sivchari in https://github.com/sivchari/golance/pull/116
+
 ## [v0.7.6](https://github.com/sivchari/golance/compare/v0.7.5...v0.7.6) - 2026-09-15
 - fix: resolve find-references on dependency and stdlib symbols by @sivchari in https://github.com/sivchari/golance/pull/111
 
