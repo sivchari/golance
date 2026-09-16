@@ -762,7 +762,22 @@ func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool, s
 		if err != nil {
 			return nil, fmt.Errorf("depcheck: parse %s: %w", path, err)
 		}
+		// A cgo file (one importing the pseudo-package "C") cannot be
+		// declaration-checked from raw source: "C" resolves to nothing the
+		// import graph can name, and the file's declarations lean on cgo
+		// preprocessing this checker never runs. Skipping the file loses its
+		// declarations from the checked package — the same bounded
+		// degradation any raw-source check of a cgo package has — instead
+		// of failing the whole package (observed: net/cgo_linux.go marking
+		// net, and transitively net/http and crypto/tls, Incomplete on
+		// GOOS=linux).
+		if importsCgo(f) {
+			continue
+		}
 		files = append(files, f)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("depcheck: %s (%s) has only cgo files; cannot declaration-check", pkgPath, dir)
 	}
 
 	info := &types.Info{
@@ -1277,4 +1292,16 @@ func declIdent(files []*ast.File, fset *token.FileSet, pos token.Pos) *ast.Ident
 		}
 	}
 	return nil
+}
+
+// importsCgo reports whether f imports the pseudo-package "C" — the marker
+// of a cgo file, which a raw-source declaration-only check must skip (see
+// the parse loop in check).
+func importsCgo(f *ast.File) bool {
+	for _, imp := range f.Imports {
+		if imp.Path != nil && imp.Path.Value == `"C"` {
+			return true
+		}
+	}
+	return false
 }
