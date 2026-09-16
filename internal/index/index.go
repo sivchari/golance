@@ -107,6 +107,20 @@ type Stats struct {
 	// on wall-clock time, which a shared CI runner's load can make an
 	// unreliable proxy for the same fact.
 	TypeChecked int
+	// Incomplete is the subset of TypeChecked whose facts/export pair was
+	// produced from a type-check that reported at least one go/types error
+	// (see checkOnePackage's doc for why that check still runs to
+	// completion rather than failing the package outright, and what it
+	// costs: go/types' own error recovery can silently drop a
+	// [store.Ref] for a specific position elsewhere in the same file,
+	// without any per-position signal distinguishing that from "genuinely
+	// never referenced"). A nonzero count here means cross-reference
+	// results (Definition/References/Implementation) for the affected
+	// package(s) may be missing entries that a clean type-check would have
+	// recorded — each occurrence is also logged by path (see
+	// buildResults.record) so the affected package is identifiable without
+	// re-running Build under a debugger.
+	Incomplete int
 	// Changed is only populated by Reindex: the changed package plus every
 	// reverse-dependency-closure hop Reindex actually reprocessed (i.e. not
 	// skipped — see processUnit's unchangedOutcome path), in the order each
