@@ -64,6 +64,7 @@ import (
 	"context"
 	"fmt"
 	"go/token"
+	"go/types"
 	"hash/fnv"
 	"os"
 	"os/exec"
@@ -322,9 +323,9 @@ func (c *Cache) checkAndPersist(pkgPath string, persist bool, key uint64) (expor
 	if err != nil {
 		return exportResult{}, fmt.Errorf("depexport: check %s: %w", pkgPath, err)
 	}
-	blob, err := typecheck.WriteExport(cp.Types(), c.provider.FileSet())
+	blob, err := writeExportRecovered(cp.Types(), c.provider.FileSet())
 	if err != nil {
-		return exportResult{}, fmt.Errorf("depexport: write export data for %s: %w", pkgPath, err)
+		return exportResult{}, fmt.Errorf("depexport: write export data for %s (declaration-only check reported: %s): %w", pkgPath, firstErrorOrNone(cp), err)
 	}
 	// gcexportdata.Write happily serializes a *types.Package graph that
 	// contains two non-identical *types.Package instances for the same
@@ -341,9 +342,12 @@ func (c *Cache) checkAndPersist(pkgPath string, persist bool, key uint64) (expor
 	// decode fast path OFF just as readily as with it on, so this check
 	// catches the corruption regardless of which mechanism produced it,
 	// current or future. A throwaway fset/cache keeps this self-check from
-	// touching any cache a real caller shares.
+	// touching any cache a real caller shares. firstErrorOrNone(cp) is
+	// folded into the wrapped error so a caller (and this Cache's own
+	// server-side logging) can see WHAT the declaration-only check itself
+	// reported, not just that the resulting blob failed to round-trip.
 	if _, err := typecheck.ReadExport(blob, token.NewFileSet(), pkgPath, typecheck.NewCache()); err != nil {
-		return exportResult{}, fmt.Errorf("depexport: export data for %s does not round-trip decode: %w", pkgPath, err)
+		return exportResult{}, fmt.Errorf("depexport: export data for %s does not round-trip decode (declaration-only check reported: %s): %w", pkgPath, firstErrorOrNone(cp), err)
 	}
 	// cp.Incomplete (see its own doc) means pkgPath's check — or a
 	// transitive import's — reported at least one error, e.g. one of its
@@ -361,6 +365,38 @@ func (c *Cache) checkAndPersist(pkgPath string, persist bool, key uint64) (expor
 		}
 	}
 	return exportResult{blob: blob, complete: complete}, nil
+}
+
+// firstErrorOrNone returns cp.FirstError(), or "(none)" when empty — a
+// declaration-only check can be Incomplete purely transitively (an import
+// it resolved was itself already Incomplete — see
+// depcheck.CheckedPackage.Incomplete's own doc), in which case cp's own
+// FirstError has nothing to report even though Incomplete is true.
+func firstErrorOrNone(cp *depcheck.CheckedPackage) string {
+	if e := cp.FirstError(); e != "" {
+		return e
+	}
+	return "(none)"
+}
+
+// writeExportRecovered calls typecheck.WriteExport, converting a panic into
+// a returned error instead of crashing checkAndPersist's own caller: a
+// declaration-only check's error recovery can leave a declaration reachable
+// from cp's exported API — most concretely a generic instantiation's
+// synthesized method — with an invalid or missing *types.Signature, which
+// gcexportdata's writer has no guard for (confirmed reproducible: a panic
+// inside internal/gcimporter's non-shallow doDecl, go/types.(*Signature).Recv
+// on a nil receiver, not an internalError-typed panic, so gcimporter's own
+// recover re-panics it — see internal/index.writeAndValidateExport's
+// identical recovery for the same confirmed mechanism on the root-package
+// export path).
+func writeExportRecovered(pkg *types.Package, fset *token.FileSet) (blob []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("write export data for %s panicked: %v", pkg.Path(), r)
+		}
+	}()
+	return typecheck.WriteExport(pkg, fset)
 }
 
 // immutable reports whether dir falls under c's GOROOT or GOModCache — the

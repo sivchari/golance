@@ -61,7 +61,8 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 	depMeta := depcheck.NewGraphMetadataSource(snap)
 	depProvider := depcheck.NewProvider(depMeta, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootCount(snap), o.Parallelism)})
 	depExp := depexport.NewCache(o.DepCAS, depMeta, depProvider, depexport.Options{BuildFlagsFingerprint: o.BuildFlagsFingerprint})
-	imp := typecheck.NewImporter(fset, exp, depExp, typecheck.NewCache())
+	cache := typecheck.NewCache()
+	imp := typecheck.NewImporter(fset, exp, depExp, cache)
 
 	var stats Stats
 	// trustStat=false: reader may be an editor overlay whose content
@@ -69,6 +70,7 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 	// processUnit's doc).
 	if _, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, &o, changedPkg, reader, false, gt, gen, &stats); err != nil {
 		stats.Elapsed = time.Since(start)
+		stats.DecodeSelfHeals = int(cache.Resets())
 		return stats, err
 	}
 
@@ -94,6 +96,7 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 		}
 	}
 	stats.Elapsed = time.Since(start)
+	stats.DecodeSelfHeals = int(cache.Resets())
 	return stats, firstErr
 }
 

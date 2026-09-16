@@ -57,7 +57,7 @@ func (r *buildResults) record(path string, outcome *unitOutcome, skipped, typeCh
 		}
 		if outcome != nil && outcome.incomplete {
 			r.stats.Incomplete++
-			log.Printf("index: %s type-checked with errors; its facts may be missing some references (see Stats.Incomplete)", path)
+			log.Printf("index: %s type-checked with errors; its facts may be missing some references (see Stats.Incomplete); first: %s", path, outcome.firstError)
 		}
 	}
 	r.queueOutcomeLocked(outcome)

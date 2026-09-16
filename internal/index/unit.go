@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/store"
@@ -26,6 +27,7 @@ type unitOutcome struct {
 	entry      *store.UnitEntry   // blob key changed (CAS hit or a fresh type-check): write via PutUnitsBatch
 	ptrRefresh *store.UnitPointer // key unchanged but the stat snapshot needs refreshing: write via PutUnitPointersBatch
 	incomplete bool               // a fresh type-check produced this entry with real errors (see checkResult.Incomplete); never set for a CAS hit or a stat-only refresh
+	firstError string             // sample error for the Incomplete log line (see checkResult.FirstError)
 }
 
 // processUnit resolves path's current combined blob key against snap and
@@ -229,7 +231,7 @@ func checkAndStoreOutcome(fset *token.FileSet, imp *typecheck.Importer, cas *sto
 	eh := hashExport(result.Export)
 	keys.set(path, unitKeyRecord{blobKey: combined, exportHash: eh})
 	pointer := store.UnitPointer{BlobKey: combined, ContentHash: ownHash, ExportHash: eh, ToolchainFingerprint: opts.ToolchainFingerprint, Files: files}
-	return &unitOutcome{pkgHash: pkgHash, entry: &store.UnitEntry{PkgHash: pkgHash, Pointer: pointer, Index: result.Index}, incomplete: result.Incomplete}, nil
+	return &unitOutcome{pkgHash: pkgHash, entry: &store.UnitEntry{PkgHash: pkgHash, Pointer: pointer, Index: result.Index}, incomplete: result.Incomplete, firstError: result.FirstError}, nil
 }
 
 // directDepExports returns pkg's direct workspace (root) dependencies'
@@ -322,6 +324,10 @@ type checkResult struct {
 	// and Stats.Incomplete's doc for what an Incomplete package's facts
 	// can and cannot be trusted for.
 	Incomplete bool
+	// FirstError is the first go/types error either pass reported when
+	// Incomplete is true — a diagnostic sample for the per-package log line,
+	// since the full error list is too noisy to persist.
+	FirstError string
 }
 
 // checkOnePackage parses goFiles (via readFile), type-checks them as
@@ -374,27 +380,60 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 		return checkResult{}, fmt.Errorf("index: no parseable files for %s", pkgPath)
 	}
 
-	tpkg, info, errs := typecheck.CheckPackage(fset, files, pkgPath, imp)
+	// scope pins, for both passes below, every dependency this call's own
+	// import resolution touches — directly or transitively via another
+	// already-decoded package's export data — against imp's shared Cache
+	// being evicted mid-check by a concurrently-finishing, unrelated
+	// package's own scheduler.finish (see CheckScope's own doc).
+	scope := imp.NewCheck()
+	defer scope.Close()
+
+	tpkg, info, errs := typecheck.CheckPackage(fset, files, pkgPath, scope)
 	if tpkg == nil {
 		return checkResult{}, fmt.Errorf("index: type-check %s produced no package", pkgPath)
-	}
-	exportBlob, err := typecheck.WriteExport(tpkg, fset)
-	if err != nil {
-		return checkResult{}, fmt.Errorf("index: write export data for %s: %w", pkgPath, err)
 	}
 
 	factsTpkg, factsInfo := tpkg, info
 	factsFiles, factsFileList := files, fileList
 	incomplete := len(errs) > 0
+	firstError := ""
+	if incomplete {
+		firstError = errs[0].Error()
+	}
+
+	// exportBlob is attempted from tpkg regardless of errs: go/types' error
+	// recovery usually leaves the exported API's own declarations perfectly
+	// usable even when SOME error was reported elsewhere in the file (an
+	// unrelated import failure, a generic-interface-satisfaction mismatch in
+	// a declaration nothing exported references, ...) — withholding on
+	// errs>0 unconditionally starves every dependent of an export that would
+	// have decoded fine, which is worse than the leniency this whole
+	// function already extends to Incomplete (see its own doc). Only a blob
+	// that genuinely fails writeAndValidateExport's own round-trip check —
+	// tpkg reaching gcexportdata.Write with an object taint that check
+	// errors alone do not reliably predict, see its doc — is withheld: a
+	// dependent asking for THIS pkgPath's export data then gets
+	// casExportSource's own clean "no export data" miss (Importer.resolve's
+	// ordinary empty-data path, gcexportdata.Read's own "empty export data
+	// for %s" error) instead of decoding corrupt bytes.
+	exportBlob, roundTripErr := writeAndValidateExport(tpkg, fset)
+	if roundTripErr != nil {
+		exportBlob = nil
+		incomplete = true
+		firstError = roundTripErr.Error()
+	}
 	if len(testFiles) > 0 {
 		testASTs, testFileList := parseGoFiles(fset, testFiles, readFile)
 		factsFiles = append(append([]*ast.File(nil), files...), testASTs...)
 		factsFileList = append(append([]string(nil), fileList...), testFileList...)
-		ftpkg, finfo, testErrs := typecheck.CheckPackage(fset, factsFiles, pkgPath, imp)
+		ftpkg, finfo, testErrs := typecheck.CheckPackage(fset, factsFiles, pkgPath, scope)
 		if ftpkg == nil {
 			return checkResult{}, fmt.Errorf("index: type-check %s (with test files) produced no package", pkgPath)
 		}
 		factsTpkg, factsInfo = ftpkg, finfo
+		if firstError == "" && len(testErrs) > 0 {
+			firstError = testErrs[0].Error()
+		}
 		incomplete = incomplete || len(testErrs) > 0
 	}
 
@@ -406,7 +445,55 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 		return checkResult{}, fmt.Errorf("index: build facts blob for %s: %w", pkgPath, err)
 	}
 
-	return checkResult{Facts: factsBlob, Export: exportBlob, Index: idx, Incomplete: incomplete}, nil
+	return checkResult{Facts: factsBlob, Export: exportBlob, Index: idx, Incomplete: incomplete, FirstError: firstError}, nil
+}
+
+// writeAndValidateExport encodes tpkg's exported API and immediately
+// decodes it back (into a throwaway fset/cache, never one a real caller
+// shares — mirroring internal/depexport.Cache.checkAndPersist's identical
+// self-check) before trusting the result, so a write that silently produced
+// bytes gcexportdata.Read cannot reliably decode is caught here instead of
+// persisted to cas and served to every dependent that imports pkgPath.
+//
+// This defends against a corruption class distinct from (but related to)
+// the identity-split family typecheck.CheckScope's own doc describes:
+// go/types.Config.Check's error recovery can leave a declaration reachable
+// from tpkg's own exported API — most concretely, a generic instantiation's
+// synthesized method, e.g. when a call site's own generic-interface-
+// satisfaction check fails — with an invalid or missing *types.Signature.
+// gcexportdata's writer (internal/gcimporter's non-shallow doDecl) has no
+// guard for that: confirmed reproducible, it can panic
+// (go/types.(*Signature).Recv on a nil receiver) or otherwise produce a
+// blob that writes without error but panics ("internal error while
+// importing ...: invalid memory address or nil pointer dereference",
+// gcimporter's own recovered-panic error shape) on a later decode. The
+// caller calls this unconditionally, even when tpkg's own check reported
+// errors (see checkOnePackage's own doc for why withholding on errs>0
+// alone is too strict): a check error does not reliably predict this
+// panic, and the vast majority of error-tainted checks still produce a
+// perfectly decodable blob, so this round-trip is what actually decides
+// whether tpkg's export is safe to use — not whether its check was clean.
+//
+// WriteExport's own panic is recovered here, not left to
+// processUnitRecovered's much coarser recover: that one discards pkgPath's
+// entry entirely (facts included), where this call's own caller degrades to
+// Incomplete instead — the facts extractFacts produces from tpkg/info never
+// go through gcexportdata at all, so they are unaffected by whatever made
+// Write panic and remain safe to keep.
+func writeAndValidateExport(tpkg *types.Package, fset *token.FileSet) (blob []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("index: write export data for %s panicked: %v", tpkg.Path(), r)
+		}
+	}()
+	blob, err = typecheck.WriteExport(tpkg, fset)
+	if err != nil {
+		return nil, fmt.Errorf("index: write export data for %s: %w", tpkg.Path(), err)
+	}
+	if _, err := typecheck.ReadExport(blob, token.NewFileSet(), tpkg.Path(), typecheck.NewCache()); err != nil {
+		return nil, fmt.Errorf("index: export data for %s does not round-trip decode: %w", tpkg.Path(), err)
+	}
+	return blob, nil
 }
 
 // parseGoFiles parses every file in goFiles (via readFile), skipping any
