@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"go/types"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sivchari/golance/internal/depcheck"
@@ -161,4 +162,32 @@ func TestDepCacheHolder_Importer_WarmIndexResolvesCrossPackageMsgField(t *testin
 	if pkg == nil || !pkg.Complete() {
 		t.Fatal("warm CheckPackage did not produce a complete *types.Package")
 	}
+}
+
+// TestDepCacheHolder_Importer_ColdMissCarriesMarker pins the discrimination
+// mechanism publishDiagnostics (internal/server/diagnostics.go) relies on
+// for B1: while the facts index is not ready, an import
+// depCacheHolder.importer cannot yet resolve must produce an error whose
+// text contains coldGateMissMarker -- the one signal that survives
+// go/types' own "could not import %s (%s)" folding down to a plain Msg
+// string (see isColdGateImportDiag's doc in diagnostics.go for why that
+// folding rules out anything sturdier).
+func TestDepCacheHolder_Importer_ColdMissCarriesMarker(t *testing.T) {
+	holder, _ := buildColdGateDepCache(t, func() bool { return false })
+
+	_, _, errs := checkDepImportSrc(t, holder.importer())
+
+	if len(errs) == 0 {
+		t.Fatal("checkDepImportSrc returned no errors, want at least one for the unresolved import")
+	}
+	for _, e := range errs {
+		if strings.Contains(e.Msg, coldGateMissMarker) {
+			return
+		}
+	}
+	var msgs []string
+	for _, e := range errs {
+		msgs = append(msgs, e.Msg)
+	}
+	t.Errorf("no error message contains coldGateMissMarker (%q): %v", coldGateMissMarker, msgs)
 }

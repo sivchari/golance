@@ -730,7 +730,50 @@ func (s *Server) openIndexAfterBuild(ctx context.Context, dbPath string, waitErr
 	s.indexFailedWarned.Store(false)
 	s.logger.Printf("golance: workspace index is now ready")
 	s.drainDirty(ctx, ws)
+	s.recheckOpenFilesAfterIndexReady(ws)
 	return false
+}
+
+// recheckOpenFilesAfterIndexReady rechecks every currently open file's
+// package now that the facts index has just become ready (see
+// openIndexAfterBuild). While the index was unavailable, publishDiagnostics
+// suppressed every "could not import" diagnostic the cold-build gate
+// caused (see coldGateSource/isColdGateImportDiag), and each such file's
+// cached CheckedPackage was itself checked against those same unresolved
+// imports — drainDirty alone does not cover this: it only reindexes a
+// package handleDidSave explicitly marked dirty while the index was nil
+// (see markDirty/takeDirty's own doc), leaving a file that was opened
+// during the cold build and never subsequently edited or saved stuck
+// showing stale (suppressed, then simply absent) diagnostics until the
+// user touches it. ws.engine.InvalidateDependency is the existing
+// mechanism for exactly this shape of staleness (a dependency changing
+// out from under an already-cached package — see its own doc): it drops
+// each dir's stale cache entry and arms the same debounce-triggered
+// recheck+publish path every ordinary edit already goes through, scoped
+// to dirs the engine already knows about, which every currently open file
+// already is.
+func (s *Server) recheckOpenFilesAfterIndexReady(ws *workspace) {
+	dirs := openFileDirs(s.overlay.OpenFiles())
+	if len(dirs) == 0 {
+		return
+	}
+	ws.engine.InvalidateDependency(dirs)
+}
+
+// openFileDirs returns the deduplicated set of directories files belong
+// to, in no particular order.
+func openFileDirs(files []string) []string {
+	seen := make(map[string]bool, len(files))
+	dirs := make([]string, 0, len(files))
+	for _, f := range files {
+		dir := filepath.Dir(f)
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		dirs = append(dirs, dir)
+	}
+	return dirs
 }
 
 // logIndexerStderr logs stderrText — the indexer subprocess's full captured

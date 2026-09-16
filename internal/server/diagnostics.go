@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"go.lsp.dev/protocol"
@@ -35,8 +36,24 @@ const refreshSemanticTokensTimeout = 5 * time.Second
 // latter matters now that two units can share res.Dir, so one publishing
 // must not clear or otherwise speak for a file only the other one checked.
 func (s *Server) publishDiagnostics(res *check.Result) {
+	// While the facts index is not yet ready (a cold build still running —
+	// see coldGateSource's own doc), depCacheHolder.importer resolves every
+	// workspace-dependency import through a gate that answers only from
+	// already-persisted data, by design: a miss there is routine and
+	// temporary, not a genuine problem with the file being checked. Without
+	// this filter, every open file importing another workspace package
+	// shows a "could not import" diagnostic for the whole span of the cold
+	// build, even though nothing is actually wrong — see
+	// recheckOpenFilesAfterIndexReady (internal/server/indexer.go) for how
+	// those same files get a fresh, accurate recheck the moment the index
+	// IS ready, so suppressing this now never hides a diagnostic
+	// permanently, only until there is a real answer for it.
+	indexReady := s.idx.Load() != nil
 	byFile := make(map[string][]protocol.Diagnostic)
 	for _, d := range res.Diags {
+		if !indexReady && isColdGateImportDiag(d.Message) {
+			continue
+		}
 		byFile[d.File] = append(byFile[d.File], protocol.Diagnostic{
 			Range: protocol.Range{
 				Start: protocol.Position{Line: d.StartLine, Character: d.StartCol},
@@ -142,4 +159,23 @@ func diagnosticSeverity(sev check.Severity) protocol.DiagnosticSeverity {
 		return protocol.DiagnosticSeverityWarning
 	}
 	return protocol.DiagnosticSeverityError
+}
+
+// isColdGateImportDiag reports whether msg is the "could not import ..."
+// diagnostic go/types produces (go/types/resolver.go: "could not import
+// %s (%s)") for an import depCacheHolder.importer's cold-build gate (see
+// coldGateSource's own doc) could not yet resolve -- as opposed to a
+// genuine syntax/type error in the file being checked. Matching is by
+// substring on coldGateMissMarker, embedded verbatim in
+// coldGateSource.ExportData's own error text: it is the only mechanism
+// available here, since go/types folds whatever ImportFrom returns down
+// to that one Msg string before this package ever sees it, discarding
+// both its Go type and the unexported Code (BrokenImport) go/types itself
+// records for the same failure internally but never exposes outside
+// go/types' own package (internal/types/errors, which this module cannot
+// import at all -- unlike the equally-unexported go116start/go116end
+// token.Pos fields typeErrorRange already reads via reflection, whose
+// type is plain and exported).
+func isColdGateImportDiag(msg string) bool {
+	return strings.Contains(msg, coldGateMissMarker)
 }
