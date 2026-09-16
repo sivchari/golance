@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"go/token"
 	"go/types"
 	"path/filepath"
@@ -111,8 +112,31 @@ type coldExportSource interface {
 type coldGateSource struct{ src coldExportSource }
 
 func (g coldGateSource) ExportData(pkgPath string) ([]byte, bool, error) {
-	return g.src.ExportDataFromCache(pkgPath)
+	data, ok, err := g.src.ExportDataFromCache(pkgPath)
+	if err != nil || ok {
+		return data, ok, err
+	}
+	// A plain ok=false here means pkgPath's export data is not (yet)
+	// persisted -- expected and routine while a cold index build is still
+	// running, not a genuine failure (see this type's own doc). Wrapping
+	// it with coldGateMissMarker lets publishDiagnostics
+	// (internal/server/diagnostics.go) tell this specific "not resolvable
+	// yet" case apart from a package that is still unresolvable once the
+	// index IS ready, entirely by this error's own text: go/types folds
+	// whatever ImportFrom returns into "could not import %s (%s)"
+	// (go/types/resolver.go), keeping only that string in the *types.Error
+	// it hands back, so a marker embedded in the string is the only signal
+	// that survives this far -- see isColdGateImportDiag's own doc for why
+	// go/types' unexported error Code cannot be read back instead.
+	return nil, false, fmt.Errorf("%s: %s", coldGateMissMarker, pkgPath)
 }
+
+// coldGateMissMarker is embedded, verbatim, in coldGateSource.ExportData's
+// error text for an import the cold-build gate could not resolve purely
+// because the facts index has not finished its first build yet -- see
+// isColdGateImportDiag (internal/server/diagnostics.go), its one intended
+// reader.
+const coldGateMissMarker = "golance: dependency export data not indexed yet (cold build in progress)"
 
 // importer returns a types.ImporterFrom decoding into d's current
 // (fset, cache) pair, first swapping in a fresh, empty pair if the current

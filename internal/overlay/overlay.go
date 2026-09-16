@@ -115,6 +115,22 @@ func (o *Overlay) OpenFilesInDir(dir string) []string {
 	return out
 }
 
+// OpenFiles returns the filesystem paths of every currently open document,
+// in no particular order. Used to recheck every open file once a
+// previously unavailable facts index becomes ready (see
+// recheckOpenFilesAfterIndexReady in internal/server/indexer.go), the
+// broader, workspace-wide counterpart to OpenFilesInDir's single-directory
+// scope.
+func (o *Overlay) OpenFiles() []string {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	out := make([]string, 0, len(o.docs))
+	for u := range o.docs {
+		out = append(out, u.FsPath())
+	}
+	return out
+}
+
 // DidOpen starts tracking p's document, replacing any existing overlay for
 // the same URI.
 func (o *Overlay) DidOpen(p *protocol.DidOpenTextDocumentParams) {
