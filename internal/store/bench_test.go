@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"path/filepath"
 	"testing"
 )
 
@@ -189,6 +190,41 @@ func BenchmarkRandomSymbolLookup(b *testing.B) {
 		_ = sym.Name()
 		_ = sym.Doc()
 		_ = sym.Sig()
+	}
+}
+
+// benchCommonNameCount is the number of packages BenchmarkPutUnitsBatch_
+// CommonName has share a single name, large enough to make a quadratic
+// per-name write cost (see applyIndexEntries' doc) show up clearly against
+// a linear one.
+const benchCommonNameCount = 2000
+
+// BenchmarkPutUnitsBatch_CommonName measures PutUnitsBatch's cost when
+// benchCommonNameCount packages all contribute the same name ("New") to
+// the name index — the shape applyIndexEntries' per-key decode-and-copy
+// write turns quadratic in the number of packages sharing a name.
+func BenchmarkPutUnitsBatch_CommonName(b *testing.B) {
+	entries := make([]UnitEntry, benchCommonNameCount)
+	for i := range entries {
+		entries[i] = UnitEntry{
+			PkgHash: uint64(i) + 1,
+			Pointer: UnitPointer{BlobKey: uint64(i) + 1, ContentHash: uint64(i) + 1},
+			Index:   PackageIndexEntries{Names: []NameEntry{{Name: "New", IDHash: uint64(i) + 1}}},
+		}
+	}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		db, err := Open(filepath.Join(b.TempDir(), "index.db"))
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := db.PutUnitsBatch(entries); err != nil {
+			b.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

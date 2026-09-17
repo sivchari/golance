@@ -21,7 +21,7 @@ func startHeapSampler(interval time.Duration) *heapSampler {
 	s := &heapSampler{stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(s.done)
-		samples := []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+		samples := []metrics.Sample{{Name: "/gc/heap/live:bytes"}}
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {

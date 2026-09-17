@@ -13,11 +13,10 @@ import (
 // Matches internal/xref's and internal/depcheck's 256MiB caps rather than
 // internal/server depCacheHolder's 512MiB: a Build decodes deep
 // (self-contained) export data for a whole workspace closure, and blob bytes
-// understate the decoded heap by roughly an order of magnitude. Measured on
-// a 2560-root monorepo (Stats.PeakHeapBytes, indexer GOMEMLIMIT 4GiB): the
-// pre-generational per-entry eviction peaked at 6.4GiB; 512MiB never rotated
-// (408MiB decoded) and peaked at 5.3GiB; 128MiB rotated 10 times for 4.7GiB
-// with re-decode time in exchange. 256MiB sits between those two.
+// understate the decoded heap by roughly an order of magnitude. On a
+// 2560-root monorepo 512MiB never rotated (408MiB decoded) while 128MiB
+// rotated 10 times, paying re-decode time for a modestly smaller heap;
+// 256MiB rotates a few times.
 const defaultDecodeCacheBudget = 256 << 20
 
 // cacheGeneration is one append-only (fset, cache, importer) triple: a
