@@ -7,6 +7,8 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"log"
+	"runtime/debug"
 
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/store"
@@ -375,8 +377,31 @@ type checkResult struct {
 // recovery." Incomplete is the closest signal available short of a full
 // store-schema change to record which positions those were.
 func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath string, goFiles, testFiles []string, readFile func(string) ([]byte, error), root string, relative bool) (checkResult, error) {
-	files, fileList := parseGoFiles(fset, goFiles, readFile)
+	files, fileList, cgoSkipped := parseGoFiles(fset, goFiles, readFile)
 	if len(files) == 0 {
+		if cgoSkipped > 0 {
+			// Every one of pkgPath's Go files imported "C" (see
+			// importsCgo's own doc): there is nothing left to
+			// declaration-check or index, but pkgPath still has real
+			// GoFiles as far as the workspace graph is concerned, so
+			// another package can still legally import it. Degrade to a
+			// clean Incomplete result — still keyed via directDepExports'
+			// own keys.set for any such dependent to find — rather than
+			// the error below, which would leave pkgPath with no index
+			// entry at all and cascade "has no recorded blob key" failures
+			// to every package that imports it. An empty-but-valid facts
+			// blob (store.NewView requires at least a header — nil is not
+			// a valid substitute) records zero symbols/refs/files.
+			emptyFacts, err := store.NewBuilder().Build()
+			if err != nil {
+				return checkResult{}, fmt.Errorf("index: build empty facts blob for %s: %w", pkgPath, err)
+			}
+			return checkResult{
+				Facts:      emptyFacts,
+				Incomplete: true,
+				FirstError: fmt.Sprintf("index: %s has only cgo file(s) (%d of %d skipped); nothing to declaration-check or index", pkgPath, cgoSkipped, len(goFiles)),
+			}, nil
+		}
 		return checkResult{}, fmt.Errorf("index: no parseable files for %s", pkgPath)
 	}
 
@@ -413,9 +438,12 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 	// tpkg reaching gcexportdata.Write with an object taint that check
 	// errors alone do not reliably predict, see its doc — is withheld: a
 	// dependent asking for THIS pkgPath's export data then gets
-	// casExportSource's own clean "no export data" miss (Importer.resolve's
-	// ordinary empty-data path, gcexportdata.Read's own "empty export data
-	// for %s" error) instead of decoding corrupt bytes.
+	// casExportSource's own clean miss (see its ExportData doc — an empty
+	// blob is never reported as a hit), so Importer.resolve falls through to
+	// its fallback tier (internal/depexport.Cache, declaration-only
+	// source-checking pkgPath itself — see depcheck.GraphMetadataSource's
+	// doc for why this works for a root package too) instead of decoding
+	// corrupt bytes or failing outright on an empty ones.
 	exportBlob, roundTripErr := writeAndValidateExport(tpkg, fset)
 	if roundTripErr != nil {
 		exportBlob = nil
@@ -423,7 +451,7 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 		firstError = roundTripErr.Error()
 	}
 	if len(testFiles) > 0 {
-		testASTs, testFileList := parseGoFiles(fset, testFiles, readFile)
+		testASTs, testFileList, _ := parseGoFiles(fset, testFiles, readFile)
 		factsFiles = append(append([]*ast.File(nil), files...), testASTs...)
 		factsFileList = append(append([]string(nil), fileList...), testFileList...)
 		ftpkg, finfo, testErrs := typecheck.CheckPackage(fset, factsFiles, pkgPath, scope)
@@ -483,6 +511,13 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 func writeAndValidateExport(tpkg *types.Package, fset *token.FileSet) (blob []byte, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			// The stack is logged, not folded into err, the same split
+			// processUnitRecovered's own top-level recover uses: firstError
+			// (this error's eventual destination — see checkOnePackage's
+			// doc) is a one-line diagnostic sample, not a dump target, but
+			// WriteExport's panic site is otherwise unrecoverable
+			// information once this defer returns.
+			log.Printf("index: write export data for %s panicked: %v\n%s", tpkg.Path(), r, debug.Stack())
 			err = fmt.Errorf("index: write export data for %s panicked: %v", tpkg.Path(), r)
 		}
 	}()
@@ -497,11 +532,15 @@ func writeAndValidateExport(tpkg *types.Package, fset *token.FileSet) (blob []by
 }
 
 // parseGoFiles parses every file in goFiles (via readFile), skipping any
-// that cannot be read or produce no AST at all. It returns the parsed files
-// alongside the matching subset of goFiles.
-func parseGoFiles(fset *token.FileSet, goFiles []string, readFile func(string) ([]byte, error)) ([]*ast.File, []string) {
-	files := make([]*ast.File, 0, len(goFiles))
-	fileList := make([]string, 0, len(goFiles))
+// that cannot be read or produce no AST at all, and any that imports the
+// pseudo-package "C" (see importsCgo's own doc). It returns the parsed
+// files alongside the matching subset of goFiles, plus how many files were
+// skipped specifically for being cgo — checkOnePackage's own zero-files
+// handling needs that count to tell "every file was cgo" apart from
+// "nothing could be read/parsed at all" (see its doc).
+func parseGoFiles(fset *token.FileSet, goFiles []string, readFile func(string) ([]byte, error)) (files []*ast.File, fileList []string, cgoSkipped int) {
+	files = make([]*ast.File, 0, len(goFiles))
+	fileList = make([]string, 0, len(goFiles))
 	for _, gf := range goFiles {
 		src, err := readFile(gf)
 		if err != nil {
@@ -511,8 +550,29 @@ func parseGoFiles(fset *token.FileSet, goFiles []string, readFile func(string) (
 		if f == nil {
 			continue
 		}
+		if importsCgo(f) {
+			cgoSkipped++
+			continue
+		}
 		files = append(files, f)
 		fileList = append(fileList, gf)
 	}
-	return files, fileList
+	return files, fileList, cgoSkipped
+}
+
+// importsCgo reports whether f imports the pseudo-package "C" — the marker
+// of a cgo file, which a checker with no cgo preprocessing must skip
+// entirely rather than feed go/types a broken "C" reference: "C" resolves
+// to nothing the workspace's import graph can name, and the file's
+// declarations lean on cgo preprocessing this indexer never runs.
+// Duplicated from internal/depcheck's identical helper (its own doc has
+// the full rationale, including the observed net/cgo_linux.go case) rather
+// than exported and imported across packages for one six-line predicate.
+func importsCgo(f *ast.File) bool {
+	for _, imp := range f.Imports {
+		if imp.Path != nil && imp.Path.Value == `"C"` {
+			return true
+		}
+	}
+	return false
 }

@@ -66,10 +66,12 @@ import (
 	"go/token"
 	"go/types"
 	"hash/fnv"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -393,6 +395,11 @@ func firstErrorOrNone(cp *depcheck.CheckedPackage) string {
 func writeExportRecovered(pkg *types.Package, fset *token.FileSet) (blob []byte, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			// See internal/index.writeAndValidateExport's identical split:
+			// the stack is logged (otherwise unrecoverable once this defer
+			// returns), not folded into err, which stays a one-line
+			// diagnostic sample.
+			log.Printf("depexport: write export data for %s panicked: %v\n%s", pkg.Path(), r, debug.Stack())
 			err = fmt.Errorf("write export data for %s panicked: %v", pkg.Path(), r)
 		}
 	}()
