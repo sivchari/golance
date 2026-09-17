@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.12](https://github.com/sivchari/golance/compare/v0.7.11...v0.7.12) - 2026-09-17
+- perf: store symbol index entries as one key each instead of rewritten lists by @sivchari in https://github.com/sivchari/golance/pull/129
+
 ## [v0.7.11](https://github.com/sivchari/golance/compare/v0.7.10...v0.7.11) - 2026-09-17
 - fix: invalidate decoded dependency caches by generation instead of per-path Delete by @sivchari in https://github.com/sivchari/golance/pull/126
 - perf: derive the default memory caps from physical memory by @sivchari in https://github.com/sivchari/golance/pull/127
