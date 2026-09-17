@@ -113,6 +113,93 @@ func TestApplyDefaultMemLimit_LeavesExistingLimitAlone(t *testing.T) {
 	}
 }
 
+// TestDeriveMemLimit verifies deriveMemLimit's floor and fraction behavior
+// for both the indexer's and the server's fraction/floor pair, including the
+// exact boundary where fraction*total equals floor.
+func TestDeriveMemLimit(t *testing.T) {
+	const GiB = int64(1 << 30)
+
+	tests := []struct {
+		name     string
+		total    uint64
+		ok       bool
+		fraction float64
+		floor    int64
+		want     int64
+	}{
+		{
+			name:     "unknown total falls back to floor",
+			total:    48 << 30,
+			ok:       false,
+			fraction: indexerMemFraction,
+			floor:    defaultIndexerMemLimit,
+			want:     defaultIndexerMemLimit,
+		},
+		{
+			name:     "16GB machine indexer stays at floor",
+			total:    16 << 30,
+			ok:       true,
+			fraction: indexerMemFraction,
+			floor:    defaultIndexerMemLimit,
+			want:     4 * GiB,
+		},
+		{
+			name:     "16GB machine server stays at floor",
+			total:    16 << 30,
+			ok:       true,
+			fraction: serverMemFraction,
+			floor:    defaultServerMemLimit,
+			want:     8 * GiB,
+		},
+		{
+			name:     "48GB machine indexer scales above floor",
+			total:    48 << 30,
+			ok:       true,
+			fraction: indexerMemFraction,
+			floor:    defaultIndexerMemLimit,
+			want:     12 * GiB,
+		},
+		{
+			name:     "48GB machine server scales above floor",
+			total:    48 << 30,
+			ok:       true,
+			fraction: serverMemFraction,
+			floor:    defaultServerMemLimit,
+			want:     24 * GiB,
+		},
+		{
+			name:     "8GB machine indexer undercuts floor",
+			total:    8 << 30,
+			ok:       true,
+			fraction: indexerMemFraction,
+			floor:    defaultIndexerMemLimit,
+			want:     4 * GiB,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := deriveMemLimit(tt.total, tt.ok, tt.fraction, tt.floor); got != tt.want {
+				t.Errorf("deriveMemLimit(%d, %v, %v, %d) = %d, want %d", tt.total, tt.ok, tt.fraction, tt.floor, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPhysicalMemory_Host verifies physicalMemory reports a plausible total
+// on platforms with an OS-specific implementation, skipping on GOOS values
+// that fall back to (0, false) (see memsize_other.go).
+func TestPhysicalMemory_Host(t *testing.T) {
+	total, ok := physicalMemory()
+	if !ok {
+		t.Skip("physicalMemory: not implemented on this GOOS")
+	}
+	const GiB = uint64(1 << 30)
+	if total < GiB {
+		t.Fatalf("physicalMemory() = %d, want > %d (1GiB)", total, GiB)
+	}
+}
+
 // writeTinyModule writes a minimal single-package module to a fresh temp
 // directory and returns its path.
 func writeTinyModule(t *testing.T) string {
