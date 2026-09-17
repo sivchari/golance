@@ -405,15 +405,7 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 		return checkResult{}, fmt.Errorf("index: no parseable files for %s", pkgPath)
 	}
 
-	// scope pins, for both passes below, every dependency this call's own
-	// import resolution touches — directly or transitively via another
-	// already-decoded package's export data — against imp's shared Cache
-	// being evicted mid-check by a concurrently-finishing, unrelated
-	// package's own scheduler.finish (see CheckScope's own doc).
-	scope := imp.NewCheck()
-	defer scope.Close()
-
-	tpkg, info, errs := typecheck.CheckPackage(fset, files, pkgPath, scope)
+	tpkg, info, errs := typecheck.CheckPackage(fset, files, pkgPath, imp)
 	if tpkg == nil {
 		return checkResult{}, fmt.Errorf("index: type-check %s produced no package", pkgPath)
 	}
@@ -454,7 +446,7 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 		testASTs, testFileList, _ := parseGoFiles(fset, testFiles, readFile)
 		factsFiles = append(append([]*ast.File(nil), files...), testASTs...)
 		factsFileList = append(append([]string(nil), fileList...), testFileList...)
-		ftpkg, finfo, testErrs := typecheck.CheckPackage(fset, factsFiles, pkgPath, scope)
+		ftpkg, finfo, testErrs := typecheck.CheckPackage(fset, factsFiles, pkgPath, imp)
 		if ftpkg == nil {
 			return checkResult{}, fmt.Errorf("index: type-check %s (with test files) produced no package", pkgPath)
 		}
@@ -488,7 +480,7 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 //
 // The round-trip check remains the backstop for every OTHER corruption
 // shape, including this one distinct from (but related to)
-// the identity-split family typecheck.CheckScope's own doc describes:
+// the identity-split family typecheck.Cache's own doc describes:
 // go/types.Config.Check's error recovery can leave a declaration reachable
 // from tpkg's own exported API — most concretely, a generic instantiation's
 // synthesized method, e.g. when a call site's own generic-interface-

@@ -71,9 +71,14 @@ type Options struct {
 	// total.
 	Progress func(done, total int)
 
-	// onEvicted, if non-nil, is called after a dependency's *types.Package
-	// is evicted from the shared typecheck.Cache. Test-only hook.
-	onEvicted func(pkgPath string, cacheLen int)
+	// DecodeCacheBudget bounds, in bytes, how much decoded export data a
+	// single generation of the shared typecheck.Cache may hold (see
+	// cacheGenerations) before Build/Reindex rotates to a fresh (fset,
+	// Cache) pair, exactly like internal/server's depCacheHolder bounds its
+	// own long-lived cache. Left zero, it defaults to
+	// defaultDecodeCacheBudget (512 MiB, the same threshold
+	// depCacheHolder's own maxDepCacheBytes uses).
+	DecodeCacheBudget int64
 }
 
 // withDefaults returns a defaulted copy of *o (o itself is never mutated:
@@ -92,6 +97,9 @@ func (o *Options) withDefaults() Options {
 	}
 	if d.ToolchainFingerprint == "" {
 		d.ToolchainFingerprint = DefaultToolchainFingerprint()
+	}
+	if d.DecodeCacheBudget <= 0 {
+		d.DecodeCacheBudget = defaultDecodeCacheBudget
 	}
 	return d
 }
@@ -148,25 +156,33 @@ type Stats struct {
 	// downstream caches (e.g. a decoded *types.Package cache) against
 	// instead of the whole closure Reindex walked to determine that.
 	Changed []string
-	// DecodeSelfHeals is the number of times this run's shared
-	// typecheck.Cache self-healed a gcexportdata.Read failure (see
-	// (*typecheck.Importer).decode's own doc): a stale, unpinned entry left
-	// over from an earlier, unrelated decode made an otherwise-valid export
-	// blob fail to decode; the cache discarded every unpinned entry and the
-	// decode was retried once, successfully, into the cleaned generation. A
-	// nonzero count here is expected background noise on a large run, not a
-	// failure signal by itself — Stats.Errors/Incomplete already cover what
-	// a self-heal could not recover from (the retry's own, second failure).
-	DecodeSelfHeals int
+	// CacheGenerations is the number of shared typecheck.Cache generations
+	// this run created (see cacheGenerations): 1 for a run whose decoded
+	// export data never exceeded Options.DecodeCacheBudget, more for one
+	// that rotated to a fresh (fset, Cache) pair one or more times. A value
+	// above 1 is expected background cost on a large enough run, not a
+	// failure signal — a rotation only ever re-decodes a dependency's
+	// export data it needed again, it can never split package identity
+	// (see typecheck.Cache's own doc).
+	CacheGenerations int
+	// PeakHeapBytes is the largest live heap (runtime/metrics
+	// /memory/classes/heap/objects:bytes) sampled while Build ran — the
+	// measured cost of Options.DecodeCacheBudget, which is only a blob-byte
+	// proxy for the decoded *types.Package heap it actually keeps resident.
+	PeakHeapBytes uint64
 }
 
 // Build resolves every root (workspace) package in snap against db and cas,
 // in dependency order, type-checking only what a stat check and (see the
 // package doc's key composition) a CAS lookup cannot rule out as already
-// current. Processing is bounded to opts.Parallelism concurrent packages; a
-// dependency's decoded *types.Package is evicted from the shared type cache
-// as soon as every package that imports it has finished, keeping peak
-// memory proportional to the worker count rather than to workspace size.
+// current. Processing is bounded to opts.Parallelism concurrent packages.
+// Every check shares one typecheck.Cache generation at a time (see
+// cacheGenerations); a generation is never deleted from while checks may
+// still be reading it — memory is bounded instead by rotating to a fresh
+// generation once decoded export data exceeds Options.DecodeCacheBudget,
+// the same whole-pair-swap internal/server's depCacheHolder already uses
+// (see typecheck.Cache's own doc for why per-entry eviction cannot safely
+// bound memory mid-build).
 //
 // Build's returned error is reserved for conditions that leave db
 // untrustworthy as a whole: a canceled context (see buildResults.recordFatal).
@@ -188,8 +204,6 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 	o.BuildFlagsFingerprint = resolveBuildFlagsFingerprint(snap, o.BuildFlagsFingerprint)
 	start := time.Now()
 
-	fset := token.NewFileSet()
-	cache := typecheck.NewCache()
 	keys := newKeyTable(ctx, db)
 	exp := newCASExportSource(ctx, cas, keys)
 	// depMeta/depProvider resolve every non-root (stdlib/module-cache)
@@ -217,14 +231,19 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 	// exported API). depExp is fresh per Build call, so memoizing every
 	// resolved path for its lifetime costs nothing beyond this run.
 	depExp := depexport.NewCache(o.DepCAS, depMeta, depProvider, depexport.Options{BuildFlagsFingerprint: o.BuildFlagsFingerprint, MemoizeForRun: true})
-	imp := typecheck.NewImporter(fset, exp, depExp, cache)
+	gens := newCacheGenerations(o.DecodeCacheBudget, func() *cacheGeneration {
+		fset := token.NewFileSet()
+		cache := typecheck.NewCache()
+		return &cacheGeneration{fset: fset, cache: cache, imp: typecheck.NewImporter(fset, exp, depExp, cache)}
+	})
 	sem := semaphore.NewWeighted(int64(o.Parallelism))
 
-	sched, total := newScheduler(snap, cache, o.onEvicted)
+	sched, total := newScheduler(snap)
 	if total == 0 {
 		return Stats{}, nil
 	}
 	results := newBuildResults(db, o.BatchSize)
+	heap := startHeapSampler(500 * time.Millisecond)
 
 	var wg sync.WaitGroup
 	for path := range sched.ready {
@@ -233,7 +252,7 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 			defer wg.Done()
 			defer sched.finish(path)
 
-			done := runBuildJob(ctx, sem, fset, imp, exp, snap, db, cas, keys, &o, path, results)
+			done := runBuildJob(ctx, sem, gens, exp, snap, db, cas, keys, &o, path, results)
 			if o.Progress != nil {
 				o.Progress(done, total)
 			}
@@ -244,10 +263,10 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 	results.flush()
 	stats, err := results.result()
 	stats.Elapsed = time.Since(start)
-	stats.DecodeSelfHeals = int(cache.Resets())
-	if stats.DecodeSelfHeals > 0 {
-		log.Printf("index: shared type cache self-healed %d decode failure(s) this run (see Stats.DecodeSelfHeals)", stats.DecodeSelfHeals)
-	}
+	stats.CacheGenerations = gens.count()
+	stats.PeakHeapBytes = heap.stopAndPeak()
+	log.Printf("index: peak live heap %d MiB; decode cache %d generation(s), current generation %d MiB decoded (budget %d MiB)",
+		stats.PeakHeapBytes>>20, stats.CacheGenerations, gens.currentBytes()>>20, o.DecodeCacheBudget>>20)
 	if err == nil {
 		// Record the toolchain this run checked db against, so a later
 		// revalidation pass (see Revalidate, used by
@@ -299,11 +318,17 @@ func nonRootCount(snap *graph.Snapshot) int {
 // A sem.Acquire failure (ctx canceled) is fatal and recorded via
 // recordFatal; any error processUnit itself returns is a single package's
 // own failure and never aborts the run (see buildResults.record's doc).
-func runBuildJob(ctx context.Context, sem *semaphore.Weighted, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, snap *graph.Snapshot, db *store.DB, cas *store.CAS, keys *keyTable, opts *Options, path string, results *buildResults) int {
+//
+// gens.acquire is called only after sem.Acquire succeeds, not before: a job
+// stalled waiting on sem must not bind to a generation that goes past
+// budget while it waits, since that would still leave it decoding into a
+// generation some concurrently-running job has already rotated past.
+func runBuildJob(ctx context.Context, sem *semaphore.Weighted, gens *cacheGenerations, exp *casExportSource, snap *graph.Snapshot, db *store.DB, cas *store.CAS, keys *keyTable, opts *Options, path string, results *buildResults) int {
 	if err := sem.Acquire(ctx, 1); err != nil {
 		return results.recordFatal(err)
 	}
-	outcome, skipped, typeChecked, err := processUnitRecovered(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, readFileDisk, true)
+	gen := gens.acquire()
+	outcome, skipped, typeChecked, err := processUnitRecovered(ctx, gen.fset, gen.imp, exp, snap, db, cas, keys, opts, path, readFileDisk, true)
 	sem.Release(1)
 	return results.record(path, outcome, skipped, typeChecked, err)
 }

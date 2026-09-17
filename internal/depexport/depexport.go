@@ -181,8 +181,9 @@ type Options struct {
 // package reached via the indexer's own #122-era withheld-export fallback,
 // but any persist=false path qualifies), for EVERY caller across an entire
 // Build/Reindex run, not just within one provider.Package call
-// (closureScope's own protection — see typecheck.CheckScope's doc for the
-// identical, already-fixed, single-call version of this). provider's own
+// (closureScope's own protection — see internal/typecheck.Cache's own doc
+// for the identical, already-fixed, append-only version of this).
+// provider's own
 // cross-call "dependency-based pin" (see depcheck.Provider.Delete's doc)
 // only protects pkgPath for as long as SOME OTHER still-cached entry
 // happens to claim it as a dependency; once that claiming entry itself is

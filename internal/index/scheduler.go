@@ -4,33 +4,25 @@ import (
 	"sync/atomic"
 
 	"github.com/sivchari/golance/internal/graph"
-	"github.com/sivchari/golance/internal/typecheck"
 )
 
 // scheduler drives Build's dependency-ordered, bounded-concurrency
-// processing of root (workspace) packages: which packages are ready to
-// run, and the reference-count bookkeeping that evicts a dependency from
-// the shared typecheck.Cache once every package that imports it has
-// finished. Non-root (stdlib/module) dependencies are never scheduled as
-// jobs of their own — they are only resolved on demand through the shared
-// Importer's fallback ExportSource tier (internal/depexport.Cache — see its
-// own package doc) — but a non-root package's decoded *types.Package still
-// lands in the same shared typecheck.Cache a root package's does, so it is
-// still ref-counted and evicted the same way, over the narrower "direct
-// import of some root package" edge set computeNonRootFanIn computes (see
-// its own doc for why the full scheduling machinery — pos ordering, the
-// pendingDeps/ready bookkeeping — is neither needed nor safe to reuse for
-// it).
+// processing of root (workspace) packages: which packages are ready to run,
+// tracked purely over direct root-to-root import edges (schedulableDepsOf).
+// It no longer ref-counts anything for cache eviction — internal/index.Build
+// now bounds the shared decode cache's memory by rotating to a fresh
+// generation once it grows past budget (see generations), not by deleting
+// entries mid-run: a dependency's references can reach a package this
+// scheduler never sees an edge to at all, through another already-decoded
+// package's own export data, so a scheduler-driven refcount can never
+// safely decide when an entry is no longer needed (see
+// internal/typecheck.Cache's own doc).
 type scheduler struct {
-	snap             *graph.Snapshot
-	cache            *typecheck.Cache
-	onEvicted        func(pkgPath string, cacheLen int)
-	remaining        map[string]*int32 // fan-in counters, drive cache eviction
-	nonRootRemaining map[string]*int32 // fan-in counters for direct non-root imports, see computeNonRootFanIn
-	pendingDeps      map[string]*int32 // unfinished direct dependency counters, drive scheduling
-	dependents       map[string][]string
-	ready            chan string
-	left             int32
+	snap        *graph.Snapshot
+	pendingDeps map[string]*int32 // unfinished direct dependency counters, drive scheduling
+	dependents  map[string][]string
+	ready       chan string
+	left        int32
 }
 
 // schedulableRoot reports whether pkg is one of the (up to two per
@@ -50,8 +42,8 @@ func schedulableRoot(snap *graph.Snapshot, pkg *graph.Package) bool {
 // no unfinished dependency (a zero in-degree in that subgraph). total is the
 // number of packages to process; a scheduler for total == 0 has nothing to
 // do.
-func newScheduler(snap *graph.Snapshot, cache *typecheck.Cache, onEvicted func(string, int)) (*scheduler, int) {
-	fanIn, dependents := computeFanIn(snap)
+func newScheduler(snap *graph.Snapshot) (*scheduler, int) {
+	dependents := computeDependents(snap)
 
 	var total int
 	pendingDeps := make(map[string]*int32, len(snap.Packages))
@@ -68,29 +60,12 @@ func newScheduler(snap *graph.Snapshot, cache *typecheck.Cache, onEvicted func(s
 		pendingDeps[path] = &v
 	}
 
-	remaining := make(map[string]*int32, len(fanIn))
-	for path, n := range fanIn {
-		v := n
-		remaining[path] = &v
-	}
-
-	nonRootFanIn := computeNonRootFanIn(snap)
-	nonRootRemaining := make(map[string]*int32, len(nonRootFanIn))
-	for path, n := range nonRootFanIn {
-		v := n
-		nonRootRemaining[path] = &v
-	}
-
 	s := &scheduler{
-		snap:             snap,
-		cache:            cache,
-		onEvicted:        onEvicted,
-		remaining:        remaining,
-		nonRootRemaining: nonRootRemaining,
-		pendingDeps:      pendingDeps,
-		dependents:       dependents,
-		ready:            make(chan string, total),
-		left:             int32(total),
+		snap:        snap,
+		pendingDeps: pendingDeps,
+		dependents:  dependents,
+		ready:       make(chan string, total),
+		left:        int32(total),
 	}
 	if total == 0 {
 		close(s.ready)
@@ -104,38 +79,10 @@ func newScheduler(snap *graph.Snapshot, cache *typecheck.Cache, onEvicted func(s
 	return s, total
 }
 
-// finish records that path has finished processing: it evicts any
-// dependency (root or non-root) whose last pending importer was path, and
-// pushes any dependent whose last pending dependency was path onto ready.
-// Call exactly once per package received from ready.
+// finish records that path has finished processing: it pushes any dependent
+// whose last pending dependency was path onto ready. Call exactly once per
+// package received from ready.
 func (s *scheduler) finish(path string) {
-	for _, dep := range schedulableDepsOf(s.snap, path, s.snap.Packages[path]) {
-		ctr, ok := s.remaining[dep]
-		if !ok {
-			continue
-		}
-		if atomic.AddInt32(ctr, -1) == 0 {
-			s.cache.Delete(dep)
-			if s.onEvicted != nil {
-				s.onEvicted(dep, s.cache.Len())
-			}
-		}
-	}
-	pkg := s.snap.Packages[path]
-	for _, imports := range [][]string{pkg.Imports, pkg.TestImports} {
-		for _, dep := range imports {
-			ctr, ok := s.nonRootRemaining[dep]
-			if !ok {
-				continue
-			}
-			if atomic.AddInt32(ctr, -1) == 0 {
-				s.cache.Delete(dep)
-				if s.onEvicted != nil {
-					s.onEvicted(dep, s.cache.Len())
-				}
-			}
-		}
-	}
 	for _, dependent := range s.dependents[path] {
 		if atomic.AddInt32(s.pendingDeps[dependent], -1) == 0 {
 			s.ready <- dependent
@@ -155,10 +102,10 @@ func (s *scheduler) finish(path string) {
 // acyclic, so graph.Snapshot.Order always places it correctly — but a
 // TestImports edge caught in the rare legal test-only cycle topoOrder's own
 // fallback could not fully order is silently dropped here instead: counting
-// it would make newScheduler's pendingDeps/remaining bookkeeping wait
-// forever on a dependency that will never signal "finished" through this
-// ordering, deadlocking Build entirely. directDepImports applies this exact
-// same snap.Before filter for its own, different reason (see its doc), so a
+// it would make newScheduler's pendingDeps bookkeeping wait forever on a
+// dependency that will never signal "finished" through this ordering,
+// deadlocking Build entirely. directDepImports applies this exact same
+// snap.Before filter for its own, different reason (see its doc), so a
 // dropped edge here is also never required for [computeUnitKey] — dropping
 // it never surfaces as this run's error the way it used to before that
 // filter existed there too.
@@ -179,60 +126,22 @@ func schedulableDepsOf(snap *graph.Snapshot, path string, pkg *graph.Package) []
 	return out
 }
 
-// computeFanIn returns, for every schedulable package in snap (see
-// schedulableRoot), the number of direct root importers (fan-in), plus a
-// dependents map from import path to the schedulable packages that import
-// it directly (see schedulableDepsOf for which edges qualify). An external
+// computeDependents returns, for every schedulable package in snap (see
+// schedulableRoot), the schedulable packages that import it directly (see
+// schedulableDepsOf for which edges qualify) — finish's own lookup table for
+// which dependents to make ready once path itself finishes. An external
 // test package's own import of its base package (always a Root package) is
-// what lets computeFanIn keep that base package's decoded *types.Package
-// warm in the shared typecheck.Cache until the external test unit has also
-// finished with it, and what makes the external test unit itself become
-// ready once its base package finishes (see finish).
-func computeFanIn(snap *graph.Snapshot) (fanIn map[string]int32, dependents map[string][]string) {
-	fanIn = make(map[string]int32, len(snap.Packages))
-	dependents = make(map[string][]string, len(snap.Packages))
+// what makes the external test unit itself become ready once its base
+// package finishes.
+func computeDependents(snap *graph.Snapshot) map[string][]string {
+	dependents := make(map[string][]string, len(snap.Packages))
 	for path, pkg := range snap.Packages {
 		if !schedulableRoot(snap, pkg) {
 			continue
 		}
 		for _, dep := range schedulableDepsOf(snap, path, pkg) {
-			fanIn[dep]++
 			dependents[dep] = append(dependents[dep], path)
 		}
 	}
-	return fanIn, dependents
-}
-
-// computeNonRootFanIn returns, for every non-root (stdlib/module-cache)
-// package directly imported by some schedulable root package, the number of
-// distinct schedulable root importers (fan-in) — the same shape as
-// computeFanIn's own return, but over exactly the non-root targets that
-// function's schedulableDepsOf deliberately excludes (see scheduler's own
-// doc). typecheck.Importer.ImportFrom populates the shared typecheck.Cache
-// for a non-root import through the exact same decode path a root import
-// uses (internal/typecheck.Importer.resolve does not distinguish the two),
-// but without this, nothing ever calls Cache.Delete for a non-root entry: it
-// would survive for Build's entire run once decoded, unlike a root
-// dependency's entry (see finish). No ordering restriction is needed here
-// the way schedulableDepsOf's pos check is for root edges: a non-root
-// package is never scheduled as a job of its own (see the package doc), so
-// counting it here creates no cycle-ordering hazard for newScheduler's ready
-// channel to deadlock on.
-func computeNonRootFanIn(snap *graph.Snapshot) map[string]int32 {
-	fanIn := make(map[string]int32)
-	for _, pkg := range snap.Packages {
-		if !schedulableRoot(snap, pkg) {
-			continue
-		}
-		for _, imports := range [][]string{pkg.Imports, pkg.TestImports} {
-			for _, dep := range imports {
-				d, ok := snap.Packages[dep]
-				if !ok || d.Root {
-					continue
-				}
-				fanIn[dep]++
-			}
-		}
-	}
-	return fanIn
+	return dependents
 }
