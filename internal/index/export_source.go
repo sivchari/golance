@@ -69,9 +69,26 @@ func (s *casExportSource) Put(pkgPath string, blob []byte) {
 	s.mem.Put(pkgPath, blob)
 }
 
-// ExportData implements typecheck.ExportSource.
+// ExportData implements typecheck.ExportSource. An empty blob — Put with
+// nil/empty bytes, or a CAS-persisted UnitBlob whose Export is nil/empty —
+// is reported as a miss (ok=false), not a hit with empty data: both cases
+// mean checkAndStoreOutcome withheld pkgPath's export because it failed
+// writeAndValidateExport's round-trip check (see checkOnePackage's own
+// doc), not that pkgPath genuinely has no exported API (a real, exported-
+// nothing package's blob is never actually empty — gcexportdata always
+// writes a non-empty header). Reporting ok=true here would make
+// Importer.resolve decode zero bytes and fail outright for every
+// dependent, instead of falling through to imp.fallback — the
+// declaration-only source-check path (internal/depexport.Cache, backed by
+// depcheck.Provider, which source-checks a workspace/root package exactly
+// as readily as a stdlib/module one — see depcheck.GraphMetadataSource's
+// doc) — that can still give a dependent a complete, usable answer despite
+// pkgPath's own compiled export being unusable.
 func (s *casExportSource) ExportData(pkgPath string) ([]byte, bool, error) {
 	if blob, ok, _ := s.mem.ExportData(pkgPath); ok {
+		if len(blob) == 0 {
+			return nil, false, nil
+		}
 		return blob, true, nil
 	}
 	rec, ok := s.keys.get(pkgPath)
@@ -88,6 +105,9 @@ func (s *casExportSource) ExportData(pkgPath string) ([]byte, bool, error) {
 	u, err := store.DecodeUnitBlob(blob)
 	if err != nil {
 		return nil, false, err
+	}
+	if len(u.Export) == 0 {
+		return nil, false, nil
 	}
 	return u.Export, true, nil
 }
