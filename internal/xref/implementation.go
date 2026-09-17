@@ -23,6 +23,7 @@ import (
 // name-based first pass over the method index followed by a
 // types.Implements confirmation against export data (see package doc).
 func (r *Resolver) Implementation(ctx context.Context, file string, line, col int) ([]Location, error) {
+	ctx = r.pinExportCache(ctx)
 	l, c, err := toUint32Pos(line, col)
 	if err != nil {
 		return nil, err
@@ -126,12 +127,54 @@ func (r *Resolver) correspondingMethodSymbols(ctx context.Context, target resolv
 	return r.interfacesSatisfiedByMethod(ctx, named, target.Name)
 }
 
-// interfacesSatisfiedByMethod is correspondingMethodSymbols' concrete ->
-// interfaces direction: given named's own methodName method, it returns the
-// matching method of every workspace interface named satisfies that also
-// declares a method by this name -- what a call through an interface-typed
-// variable resolves to, and so what References on the concrete method must
-// union in alongside target's own direct call sites.
+// methodMemoKey identifies one interfacesSatisfiedByMethod memo entry (see
+// Resolver.interfacesSatisfiedByMethodMemo): named's own candidateKey plus
+// the single method name that direction is bounded to (see
+// interfacesSatisfiedByMethodConfirm's own doc), since -- unlike
+// implementingTypes/embeddingInterfaces/implementedInterfaces, whose
+// methodNames argument is always deterministically named's/ifaceNamed's own
+// FULL method set -- this direction's result genuinely varies by which
+// single method name a query asked about.
+type methodMemoKey struct {
+	Type   candidateKey
+	Method string
+}
+
+// interfacesSatisfiedByMethod is interfacesSatisfiedByMethodConfirm's
+// memoized entrypoint: a repeat query for the identical (named, methodName)
+// pair, or an unrelated query that happens to land on the same concrete
+// method, reuses the prior confirmation instead of re-running
+// methodEntriesOfKind's LookupMethod scan plus a decode-and-types.Implements
+// call per candidate (see interfacesSatisfiedByMethodConfirm's own doc for
+// why that decode cost, though itself cached per package by r.cache, still
+// re-runs the types.Implements comparison on every call). named with no
+// package (selfCandidateKey's ok=false; never a real workspace method's
+// receiver) always misses the memo and falls straight through, matching
+// interfacesSatisfiedByMethodConfirm's own unmemoized behavior.
+func (r *Resolver) interfacesSatisfiedByMethod(ctx context.Context, named *types.Named, methodName string) ([]resolvedSymbol, error) {
+	key, ok := selfCandidateKey(named)
+	if ok {
+		if v, hit := r.interfacesSatisfiedByMethodMemo.get(methodMemoKey{Type: key, Method: methodName}); hit {
+			return v, nil
+		}
+	}
+	out, err := r.interfacesSatisfiedByMethodConfirm(ctx, named, methodName)
+	if err != nil {
+		return nil, err
+	}
+	r.confirmRuns.Add(1)
+	if ok {
+		r.interfacesSatisfiedByMethodMemo.put(methodMemoKey{Type: key, Method: methodName}, out)
+	}
+	return out, nil
+}
+
+// interfacesSatisfiedByMethodConfirm is correspondingMethodSymbols' concrete
+// -> interfaces direction: given named's own methodName method, it returns
+// the matching method of every workspace interface named satisfies that
+// also declares a method by this name -- what a call through an
+// interface-typed variable resolves to, and so what References on the
+// concrete method must union in alongside target's own direct call sites.
 //
 // Candidate gathering is deliberately bounded to a SINGLE
 // [store.DB.LookupMethod] posting list (methodName alone), unlike
@@ -167,7 +210,7 @@ func (r *Resolver) correspondingMethodSymbols(ctx context.Context, target resolv
 // logImplDiag: logging every miss would be log noise on References' hot
 // path, not the rare, actionable signal implDiag exists for. ctx is checked
 // once per candidate, mirroring implementedInterfaces' own loop.
-func (r *Resolver) interfacesSatisfiedByMethod(ctx context.Context, named *types.Named, methodName string) ([]resolvedSymbol, error) {
+func (r *Resolver) interfacesSatisfiedByMethodConfirm(ctx context.Context, named *types.Named, methodName string) ([]resolvedSymbol, error) {
 	diag := newImplDiag([]string{methodName})
 	candidates, err := r.methodEntriesOfKind(ctx, methodName, index.KindInterface, diag)
 	if err != nil {
@@ -238,7 +281,8 @@ func (r *Resolver) resolveMethodFunc(ctx context.Context, pkgPath string, idHash
 	if err != nil {
 		return nil, fmt.Errorf("xref: read export data for %s: %w", pkgPath, err)
 	}
-	tpkg, err := typecheck.ReadExport(u.Export, r.fset, pkgPath, r.cache)
+	fset, cache := r.exportCacheFor(ctx)
+	tpkg, err := typecheck.ReadExport(u.Export, fset, pkgPath, cache)
 	if err != nil {
 		r.logDecodeFailureOnce(pkgPath, err)
 		return nil, fmt.Errorf("xref: decode export data for %s: %w", pkgPath, err)
@@ -324,20 +368,62 @@ func (r *Resolver) appendCandidateLocations(ctx context.Context, out []Location,
 	return out, nil
 }
 
-// embeddingInterfaces finds every interface in the workspace, OTHER than
-// ifaceNamed itself, whose own (already-flattened, promotion-included)
+// memoizeByOwnIdentity runs confirm -- one call to implementingTypesConfirm/
+// embeddingInterfacesConfirm/implementedInterfacesConfirm -- through memo,
+// keyed by named's own candidateKey (via selfCandidateKey). All three share
+// this shape because each one's own methodNames argument is always
+// deterministically named's/ifaceNamed's own FULL method set (every one of
+// their callers builds it that way -- see implementationsOfInterface,
+// methodImplementationSymbols, interfacesImplementedBy, and
+// methodInterfaceSymbols), so named's identity alone is a sufficient memo
+// key without also needing methodNames itself in it (unlike
+// interfacesSatisfiedByMethod's own methodMemoKey, whose direction is
+// deliberately bounded to a single, caller-chosen method name -- see its
+// doc). named with no package (selfCandidateKey's ok=false; never a real
+// workspace interface/type) always misses and falls straight through to
+// confirm, unmemoized.
+func memoizeByOwnIdentity[V any](r *Resolver, named *types.Named, memo *confirmMemo[candidateKey, V], confirm func() (V, error)) (V, error) {
+	key, ok := selfCandidateKey(named)
+	if ok {
+		if v, hit := memo.get(key); hit {
+			return v, nil
+		}
+	}
+	out, err := confirm()
+	if err != nil {
+		var zero V
+		return zero, err
+	}
+	r.confirmRuns.Add(1)
+	if ok {
+		memo.put(key, out)
+	}
+	return out, nil
+}
+
+// embeddingInterfaces is embeddingInterfacesConfirm's memoized entrypoint;
+// see memoizeByOwnIdentity's doc.
+func (r *Resolver) embeddingInterfaces(ctx context.Context, ifaceNamed *types.Named, iface *types.Interface, methodNames []string, diag *implDiag) (candidateOccurrences, error) {
+	return memoizeByOwnIdentity(r, ifaceNamed, r.embeddingInterfacesMemo, func() (candidateOccurrences, error) {
+		return r.embeddingInterfacesConfirm(ctx, ifaceNamed, iface, methodNames, diag)
+	})
+}
+
+// embeddingInterfacesConfirm finds every interface in the workspace, OTHER
+// than ifaceNamed itself, whose own (already-flattened, promotion-included)
 // method set is a superset of ifaceNamed's methodNames -- i.e. every
 // interface that embeds ifaceNamed, directly or through further embedding.
-// Candidate gathering and fingerprint confirmation mirror implementingTypes
-// exactly (see its doc), with two differences specific to an interface
-// candidate: confirmation calls types.Implements(cnamed, iface) directly,
-// with no *types.Pointer wrapping (an interface's method set already is its
-// value method set, unlike a concrete receiver), and ifaceNamed's own
-// candidateKey is excluded before either the fingerprint or decode path
-// runs -- ifaceNamed trivially has all of its own methods (both by
-// fingerprint and by types.Implements), so without this exclusion it would
-// always list itself as its own "implementer".
-func (r *Resolver) embeddingInterfaces(ctx context.Context, ifaceNamed *types.Named, iface *types.Interface, methodNames []string, diag *implDiag) (candidateOccurrences, error) {
+// Candidate gathering and fingerprint confirmation mirror
+// implementingTypesConfirm exactly (see its doc), with two differences
+// specific to an interface candidate: confirmation calls
+// types.Implements(cnamed, iface) directly, with no *types.Pointer wrapping
+// (an interface's method set already is its value method set, unlike a
+// concrete receiver), and ifaceNamed's own candidateKey is excluded before
+// either the fingerprint or decode path runs -- ifaceNamed trivially has
+// all of its own methods (both by fingerprint and by types.Implements), so
+// without this exclusion it would always list itself as its own
+// "implementer".
+func (r *Resolver) embeddingInterfacesConfirm(ctx context.Context, ifaceNamed *types.Named, iface *types.Interface, methodNames []string, diag *implDiag) (candidateOccurrences, error) {
 	ifaceGeneric := ifaceNamed.TypeParams().Len() > 0
 	ifaceFPs := make(map[string]uint64, len(methodNames))
 	if !ifaceGeneric {
@@ -506,10 +592,18 @@ type candidateKey struct {
 // to agree.
 type candidateOccurrences map[candidateKey]map[string][]store.MethodEntry
 
-// implementingTypes intersects [store.DB.LookupMethod] candidates across
-// every one of methodNames (a real implementer must have all of them, so a
-// candidate missing even one is never confirmed), then confirms each
-// survivor by comparing each required method's canonical signature
+// implementingTypes is implementingTypesConfirm's memoized entrypoint; see
+// memoizeByOwnIdentity's doc.
+func (r *Resolver) implementingTypes(ctx context.Context, ifaceNamed *types.Named, iface *types.Interface, methodNames []string, diag *implDiag) (candidateOccurrences, error) {
+	return memoizeByOwnIdentity(r, ifaceNamed, r.implementingTypesMemo, func() (candidateOccurrences, error) {
+		return r.implementingTypesConfirm(ctx, ifaceNamed, iface, methodNames, diag)
+	})
+}
+
+// implementingTypesConfirm intersects [store.DB.LookupMethod] candidates
+// across every one of methodNames (a real implementer must have all of
+// them, so a candidate missing even one is never confirmed), then confirms
+// each survivor by comparing each required method's canonical signature
 // fingerprint against ifaceNamed's own (see internal/index's
 // MethodFingerprint/registerMethodSet and [store.MethodEntry]'s doc) --
 // which needs no export-data decode of the candidate at all. That is what
@@ -551,7 +645,7 @@ type candidateOccurrences map[candidateKey]map[string][]store.MethodEntry
 // decode fallback: a canceled query stops before decoding the next
 // candidate's export data (the expensive part of this loop) instead of
 // running to completion regardless.
-func (r *Resolver) implementingTypes(ctx context.Context, ifaceNamed *types.Named, iface *types.Interface, methodNames []string, diag *implDiag) (candidateOccurrences, error) {
+func (r *Resolver) implementingTypesConfirm(ctx context.Context, ifaceNamed *types.Named, iface *types.Interface, methodNames []string, diag *implDiag) (candidateOccurrences, error) {
 	ifaceGeneric := ifaceNamed.TypeParams().Len() > 0
 	ifaceFPs := make(map[string]uint64, len(methodNames))
 	if !ifaceGeneric {
@@ -749,28 +843,36 @@ func (r *Resolver) methodInterfaceSymbols(ctx context.Context, named *types.Name
 	return out, nil
 }
 
-// implementedInterfaces unions [store.DB.LookupMethod] candidates across
-// every name in methodNames (an interface named satisfies must have at
-// least one method named also has), then confirms each survivor with
+// implementedInterfaces is implementedInterfacesConfirm's memoized
+// entrypoint; see memoizeByOwnIdentity's doc.
+func (r *Resolver) implementedInterfaces(ctx context.Context, named *types.Named, methodNames []string, diag *implDiag) (map[candidateKey]*types.Interface, error) {
+	return memoizeByOwnIdentity(r, named, r.implementedInterfacesMemo, func() (map[candidateKey]*types.Interface, error) {
+		return r.implementedInterfacesConfirm(ctx, named, methodNames, diag)
+	})
+}
+
+// implementedInterfacesConfirm unions [store.DB.LookupMethod] candidates
+// across every name in methodNames (an interface named satisfies must have
+// at least one method named also has), then confirms each survivor with
 // types.Implements -- which also rejects the interfaces the first pass
 // over-approximated -- returning the ones that pass alongside their
 // resolved *types.Interface.
 //
-// Unlike implementingTypes' interface -> implementers direction, this stays
-// on the decode-based confirmation deliberately: unioning only named's own
-// method names finds every candidate interface that shares AT LEAST ONE
-// name with named, but never rules out a candidate that additionally
-// requires some OTHER method named does not have -- only fully decoding the
-// candidate's own method set (via resolveNamed, then types.Implements)
-// answers that. Fingerprint-confirming this direction soundly would need an
-// index of each interface's TOTAL method count (or full name set) to bound
-// it, which is disproportionate scope for a direction the reported bug
-// never actually implicated: the "unexported struct implements an exported
-// interface" pattern this fix targets means the candidates on THIS side are
-// interfaces, conventionally exported and so already decodable in practice.
-// ctx is checked once per candidate, mirroring implementingTypes' decode
-// fallback.
-func (r *Resolver) implementedInterfaces(ctx context.Context, named *types.Named, methodNames []string, diag *implDiag) (map[candidateKey]*types.Interface, error) {
+// Unlike implementingTypesConfirm's interface -> implementers direction,
+// this stays on the decode-based confirmation deliberately: unioning only
+// named's own method names finds every candidate interface that shares AT
+// LEAST ONE name with named, but never rules out a candidate that
+// additionally requires some OTHER method named does not have -- only fully
+// decoding the candidate's own method set (via resolveNamed, then
+// types.Implements) answers that. Fingerprint-confirming this direction
+// soundly would need an index of each interface's TOTAL method count (or
+// full name set) to bound it, which is disproportionate scope for a
+// direction the reported bug never actually implicated: the "unexported
+// struct implements an exported interface" pattern this fix targets means
+// the candidates on THIS side are interfaces, conventionally exported and
+// so already decodable in practice. ctx is checked once per candidate,
+// mirroring implementingTypesConfirm's decode fallback.
+func (r *Resolver) implementedInterfacesConfirm(ctx context.Context, named *types.Named, methodNames []string, diag *implDiag) (map[candidateKey]*types.Interface, error) {
 	candidates, err := r.candidatesByAnyMethod(ctx, methodNames, index.KindInterface, diag)
 	if err != nil {
 		return nil, err

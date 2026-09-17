@@ -92,6 +92,7 @@ func (r *Resolver) Definition(ctx context.Context, file string, line, col int) (
 // declaration), matching Definition/Rename's existing "one symbol, one
 // declaration" behavior.
 func (r *Resolver) References(ctx context.Context, file string, line, col int, includeDecl bool) ([]Location, error) {
+	ctx = r.pinExportCache(ctx)
 	l, c, err := toUint32Pos(line, col)
 	if err != nil {
 		return nil, err

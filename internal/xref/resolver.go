@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/store"
@@ -44,16 +45,53 @@ type Edit struct {
 // Resolver answers cross-reference queries over db's per-root index, cas's
 // content-addressed blobs, and snap's import graph. A Resolver decodes
 // export data through one shared internal/typecheck.Cache and
-// token.FileSet for its lifetime (see package doc); construct a fresh one
-// to bound their growth for a long session.
+// token.FileSet pair, reused across every query for its lifetime so a
+// repeat query (or a later query touching the same package) never
+// re-decodes what an earlier one already did (see resolveNamed's doc and
+// exportCache below). That pair is discarded and replaced wholesale, never
+// piecemeal, once its retained blob bytes cross exportCacheBytes --
+// mirroring internal/depcheck's exportResolver (see exportCache's doc) --
+// so unbounded growth across a long session is bounded the same way
+// r.units already bounds the raw facts/export blob cache.
 type Resolver struct {
 	db   *store.DB
 	cas  *store.CAS
 	snap *graph.Snapshot
-	fset *token.FileSet
 
-	cache *typecheck.Cache
+	// cacheMu guards fset/cache against the coarse whole-pair reset
+	// exportCache performs when exportCacheBytes is exceeded: every read or
+	// replacement of either field goes through it, so a query already
+	// mid-decode against one generation of the pair never observes the
+	// other's fset (see typecheck.Cache's own doc on why fset and cache
+	// must never be discarded independently). It protects only the two
+	// field values themselves -- decoding through a returned (fset, cache)
+	// pair runs unlocked afterward, exactly like exportResolver.resolve.
+	cacheMu           sync.Mutex
+	fset              *token.FileSet
+	cache             *typecheck.Cache
+	exportCacheBytes  int64
+	exportCacheResets int64 // exportCache's own reset count; see exportCacheResetCount
+
 	units *unitCache
+
+	// implementingTypesMemo/embeddingInterfacesMemo/implementedInterfacesMemo/
+	// interfacesSatisfiedByMethodMemo memoize Implementation/References' own
+	// candidate-confirmation loops (see implementation.go's wrappers around
+	// each of their *Confirm namesakes): the sound name-based LookupMethod
+	// shortlist plus fingerprint/decode confirmation those functions run is
+	// deterministic for a given queried type's identity, so a repeat query
+	// (or a different query that happens to land on the same interface or
+	// concrete type) reuses the prior result instead of re-running it.
+	// Bounded by confirmMemoCapacity, cleared by Invalidate (see its doc). A
+	// stored value can never straddle two exportCache generations: pinExportCache
+	// (see its doc) guarantees every decode belonging to one query shares a
+	// single (fset, cache) pair, so a memoized result reflects exactly one
+	// generation's type identity, never a mix.
+	implementingTypesMemo           *confirmMemo[candidateKey, candidateOccurrences]
+	embeddingInterfacesMemo         *confirmMemo[candidateKey, candidateOccurrences]
+	implementedInterfacesMemo       *confirmMemo[candidateKey, map[candidateKey]*types.Interface]
+	interfacesSatisfiedByMethodMemo *confirmMemo[methodMemoKey, []resolvedSymbol]
+	confirmRuns                     atomic.Int64 // confirmation-run counter; see confirmRunCount
 
 	fileToPkg     map[string]string
 	dirToPkg      map[string]string
@@ -86,6 +124,32 @@ type Option func(*Resolver)
 func WithUnitCacheBytes(n int64) Option {
 	return func(r *Resolver) {
 		r.units = newUnitCache(n)
+	}
+}
+
+// WithExportCacheBytes overrides r's default gcexportdata decode-cache
+// bound (defaultExportCacheBytes) with n. Same rationale as
+// WithUnitCacheBytes; a test asserting exportCache's coarse-reset eviction
+// behavior needs a bound small enough to cross at fixture scale, which
+// defaultExportCacheBytes deliberately is not.
+func WithExportCacheBytes(n int64) Option {
+	return func(r *Resolver) {
+		r.exportCacheBytes = n
+	}
+}
+
+// WithConfirmMemoCapacity overrides r's default candidate-confirmation memo
+// bound (confirmMemoCapacity, applied to all four of
+// implementingTypesMemo/embeddingInterfacesMemo/implementedInterfacesMemo/
+// interfacesSatisfiedByMethodMemo) with n entries. Same rationale as
+// WithUnitCacheBytes/WithExportCacheBytes: a test asserting LRU eviction
+// needs a cap small enough to cross at fixture scale.
+func WithConfirmMemoCapacity(n int) Option {
+	return func(r *Resolver) {
+		r.implementingTypesMemo = newConfirmMemo[candidateKey, candidateOccurrences](n)
+		r.embeddingInterfacesMemo = newConfirmMemo[candidateKey, candidateOccurrences](n)
+		r.implementedInterfacesMemo = newConfirmMemo[candidateKey, map[candidateKey]*types.Interface](n)
+		r.interfacesSatisfiedByMethodMemo = newConfirmMemo[methodMemoKey, []resolvedSymbol](n)
 	}
 }
 
@@ -141,17 +205,22 @@ func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool, opts
 		}
 	}
 	r := &Resolver{
-		db:            db,
-		cas:           cas,
-		snap:          snap,
-		fset:          token.NewFileSet(),
-		cache:         typecheck.NewCache(),
-		units:         newUnitCache(defaultUnitCacheBytes),
-		fileToPkg:     fileToPkg,
-		dirToPkg:      dirToPkg,
-		pkgPathByHash: pkgPathByHash,
-		root:          snap.Dir(),
-		relative:      relative,
+		db:                              db,
+		cas:                             cas,
+		snap:                            snap,
+		fset:                            token.NewFileSet(),
+		cache:                           typecheck.NewCache(),
+		exportCacheBytes:                defaultExportCacheBytes,
+		units:                           newUnitCache(defaultUnitCacheBytes),
+		implementingTypesMemo:           newConfirmMemo[candidateKey, candidateOccurrences](confirmMemoCapacity),
+		embeddingInterfacesMemo:         newConfirmMemo[candidateKey, candidateOccurrences](confirmMemoCapacity),
+		implementedInterfacesMemo:       newConfirmMemo[candidateKey, map[candidateKey]*types.Interface](confirmMemoCapacity),
+		interfacesSatisfiedByMethodMemo: newConfirmMemo[methodMemoKey, []resolvedSymbol](confirmMemoCapacity),
+		fileToPkg:                       fileToPkg,
+		dirToPkg:                        dirToPkg,
+		pkgPathByHash:                   pkgPathByHash,
+		root:                            snap.Dir(),
+		relative:                        relative,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -343,14 +412,119 @@ func (r *Resolver) symbolByHash(ctx context.Context, pkgHash, idHash uint64) (na
 	return s.Name(), s.Kind(), loc, nil
 }
 
-// resolveNamed decodes pkgPath's export data through r's shared cache and
-// looks up name in its package scope.
+// defaultExportCacheBytes bounds exportCache's retained gcexportdata decode
+// cache, measured the same way internal/depcheck's exportDecodeCap is (see
+// exportCache's doc): a serialized-blob byte sum, not the live
+// *types.Package object graph those blobs decode into. Same 256MiB value as
+// exportDecodeCap and defaultUnitCacheBytes -- generous enough that one
+// query's own candidate closure stays resident for its own duration, while
+// still bounding a long Resolver lifetime's unbounded growth (the gap
+// r.units already closed for raw blob bytes; r.cache had none until this).
+const defaultExportCacheBytes = 256 << 20
+
+// exportCachePin is one top-level query's own snapshot of r's (fset, cache)
+// pair (see pinExportCache), so every resolveNamed/resolveMethodFunc call
+// that query makes -- directly, or through a confirmation loop visiting
+// many candidates -- decodes into the SAME gcexportdata imports map. Two
+// decodes into DIFFERENT (fset, cache) pairs build two distinct *types.Named
+// for what is, in source, the same shared dependency type two candidates
+// both import, which silently fails a types.Implements comparison between
+// them -- exportcache_split_test.go reproduces exactly this collapsing a
+// genuine 3-implementer result to 1 (or, with a smaller cap, to 0) once
+// exportCache's reset fell between two decodes belonging to one query.
+type exportCachePin struct {
+	fset  *token.FileSet
+	cache *typecheck.Cache
+}
+
+// exportCachePinKey is the context key pinExportCache/exportCacheFor use.
+type exportCachePinKey struct{}
+
+// pinExportCache returns a child of ctx carrying r's current (fset, cache)
+// pair for the rest of one top-level query's call chain. Implementation,
+// References, Supertypes, and Subtypes each call this exactly once, at
+// their own entry, before any resolveNamed/resolveMethodFunc call of their
+// own: exportCache's coarse cap reset (see its doc) can then only ever fire
+// between two SEPARATE top-level queries, never between two decodes
+// belonging to the same one. Idempotent -- a ctx that already carries a pin
+// is returned unchanged -- so a caller reached from within an
+// already-pinned entrypoint doesn't re-pin against a possibly-since-reset
+// generation partway through.
+func (r *Resolver) pinExportCache(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(exportCachePinKey{}).(exportCachePin); ok {
+		return ctx
+	}
+	fset, cache := r.exportCache()
+	return context.WithValue(ctx, exportCachePinKey{}, exportCachePin{fset: fset, cache: cache})
+}
+
+// exportCacheFor returns ctx's pinned (fset, cache) pair (see
+// pinExportCache), falling back to exportCache's own unpinned check+reset
+// for a caller reached without one -- every production call chain pins at
+// its own public entrypoint; only this package's own tests calling
+// resolveNamed/resolveMethodFunc directly hit the fallback.
+func (r *Resolver) exportCacheFor(ctx context.Context) (*token.FileSet, *typecheck.Cache) {
+	if pin, ok := ctx.Value(exportCachePinKey{}).(exportCachePin); ok {
+		return pin.fset, pin.cache
+	}
+	return r.exportCache()
+}
+
+// exportCache returns r's current (fset, cache) pair, first discarding and
+// replacing both together -- coarse, whole-pair reset, never fset alone
+// (typecheck.Cache's own doc: "must discard the Cache and its fset
+// together, never independently") -- if r.cache's retained blob bytes
+// exceed r.exportCacheBytes. Mirrors internal/depcheck's
+// exportResolver.resolve, except pinExportCache is the only call site that
+// matters in practice: every decode within one query reuses ITS pin rather
+// than calling this directly (see pinExportCache's own doc for why that
+// distinction is load-bearing, not cosmetic).
+func (r *Resolver) exportCache() (*token.FileSet, *typecheck.Cache) {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if r.cache.Bytes() > r.exportCacheBytes {
+		r.fset = token.NewFileSet()
+		r.cache = typecheck.NewCache()
+		r.exportCacheResets++
+	}
+	return r.fset, r.cache
+}
+
+// exportCacheResetCount returns the number of times exportCache has
+// discarded and replaced r's (fset, cache) pair for crossing
+// r.exportCacheBytes, so far. Test-observability hook for asserting the
+// byte cap actually evicts (see exportCache's own regression test): once a
+// reset has happened, r.cache.Decodes() alone under-reports total decode
+// work, since typecheck.NewCache's replacement starts that counter back at
+// 0.
+func (r *Resolver) exportCacheResetCount() int64 {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	return r.exportCacheResets
+}
+
+// confirmRunCount returns the number of times implementingTypesConfirm/
+// embeddingInterfacesConfirm/implementedInterfacesConfirm/
+// interfacesSatisfiedByMethodConfirm have actually executed (a memo miss),
+// as opposed to being served from implementation.go's own memo wrappers.
+// Test-observability hook, mirroring typecheck.Cache.Decodes' role: asserts
+// that a repeat Implementation/References query reuses a prior
+// confirmation instead of re-running the LookupMethod-plus-fingerprint/
+// decode loop that dominates the "resolve" phase on a large workspace.
+func (r *Resolver) confirmRunCount() int64 {
+	return r.confirmRuns.Load()
+}
+
+// resolveNamed decodes pkgPath's export data through ctx's pinned
+// (fset, cache) pair (see exportCacheFor) and looks up name in its package
+// scope.
 func (r *Resolver) resolveNamed(ctx context.Context, pkgPath, name string) (*types.Named, error) {
 	u, err := r.unitBlob(ctx, store.Hash(pkgPath))
 	if err != nil {
 		return nil, fmt.Errorf("xref: read export data for %s: %w", pkgPath, err)
 	}
-	tpkg, err := typecheck.ReadExport(u.Export, r.fset, pkgPath, r.cache)
+	fset, cache := r.exportCacheFor(ctx)
+	tpkg, err := typecheck.ReadExport(u.Export, fset, pkgPath, cache)
 	if err != nil {
 		r.logDecodeFailureOnce(pkgPath, err)
 		return nil, fmt.Errorf("xref: decode export data for %s: %w", pkgPath, err)
@@ -446,11 +620,36 @@ func (r *Resolver) logDecodeFailureOnce(pkgPath string, err error) {
 // and this also resets r.decodeFailureLogged for pkgPath, so a failure
 // that recurs after reindexing logs again instead of staying silent from
 // logDecodeFailureOnce's earlier dedup.
+//
+// Reads r.cache once under cacheMu rather than through exportCache: a
+// concurrent exportCache reset racing this call is the same accepted,
+// narrow window exportCache's own doc describes -- either the pre- or
+// post-reset cache gets pkgPaths' Delete calls, and a reset already
+// discards every entry Invalidate would have dropped anyway.
+//
+// Also clears every confirmMemo outright, rather than surgically dropping
+// only entries touching pkgPaths: unlike r.cache (keyed by exactly the
+// package whose decode it holds), a confirmMemo entry's correctness depends
+// on every CANDIDATE package the confirmation loop it memoized visited, not
+// just the queried interface/type's own package -- implementingTypes has no
+// existing reverse index from "packages this entry's confirmation touched"
+// back to memo keys to invalidate surgically, and building one solely for
+// this would be real added bookkeeping for a case (a didSave reindex) that
+// is already far rarer than the queries it protects. A full clear costs at
+// most what every affected query would have cost before this memo existed
+// (see implementation.go's *Confirm functions), never more.
 func (r *Resolver) Invalidate(pkgPaths []string) {
+	r.cacheMu.Lock()
+	cache := r.cache
+	r.cacheMu.Unlock()
 	for _, p := range pkgPaths {
-		r.cache.Delete(p)
+		cache.Delete(p)
 		r.decodeFailureLogged.Delete(p)
 	}
+	r.implementingTypesMemo.clear()
+	r.embeddingInterfacesMemo.clear()
+	r.implementedInterfacesMemo.clear()
+	r.interfacesSatisfiedByMethodMemo.clear()
 }
 
 // pkgPathForFile resolves file to its containing package's import path,

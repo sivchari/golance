@@ -34,6 +34,7 @@ type TypeHierarchyItemInfo struct {
 // literal AST embeds-scan, matching gopls's own methodsets.Index.Search),
 // the interfaces it embeds.
 func (r *Resolver) Supertypes(ctx context.Context, file string, line, col int) ([]TypeHierarchyItemInfo, error) {
+	ctx = r.pinExportCache(ctx)
 	named, key, err := r.typeHierarchyTarget(ctx, file, line, col)
 	if err != nil {
 		return nil, err
@@ -132,6 +133,7 @@ func (r *Resolver) confirmSupertypeCandidate(ctx context.Context, k candidateKey
 // (methodsets.Index.Search scans every package-level type/interface's
 // method set alike, with no kind filter of its own).
 func (r *Resolver) Subtypes(ctx context.Context, file string, line, col int) ([]TypeHierarchyItemInfo, error) {
+	ctx = r.pinExportCache(ctx)
 	named, key, err := r.typeHierarchyTarget(ctx, file, line, col)
 	if err != nil {
 		return nil, err

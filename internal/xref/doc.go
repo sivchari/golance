@@ -42,10 +42,15 @@
 // direction (implementedInterfaces) keeps the original decode-based
 // confirmation unconditionally — see its own doc for why that asymmetry is
 // intentional. A [Resolver] decodes export data through one shared
-// internal/typecheck.Cache and token.FileSet for its lifetime, so that a
-// decode-based confirmation sees consistent object identity for any
-// package an interface and a candidate both depend on. Neither is evicted,
-// so long-lived Resolvers should be recycled periodically.
+// internal/typecheck.Cache and token.FileSet pair, reused across every
+// query for the Resolver's whole lifetime (indexState installs a fresh
+// Resolver on every reindex, so a stale pair never outlives the index
+// generation it was decoded against), so a decode-based confirmation sees
+// consistent object identity for any package an interface and a candidate
+// both depend on, and a repeat query re-decodes nothing. That pair is
+// discarded and replaced wholesale, never piecemeal, once it grows past a
+// byte budget (see Resolver.exportCache), the same bound r.units already
+// applies to the raw facts/export blob cache.
 //
 // An implementation query's own diagnostics (implDiag/logImplDiag, in
 // implementation.go) never see the LSP session's live, already
