@@ -19,6 +19,53 @@ func WriteExport(pkg *types.Package, fset *token.FileSet) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// DuplicateImportPath reports the first import path reachable from tpkg
+// through two non-identical *types.Package objects, or "" if none exists.
+// Confirmed root cause of every observed WriteExport/ReadExport round-trip
+// failure in production (five real corpus packages, one shared dependency
+// cluster): gcexportdata's writer indexes referenced packages by object
+// identity, not by path, so it happily serializes two manifest entries
+// sharing one PkgPath when tpkg's own dependency resolution embedded two
+// non-identical instances of it — an identity split somewhere upstream
+// (see typecheck.CheckScope's own doc for the general class, and
+// internal/depcheck.Provider's closureScope for its declaration-only-check
+// counterpart). gcexportdata's own reader then panics decoding that
+// manifest: golang.org/x/tools/internal/gcimporter.iimportCommon's "found
+// duplicate PkgPaths" self-diagnostic (added for their own issue #63822)
+// calls a hard-coded nil reportf in the public gcexportdata.Read/
+// IImportData entry point, an unconditional nil-pointer dereference the
+// moment it fires — confirmed by decoding real corpus blobs with x/tools'
+// own panic recovery disabled. Callers should check this before calling
+// WriteExport: it turns that opaque "internal error while importing ...:
+// invalid memory address..." into an immediate, precisely-named
+// diagnostic; WriteExport+ReadExport's own round-trip check remains the
+// backstop for every other corruption shape.
+//
+// A breadth-first walk over Imports() (not a single flat scan) is
+// necessary and sufficient: Imports() of a decoded, complete package
+// reports its own full transitive reference set as a flat list (see
+// CheckScope's own doc, citing gcimporter's ureader.go), so walking one
+// hop from every package already visited reaches every package tpkg's own
+// exported declarations can possibly reference, without needing to walk
+// tpkg's declarations/types directly.
+func DuplicateImportPath(tpkg *types.Package) string {
+	seen := map[string]*types.Package{tpkg.Path(): tpkg}
+	queue := tpkg.Imports()
+	for len(queue) > 0 {
+		pkg := queue[0]
+		queue = queue[1:]
+		if existing, ok := seen[pkg.Path()]; ok {
+			if existing != pkg {
+				return pkg.Path()
+			}
+			continue
+		}
+		seen[pkg.Path()] = pkg
+		queue = append(queue, pkg.Imports()...)
+	}
+	return ""
+}
+
 // ReadExport decodes a blob written by WriteExport back into a
 // *types.Package for pkgPath, adding position information to fset and
 // registering the result in cache. Unlike a GOCACHE-generated export file,

@@ -139,6 +139,12 @@ type Options struct {
 	// under testdata instead of the real one.
 	GOROOT     string
 	GOModCache string
+	// MemoizeForRun, if set, makes Cache remember every pkgPath it
+	// successfully resolves (blob, complete, and ok — including a genuine
+	// ok=false "not known to the graph" answer) for as long as this Cache
+	// instance lives, regardless of persist/immutability — see Cache's own
+	// doc for why this matters and why it defaults to off.
+	MemoizeForRun bool
 }
 
 // Cache resolves and persists export data for non-root packages, backed by
@@ -166,6 +172,49 @@ type Options struct {
 // where a Provider used for both navigation and export production was ever
 // a real risk) is an additional safety margin on top of that, not the
 // primary guarantee.
+//
+// Options.MemoizeForRun closes a SEPARATE, confirmed corruption class from
+// either of the above: provider's own LRU (sized by RecommendedCap, bounded
+// on purpose — see its own doc) is the ONLY identity source for a pkgPath
+// this Cache is not persisting (a non-immutable directory — see the
+// package doc's "Cache identity" section — most concretely a WORKSPACE
+// package reached via the indexer's own #122-era withheld-export fallback,
+// but any persist=false path qualifies), for EVERY caller across an entire
+// Build/Reindex run, not just within one provider.Package call
+// (closureScope's own protection — see typecheck.CheckScope's doc for the
+// identical, already-fixed, single-call version of this). provider's own
+// cross-call "dependency-based pin" (see depcheck.Provider.Delete's doc)
+// only protects pkgPath for as long as SOME OTHER still-cached entry
+// happens to claim it as a dependency; once that claiming entry itself is
+// evicted — an ordinary event over a large build, and MORE frequent the
+// more separate top-level callers a withheld root package's fallback now
+// has (#122 multiplies exactly that) — pkgPath becomes eligible for
+// eviction too, and the NEXT caller's resolve() re-checks it from scratch,
+// producing a non-identical *types.Package for the same import path.
+// Confirmed root cause of every observed WriteExport/ReadExport
+// round-trip-decode panic in production so far (see
+// typecheck.DuplicateImportPath's own doc): two dependents of a shared,
+// widely-used cluster (github.com/microsoft/kiota-abstractions-go and a
+// workspace package built on it) each independently re-checking it,
+// producing two non-identical instances later woven into one consumer's
+// own exported API. Memoizing every resolved pkgPath (bytes only, not the
+// live *types.Package graph — a small, fixed cost per distinct path this
+// run actually touches, unlike provider's own much larger live working
+// set RecommendedCap bounds) for THIS Cache instance's own lifetime makes
+// every resolve()for pkgPath within one run return byte-identical results
+// regardless of how many separate callers ask, or how provider's own LRU
+// has churned in between — closing the window without needing provider's
+// LRU to hold anything longer than it already does.
+//
+// Left off by default (zero value) because Cache is also used by
+// internal/server across a long-lived session spanning many file edits
+// (see ensureDepProvider's own doc): a non-immutable (workspace) package's
+// content genuinely CAN change between two ExportData calls there, and
+// this Cache has no invalidation hook for an in-process memo the way
+// typecheck.Cache's Delete gives its own decoded-package cache — memoizing
+// unconditionally would serve stale bytes after an edit. internal/index's
+// own Build/Reindex, which construct a brand-new Cache per call (see
+// index.go/reindex.go), are the only current callers that opt in.
 type Cache struct {
 	cas      *store.CAS
 	meta     depcheck.MetadataSource
@@ -175,8 +224,20 @@ type Cache struct {
 	buildFP    string
 	goroot     string
 	gomodcache string
+	memoizeRun bool
 
 	sf singleflight.Group
+
+	memoMu sync.Mutex
+	memo   map[string]memoEntry
+}
+
+// memoEntry is one pkgPath's remembered resolve() result, used only when
+// Options.MemoizeForRun is set (see Cache's own doc).
+type memoEntry struct {
+	data     []byte
+	complete bool
+	ok       bool
 }
 
 // NewCache returns a Cache resolving non-root package metadata via meta
@@ -202,6 +263,8 @@ func NewCache(cas *store.CAS, meta depcheck.MetadataSource, provider *depcheck.P
 		cas: cas, meta: meta, provider: provider,
 		goVersion: goVersion, buildFP: opts.BuildFlagsFingerprint,
 		goroot: goroot, gomodcache: gomodcache,
+		memoizeRun: opts.MemoizeForRun,
+		memo:       make(map[string]memoEntry),
 	}
 }
 
@@ -276,7 +339,44 @@ func (c *Cache) ExportDataFromCache(pkgPath string) (data []byte, ok bool, err e
 }
 
 // resolve is ExportData's and ExportDataComplete's shared implementation.
+// See Cache's own doc for the MemoizeForRun tier this checks first and
+// populates last.
 func (c *Cache) resolve(pkgPath string) (data []byte, complete, ok bool, err error) {
+	if c.memoizeRun {
+		c.memoMu.Lock()
+		e, known := c.memo[pkgPath]
+		c.memoMu.Unlock()
+		if known {
+			return e.data, e.complete, e.ok, nil
+		}
+	}
+
+	data, complete, ok, err = c.resolveUnmemoized(pkgPath)
+	// A transient failure (e.g. a momentarily unresolvable transitive
+	// import — see checkAndPersist's own doc) is never memoized: the NEXT
+	// call may legitimately succeed once whatever made this one fail
+	// resolves, the same leniency checkAndPersist already extends to an
+	// Incomplete-but-otherwise-usable result (which IS memoized: Incomplete
+	// is not an error here).
+	if c.memoizeRun && err == nil {
+		c.memoMu.Lock()
+		if e, known := c.memo[pkgPath]; known {
+			// A concurrent caller's own resolve already landed first;
+			// keep it, not this one — two independently-resolved results
+			// for the same path is exactly the divergence MemoizeForRun
+			// exists to prevent, so whichever is memoized first wins for
+			// every caller for the rest of this run.
+			data, complete, ok = e.data, e.complete, e.ok
+		} else {
+			c.memo[pkgPath] = memoEntry{data: data, complete: complete, ok: ok}
+		}
+		c.memoMu.Unlock()
+	}
+	return data, complete, ok, err
+}
+
+// resolveUnmemoized is resolve's own pre-MemoizeForRun implementation.
+func (c *Cache) resolveUnmemoized(pkgPath string) (data []byte, complete, ok bool, err error) {
 	dir, _, _, ok := c.meta.Package(pkgPath)
 	if !ok {
 		return nil, false, false, nil
@@ -324,6 +424,9 @@ func (c *Cache) checkAndPersist(pkgPath string, persist bool, key uint64) (expor
 	cp, err := c.provider.Package(context.Background(), pkgPath)
 	if err != nil {
 		return exportResult{}, fmt.Errorf("depexport: check %s: %w", pkgPath, err)
+	}
+	if dup := typecheck.DuplicateImportPath(cp.Types()); dup != "" {
+		return exportResult{}, fmt.Errorf("depexport: export data for %s would reference two non-identical packages both named %q (declaration-only check reported: %s): see typecheck.DuplicateImportPath's doc", pkgPath, dup, firstErrorOrNone(cp))
 	}
 	blob, err := writeExportRecovered(cp.Types(), c.provider.FileSet())
 	if err != nil {

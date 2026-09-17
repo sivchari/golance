@@ -8,7 +8,10 @@ import (
 	"go/token"
 	"go/types"
 	"log"
+	"os"
+	"path/filepath"
 	"runtime/debug"
+	"strings"
 
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/store"
@@ -476,14 +479,18 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 	return checkResult{Facts: factsBlob, Export: exportBlob, Index: idx, Incomplete: incomplete, FirstError: firstError}, nil
 }
 
-// writeAndValidateExport encodes tpkg's exported API and immediately
+// writeAndValidateExport first refuses tpkg outright if
+// typecheck.DuplicateImportPath finds it — the confirmed cause of every
+// production round-trip-decode failure so far (see its own doc for the
+// x/tools decode-site) — then encodes tpkg's exported API and immediately
 // decodes it back (into a throwaway fset/cache, never one a real caller
 // shares — mirroring internal/depexport.Cache.checkAndPersist's identical
 // self-check) before trusting the result, so a write that silently produced
 // bytes gcexportdata.Read cannot reliably decode is caught here instead of
 // persisted to cas and served to every dependent that imports pkgPath.
 //
-// This defends against a corruption class distinct from (but related to)
+// The round-trip check remains the backstop for every OTHER corruption
+// shape, including this one distinct from (but related to)
 // the identity-split family typecheck.CheckScope's own doc describes:
 // go/types.Config.Check's error recovery can leave a declaration reachable
 // from tpkg's own exported API — most concretely, a generic instantiation's
@@ -521,14 +528,38 @@ func writeAndValidateExport(tpkg *types.Package, fset *token.FileSet) (blob []by
 			err = fmt.Errorf("index: write export data for %s panicked: %v", tpkg.Path(), r)
 		}
 	}()
+	if dup := typecheck.DuplicateImportPath(tpkg); dup != "" {
+		return nil, fmt.Errorf("index: export data for %s would reference two non-identical packages both named %q (an identity split somewhere in its dependency resolution — see typecheck.DuplicateImportPath's doc)", tpkg.Path(), dup)
+	}
 	blob, err = typecheck.WriteExport(tpkg, fset)
 	if err != nil {
 		return nil, fmt.Errorf("index: write export data for %s: %w", tpkg.Path(), err)
 	}
 	if _, err := typecheck.ReadExport(blob, token.NewFileSet(), tpkg.Path(), typecheck.NewCache()); err != nil {
+		dumpBadExport(tpkg.Path(), blob, err)
 		return nil, fmt.Errorf("index: export data for %s does not round-trip decode: %w", tpkg.Path(), err)
 	}
 	return blob, nil
+}
+
+// dumpBadExport writes a blob that failed round-trip validation to the
+// directory named by GOLANCE_DUMP_BAD_EXPORT, so the otherwise-discarded
+// bytes survive for offline analysis (the failing decode's panic is
+// recovered inside x/tools with its stack lost, making the blob itself the
+// only actionable artifact). Diagnostic-only; a write failure is logged and
+// otherwise ignored.
+func dumpBadExport(pkgPath string, blob []byte, decodeErr error) {
+	dir := os.Getenv("GOLANCE_DUMP_BAD_EXPORT")
+	if dir == "" {
+		return
+	}
+	name := strings.ReplaceAll(pkgPath, "/", "__")
+	if err := os.WriteFile(filepath.Join(dir, name+".export"), blob, 0o600); err != nil {
+		log.Printf("index: dump bad export for %s: %v", pkgPath, err)
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, name+".error"), []byte(decodeErr.Error()), 0o600)
+	log.Printf("index: dumped undecodable export for %s (%d bytes) to %s", pkgPath, len(blob), dir)
 }
 
 // parseGoFiles parses every file in goFiles (via readFile), skipping any
