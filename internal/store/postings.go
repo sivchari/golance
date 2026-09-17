@@ -163,15 +163,10 @@ func decodePostingLocations(b []byte) ([]PostingLocation, error) {
 
 // appendManifestEntry appends one (targetPkgHash, targetIDHash) pair to
 // list, the fixed-16-byte-per-entry encoding of a srcPkgHash's posting
-// manifest (see applyPostings). Unlike appendUint64/appendMethodEntry/
-// appendStringList — which must defensively copy because their own list
-// argument is frequently a slice bbolt itself owns (a prior Bucket.Get,
-// still live inside the same read-write transaction — see their own call
-// sites in applyIndexEntries) and so cannot be grown via append without
-// risking an in-place write into bbolt's mmap'd page — list here is always
-// applyPostings' own purely local variable, rebuilt from scratch on every
-// call, so plain append's amortized growth is safe: its only caller
-// (applyPostings) never passes it anything bbolt owns.
+// manifest (see applyPostings). Plain append is safe here: list is always
+// applyPostings' own local variable, rebuilt from scratch on every call,
+// never a slice bbolt owns (a Bucket.Get result live inside the same
+// read-write transaction, which append could write into in place).
 func appendManifestEntry(list []byte, k postingGroupKey) []byte {
 	var buf [16]byte
 	binary.LittleEndian.PutUint64(buf[0:8], k.TargetPkgHash)

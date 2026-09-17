@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -159,6 +160,56 @@ func TestDBNameIndexPrefixScan(t *testing.T) {
 	}
 	if _, ok := got["baz"]; ok {
 		t.Errorf("LookupNamePrefix(foo) unexpectedly contains baz")
+	}
+}
+
+// TestPutUnitsBatch_IndexEntriesDedupeAcrossPackages covers the shape the
+// per-entry key layout exists for: many packages contributing the same
+// name, method, and SymbolID string in one batch must each appear exactly
+// once, with every field of a method entry intact.
+func TestPutUnitsBatch_IndexEntriesDedupeAcrossPackages(t *testing.T) {
+	db := openTestDB(t)
+	method := MethodEntry{PkgHash: 1, TypeSymbolIDHash: 2, MethodPkgHash: 3, MethodIDHash: 4, Fingerprint: 5}
+	var entries []UnitEntry
+	for i := range uint64(50) {
+		entries = append(entries, UnitEntry{
+			PkgHash: i + 1,
+			Index: PackageIndexEntries{
+				Names:   []NameEntry{{Name: "New", IDHash: i%10 + 1}, {Name: "NewThing", IDHash: 99}},
+				Methods: []MethodSymbolEntry{{Name: "String", Entry: method}},
+				SymStrs: []SymStrEntry{{IDHash: 7, SymbolID: "p#New"}, {IDHash: 7, SymbolID: "q#New"}},
+			},
+		})
+	}
+	if err := db.PutUnitsBatch(entries); err != nil {
+		t.Fatalf("PutUnitsBatch() error = %v", err)
+	}
+
+	names, err := db.LookupNamePrefix(context.Background(), "new")
+	if err != nil {
+		t.Fatalf("LookupNamePrefix(new) error = %v", err)
+	}
+	if want := []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}; !slices.Equal(names["new"], want) {
+		t.Errorf("LookupNamePrefix(new)[new] = %v, want %v", names["new"], want)
+	}
+	if want := []uint64{99}; !slices.Equal(names["newthing"], want) {
+		t.Errorf("LookupNamePrefix(new)[newthing] = %v, want %v", names["newthing"], want)
+	}
+
+	methods, err := db.LookupMethod(context.Background(), "String")
+	if err != nil || len(methods) != 1 || methods[0] != method {
+		t.Errorf("LookupMethod(String) = %v, %v, want [%v]", methods, err, method)
+	}
+	if methods, err := db.LookupMethod(context.Background(), "Str"); err != nil || methods != nil {
+		t.Errorf("LookupMethod(Str) = %v, %v, want nil, nil (a method-name prefix must not match)", methods, err)
+	}
+
+	strs, err := db.SymbolIDStrings(context.Background(), 7)
+	if want := []string{"p#New", "q#New"}; err != nil || !slices.Equal(strs, want) {
+		t.Errorf("SymbolIDStrings(7) = %v, %v, want %v", strs, err, want)
+	}
+	if strs, err := db.SymbolIDStrings(context.Background(), 8); err != nil || strs != nil {
+		t.Errorf("SymbolIDStrings(8) = %v, %v, want nil, nil", strs, err)
 	}
 }
 
@@ -434,8 +485,7 @@ func writeSchemaVersion(t *testing.T, path string, version uint16) error {
 // store.go's schemaVersion doc): a database explicitly recorded under the
 // PRIOR numeric version -- not just one missing the key entirely -- must
 // also be discarded and recreated, since its "method" bucket posting lists
-// were written under the old, 16-byte-per-entry stride and would otherwise
-// misdecode against decodeMethodEntryList's new 40-byte one instead of
+// were written in an older layout and would otherwise misdecode instead of
 // erroring outright (see the doc for why a decode-error check alone cannot
 // catch this).
 func TestOpen_DiscardsDatabaseWithOldSchemaVersion(t *testing.T) {

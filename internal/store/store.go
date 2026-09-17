@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -29,9 +30,9 @@ const openTimeout = 5 * time.Second
 var (
 	bucketUnit               = []byte("unit")            // pkgPathHash -> UnitPointer (see PutUnit)
 	bucketMeta               = []byte("meta")            // reserved keys, e.g. buildFingerprintKey
-	bucketName               = []byte("name")            // lowercased symbol name -> []symbolIDHash
-	bucketMethod             = []byte("method")          // method name -> []MethodEntry
-	bucketSymStr             = []byte("symstr")          // symbolIDHash -> []original SymbolID string
+	bucketName               = []byte("name")            // lowercased symbol name 0x00 symbolIDHash -> nil (see nameKey)
+	bucketMethod             = []byte("method")          // method name 0x00 MethodEntry -> nil (see methodKey)
+	bucketSymStr             = []byte("symstr")          // symbolIDHash original SymbolID string -> nil (see symStrKey)
 	bucketRefPostings        = []byte("refposting")      // (targetPkgHash, targetIDHash, srcPkgHash) -> []PostingLocation (see PostingsFor)
 	bucketRefPostingManifest = []byte("refpostmanifest") // srcPkgHash -> [](targetPkgHash, targetIDHash), for exact incremental delete (see applyPostings)
 )
@@ -56,6 +57,12 @@ var buildFingerprintKey = []byte("\x00golance:fingerprint")
 // internal/server). A decode-error check alone cannot catch that; this
 // version marker can.
 //
+// Bumped to 4 for one key per entry in the name/method/symstr buckets (see
+// nameKey): each bucket used to hold one list value per name or hash, and a
+// version-3 database's list values would now be read as malformed keys.
+// Nothing in the CAS blobs changed, so internal/index's factsSchemaVersion
+// does not move with it.
+//
 // Bumped to 3 for the reverse reference index (bucketRefPostings/
 // bucketRefPostingManifest, see applyPostings/PostingsFor): a database that
 // predates this change has neither bucket at all, so References would
@@ -73,7 +80,7 @@ var buildFingerprintKey = []byte("\x00golance:fingerprint")
 // internal/index's factsSchemaVersion for the matching CAS-side key bump
 // (this field alone does not force a rebuild of the [CAS] blobs a discarded
 // database's fresh Open would otherwise point right back at).
-const schemaVersion uint16 = 3
+const schemaVersion uint16 = 4
 
 // schemaVersionKey is a reserved bucketMeta key recording the schemaVersion
 // the database's buckets were last (re)written under.
@@ -783,15 +790,39 @@ func (db *DB) BuildFingerprint() (string, error) {
 // [DB.LookupNamePrefix]. name is matched case-insensitively (stored
 // lowercased).
 func (db *DB) AddNameSymbol(name string, idHash uint64) error {
-	key := []byte(strings.ToLower(name))
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketName)
-		cur := b.Get(key)
-		if containsUint64(cur, idHash) {
-			return nil
-		}
-		return b.Put(key, appendUint64(cur, idHash))
+		return tx.Bucket(bucketName).Put(nameKey(name, idHash), nil)
 	})
+}
+
+// nameKey is bucketName's key for one (name, idHash) entry: the lowercased
+// name, a 0x00 separator no Go identifier can contain, then idHash. One key
+// per entry makes a duplicate write an idempotent Put, instead of decoding
+// and rewriting a whole per-name list for every entry — which was quadratic
+// in the number of packages sharing a common name such as New or String.
+func nameKey(name string, idHash uint64) []byte {
+	lower := strings.ToLower(name)
+	k := make([]byte, 0, len(lower)+1+8)
+	k = append(k, lower...)
+	k = append(k, 0)
+	return binary.BigEndian.AppendUint64(k, idHash)
+}
+
+// methodKey is bucketMethod's key for one (methodName, entry) pair: the
+// name, a 0x00 separator, then e's fixed 40-byte encoding (see nameKey for
+// why one key per entry).
+func methodKey(methodName string, e MethodEntry) []byte {
+	k := make([]byte, 0, len(methodName)+1+methodEntrySize)
+	k = append(k, methodName...)
+	k = append(k, 0)
+	return appendMethodEntry(k, e)
+}
+
+// symStrKey is bucketSymStr's key for one (idHash, symbolID) pair: the
+// fixed 8-byte idHash, then the string (see nameKey for why one key per
+// entry).
+func symStrKey(idHash uint64, symbolID string) []byte {
+	return append(hashKey(idHash), symbolID...)
 }
 
 // LookupNamePrefix returns, for every stored name with the given prefix
@@ -806,8 +837,13 @@ func (db *DB) LookupNamePrefix(ctx context.Context, prefix string) (map[string][
 	result := make(map[string][]uint64)
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
 		c := tx.Bucket(bucketName).Cursor()
-		for k, v := c.Seek(lower); k != nil && strings.HasPrefix(string(k), string(lower)); k, v = c.Next() {
-			result[string(k)] = decodeUint64List(v)
+		for k, _ := c.Seek(lower); k != nil && bytes.HasPrefix(k, lower); k, _ = c.Next() {
+			sep := len(k) - 9
+			if sep < 0 || k[sep] != 0 {
+				return fmt.Errorf("store: malformed name index key %q", k)
+			}
+			name := string(k[:sep])
+			result[name] = append(result[name], binary.BigEndian.Uint64(k[sep+1:]))
 		}
 		return nil
 	})
@@ -857,14 +893,8 @@ type MethodEntry struct {
 // to loading export data and confirming with types.Implements, exactly as
 // every candidate used to.
 func (db *DB) AddMethodSymbol(methodName string, e MethodEntry) error {
-	key := []byte(methodName)
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketMethod)
-		cur := b.Get(key)
-		if containsMethodEntry(cur, e) {
-			return nil
-		}
-		return b.Put(key, appendMethodEntry(cur, e))
+		return tx.Bucket(bucketMethod).Put(methodKey(methodName, e), nil)
 	})
 }
 
@@ -875,9 +905,15 @@ func (db *DB) LookupMethod(ctx context.Context, methodName string) ([]MethodEntr
 		return nil, err
 	}
 	var entries []MethodEntry
+	prefix := append([]byte(methodName), 0)
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
-		v := tx.Bucket(bucketMethod).Get([]byte(methodName))
-		entries = decodeMethodEntryList(v)
+		c := tx.Bucket(bucketMethod).Cursor()
+		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
+			if len(k) != len(prefix)+methodEntrySize {
+				return fmt.Errorf("store: malformed method index key %q", k)
+			}
+			entries = append(entries, decodeMethodEntry(k[len(prefix):]))
+		}
 		return nil
 	})
 	if err != nil {
@@ -891,16 +927,8 @@ func (db *DB) LookupMethod(ctx context.Context, methodName string) ([]MethodEntr
 // map to the same idHash; storing every known string lets
 // [DB.VerifySymbolIDString] tell a genuine match from a collision.
 func (db *DB) PutSymbolIDString(idHash uint64, symbolID string) error {
-	key := hashKey(idHash)
 	return db.bolt.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(bucketSymStr)
-		cur := b.Get(key)
-		for _, s := range decodeStringList(cur) {
-			if s == symbolID {
-				return nil
-			}
-		}
-		return b.Put(key, appendStringList(cur, symbolID))
+		return tx.Bucket(bucketSymStr).Put(symStrKey(idHash, symbolID), nil)
 	})
 }
 
@@ -915,8 +943,12 @@ func (db *DB) SymbolIDStrings(ctx context.Context, idHash uint64) ([]string, err
 		return nil, err
 	}
 	var out []string
+	prefix := hashKey(idHash)
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
-		out = decodeStringList(tx.Bucket(bucketSymStr).Get(hashKey(idHash)))
+		c := tx.Bucket(bucketSymStr).Cursor()
+		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
+			out = append(out, string(k[len(prefix):]))
+		}
 		return nil
 	})
 	if err != nil {
@@ -932,13 +964,7 @@ func (db *DB) SymbolIDStrings(ctx context.Context, idHash uint64) ([]string, err
 func (db *DB) VerifySymbolIDString(idHash uint64, symbolID string) (bool, error) {
 	var found bool
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
-		v := tx.Bucket(bucketSymStr).Get(hashKey(idHash))
-		for _, s := range decodeStringList(v) {
-			if s == symbolID {
-				found = true
-				return nil
-			}
-		}
+		found = tx.Bucket(bucketSymStr).Get(symStrKey(idHash, symbolID)) != nil
 		return nil
 	})
 	if err != nil {
@@ -982,9 +1008,9 @@ type PackageIndexEntries struct {
 }
 
 // applyIndexEntries writes entries' name-index, method-index, and
-// SymbolID-string entries into tx's buckets, deduplicating each posting
-// list against its existing content the same way AddNameSymbol,
-// AddMethodSymbol, and PutSymbolIDString do individually. Entries are never
+// SymbolID-string entries into tx's buckets, one key per entry exactly as
+// AddNameSymbol, AddMethodSymbol, and PutSymbolIDString do individually, so
+// a duplicate is an idempotent Put. Entries are never
 // removed when a package's blob changes: a stale entry pointing at a since-
 // overwritten symbol is harmless (see internal/xref's symbolByHash, which
 // silently skips a lookup that no longer resolves) and self-heals the next
@@ -998,43 +1024,21 @@ type PackageIndexEntries struct {
 func applyIndexEntries(tx *bbolt.Tx, srcPkgHash uint64, entries *PackageIndexEntries) error {
 	nameB := tx.Bucket(bucketName)
 	for _, n := range entries.Names {
-		key := []byte(strings.ToLower(n.Name))
-		cur := nameB.Get(key)
-		if containsUint64(cur, n.IDHash) {
-			continue
-		}
-		if err := nameB.Put(key, appendUint64(cur, n.IDHash)); err != nil {
+		if err := nameB.Put(nameKey(n.Name, n.IDHash), nil); err != nil {
 			return err
 		}
 	}
 
 	methodB := tx.Bucket(bucketMethod)
 	for _, m := range entries.Methods {
-		key := []byte(m.Name)
-		cur := methodB.Get(key)
-		if containsMethodEntry(cur, m.Entry) {
-			continue
-		}
-		if err := methodB.Put(key, appendMethodEntry(cur, m.Entry)); err != nil {
+		if err := methodB.Put(methodKey(m.Name, m.Entry), nil); err != nil {
 			return err
 		}
 	}
 
 	symB := tx.Bucket(bucketSymStr)
 	for _, s := range entries.SymStrs {
-		key := hashKey(s.IDHash)
-		cur := symB.Get(key)
-		dup := false
-		for _, existing := range decodeStringList(cur) {
-			if existing == s.SymbolID {
-				dup = true
-				break
-			}
-		}
-		if dup {
-			continue
-		}
-		if err := symB.Put(key, appendStringList(cur, s.SymbolID)); err != nil {
+		if err := symB.Put(symStrKey(s.IDHash, s.SymbolID), nil); err != nil {
 			return err
 		}
 	}
@@ -1042,94 +1046,26 @@ func applyIndexEntries(tx *bbolt.Tx, srcPkgHash uint64, entries *PackageIndexEnt
 	return applyPostings(tx, srcPkgHash, entries.Postings)
 }
 
-// --- fixed-width list encodings for posting-list bucket values ---
-
-func appendUint64(list []byte, v uint64) []byte {
-	out := make([]byte, len(list)+8)
-	copy(out, list)
-	binary.LittleEndian.PutUint64(out[len(list):], v)
-	return out
-}
-
-func decodeUint64List(list []byte) []uint64 {
-	if len(list) == 0 {
-		return nil
-	}
-	out := make([]uint64, 0, len(list)/8)
-	for i := 0; i+8 <= len(list); i += 8 {
-		out = append(out, binary.LittleEndian.Uint64(list[i:i+8]))
-	}
-	return out
-}
-
-func containsUint64(list []byte, v uint64) bool {
-	for _, x := range decodeUint64List(list) {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
+// methodEntrySize is the fixed encoded size of a MethodEntry: five uint64s.
 const methodEntrySize = 40
 
-func appendMethodEntry(list []byte, e MethodEntry) []byte {
-	out := make([]byte, len(list)+methodEntrySize)
-	copy(out, list)
-	binary.LittleEndian.PutUint64(out[len(list):], e.PkgHash)
-	binary.LittleEndian.PutUint64(out[len(list)+8:], e.TypeSymbolIDHash)
-	binary.LittleEndian.PutUint64(out[len(list)+16:], e.MethodPkgHash)
-	binary.LittleEndian.PutUint64(out[len(list)+24:], e.MethodIDHash)
-	binary.LittleEndian.PutUint64(out[len(list)+32:], e.Fingerprint)
-	return out
+// appendMethodEntry appends e's fixed 40-byte encoding to b.
+func appendMethodEntry(b []byte, e MethodEntry) []byte {
+	b = binary.LittleEndian.AppendUint64(b, e.PkgHash)
+	b = binary.LittleEndian.AppendUint64(b, e.TypeSymbolIDHash)
+	b = binary.LittleEndian.AppendUint64(b, e.MethodPkgHash)
+	b = binary.LittleEndian.AppendUint64(b, e.MethodIDHash)
+	return binary.LittleEndian.AppendUint64(b, e.Fingerprint)
 }
 
-func decodeMethodEntryList(list []byte) []MethodEntry {
-	if len(list) == 0 {
-		return nil
+// decodeMethodEntry decodes one appendMethodEntry encoding from b, which
+// must be exactly methodEntrySize bytes.
+func decodeMethodEntry(b []byte) MethodEntry {
+	return MethodEntry{
+		PkgHash:          binary.LittleEndian.Uint64(b[0:]),
+		TypeSymbolIDHash: binary.LittleEndian.Uint64(b[8:]),
+		MethodPkgHash:    binary.LittleEndian.Uint64(b[16:]),
+		MethodIDHash:     binary.LittleEndian.Uint64(b[24:]),
+		Fingerprint:      binary.LittleEndian.Uint64(b[32:]),
 	}
-	out := make([]MethodEntry, 0, len(list)/methodEntrySize)
-	for i := 0; i+methodEntrySize <= len(list); i += methodEntrySize {
-		out = append(out, MethodEntry{
-			PkgHash:          binary.LittleEndian.Uint64(list[i:]),
-			TypeSymbolIDHash: binary.LittleEndian.Uint64(list[i+8:]),
-			MethodPkgHash:    binary.LittleEndian.Uint64(list[i+16:]),
-			MethodIDHash:     binary.LittleEndian.Uint64(list[i+24:]),
-			Fingerprint:      binary.LittleEndian.Uint64(list[i+32:]),
-		})
-	}
-	return out
-}
-
-func containsMethodEntry(list []byte, e MethodEntry) bool {
-	for _, x := range decodeMethodEntryList(list) {
-		if x == e {
-			return true
-		}
-	}
-	return false
-}
-
-// string list: repeated [uint32 len][bytes].
-
-func appendStringList(list []byte, s string) []byte {
-	out := make([]byte, len(list)+4+len(s))
-	copy(out, list)
-	binary.LittleEndian.PutUint32(out[len(list):], u32len(len(s)))
-	copy(out[len(list)+4:], s)
-	return out
-}
-
-func decodeStringList(list []byte) []string {
-	var out []string
-	for i := 0; i+4 <= len(list); {
-		n := int(binary.LittleEndian.Uint32(list[i:]))
-		i += 4
-		if i+n > len(list) {
-			break
-		}
-		out = append(out, string(list[i:i+n]))
-		i += n
-	}
-	return out
 }

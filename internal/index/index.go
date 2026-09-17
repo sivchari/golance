@@ -165,10 +165,10 @@ type Stats struct {
 	// export data it needed again, it can never split package identity
 	// (see typecheck.Cache's own doc).
 	CacheGenerations int
-	// PeakHeapBytes is the largest live heap (runtime/metrics
-	// /memory/classes/heap/objects:bytes) sampled while Build ran — the
-	// measured cost of Options.DecodeCacheBudget, which is only a blob-byte
-	// proxy for the decoded *types.Package heap it actually keeps resident.
+	// PeakHeapBytes is the largest heap the garbage collector found live
+	// (runtime/metrics /gc/heap/live:bytes) while Build ran. It excludes
+	// garbage not yet collected, so it measures what the build actually
+	// keeps resident rather than how much it churns.
 	PeakHeapBytes uint64
 }
 
