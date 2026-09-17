@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.7.11](https://github.com/sivchari/golance/compare/v0.7.10...v0.7.11) - 2026-09-17
+- fix: invalidate decoded dependency caches by generation instead of per-path Delete by @sivchari in https://github.com/sivchari/golance/pull/126
+- perf: derive the default memory caps from physical memory by @sivchari in https://github.com/sivchari/golance/pull/127
+
 ## [v0.7.10](https://github.com/sivchari/golance/compare/v0.7.9...v0.7.10) - 2026-09-17
 - fix: source fallback for withheld root exports and cgo-file handling in the indexer by @sivchari in https://github.com/sivchari/golance/pull/122
 - fix: memoize per-run dep exports and guard duplicate import paths before write by @sivchari in https://github.com/sivchari/golance/pull/124
