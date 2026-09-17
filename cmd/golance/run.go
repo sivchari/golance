@@ -67,7 +67,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	logger := log.New(logOut, "", log.LstdFlags)
 
-	applyDefaultMemLimit(defaultServerMemLimit)
+	serverMemTotal, serverMemOK := physicalMemory()
+	applyDefaultMemLimit(deriveMemLimit(serverMemTotal, serverMemOK, serverMemFraction, defaultServerMemLimit))
 
 	rpcServer := rpc.NewServer(rpc.WithLogger(logger))
 	srv := server.New(rpcServer, server.Options{
@@ -135,7 +136,8 @@ func runIndexer(stdout, stderr io.Writer) int {
 	// future standalone CLI use) should not be forced to know about it.
 	depCASPath := os.Getenv(server.EnvDepCAS)
 
-	applyDefaultMemLimit(defaultIndexerMemLimit)
+	indexerMemTotal, indexerMemOK := physicalMemory()
+	applyDefaultMemLimit(deriveMemLimit(indexerMemTotal, indexerMemOK, indexerMemFraction, defaultIndexerMemLimit))
 
 	stopProfiling, ok := setupProfiling(stderr)
 	defer stopProfiling()
@@ -146,44 +148,77 @@ func runIndexer(stdout, stderr io.Writer) int {
 	return buildIndex(stdout, stderr, root, dbPath, casPath, depCASPath)
 }
 
-// defaultIndexerMemLimit is the GOMEMLIMIT applied to the indexer subprocess
-// when nothing else already set one (see applyDefaultMemLimit): a cold
+// defaultIndexerMemLimit is the floor deriveMemLimit applies to the indexer
+// subprocess's GOMEMLIMIT (see applyDefaultMemLimit) on a machine too small,
+// or too unmeasurable (physicalMemory returning !ok), to scale from: a cold
 // index build's Go heap otherwise grows unbounded (GOGC=100, no ceiling),
 // which measured 7.4GB peak "memory footprint" (9.0GB peak RSS) type-checking
-// a ~2,500-package, 34k-file monorepo. Capping it at 4GiB cut that to a
-// measured 5.0GB peak footprint (7.9GB peak RSS) with no wall-time cost (the
-// more frequent GC this forces was, if anything, slightly faster in that
-// measurement) — small enough headroom above this that a further cut (2GiB
-// was tried) buys little more RSS reduction while making the GC thrash badly
-// (2.3x wall time), so this is deliberately conservative rather than
-// minimal. It leaves comfortable room for the LSP server process itself
-// alongside it on a 16GB machine; a caller with a reason to run tighter or
-// looser can still override it via --mem-limit/GOLANCE_MEM_LIMIT (forwarded
-// as this same process's GOMEMLIMIT — see applyDefaultMemLimit).
+// a ~2,500-package, 34k-file monorepo. A flat 4GiB cap cut that to a measured
+// 5.0GB peak footprint (7.9GB peak RSS) at no wall-time cost on that
+// machine — but on a 48GB, 2,560-root monorepo machine the same flat cap
+// measured 442.6s for a cold build, against 171.9s (peak heap ~9.3GiB) with
+// the cap effectively removed: the live-heap floor for a build that size
+// (~4-5GiB) sits above 4GiB, so the GC ran continuously at the limiter
+// ceiling instead of at its ordinary pace. indexerMemFraction (0.25) fixes
+// that by scaling with the machine instead of pinning everyone to the
+// smallest one measured: a 16GB machine still gets this floor unchanged
+// (0.25*16GiB == 4GiB), while the 48GB machine above gets 12GiB, clearing
+// its measured ~9.3GiB peak with headroom. A caller with a reason to run
+// tighter or looser can still override either via --mem-limit/GOLANCE_MEM_LIMIT
+// (forwarded as this same process's GOMEMLIMIT — see applyDefaultMemLimit).
 const defaultIndexerMemLimit = 4 << 30
 
-// defaultServerMemLimit is the GOMEMLIMIT soft cap applied to the SERVER
-// (leader) process itself — a backstop, not the primary fix, for the
-// cold-start recursive dependency-closure re-check depCacheHolder.importer's
-// cold-index-build gate (internal/server/workspace.go) already closes off:
-// this exists in case some OTHER path still lets the server's heap grow
-// unbounded, now or in the future, the same way defaultIndexerMemLimit backstops
-// the indexer subprocess (whose own 4GiB default this constant is sized
-// relative to, not duplicated — see that constant's own doc for the
-// measurement behind ITS value). 8GiB leaves the indexer subprocess's own
-// 4GiB cap room to run alongside the server on the same 16GB machine
-// defaultIndexerMemLimit's own doc already targets, plus headroom for the
-// editor and OS: 4+8=12GiB of the 16GB total, both caps being soft (the Go
-// runtime runs GC more aggressively as either process nears its own limit
-// rather than being OOM-killed outright), so briefly exceeding one is
-// tolerated rather than fatal. Applied in-process via debug.SetMemoryLimit,
-// never as an env var: cmd.Env for the indexer subprocess (see
-// internal/server/indexer.go) starts from THIS process's os.Environ(), so a
-// real GOMEMLIMIT env var set here would leak into and override the
-// indexer's own deliberately-sized default; debug.SetMemoryLimit affects
-// only the calling process's own runtime, never the environment, so no such
-// override can happen.
+// indexerMemFraction is the fraction of physical memory deriveMemLimit
+// scales defaultIndexerMemLimit's floor by — see that constant's own doc for
+// the measurement this value is sized against.
+const indexerMemFraction = 0.25
+
+// defaultServerMemLimit is the floor deriveMemLimit applies to the SERVER
+// (leader) process's own GOMEMLIMIT — a backstop, not the primary fix, for
+// the cold-start recursive dependency-closure re-check
+// depCacheHolder.importer's cold-index-build gate (internal/server/workspace.go)
+// already closes off: this exists in case some OTHER path still lets the
+// server's heap grow unbounded, now or in the future, the same way
+// defaultIndexerMemLimit backstops the indexer subprocess (whose own fraction
+// and floor this constant and serverMemFraction are sized relative to, not
+// duplicated — see defaultIndexerMemLimit's own doc for the measurement
+// behind its values). serverMemFraction (0.5) plus indexerMemFraction (0.25)
+// sum to 0.75 of physical memory, leaving a quarter for the editor and OS
+// regardless of machine size, the same proportion the original flat 8GiB+4GiB
+// pair left on the 16GB machine they were sized for (12 of 16GiB). Both caps
+// are soft (the Go runtime runs GC more aggressively as either process nears
+// its own limit rather than being OOM-killed outright), so briefly exceeding
+// one is tolerated rather than fatal. Applied in-process via
+// debug.SetMemoryLimit, never as an env var: cmd.Env for the indexer
+// subprocess (see internal/server/indexer.go) starts from THIS process's
+// os.Environ(), so a real GOMEMLIMIT env var set here would leak into and
+// override the indexer's own deliberately-sized default; debug.SetMemoryLimit
+// affects only the calling process's own runtime, never the environment, so
+// no such override can happen.
 const defaultServerMemLimit = 8 << 30
+
+// serverMemFraction is the fraction of physical memory deriveMemLimit scales
+// defaultServerMemLimit's floor by — see that constant's own doc for the
+// reasoning behind this value.
+const serverMemFraction = 0.5
+
+// deriveMemLimit computes a GOMEMLIMIT default that scales with the
+// machine's physical memory instead of pinning every machine to the same
+// fixed value: total and ok are physicalMemory's return values, and floor
+// applies whenever ok is false (the host's physical memory could not be
+// determined) or fraction*total would otherwise undercut it, so a small or
+// unmeasurable machine never gets a smaller limit than the flat default this
+// replaces.
+func deriveMemLimit(total uint64, ok bool, fraction float64, floor int64) int64 {
+	if !ok {
+		return floor
+	}
+	scaled := int64(fraction * float64(total))
+	if scaled < floor {
+		return floor
+	}
+	return scaled
+}
 
 // applyDefaultMemLimit sets a GOMEMLIMIT soft cap of limit for this process
 // via debug.SetMemoryLimit, but only when nothing has already configured
