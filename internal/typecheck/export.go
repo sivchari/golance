@@ -27,7 +27,7 @@ func WriteExport(pkg *types.Package, fset *token.FileSet) ([]byte, error) {
 // identity, not by path, so it happily serializes two manifest entries
 // sharing one PkgPath when tpkg's own dependency resolution embedded two
 // non-identical instances of it — an identity split somewhere upstream
-// (see typecheck.CheckScope's own doc for the general class, and
+// (see typecheck.Cache's own doc for the general class, and
 // internal/depcheck.Provider's closureScope for its declaration-only-check
 // counterpart). gcexportdata's own reader then panics decoding that
 // manifest: golang.org/x/tools/internal/gcimporter.iimportCommon's "found
@@ -44,7 +44,8 @@ func WriteExport(pkg *types.Package, fset *token.FileSet) ([]byte, error) {
 // A breadth-first walk over Imports() (not a single flat scan) is
 // necessary and sufficient: Imports() of a decoded, complete package
 // reports its own full transitive reference set as a flat list (see
-// CheckScope's own doc, citing gcimporter's ureader.go), so walking one
+// gcimporter's ureader.go: "Imports() of pkg are all of the transitive
+// packages that were loaded"), so walking one
 // hop from every package already visited reaches every package tpkg's own
 // exported declarations can possibly reference, without needing to walk
 // tpkg's declarations/types directly.

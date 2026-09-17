@@ -228,7 +228,7 @@ func (r *exportResolver) resolve(ctx context.Context, path string) (pkg *types.P
 			// window resolve's own doc already names for the byte-cap
 			// trigger) or has not yet, and lands in the fresh one instead —
 			// no live *types.Package graph anywhere depends on r's own
-			// generation staying stable the way a live CheckScope does for
+			// generation staying stable the way an in-flight check does for
 			// typecheck.Cache, so this cannot split identity for any
 			// concurrent resolve the way a reset mid-CheckPackage-call
 			// could.

@@ -49,7 +49,6 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 	gt := genTableFor(db)
 	gen := gt.nextGen()
 
-	fset := token.NewFileSet()
 	keys := newKeyTable(ctx, db)
 	exp := newCASExportSource(ctx, cas, keys)
 	// See Build's identical comments: depExp replaces the removed
@@ -64,16 +63,23 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 	depMeta := depcheck.NewGraphMetadataSource(snap)
 	depProvider := depcheck.NewProvider(depMeta, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootCount(snap), o.Parallelism)})
 	depExp := depexport.NewCache(o.DepCAS, depMeta, depProvider, depexport.Options{BuildFlagsFingerprint: o.BuildFlagsFingerprint, MemoizeForRun: true})
-	cache := typecheck.NewCache()
-	imp := typecheck.NewImporter(fset, exp, depExp, cache)
+	// gens rotates the shared (fset, typecheck.Cache) pair by decoded bytes
+	// exactly like Build's own does (see cacheGenerations' doc); acquired
+	// once per reindexOne call below, since Reindex's own closure walk is
+	// single-threaded and so needs no per-call synchronization beyond that.
+	gens := newCacheGenerations(o.DecodeCacheBudget, func() *cacheGeneration {
+		fset := token.NewFileSet()
+		cache := typecheck.NewCache()
+		return &cacheGeneration{fset: fset, cache: cache, imp: typecheck.NewImporter(fset, exp, depExp, cache)}
+	})
 
 	var stats Stats
 	// trustStat=false: reader may be an editor overlay whose content
 	// differs from disk while disk's own stat stays untouched (see
 	// processUnit's doc).
-	if _, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, &o, changedPkg, reader, false, gt, gen, &stats); err != nil {
+	if _, err := reindexOne(ctx, gens, exp, db, cas, keys, snap, &o, changedPkg, reader, false, gt, gen, &stats); err != nil {
 		stats.Elapsed = time.Since(start)
-		stats.DecodeSelfHeals = int(cache.Resets())
+		stats.CacheGenerations = gens.count()
 		return stats, err
 	}
 
@@ -84,7 +90,7 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 			break
 		}
 		// trustStat=true: every closure hop is always read from disk.
-		fatal, err := reindexOne(ctx, fset, imp, exp, db, cas, keys, snap, &o, path, readFileDisk, true, gt, gen, &stats)
+		fatal, err := reindexOne(ctx, gens, exp, db, cas, keys, snap, &o, path, readFileDisk, true, gt, gen, &stats)
 		if err != nil {
 			firstErr = errors.Join(firstErr, err)
 			if fatal {
@@ -99,7 +105,7 @@ func Reindex(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store
 		}
 	}
 	stats.Elapsed = time.Since(start)
-	stats.DecodeSelfHeals = int(cache.Resets())
+	stats.CacheGenerations = gens.count()
 	return stats, firstErr
 }
 
@@ -141,12 +147,14 @@ func orderedReverseClosure(snap *graph.Snapshot, changedPkg string) []string {
 // A persist failure for the pointer-only refresh path stays best-effort,
 // not fatal — see [buildResults.flushPtrsLocked]'s identical rationale.
 //
-// gen is this Reindex call's own generation (see genTable's doc); gt gates
-// both persist branches below against it, so a write from an older,
-// slower-to-complete Reindex call for path never clobbers one a newer call
-// already committed.
-func reindexOne(ctx context.Context, fset *token.FileSet, imp *typecheck.Importer, exp *casExportSource, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, opts *Options, path string, reader FileReader, trustStat bool, gt *genTable, gen uint64, stats *Stats) (fatal bool, err error) {
-	outcome, skipped, typeChecked, err := processUnitRecovered(ctx, fset, imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
+// gen is this Reindex call's own write-ordering generation (see genTable's
+// doc, distinct from cacheGenerations' decode-cache generations gens itself
+// rotates through); gt gates both persist branches below against it, so a
+// write from an older, slower-to-complete Reindex call for path never
+// clobbers one a newer call already committed.
+func reindexOne(ctx context.Context, gens *cacheGenerations, exp *casExportSource, db *store.DB, cas *store.CAS, keys *keyTable, snap *graph.Snapshot, opts *Options, path string, reader FileReader, trustStat bool, gt *genTable, gen uint64, stats *Stats) (fatal bool, err error) {
+	cg := gens.acquire()
+	outcome, skipped, typeChecked, err := processUnitRecovered(ctx, cg.fset, cg.imp, exp, snap, db, cas, keys, opts, path, reader, trustStat)
 	if err != nil {
 		stats.Errors++
 		return false, fmt.Errorf("index: reindex: %s: %w", path, err)

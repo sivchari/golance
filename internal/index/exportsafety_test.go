@@ -187,9 +187,9 @@ var _ = consumer.Get
 // iimportCommon's own recover re-panics it (see writeAndValidateExport's
 // own doc). This constructs that shape directly via go/types' public API,
 // independent of any particular type-check that might produce it in
-// practice (typecheck.CheckScope's own cached-lifetime pinning — see its
-// doc — now closes the specific identity-split path this test used to
-// drive through checkOnePackage's own Importer to reach the same taint).
+// practice (typecheck.Cache's own append-only, generation-scoped design —
+// see its doc — now closes the specific identity-split path this test used
+// to drive through checkOnePackage's own Importer to reach the same taint).
 func TestWriteAndValidateExport_PoisonBlobWithheld(t *testing.T) {
 	fset := token.NewFileSet()
 	pkg := types.NewPackage("example.com/exportsafety/poison", "poison")
