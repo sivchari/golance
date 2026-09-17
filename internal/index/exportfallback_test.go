@@ -54,7 +54,7 @@ func TestCheckOnePackage_WithheldRootExportFallsBackToDeclarationCheck(t *testin
 	keys := newKeyTable(ctx, db)
 	exp := newCASExportSource(ctx, cas, keys)
 	fset := token.NewFileSet()
-	readFile := func(path string) ([]byte, error) { return os.ReadFile(path) }
+	readFile := os.ReadFile
 
 	// Build leaf and mid normally first, exactly as Build's own scheduler
 	// would (dependency order), populating exp the way checkAndStoreOutcome
