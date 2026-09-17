@@ -11,5 +11,5 @@ func physicalMemory() (uint64, bool) {
 	if err := unix.Sysinfo(&info); err != nil {
 		return 0, false
 	}
-	return uint64(info.Totalram) * uint64(info.Unit), true
+	return info.Totalram * uint64(info.Unit), true
 }
