@@ -212,7 +212,7 @@ type Options struct {
 // (see ensureDepProvider's own doc): a non-immutable (workspace) package's
 // content genuinely CAN change between two ExportData calls there, and
 // this Cache has no invalidation hook for an in-process memo the way
-// typecheck.Cache's Delete gives its own decoded-package cache — memoizing
+// typecheck.Cache's Invalidate gives its own decoded-package cache — memoizing
 // unconditionally would serve stale bytes after an edit. internal/index's
 // own Build/Reindex, which construct a brand-new Cache per call (see
 // index.go/reindex.go), are the only current callers that opt in.

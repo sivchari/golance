@@ -232,20 +232,22 @@ func (d *depCacheHolder) decodeExport(pkgPath string, data []byte) (*types.Packa
 	return typecheck.ReadExport(data, fset, pkgPath, cache)
 }
 
-// invalidate drops pkgPaths from the current cache and from d.provider's and
+// invalidate replaces d.cache with typecheck.Cache.Invalidate(pkgPaths)'s
+// result (see its own doc: this also drops any complete entry that still
+// embeds one of pkgPaths, and every incomplete placeholder, not just
+// pkgPaths themselves) and drops pkgPaths from d.provider's and
 // d.exportProvider's own LRUs (see depcheck.Provider.Delete's doc for why a
 // workspace package can be cached there too — either Provider's recursive
 // import resolution can reach one), so the next recheck that imports any of
 // them re-decodes fresh export data instead of reusing a now-possibly-stale
 // *types.Package. Callers use this after a workspace package's on-disk
-// export data changes (didSave's background reindex).
+// export data changes (didSave's background reindex). d.fset is left as is:
+// Invalidate's result stays paired with it, and every surviving entry's
+// positions already live there.
 func (d *depCacheHolder) invalidate(pkgPaths []string) {
 	d.mu.Lock()
-	cache := d.cache
+	d.cache = d.cache.Invalidate(pkgPaths)
 	d.mu.Unlock()
-	for _, p := range pkgPaths {
-		cache.Delete(p)
-	}
 	d.provider.Delete(pkgPaths...)
 	d.exportProvider.Delete(pkgPaths...)
 }
