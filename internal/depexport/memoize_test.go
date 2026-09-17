@@ -1,6 +1,7 @@
 package depexport
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/sivchari/golance/internal/depcheck"
@@ -67,7 +68,7 @@ func TestCache_MemoizeForRun_AvoidsRedundantRecheckAfterEviction(t *testing.T) {
 			if !tc.memoize && !rechecked {
 				t.Errorf("Checked() stayed at %d re-requesting dep without MemoizeForRun: want a real re-check after Cap:1 evicted it (test no longer exercises eviction)", checkedAfterUser)
 			}
-			if tc.memoize && string(blob1) != string(blob2) {
+			if tc.memoize && !bytes.Equal(blob1, blob2) {
 				t.Error("MemoizeForRun set but the second ExportData(dep) call returned different bytes than the first")
 			}
 		})

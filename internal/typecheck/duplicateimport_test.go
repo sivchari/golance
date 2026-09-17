@@ -28,8 +28,13 @@ func newPackageWithNamedT(path string) *types.Package {
 }
 
 // namedFrom returns pkg's own "T" declaration's *types.Named type.
-func namedFrom(pkg *types.Package) *types.Named {
-	return pkg.Scope().Lookup("T").Type().(*types.Named)
+func namedFrom(t *testing.T, pkg *types.Package) *types.Named {
+	t.Helper()
+	named, ok := pkg.Scope().Lookup("T").Type().(*types.Named)
+	if !ok {
+		t.Fatalf("%s.T is not a *types.Named", pkg.Path())
+	}
+	return named
 }
 
 func TestDuplicateImportPath_DetectsSplitDependency(t *testing.T) {
@@ -37,8 +42,8 @@ func TestDuplicateImportPath_DetectsSplitDependency(t *testing.T) {
 	a, b := twoInstancePackages(sharedPath)
 
 	consumer := types.NewPackage("example.com/consumer", "consumer")
-	consumer.Scope().Insert(types.NewVar(token.NoPos, consumer, "A", namedFrom(a)))
-	consumer.Scope().Insert(types.NewVar(token.NoPos, consumer, "B", namedFrom(b)))
+	consumer.Scope().Insert(types.NewVar(token.NoPos, consumer, "A", namedFrom(t, a)))
+	consumer.Scope().Insert(types.NewVar(token.NoPos, consumer, "B", namedFrom(t, b)))
 	consumer.SetImports([]*types.Package{a, b})
 	consumer.MarkComplete()
 
@@ -51,7 +56,7 @@ func TestDuplicateImportPath_CleanGraphReportsNone(t *testing.T) {
 	shared := newPackageWithNamedT("example.com/shared")
 
 	consumer := types.NewPackage("example.com/consumer", "consumer")
-	consumer.Scope().Insert(types.NewVar(token.NoPos, consumer, "A", namedFrom(shared)))
+	consumer.Scope().Insert(types.NewVar(token.NoPos, consumer, "A", namedFrom(t, shared)))
 	consumer.SetImports([]*types.Package{shared})
 	consumer.MarkComplete()
 
@@ -72,8 +77,8 @@ func TestDuplicateImportPath_ShapeAlsoFailsRoundTrip(t *testing.T) {
 	a, b := twoInstancePackages(sharedPath)
 
 	consumer := types.NewPackage("example.com/consumer", "consumer")
-	consumer.Scope().Insert(types.NewVar(token.NoPos, consumer, "A", namedFrom(a)))
-	consumer.Scope().Insert(types.NewVar(token.NoPos, consumer, "B", namedFrom(b)))
+	consumer.Scope().Insert(types.NewVar(token.NoPos, consumer, "A", namedFrom(t, a)))
+	consumer.Scope().Insert(types.NewVar(token.NoPos, consumer, "B", namedFrom(t, b)))
 	consumer.SetImports([]*types.Package{a, b})
 	consumer.MarkComplete()
 

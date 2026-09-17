@@ -8,10 +8,7 @@ import (
 	"go/token"
 	"go/types"
 	"log"
-	"os"
-	"path/filepath"
 	"runtime/debug"
-	"strings"
 
 	"github.com/sivchari/golance/internal/graph"
 	"github.com/sivchari/golance/internal/store"
@@ -536,30 +533,9 @@ func writeAndValidateExport(tpkg *types.Package, fset *token.FileSet) (blob []by
 		return nil, fmt.Errorf("index: write export data for %s: %w", tpkg.Path(), err)
 	}
 	if _, err := typecheck.ReadExport(blob, token.NewFileSet(), tpkg.Path(), typecheck.NewCache()); err != nil {
-		dumpBadExport(tpkg.Path(), blob, err)
 		return nil, fmt.Errorf("index: export data for %s does not round-trip decode: %w", tpkg.Path(), err)
 	}
 	return blob, nil
-}
-
-// dumpBadExport writes a blob that failed round-trip validation to the
-// directory named by GOLANCE_DUMP_BAD_EXPORT, so the otherwise-discarded
-// bytes survive for offline analysis (the failing decode's panic is
-// recovered inside x/tools with its stack lost, making the blob itself the
-// only actionable artifact). Diagnostic-only; a write failure is logged and
-// otherwise ignored.
-func dumpBadExport(pkgPath string, blob []byte, decodeErr error) {
-	dir := os.Getenv("GOLANCE_DUMP_BAD_EXPORT")
-	if dir == "" {
-		return
-	}
-	name := strings.ReplaceAll(pkgPath, "/", "__")
-	if err := os.WriteFile(filepath.Join(dir, name+".export"), blob, 0o600); err != nil {
-		log.Printf("index: dump bad export for %s: %v", pkgPath, err)
-		return
-	}
-	_ = os.WriteFile(filepath.Join(dir, name+".error"), []byte(decodeErr.Error()), 0o600)
-	log.Printf("index: dumped undecodable export for %s (%d bytes) to %s", pkgPath, len(blob), dir)
 }
 
 // parseGoFiles parses every file in goFiles (via readFile), skipping any
