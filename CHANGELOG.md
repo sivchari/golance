@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.7.9](https://github.com/sivchari/golance/compare/v0.7.8...v0.7.9) - 2026-09-17
+- fix: enforce single-generation type identity across the indexing pipeline by @sivchari in https://github.com/sivchari/golance/pull/119
+- perf: memoize implementer confirmation and pin decode generations per query by @sivchari in https://github.com/sivchari/golance/pull/121
+
 ## [v0.7.8](https://github.com/sivchari/golance/compare/v0.7.7...v0.7.8) - 2026-09-16
 - fix: fold golance's own version into the index build fingerprint by @sivchari in https://github.com/sivchari/golance/pull/117
 
