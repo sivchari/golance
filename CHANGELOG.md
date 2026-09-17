@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.7.10](https://github.com/sivchari/golance/compare/v0.7.9...v0.7.10) - 2026-09-17
+- fix: source fallback for withheld root exports and cgo-file handling in the indexer by @sivchari in https://github.com/sivchari/golance/pull/122
+- fix: memoize per-run dep exports and guard duplicate import paths before write by @sivchari in https://github.com/sivchari/golance/pull/124
+- fix: bound the index decode cache by generation instead of per-entry eviction by @sivchari in https://github.com/sivchari/golance/pull/125
+
 ## [v0.7.9](https://github.com/sivchari/golance/compare/v0.7.8...v0.7.9) - 2026-09-17
 - fix: enforce single-generation type identity across the indexing pipeline by @sivchari in https://github.com/sivchari/golance/pull/119
 - perf: memoize implementer confirmation and pin decode generations per query by @sivchari in https://github.com/sivchari/golance/pull/121
