@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"strings"
 	"testing"
 
 	"github.com/sivchari/golance/internal/typecheck"
@@ -201,4 +202,40 @@ func TestWriteAndValidateExport_PoisonBlobWithheld(t *testing.T) {
 		return
 	}
 	t.Errorf("writeAndValidateExport produced %d bytes with no error: this shape was expected to fail its own round-trip check", len(blob))
+}
+
+// TestWriteAndValidateExport_DuplicateImportPathWithheld is the regression
+// pin for the confirmed real-world poison shape (see
+// typecheck.DuplicateImportPath's own doc): tpkg reaches two non-identical
+// *types.Package objects sharing one import path — an identity split
+// somewhere in dependency resolution, not tpkg's own declarations. This
+// must be caught (and reported with the split path name) before ever
+// calling gcexportdata.Write, not only via the round-trip decode fallback.
+func TestWriteAndValidateExport_DuplicateImportPathWithheld(t *testing.T) {
+	const sharedPath = "example.com/exportsafety/shareddup"
+	newInstance := func() *types.Package {
+		pkg := types.NewPackage(sharedPath, "shareddup")
+		tname := types.NewTypeName(token.NoPos, pkg, "T", nil)
+		types.NewNamed(tname, types.NewStruct(nil, nil), nil)
+		pkg.Scope().Insert(tname)
+		pkg.MarkComplete()
+		return pkg
+	}
+	a, b := newInstance(), newInstance()
+
+	pkg := types.NewPackage("example.com/exportsafety/dupconsumer", "dupconsumer")
+	pkg.Scope().Insert(types.NewVar(token.NoPos, pkg, "A", a.Scope().Lookup("T").Type()))
+	pkg.Scope().Insert(types.NewVar(token.NoPos, pkg, "B", b.Scope().Lookup("T").Type()))
+	pkg.SetImports([]*types.Package{a, b})
+	pkg.MarkComplete()
+
+	fset := token.NewFileSet()
+	blob, err := writeAndValidateExport(pkg, fset)
+	if err == nil {
+		t.Fatalf("writeAndValidateExport produced %d bytes with no error: a split dependency on %q should have been withheld", len(blob), sharedPath)
+	}
+	if !strings.Contains(err.Error(), sharedPath) {
+		t.Errorf("writeAndValidateExport error = %v, want it to name the split path %q", err, sharedPath)
+	}
+	t.Logf("writeAndValidateExport correctly withheld the split-dependency blob: %v", err)
 }

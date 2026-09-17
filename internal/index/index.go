@@ -209,7 +209,14 @@ func Build(ctx context.Context, snap *graph.Snapshot, db *store.DB, cas *store.C
 	// risks at DefaultCap's much smaller, navigation-sized capacity.
 	depMeta := depcheck.NewGraphMetadataSource(snap)
 	depProvider := depcheck.NewProvider(depMeta, depcheck.Options{Cap: depcheck.RecommendedCap(nonRootCount(snap), o.Parallelism)})
-	depExp := depexport.NewCache(o.DepCAS, depMeta, depProvider, depexport.Options{BuildFlagsFingerprint: o.BuildFlagsFingerprint})
+	// MemoizeForRun: depProvider's own LRU (sized above) can evict a widely-
+	// shared dependency between two separate top-level ExportData calls this
+	// one Build call makes for it — see depexport.Cache's own doc for the
+	// confirmed round-trip corruption that produces (two non-identical
+	// instances of the same import path woven into one dependent's own
+	// exported API). depExp is fresh per Build call, so memoizing every
+	// resolved path for its lifetime costs nothing beyond this run.
+	depExp := depexport.NewCache(o.DepCAS, depMeta, depProvider, depexport.Options{BuildFlagsFingerprint: o.BuildFlagsFingerprint, MemoizeForRun: true})
 	imp := typecheck.NewImporter(fset, exp, depExp, cache)
 	sem := semaphore.NewWeighted(int64(o.Parallelism))
 

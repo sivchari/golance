@@ -476,14 +476,18 @@ func checkOnePackage(fset *token.FileSet, imp *typecheck.Importer, pkgPath strin
 	return checkResult{Facts: factsBlob, Export: exportBlob, Index: idx, Incomplete: incomplete, FirstError: firstError}, nil
 }
 
-// writeAndValidateExport encodes tpkg's exported API and immediately
+// writeAndValidateExport first refuses tpkg outright if
+// typecheck.DuplicateImportPath finds it — the confirmed cause of every
+// production round-trip-decode failure so far (see its own doc for the
+// x/tools decode-site) — then encodes tpkg's exported API and immediately
 // decodes it back (into a throwaway fset/cache, never one a real caller
 // shares — mirroring internal/depexport.Cache.checkAndPersist's identical
 // self-check) before trusting the result, so a write that silently produced
 // bytes gcexportdata.Read cannot reliably decode is caught here instead of
 // persisted to cas and served to every dependent that imports pkgPath.
 //
-// This defends against a corruption class distinct from (but related to)
+// The round-trip check remains the backstop for every OTHER corruption
+// shape, including this one distinct from (but related to)
 // the identity-split family typecheck.CheckScope's own doc describes:
 // go/types.Config.Check's error recovery can leave a declaration reachable
 // from tpkg's own exported API — most concretely, a generic instantiation's
@@ -521,6 +525,9 @@ func writeAndValidateExport(tpkg *types.Package, fset *token.FileSet) (blob []by
 			err = fmt.Errorf("index: write export data for %s panicked: %v", tpkg.Path(), r)
 		}
 	}()
+	if dup := typecheck.DuplicateImportPath(tpkg); dup != "" {
+		return nil, fmt.Errorf("index: export data for %s would reference two non-identical packages both named %q (an identity split somewhere in its dependency resolution — see typecheck.DuplicateImportPath's doc)", tpkg.Path(), dup)
+	}
 	blob, err = typecheck.WriteExport(tpkg, fset)
 	if err != nil {
 		return nil, fmt.Errorf("index: write export data for %s: %w", tpkg.Path(), err)
