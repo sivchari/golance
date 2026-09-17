@@ -45,9 +45,9 @@ type confirmMemoEntry[K comparable, V any] struct {
 	value V
 }
 
-// newConfirmMemo returns an empty confirmMemo bounded to cap entries.
-func newConfirmMemo[K comparable, V any](cap int) *confirmMemo[K, V] {
-	return &confirmMemo[K, V]{order: list.New(), index: make(map[K]*list.Element), cap: cap}
+// newConfirmMemo returns an empty confirmMemo bounded to capacity entries.
+func newConfirmMemo[K comparable, V any](capacity int) *confirmMemo[K, V] {
+	return &confirmMemo[K, V]{order: list.New(), index: make(map[K]*list.Element), cap: capacity}
 }
 
 // get returns key's memoized value, if present, moving it to the front
