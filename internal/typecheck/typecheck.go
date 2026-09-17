@@ -35,7 +35,7 @@ type ExportSource interface {
 // CheckPackage calls. Callers own its lifetime: create one to share type
 // identity across a batch of related checks, discard it to release memory.
 //
-// Cache is append-only for as long as it is shared across concurrent
+// Cache itself is append-only for as long as it is shared across concurrent
 // checks: nothing here evicts an entry to bound memory. gcexportdata's
 // decode can never produce a second, non-identical *types.Package for a
 // path already present in Cache.pkgs — an incomplete placeholder is filled
@@ -48,6 +48,9 @@ type ExportSource interface {
 // depCacheHolder, internal/xref's Resolver, and internal/depcheck's
 // exportResolver already use for their own caches (see each package's own
 // doc), and internal/index's own generations type applies to Build/Reindex.
+// A caller that instead needs to invalidate a known set of paths without
+// discarding everything else uses Invalidate, which returns a new Cache
+// rather than mutating this one, preserving the same guarantee.
 //
 // A Cache is tied to the single *token.FileSet its entries were decoded
 // into (gcexportdata.Read registers position information into that fset as
@@ -73,37 +76,82 @@ func NewCache() *Cache {
 	}
 }
 
-// Delete removes pkgPath's cached *types.Package and any cached ReadExport
-// failure for it, if either exists, subtracting its recorded size from
-// bytes so bytes reflects only entries still cached rather than growing
-// monotonically forever. A later ImportFrom/ReadExport call for pkgPath
-// re-decodes it from export data instead of serving a stale success or a
-// stale failure.
+// Invalidate returns a new Cache for callers that must treat changed's
+// paths as stale (e.g. Resolver.Invalidate, depCacheHolder.invalidate,
+// after a reindex changes their export data), sharing every surviving
+// entry — not the underlying map — with c. It drops:
 //
-// Delete is for identifier-staleness invalidation only (e.g.
-// internal/xref.Resolver.Invalidate after a reindex, called between
-// batches of checks, never during one) — not for bounding memory by
-// evicting a dependency mid-build. Removing an entry a concurrent,
-// in-flight check has already embedded into its own *types.Info, or that
-// some other already-cached entry's own export data still references via
-// gcexportdata's shared imports map, lets a later decode for the same path
-// mint a second, non-identical *types.Package — the identity split #116
-// fixed for internal/depcheck's own separate cache. A caller sharing one
-// Cache across concurrent checks (internal/index.Build) must instead never
-// delete mid-run, rotating to a fresh (fset, Cache) pair by Bytes() the way
-// Cache's own doc describes.
-func (c *Cache) Delete(pkgPath string) {
+//   - every path in changed itself, and any cached ReadExport failure for
+//     it, so a later decode re-reads fresh export data instead of serving
+//     a stale success or a stale failure;
+//   - every COMPLETE entry whose Imports() contains a path in changed: a
+//     decoded, complete package's Imports() is the deep export data's own
+//     full manifest, i.e. every package its declarations can reference
+//     (see x/tools/internal/gcimporter/iimport.go's
+//     SetImports(pkgList[1:])), so one-level membership is enough to find
+//     every entry that could still embed the stale package;
+//   - every INCOMPLETE entry, regardless of changed: gcexportdata inserts
+//     an incomplete placeholder for a manifest path it has not yet been
+//     asked to decode as a top-level package, and other entries' own
+//     declarations can be decoded straight into that placeholder's scope
+//     without ever completing it — references invisible to Imports() and
+//     so impossible to find by walking it. Dropping every incomplete entry
+//     unconditionally is cheap (decode recreates it from data already
+//     available) and closes that blind spot instead of trying to track it.
+//
+// The returned Cache MUST be paired with the SAME *token.FileSet as c: a
+// surviving entry's positions were registered into that fset by decode and
+// nowhere else. c itself is left untouched, so a check or query already
+// holding it (e.g. one pinned via a caller's own context, mirroring
+// internal/xref's pinExportCache) keeps a consistent, append-only view for
+// its own duration. This is Cache's staleness counterpart to the
+// byte-budget whole-pair swap its own doc describes: unlike that swap,
+// which discards every entry, Invalidate keeps every entry changed does
+// not implicate.
+func (c *Cache) Invalidate(changed []string) *Cache {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.deleteLocked(pkgPath)
+
+	stale := make(map[string]bool, len(changed))
+	for _, p := range changed {
+		stale[p] = true
+	}
+
+	next := &Cache{
+		pkgs:   make(map[string]*types.Package, len(c.pkgs)),
+		sizes:  make(map[string]int64, len(c.sizes)),
+		failed: make(map[string]error, len(c.failed)),
+	}
+	for path, pkg := range c.pkgs {
+		if stale[path] || !pkg.Complete() || embedsAny(pkg, stale) {
+			continue
+		}
+		next.pkgs[path] = pkg
+		if size, ok := c.sizes[path]; ok {
+			next.sizes[path] = size
+			next.bytes += size
+		}
+	}
+	for path, err := range c.failed {
+		if stale[path] {
+			continue
+		}
+		next.failed[path] = err
+	}
+	next.decodes = c.decodes
+	return next
 }
 
-// deleteLocked performs Delete's actual removal. c.mu must already be held.
-func (c *Cache) deleteLocked(pkgPath string) {
-	delete(c.pkgs, pkgPath)
-	delete(c.failed, pkgPath)
-	c.bytes -= c.sizes[pkgPath]
-	delete(c.sizes, pkgPath)
+// embedsAny reports whether pkg's manifest (Imports()) contains any path in
+// stale — see Invalidate's doc for why one-level membership over a
+// complete package's Imports() is sufficient.
+func embedsAny(pkg *types.Package, stale map[string]bool) bool {
+	for _, imp := range pkg.Imports() {
+		if stale[imp.Path()] {
+			return true
+		}
+	}
+	return false
 }
 
 // Len returns the number of *types.Package values currently cached.

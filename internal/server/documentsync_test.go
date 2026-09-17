@@ -187,25 +187,40 @@ func TestHandleDidSave_TestFileReindexesNewSymbol(t *testing.T) {
 	})
 }
 
-// TestReindex_NarrowsDepCacheInvalidationToActuallyChangedHops verifies
-// Server.reindex evicts ws.depCache only for the hops index.Reindex reports
-// via Stats.Changed, not the whole reverse-dependency closure: mid is
-// imported by top, and a body-only edit to mid must leave top's decoded
-// dependency entry alone, while a signature-changing edit must evict it
-// too. Presence in depCache is observed indirectly through
+// TestReindex_InvalidatesDepCacheEntriesReferencingChangedHops verifies
+// Server.reindex evicts ws.depCache not only for the hops index.Reindex
+// itself reprocessed (Stats.Changed) but also for any OTHER cached,
+// complete entry that structurally embeds one of those hops: mid exports a
+// named type, top's own exported API returns it, so a decoded, complete
+// depCache entry for top references mid's declaration directly, in its
+// Imports() manifest — even for a body-only edit to mid, where
+// Stats.Changed is just {mid} (mid's own export data provably did not
+// change; see this package's other reindex tests for that guarantee), top
+// must still be dropped: its cached *types.Package still embeds mid's OLD
+// declarations, and reusing it after mid is redecoded is exactly the
+// identity split typecheck.Cache.Invalidate's own doc describes. other has
+// no dependency on mid at all and must stay cached (a hit) in every case —
+// the negative control proving eviction is scoped to entries that actually
+// reference a changed path, not a blanket cache reset.
+//
+// Presence in depCache is observed indirectly through
 // typecheck.Cache.Decodes(): re-importing a path that is still cached is a
 // hit (no new decode), while re-importing an evicted path forces a fresh
-// one.
-func TestReindex_NarrowsDepCacheInvalidationToActuallyChangedHops(t *testing.T) {
+// one. depCache.invalidate replaces ws.depCache.cache with a new *Cache
+// rather than mutating the old one in place (see its own doc), so the
+// Importer used to observe post-reindex state must be fetched fresh via
+// ws.depCache.importer() after reindexing — reusing the pre-reindex
+// Importer would silently keep observing the old, now-orphaned Cache.
+func TestReindex_InvalidatesDepCacheEntriesReferencingChangedHops(t *testing.T) {
 	const (
-		pkgMid = "example.com/depcachetest/mid"
-		pkgTop = "example.com/depcachetest/top"
+		pkgMid   = "example.com/depcachetest/mid"
+		pkgTop   = "example.com/depcachetest/top"
+		pkgOther = "example.com/depcachetest/other"
 	)
 
 	tests := []struct {
-		name        string
-		edited      string
-		wantEvicted map[string]bool
+		name   string
+		edited string
 	}{
 		{
 			name: "body only edit",
@@ -213,12 +228,14 @@ func TestReindex_NarrowsDepCacheInvalidationToActuallyChangedHops(t *testing.T) 
 
 import "example.com/depcachetest/leaf"
 
+// Greeting is mid's own exported type, embedded in top's exported API.
+type Greeting string
+
 // Shout returns a greeting for name.
-func Shout(name string) string {
-	return leaf.Hello(name) + "!"
+func Shout(name string) Greeting {
+	return Greeting(leaf.Hello(name) + "!")
 }
 `,
-			wantEvicted: map[string]bool{pkgMid: true, pkgTop: false},
 		},
 		{
 			name: "signature changing edit",
@@ -226,29 +243,31 @@ func Shout(name string) string {
 
 import "example.com/depcachetest/leaf"
 
+// Greeting is mid's own exported type, embedded in top's exported API.
+type Greeting string
+
 // Shout returns a greeting for name, repeated n times.
-func Shout(name string, n int) string {
+func Shout(name string, n int) Greeting {
 	out := leaf.Hello(name)
 	for i := 1; i < n; i++ {
 		out += out
 	}
-	return out
+	return Greeting(out)
 }
 `,
-			wantEvicted: map[string]bool{pkgMid: true, pkgTop: true},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s, idx, midFile, _ := newDepCacheReindexServer(t)
+			s, idx, midFile := newTypedDepCacheReindexServer(t)
 			ws := s.workspace()
-			// Warm depCache with a decoded entry for both mid and top,
+			// Warm depCache with a decoded entry for mid, top, and other,
 			// mirroring what a real recheck of some other package importing
-			// top (and so transitively mid) would leave behind.
-			imp := ws.depCache.importer()
-			for _, p := range []string{pkgMid, pkgTop} {
-				if _, err := imp.ImportFrom(p, "", 0); err != nil {
+			// each of them would leave behind.
+			warmImp := ws.depCache.importer()
+			for _, p := range []string{pkgMid, pkgTop, pkgOther} {
+				if _, err := warmImp.ImportFrom(p, "", 0); err != nil {
 					t.Fatalf("warm depCache for %s: %v", p, err)
 				}
 			}
@@ -256,18 +275,94 @@ func Shout(name string, n int) string {
 			openDoc(t, s, midFile, tt.edited)
 			_ = s.reindex(context.Background(), ws, idx, pkgMid)
 
-			for _, p := range []string{pkgMid, pkgTop} {
+			wantEvicted := map[string]bool{pkgMid: true, pkgTop: true, pkgOther: false}
+			checkImp := ws.depCache.importer()
+			for _, p := range []string{pkgMid, pkgTop, pkgOther} {
 				before := ws.depCache.cache.Decodes()
-				if _, err := imp.ImportFrom(p, "", 0); err != nil {
+				if _, err := checkImp.ImportFrom(p, "", 0); err != nil {
 					t.Fatalf("re-import %s after reindex: %v", p, err)
 				}
 				evicted := ws.depCache.cache.Decodes() > before
-				if evicted != tt.wantEvicted[p] {
-					t.Errorf("%s evicted from depCache = %v, want %v", p, evicted, tt.wantEvicted[p])
+				if evicted != wantEvicted[p] {
+					t.Errorf("%s evicted from depCache = %v, want %v", p, evicted, wantEvicted[p])
 				}
 			}
 		})
 	}
+}
+
+// newTypedDepCacheReindexServer builds a leaf/mid/top/other synthetic
+// module like newDepCacheReindexServer, except mid exports a named type
+// (mid.Greeting) that top's own exported API returns, so a decoded,
+// complete depCache entry for top structurally embeds mid's declaration —
+// deep (non-shallow) gcexportdata only records a manifest reference for a
+// dependency actually named in an exported declaration, never one merely
+// called from a function body. other has no dependency on mid at all, the
+// negative control TestReindex_InvalidatesDepCacheEntriesReferencingChangedHops
+// needs.
+func newTypedDepCacheReindexServer(t *testing.T) (s *Server, idx *indexState, midFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	writeModuleFile(t, dir, "go.mod", "module example.com/depcachetest\n\ngo 1.23\n")
+	writeModuleFile(t, dir, "leaf/leaf.go", "package leaf\n\n// Hello returns a greeting for name.\nfunc Hello(name string) string { return \"hello \" + name }\n")
+	midFile = writeModuleFile(t, dir, "mid/mid.go", `package mid
+
+import "example.com/depcachetest/leaf"
+
+// Greeting is mid's own exported type, embedded in top's exported API.
+type Greeting string
+
+// Shout returns a greeting for name.
+func Shout(name string) Greeting {
+	return Greeting(leaf.Hello(name))
+}
+`)
+	writeModuleFile(t, dir, "top/top.go", `package top
+
+import "example.com/depcachetest/mid"
+
+// Run calls mid.Shout.
+func Run(name string) mid.Greeting {
+	return mid.Shout(name)
+}
+`)
+	writeModuleFile(t, dir, "other/other.go", `package other
+
+// Echo returns name unchanged, with no dependency on mid at all.
+func Echo(name string) string {
+	return name
+}
+`)
+
+	snap, err := graph.Load(graph.Options{Dir: dir}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("db.Close: %v", err)
+		}
+	})
+	cas, err := store.OpenCAS(filepath.Join(t.TempDir(), "cas"))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	relative := RelativeIndexPaths(dir)
+	if _, err := index.Build(context.Background(), snap, db, cas, &index.Options{RelativePaths: relative}); err != nil {
+		t.Fatalf("index.Build: %v", err)
+	}
+
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+	s = New(rpcServer, Options{Logger: newTestLogger(t)})
+	s.setWorkspace(dir, snap)
+	stopWorkspaceEngineOnCleanup(t, s)
+	idx = &indexState{db: db, cas: cas, resolver: xref.New(db, cas, snap, relative)}
+	s.idx.Store(idx)
+	return s, idx, midFile
 }
 
 // newDepCacheReindexServer builds the leaf/mid/top synthetic module,

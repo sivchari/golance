@@ -89,9 +89,9 @@ func DuplicateImportPath(tpkg *types.Package) string {
 // closes is an implementation/references query that costs about as long
 // as a first decode on EVERY call for a workspace package whose export
 // data cannot be decoded, because nothing remembered the earlier failure.
-// A pkgPath's cached failure survives until cache.Delete(pkgPath) is
-// called for it (see the doc there), the same reindex-triggered
-// invalidation a successful decode gets.
+// A pkgPath's cached failure survives until cache.Invalidate names it (see
+// the doc there), the same reindex-triggered invalidation a successful
+// decode gets.
 func ReadExport(data []byte, fset *token.FileSet, pkgPath string, cache *Cache) (*types.Package, error) {
 	cache.mu.Lock()
 	defer cache.mu.Unlock()

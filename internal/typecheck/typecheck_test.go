@@ -240,76 +240,229 @@ func TestReadExport_CachesFailure(t *testing.T) {
 	}
 }
 
-// TestCache_DeleteClearsFailure confirms Delete drops a cached decode
-// failure too, not just a cached success, so a package reindexed after an
-// earlier decode failure gets a genuine retry instead of the stale error
-// forever (mirroring Resolver.Invalidate's existing contract for a
-// successful decode).
-func TestCache_DeleteClearsFailure(t *testing.T) {
-	fset := token.NewFileSet()
-	cache := typecheck.NewCache()
-	if _, err := typecheck.ReadExport([]byte("not export data"), fset, "example.com/broken", cache); err == nil {
-		t.Fatal("expected a decode error")
+// checkPkg parses rel, type-checks it as pkgPath against cache using src
+// (nil to rely on stdlib alone) and stdlib as its two ExportSource tiers,
+// and returns the resulting *types.Package.
+func checkPkg(t *testing.T, fset *token.FileSet, cache *typecheck.Cache, stdlib typecheck.ExportSource, rel, pkgPath string, src typecheck.ExportSource) *types.Package {
+	t.Helper()
+	f := parseTestdata(t, fset, rel)
+	imp := typecheck.NewImporter(fset, src, stdlib, cache)
+	pkg, _, errs := typecheck.CheckPackage(fset, []*ast.File{f}, pkgPath, imp)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected type errors checking %s: %v", pkgPath, errs)
 	}
-	if got := cache.FailedLen(); got != 1 {
-		t.Fatalf("FailedLen() before Delete = %d, want 1", got)
+	return pkg
+}
+
+// writeBlob is typecheck.WriteExport, failing the test on error.
+func writeBlob(t *testing.T, pkg *types.Package, fset *token.FileSet) []byte {
+	t.Helper()
+	blob, err := typecheck.WriteExport(pkg, fset)
+	if err != nil {
+		t.Fatalf("WriteExport(%s): %v", pkg.Path(), err)
 	}
+	return blob
+}
 
-	cache.Delete("example.com/broken")
+// probeCache imports path through an Importer bound to (fset, cache) with
+// every blob in all available, reporting the resulting *types.Package and
+// whether it was served from cache (Decodes() unchanged) rather than
+// freshly decoded.
+func probeCache(t *testing.T, fset *token.FileSet, cache *typecheck.Cache, all typecheck.ExportSource, path string) (*types.Package, bool) {
+	t.Helper()
+	before := cache.Decodes()
+	pkg, err := typecheck.NewImporter(fset, nil, all, cache).ImportFrom(path, "", 0)
+	if err != nil {
+		t.Fatalf("probe ImportFrom(%s): %v", path, err)
+	}
+	return pkg, cache.Decodes() == before
+}
 
-	if got := cache.FailedLen(); got != 0 {
-		t.Errorf("FailedLen() after Delete = %d, want 0", got)
+// invalidateFixturePaths are the import paths newInvalidateFixture's Cache
+// holds entries or failures for.
+type invalidateFixturePaths struct {
+	dep, typedep, typeuser, unsafeuser, broken1, broken2 string
+}
+
+// newInvalidateFixture builds a Cache holding: dep (complete, unrelated to
+// typedep/typeuser), unsafeuser (complete, unrelated to everything else —
+// the negative control), typeuser (complete, whose deep export data embeds
+// typedep because typeuser's own exported API returns a typedep.Greeting),
+// and typedep itself, present only as the INCOMPLETE placeholder that
+// decoding typeuser's self-contained blob leaves behind for it (see
+// typedep's own testdata doc — gcexportdata only completes the top-level
+// package a decode call was made for, see
+// x/tools/internal/gcimporter/iimport.go's non-bundle pkgs[:1] completion
+// loop). Two cached ReadExport failures (broken1, broken2) round out the
+// fixture. Also returns fset (which any Cache.Invalidate result must be
+// paired with), an ExportSource able to answer every non-failing path (for
+// probeCache), and unsafeuser's own decoded pointer (for the
+// pointer-identity assertion).
+func newInvalidateFixture(t *testing.T) (fset *token.FileSet, cache *typecheck.Cache, all typecheck.ExportSource, unsafeuserPkg *types.Package, paths invalidateFixturePaths) {
+	t.Helper()
+	paths = invalidateFixturePaths{
+		dep:        "example.com/tcmod/dep",
+		typedep:    "example.com/tcmod/typedep",
+		typeuser:   "example.com/tcmod/typeuser",
+		unsafeuser: "example.com/tcmod/unsafeuser",
+		broken1:    "example.com/broken1",
+		broken2:    "example.com/broken2",
+	}
+	stdlib := newStdlibExportSource(t)
+
+	// Build phase: a throwaway (buildFset, buildCache) pair produces the
+	// checked packages and their WriteExport blobs, kept separate from the
+	// (fset, cache) pair under test so that pair's decode order is fully
+	// controlled (in particular, so typedep is never decoded there except
+	// as a side effect of decoding typeuser).
+	buildFset := token.NewFileSet()
+	buildCache := typecheck.NewCache()
+	depBlob := writeBlob(t, checkPkg(t, buildFset, buildCache, stdlib, "dep/dep.go", paths.dep, nil), buildFset)
+	typedepBlob := writeBlob(t, checkPkg(t, buildFset, buildCache, stdlib, "typedep/typedep.go", paths.typedep, nil), buildFset)
+	typedepSrc := blobSource{blobs: map[string][]byte{paths.typedep: typedepBlob}}
+	typeuserBlob := writeBlob(t, checkPkg(t, buildFset, buildCache, stdlib, "typeuser/typeuser.go", paths.typeuser, typedepSrc), buildFset)
+	unsafeuserBlob := writeBlob(t, checkPkg(t, buildFset, buildCache, stdlib, "unsafeuser/unsafeuser.go", paths.unsafeuser, nil), buildFset)
+
+	all = blobSource{blobs: map[string][]byte{
+		paths.dep:        depBlob,
+		paths.typedep:    typedepBlob,
+		paths.typeuser:   typeuserBlob,
+		paths.unsafeuser: unsafeuserBlob,
+	}}
+
+	fset = token.NewFileSet()
+	cache = typecheck.NewCache()
+	if _, err := typecheck.ReadExport(depBlob, fset, paths.dep, cache); err != nil {
+		t.Fatalf("ReadExport(dep): %v", err)
+	}
+	unsafeuserPkg, err := typecheck.ReadExport(unsafeuserBlob, fset, paths.unsafeuser, cache)
+	if err != nil {
+		t.Fatalf("ReadExport(unsafeuser): %v", err)
+	}
+	typeuserPkg, err := typecheck.ReadExport(typeuserBlob, fset, paths.typeuser, cache)
+	if err != nil {
+		t.Fatalf("ReadExport(typeuser): %v", err)
+	}
+	assertTypeuserEmbedsIncompleteTypedep(t, typeuserPkg, paths.typedep)
+
+	if _, err := typecheck.ReadExport([]byte("not export data 1"), fset, paths.broken1, cache); err == nil {
+		t.Fatal("ReadExport(broken1): want a decode error")
+	}
+	if _, err := typecheck.ReadExport([]byte("not export data 2"), fset, paths.broken2, cache); err == nil {
+		t.Fatal("ReadExport(broken2): want a decode error")
+	}
+	return fset, cache, all, unsafeuserPkg, paths
+}
+
+// assertTypeuserEmbedsIncompleteTypedep confirms the fixture assumption
+// newInvalidateFixture depends on: typeuserPkg's own deep export data
+// manifest contains typedepPath, and that entry is still an INCOMPLETE
+// placeholder.
+func assertTypeuserEmbedsIncompleteTypedep(t *testing.T, typeuserPkg *types.Package, typedepPath string) {
+	t.Helper()
+	if !typeuserPkg.Complete() {
+		t.Fatal("typeuser: want Complete() after its own ReadExport call")
+	}
+	for _, imp := range typeuserPkg.Imports() {
+		if imp.Path() != typedepPath {
+			continue
+		}
+		if imp.Complete() {
+			t.Fatal("typedep: want an INCOMPLETE placeholder (never independently decoded); fixture assumption broken")
+		}
+		return
+	}
+	t.Fatal("typeuser.Imports() does not contain typedep; fixture assumption broken")
+}
+
+// assertInvalidateResult checks next — the result of some
+// cache.Invalidate(changed) call — against wantPresent/wantAbsent path
+// lists (see probeCache) and wantFailedLen.
+func assertInvalidateResult(t *testing.T, fset *token.FileSet, next *typecheck.Cache, all typecheck.ExportSource, changed, wantPresent, wantAbsent []string, wantFailedLen int) {
+	t.Helper()
+	for _, p := range wantAbsent {
+		if _, hit := probeCache(t, fset, next, all, p); hit {
+			t.Errorf("%s: want absent (forced a fresh decode) after Invalidate(%v), got a cache hit", p, changed)
+		}
+	}
+	for _, p := range wantPresent {
+		if _, hit := probeCache(t, fset, next, all, p); !hit {
+			t.Errorf("%s: want present (cache hit) after Invalidate(%v), got a fresh decode", p, changed)
+		}
+	}
+	if got := next.FailedLen(); got != wantFailedLen {
+		t.Errorf("FailedLen() after Invalidate(%v) = %d, want %d", changed, got, wantFailedLen)
 	}
 }
 
-// TestCache_DeleteDecrementsBytes confirms Delete subtracts the deleted
-// entry's own decoded size from Bytes(), rather than leaving it in the
-// running total forever: a Cache that outlives many Delete calls (e.g.
-// depCacheHolder's long-lived cache across setWorkspace reuses) must not
-// have Bytes() grow monotonically from entries no longer even cached, or it
-// eventually forces a spurious full-cache discard past maxDepCacheBytes.
-func TestCache_DeleteDecrementsBytes(t *testing.T) {
-	fset := token.NewFileSet()
-	depFile := parseTestdata(t, fset, "dep/dep.go")
-	userFile := parseTestdata(t, fset, "user/user.go")
-	cache := typecheck.NewCache()
-	stdlib := newStdlibExportSource(t)
+// TestCache_Invalidate exercises Cache.Invalidate against
+// newInvalidateFixture's Cache.
+func TestCache_Invalidate(t *testing.T) {
+	fset, cache, all, unsafeuserPkg, paths := newInvalidateFixture(t)
 
-	depImp := typecheck.NewImporter(fset, nil, stdlib, cache)
-	depPkg, _, errs := typecheck.CheckPackage(fset, []*ast.File{depFile}, "example.com/tcmod/dep", depImp)
-	if len(errs) != 0 {
-		t.Fatalf("unexpected type errors checking dep: %v", errs)
+	baseLen, baseFailedLen, baseBytes := cache.Len(), cache.FailedLen(), cache.Bytes()
+	if baseLen != 4 {
+		t.Fatalf("cache.Len() before any Invalidate call = %d, want 4 (dep, typeuser, typedep placeholder, unsafeuser)", baseLen)
 	}
-	depBlob, err := typecheck.WriteExport(depPkg, fset)
-	if err != nil {
-		t.Fatalf("WriteExport: %v", err)
-	}
-	depSrc := blobSource{blobs: map[string][]byte{"example.com/tcmod/dep": depBlob}}
-
-	userImp := typecheck.NewImporter(fset, depSrc, stdlib, cache)
-	_, _, errs = typecheck.CheckPackage(fset, []*ast.File{userFile}, "example.com/tcmod/user", userImp)
-	if len(errs) != 0 {
-		t.Fatalf("unexpected type errors checking user: %v", errs)
+	if baseFailedLen != 2 {
+		t.Fatalf("cache.FailedLen() before any Invalidate call = %d, want 2", baseFailedLen)
 	}
 
-	afterBothDecoded := cache.Bytes()
-	if afterBothDecoded <= int64(len(depBlob)) {
-		t.Fatalf("Bytes() after decoding dep and stdlib fmt = %d, want more than dep's own blob size %d", afterBothDecoded, len(depBlob))
+	tests := []struct {
+		name          string
+		changed       []string
+		wantPresent   []string
+		wantAbsent    []string
+		wantFailedLen int
+	}{
+		{
+			name:          "changed path and the complete entry embedding it are both dropped",
+			changed:       []string{paths.typedep},
+			wantPresent:   []string{paths.dep, paths.unsafeuser},
+			wantAbsent:    []string{paths.typedep, paths.typeuser},
+			wantFailedLen: 2,
+		},
+		{
+			name:          "incomplete placeholder dropped even when unrelated to changed",
+			changed:       []string{paths.dep},
+			wantPresent:   []string{paths.unsafeuser, paths.typeuser},
+			wantAbsent:    []string{paths.dep, paths.typedep},
+			wantFailedLen: 2,
+		},
+		{
+			name:          "failure for a changed path dropped, failure for another path kept",
+			changed:       []string{paths.broken1},
+			wantPresent:   []string{paths.dep, paths.unsafeuser, paths.typeuser},
+			wantAbsent:    []string{paths.typedep},
+			wantFailedLen: 1,
+		},
 	}
 
-	cache.Delete("example.com/tcmod/dep")
-
-	if got, want := cache.Bytes(), afterBothDecoded-int64(len(depBlob)); got != want {
-		t.Errorf("Bytes() after Delete(dep) = %d, want %d (previous total minus dep's own decoded size)", got, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assertInvalidateResult(t, fset, cache.Invalidate(tt.changed), all, tt.changed, tt.wantPresent, tt.wantAbsent, tt.wantFailedLen)
+		})
 	}
 
-	decodesBefore := cache.Decodes()
-	depImp2 := typecheck.NewImporter(fset, depSrc, nil, cache)
-	if _, err := depImp2.ImportFrom("example.com/tcmod/dep", "", 0); err != nil {
-		t.Fatalf("re-import dep after Delete: %v", err)
+	t.Run("unrelated complete entry survives as the identical pointer", func(t *testing.T) {
+		next := cache.Invalidate([]string{paths.typedep, paths.dep, paths.broken1})
+		got, hit := probeCache(t, fset, next, all, paths.unsafeuser)
+		if !hit {
+			t.Fatal("unsafeuser: want a cache hit in the new Cache")
+		}
+		if got != unsafeuserPkg {
+			t.Error("unsafeuser: want the SAME *types.Package pointer in the new Cache, got a different one")
+		}
+	})
+
+	if got := cache.Len(); got != baseLen {
+		t.Errorf("cache.Len() after Invalidate calls = %d, want unchanged %d (Invalidate must not mutate its receiver)", got, baseLen)
 	}
-	if got := cache.Decodes(); got != decodesBefore+1 {
-		t.Errorf("Decodes() after re-importing deleted dep = %d, want %d (a fresh decode)", got, decodesBefore+1)
+	if got := cache.FailedLen(); got != baseFailedLen {
+		t.Errorf("cache.FailedLen() after Invalidate calls = %d, want unchanged %d (Invalidate must not mutate its receiver)", got, baseFailedLen)
+	}
+	if got := cache.Bytes(); got != baseBytes {
+		t.Errorf("cache.Bytes() after Invalidate calls = %d, want unchanged %d (Invalidate must not mutate its receiver)", got, baseBytes)
 	}
 }
 

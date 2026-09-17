@@ -37,9 +37,9 @@ type cacheGeneration struct {
 // one once its cache grows past budget — the same whole-pair-swap pattern
 // internal/server's depCacheHolder, internal/xref's Resolver, and
 // internal/depcheck's exportResolver already use for their own caches (see
-// each package's own doc) — instead of internal/typecheck.Cache's own
-// per-entry Delete, which cannot safely bound memory mid-build without
-// risking the identity split Cache's own doc describes. A generation an
+// each package's own doc) — instead of per-entry removal mid-build, which
+// cannot safely bound memory without risking the identity split
+// internal/typecheck.Cache's own doc describes. A generation an
 // in-flight check is still holding a local reference to is never mutated
 // once rotated past; it is simply dropped, along with everything it
 // cached, once nothing references it any longer — an ordinary Go GC, not an

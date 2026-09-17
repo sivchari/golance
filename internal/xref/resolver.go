@@ -576,10 +576,11 @@ func (r *Resolver) logDecodeFailureOnce(pkgPath string, err error) {
 	r.logger.Printf("xref: %s", err)
 }
 
-// Invalidate drops pkgPaths' decoded *types.Package entries from r's shared
-// export-data cache, so a later resolveNamed/resolveMethodFunc call
-// re-decodes fresh export data instead of silently reusing a *types.Package
-// decoded before pkgPaths' facts were last reindexed.
+// Invalidate replaces r's shared export-data cache with
+// typecheck.Cache.Invalidate(pkgPaths)'s result, so a later
+// resolveNamed/resolveMethodFunc call re-decodes fresh export data instead
+// of silently reusing a *types.Package decoded before pkgPaths' facts were
+// last reindexed.
 //
 // This matters because r.cache is shared across every query for r's whole
 // lifetime (see the Resolver doc), while the underlying CAS blob a given
@@ -589,43 +590,32 @@ func (r *Resolver) logDecodeFailureOnce(pkgPath string, err error) {
 // [typecheck.ReadExport]) returns whatever *types.Package is already in the
 // imports map it is given for a path, without even looking at the newly
 // read bytes, once that path has been decoded into the map once — so
-// without this, a package queried once early in a session (e.g. an
-// interface whose method set later gains or loses a method) would keep
+// without this, a package queried once early in a session would keep
 // answering from that first decode forever, regardless of how many times
-// it is actually reindexed afterward. That is the "Go to Implementation
-// alternates between working and not" instability this exists to close:
-// whether a given package's cache entry happens to already be warm from an
-// earlier query is invisible to the caller, so the same query can look
-// flaky depending only on session history.
+// it is actually reindexed afterward: the "Go to Implementation alternates
+// between working and not" instability this exists to close.
 //
-// pkgPaths is the set of packages whose export data may have changed and so
-// must be re-decoded on next use — not necessarily an exhaustive
-// reverse-dependency closure: Server.reindex, this method's production
-// caller, passes only the hops index.Reindex actually reprocessed
-// ([index.Stats.Changed]), on the grounds that a hop it skipped had export
-// data provably unchanged (see reindex's own doc). A dropped entry's own
-// decoded *types.Package can still be embedded inside another cached
-// entry's types (e.g. via an embedded interface or struct field), so a
-// caller that wants those covered too must include them in pkgPaths
-// itself, the same way depCacheHolder.invalidate's caller does.
+// pkgPaths is the set of packages whose export data may have changed —
+// Server.reindex, this method's production caller, passes only the hops
+// index.Reindex actually reprocessed ([index.Stats.Changed]) — not an
+// exhaustive reverse-dependency closure. typecheck.Cache.Invalidate covers
+// the rest itself: it also drops any complete cache entry that still
+// embeds one of pkgPaths (e.g. via an embedded interface or struct field)
+// and every incomplete placeholder, so a caller here need not enumerate
+// dependents the way an in-place per-path delete would have required.
 //
 // r.units needs no equivalent treatment here: it is keyed by BlobKey, the
 // CAS content address a reindex necessarily changes (see unitCache's doc),
 // so a stale entry simply stops being looked up on its own rather than
 // needing an explicit drop.
 //
-// r.cache.Delete also drops pkgPath's cached ReadExport FAILURE, if any
-// (see typecheck.Cache's doc) — a package that failed to decode before
-// this reindex deserves a genuine retry, not the stale error forever —
-// and this also resets r.decodeFailureLogged for pkgPath, so a failure
-// that recurs after reindexing logs again instead of staying silent from
+// A query already holding r's (fset, cache) pair via pinExportCache is
+// unaffected: Invalidate returns a new Cache rather than mutating the one
+// that query pinned, so it keeps a consistent view for its own duration
+// (see typecheck.Cache.Invalidate's own doc). r.decodeFailureLogged is
+// cleared per pkgPaths entry regardless, so a failure that recurs after
+// reindexing logs again instead of staying silent from
 // logDecodeFailureOnce's earlier dedup.
-//
-// Reads r.cache once under cacheMu rather than through exportCache: a
-// concurrent exportCache reset racing this call is the same accepted,
-// narrow window exportCache's own doc describes -- either the pre- or
-// post-reset cache gets pkgPaths' Delete calls, and a reset already
-// discards every entry Invalidate would have dropped anyway.
 //
 // Also clears every confirmMemo outright, rather than surgically dropping
 // only entries touching pkgPaths: unlike r.cache (keyed by exactly the
@@ -640,10 +630,9 @@ func (r *Resolver) logDecodeFailureOnce(pkgPath string, err error) {
 // (see implementation.go's *Confirm functions), never more.
 func (r *Resolver) Invalidate(pkgPaths []string) {
 	r.cacheMu.Lock()
-	cache := r.cache
+	r.cache = r.cache.Invalidate(pkgPaths)
 	r.cacheMu.Unlock()
 	for _, p := range pkgPaths {
-		cache.Delete(p)
 		r.decodeFailureLogged.Delete(p)
 	}
 	r.implementingTypesMemo.clear()
