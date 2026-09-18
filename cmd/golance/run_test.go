@@ -85,22 +85,21 @@ func TestRun_DeadlineExceededExitsZero(t *testing.T) {
 // pollableStdin must produce a *os.File that DOES support deadlines from
 // one that does not.
 //
-// The first half of this test (forcing the pipe's read end back into
-// blocking mode via syscall.SetNonblock, then re-wrapping it with
-// os.NewFile) reproduces exactly the state an inherited fd 0 is normally
-// found in, without needing a real subprocess.
+// The pipe is created with raw syscall.Pipe, not os.Pipe: its fds start out
+// blocking and were never registered with the runtime poller, exactly the
+// state an inherited fd 0 is found in. Re-wrapping an os.Pipe fd instead
+// would leave a stale epoll registration behind on Linux, where a second
+// registration of the same fd fails (EEXIST) and silently forces
+// pollableStdin's result back into blocking mode — a test-only artifact a
+// real inherited stdin can never hit.
 func TestPollableStdin_MakesInheritedBlockingPipeDeadlineCapable(t *testing.T) {
-	pr, pw, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
+	var p [2]int
+	if err := syscall.Pipe(p[:]); err != nil {
+		t.Fatalf("syscall.Pipe: %v", err)
 	}
-	t.Cleanup(func() { _ = pw.Close() })
+	t.Cleanup(func() { _ = syscall.Close(p[1]) })
 
-	fd := pr.Fd()
-	if err := syscall.SetNonblock(int(fd), false); err != nil {
-		t.Fatalf("SetNonblock(false): %v", err)
-	}
-	blocking := os.NewFile(fd, pr.Name())
+	blocking := os.NewFile(uintptr(p[0]), "inherited-stdin")
 	t.Cleanup(func() { _ = blocking.Close() })
 
 	if err := blocking.SetReadDeadline(time.Now()); !errors.Is(err, os.ErrNoDeadline) {
