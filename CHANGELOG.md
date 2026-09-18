@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.15](https://github.com/sivchari/golance/compare/v0.7.14...v0.7.15) - 2026-09-18
+- fix: build-tag pollableStdin so the Windows release binaries compile again by @sivchari in https://github.com/sivchari/golance/pull/135
+
 ## [v0.7.14](https://github.com/sivchari/golance/compare/v0.7.13...v0.7.14) - 2026-09-18
 - fix: exit the server when the editor client dies by @sivchari in https://github.com/sivchari/golance/pull/133
 
