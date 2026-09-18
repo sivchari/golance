@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -46,6 +48,88 @@ func TestRunServesUntilEOF(t *testing.T) {
 	code := run(nil, strings.NewReader(""), &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("run() code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+}
+
+// deadlineExceededReader's Read always fails with os.ErrDeadlineExceeded,
+// standing in for a real *os.File past its read deadline: since it is not a
+// *os.File, pollableStdin passes it through unchanged, letting
+// TestRun_DeadlineExceededExitsZero isolate run's own serveErr handling from
+// pollableStdin's fd rewrapping (covered separately by
+// TestPollableStdin_MakesInheritedBlockingPipeDeadlineCapable).
+type deadlineExceededReader struct{}
+
+func (deadlineExceededReader) Read([]byte) (int, error) {
+	return 0, os.ErrDeadlineExceeded
+}
+
+// TestRun_DeadlineExceededExitsZero verifies run treats stdin's own
+// SetReadDeadline-induced os.ErrDeadlineExceeded as a clean, intentional
+// disconnect (exit code 0) rather than a real I/O error: this is exactly
+// what a ClientGone callback triggers on stdin to unblock Serve's read loop
+// when the LSP client process itself has died (see server.Options.ClientGone
+// and internal/rpc.Server.Serve's read loop).
+func TestRun_DeadlineExceededExitsZero(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run(nil, deadlineExceededReader{}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+}
+
+// TestPollableStdin_MakesInheritedBlockingPipeDeadlineCapable is a
+// regression test for a real e2e finding: an inherited fd 0 (a child
+// process's real stdin, as opposed to an os.Pipe() created in-process) is in
+// blocking mode and so is never registered with the runtime poller, making
+// File.SetReadDeadline silently ineffective on it (os.ErrNoDeadline).
+// pollableStdin must produce a *os.File that DOES support deadlines from
+// one that does not.
+//
+// The first half of this test (forcing the pipe's read end back into
+// blocking mode via syscall.SetNonblock, then re-wrapping it with
+// os.NewFile) reproduces exactly the state an inherited fd 0 is normally
+// found in, without needing a real subprocess.
+func TestPollableStdin_MakesInheritedBlockingPipeDeadlineCapable(t *testing.T) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() { _ = pw.Close() })
+
+	fd := pr.Fd()
+	if err := syscall.SetNonblock(int(fd), false); err != nil {
+		t.Fatalf("SetNonblock(false): %v", err)
+	}
+	blocking := os.NewFile(fd, pr.Name())
+	t.Cleanup(func() { _ = blocking.Close() })
+
+	if err := blocking.SetReadDeadline(time.Now()); !errors.Is(err, os.ErrNoDeadline) {
+		t.Fatalf("SetReadDeadline on the simulated inherited blocking fd = %v, want os.ErrNoDeadline (test setup does not reproduce the bug)", err)
+	}
+
+	pollable := pollableStdin(blocking)
+	pf, ok := pollable.(*os.File)
+	if !ok {
+		t.Fatalf("pollableStdin() returned %T, want *os.File", pollable)
+	}
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := pf.Read(make([]byte, 1))
+		readErr <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // let the Read above actually block first
+	if err := pf.SetReadDeadline(time.Now()); err != nil {
+		t.Fatalf("SetReadDeadline() on pollableStdin's result = %v, want nil", err)
+	}
+
+	select {
+	case err := <-readErr:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("Read() error = %v, want os.ErrDeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read() did not unblock after SetReadDeadline; pollableStdin did not make the fd poller-registered")
 	}
 }
 

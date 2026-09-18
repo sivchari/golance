@@ -51,6 +51,10 @@ type Options struct {
 	// file-change notifications to go quiet before revalidating the
 	// workspace (see watchDebouncer). <= 0 uses defaultWatchDebounce.
 	WatchDebounce time.Duration
+	// ClientGone is called at most once, from a background goroutine, when
+	// the client process from initialize's processId no longer exists (see
+	// watchClientProcess). nil disables the check entirely.
+	ClientGone func()
 }
 
 // workspace bundles every value that depends on the current import graph

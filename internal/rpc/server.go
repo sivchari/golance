@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.lsp.dev/protocol"
 )
@@ -77,6 +78,11 @@ type Server struct {
 	// against Serve's write. Nil before Serve is called.
 	ctx atomic.Pointer[context.Context]
 
+	// drainTimeout bounds how long Serve's shutdown-time drain (see drain)
+	// waits for in-flight handlers and Go-launched background work before
+	// abandoning them, set by NewServer to defaultDrainTimeout.
+	drainTimeout time.Duration
+
 	conn *conn
 }
 
@@ -122,6 +128,10 @@ func defaultBackgroundWorkers() int {
 	return 4
 }
 
+// defaultDrainTimeout is drainTimeout's default, set by NewServer. See
+// drain's own doc for why shutdown must not wait unboundedly.
+const defaultDrainTimeout = 30 * time.Second
+
 // NewServer constructs a Server. Register handlers with Handle and
 // HandleNotification, then call Serve.
 func NewServer(opts ...Option) *Server {
@@ -133,8 +143,9 @@ func NewServer(opts ...Option) *Server {
 			Interactive: newPool(0),
 			Background:  newPool(defaultBackgroundWorkers()),
 		},
-		queues:  make(map[string]*notifQueue),
-		pending: make(map[string]chan *message),
+		queues:       make(map[string]*notifQueue),
+		pending:      make(map[string]chan *message),
+		drainTimeout: defaultDrainTimeout,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -172,7 +183,9 @@ func (e *ExitError) Error() string {
 // them to registered handlers until r is exhausted or the client sends
 // "exit". Responses and server-initiated notifications (see Notify) are
 // written to w. Serve returns nil on a clean EOF from r (peer closed the
-// pipe without sending exit) and an *ExitError after "exit".
+// pipe without sending exit) and an *ExitError after "exit". Before
+// returning, Serve waits (bounded by drainTimeout — see drain) for every
+// in-flight handler and Go-launched background goroutine to finish.
 func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	s.conn = newConn(w)
 	// s.ctx is deliberately independent of the per-request/notification ctx
@@ -186,11 +199,11 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	// background work that has no other reason to stop.
 	sessionCtx, cancel := context.WithCancel(ctx)
 	s.ctx.Store(&sessionCtx)
-	// cancel must run before wg.Wait below (defers run LIFO): canceling
-	// first lets every Go-launched background goroutine observe it and
-	// return promptly, so wg.Wait — which also drains those — does not
-	// block on work that would otherwise never stop on its own.
-	defer s.wg.Wait()
+	// cancel must run before drain below (defers run LIFO): canceling first
+	// lets every Go-launched background goroutine observe it and return
+	// promptly, so drain's own wait does not block on work that would
+	// otherwise never stop on its own.
+	defer s.drain()
 	defer cancel()
 	br := bufio.NewReaderSize(r, 1<<20)
 	for {
@@ -226,10 +239,31 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	}
 }
 
+// drain waits for wg — every in-flight request/notification handler plus
+// every Go-launched background goroutine — to finish, bounded by
+// drainTimeout. A handler that never returns (a genuine bug, or a client
+// process that died mid-request with nothing left to observe cancellation)
+// would otherwise block Serve from ever returning: the process this Serve
+// call belongs to is already on its way out by the time drain runs, so
+// abandoning a wedged handler here trades a clean wait for guaranteed
+// forward progress instead of orphaning the whole process indefinitely.
+func (s *Server) drain() {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(s.drainTimeout):
+		s.logger.Printf("rpc: shutdown drain timed out after %s; abandoning in-flight handlers", s.drainTimeout)
+	}
+}
+
 // Context returns the context bound to this Serve call's own lifetime: a
 // child of the ctx passed to Serve, canceled once Serve returns (client
 // "exit", EOF, or a read error) but before Serve's own shutdown-time
-// wg.Wait completes. A request handler's own ctx parameter is instead a
+// drain completes. A request handler's own ctx parameter is instead a
 // per-request child canceled the moment that handler returns (see
 // dispatchRequest), so it is the wrong choice for detached background
 // work started from a request handler that must outlive the request
@@ -247,10 +281,11 @@ func (s *Server) Context() context.Context {
 
 // Go runs fn in its own goroutine, passed Context() and tracked by wg the
 // same way an in-flight request/notification handler is — so Serve's
-// shutdown-time drain waits (briefly) for it instead of abandoning it —
-// for detached background work a handler starts that must outlive the
-// call that started it (e.g. launching the indexer subprocess, a
-// debounced reindex) but should still stop once the session itself ends.
+// shutdown-time drain waits for it, bounded by drainTimeout, instead of
+// abandoning it immediately — for detached background work a handler
+// starts that must outlive the call that started it (e.g. launching the
+// indexer subprocess, a debounced reindex) but should still stop once the
+// session itself ends.
 //
 // A panic in fn is recovered and logged with a stack trace, mirroring
 // callRequestHandler's and callNotificationHandler's own handler-panic

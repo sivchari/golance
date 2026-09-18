@@ -860,3 +860,53 @@ func TestGo_PanicRecoveredLoggedAndDrainsOnShutdown(t *testing.T) {
 		t.Fatalf("log output = %q, want a stack trace", got)
 	}
 }
+
+// TestServe_DrainTimeoutAbandonsWedgedHandler verifies Serve's shutdown-time
+// drain is bounded by drainTimeout: a request handler that never returns
+// must not block Serve from returning after EOF forever, since a wedged
+// handler otherwise leaves the whole process orphaned (see internal/server's
+// watchClientProcess, whose ClientGone teardown path depends on Serve
+// actually returning within a bounded time).
+func TestServe_DrainTimeoutAbandonsWedgedHandler(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var logBuf bytes.Buffer
+		s := NewServer(WithLogger(log.New(&logBuf, "", 0)))
+		s.drainTimeout = 50 * time.Millisecond
+
+		block := make(chan struct{})
+		s.Handle("initialize", Interactive, func(context.Context, json.RawMessage) (any, error) {
+			<-block // never released: simulates a wedged handler
+			return nil, nil
+		})
+
+		pr, pw := io.Pipe()
+		var out bytes.Buffer
+		go func() {
+			_, _ = pw.Write([]byte(frame(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)))
+			_ = pw.Close()
+		}()
+
+		done := make(chan error, 1)
+		go func() { done <- s.Serve(context.Background(), pr, &out) }()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Serve() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Serve() did not return within the bounded drain timeout; the wedged handler blocked shutdown")
+		}
+
+		// Release the abandoned handler so its goroutine can finish: a
+		// synctest bubble deadlocks if it exits with a goroutine still
+		// durably blocked, even though drain itself is exactly what let
+		// Serve return without waiting for it.
+		close(block)
+		synctest.Wait()
+
+		if got := logBuf.String(); !strings.Contains(got, "shutdown drain timed out") {
+			t.Fatalf("log output = %q, want it to mention the drain timeout", got)
+		}
+	})
+}
