@@ -294,6 +294,16 @@ func (s *Server) tryWarmOpen(root string) (*indexState, bool) {
 		_ = db.Close()
 		return nil, false
 	}
+	// Say so: a warm open is otherwise silent, which makes "did it reuse the
+	// index or is it rebuilding again?" unanswerable from the log alone —
+	// the question every "invalid type after restart" report starts with.
+	// A database discarded for a schema change (WasRecreated) is empty, so
+	// the revalidate pass that follows will rebuild it.
+	if db.WasRecreated() {
+		s.logger.Printf("golance: index discarded: written by a different golance version or index format; rebuilding")
+	} else {
+		s.logger.Printf("golance: index opened from disk")
+	}
 	return &indexState{db: db, cas: cas, resolver: s.newResolver(db, cas, ws.snap, RelativeIndexPaths(root))}, true
 }
 
@@ -341,6 +351,32 @@ func chooseIndexRevalidateAction(pkgs []string, wholeDBStale bool) indexRevalida
 	return indexRevalidateRebuild
 }
 
+// String names the action for revalidateIndex's own log line.
+func (a indexRevalidateAction) String() string {
+	switch a {
+	case indexRevalidateRepair:
+		return "repairing stale packages in place"
+	case indexRevalidateRebuild:
+		return "rebuilding the whole index"
+	default:
+		return "up to date"
+	}
+}
+
+// samplePkgs renders at most three of pkgs for a log line, so a rebuild
+// triggered by a handful of packages names them without printing thousands.
+func samplePkgs(pkgs []string) string {
+	if len(pkgs) == 0 {
+		return ""
+	}
+	shown := pkgs
+	suffix := ""
+	if len(shown) > 3 {
+		shown, suffix = shown[:3], ", ..."
+	}
+	return ", e.g. " + strings.Join(shown, ", ") + suffix
+}
+
 // revalidateIndex checks, cheaply and in-process, whether root's
 // warm-opened facts index (installed by a prior tryWarmOpen) is still up
 // to date — the same skip logic [index.Build] uses to decide whether a
@@ -382,6 +418,15 @@ func (s *Server) revalidateIndex(ctx context.Context, root string) {
 	defer s.idxMu.Unlock()
 	pkgs, wholeDBStale := s.staleIndexPackages(ctx)
 	action := chooseIndexRevalidateAction(pkgs, wholeDBStale)
+	// A rebuild drops the open index (below), which makes every dependency
+	// import unresolvable until it finishes — the visible symptom being
+	// "invalid type" on files that were fine a moment ago. Log why it was
+	// chosen: whether the database as a whole was untrustworthy, or which
+	// packages looked stale, is otherwise invisible from outside.
+	if action != indexRevalidateNone {
+		s.logger.Printf("golance: index revalidate: %s (whole database stale: %v; stale packages: %d%s)",
+			action, wholeDBStale, len(pkgs), samplePkgs(pkgs))
+	}
 	if action == indexRevalidateRepair {
 		idx := s.idx.Load()
 		ws := s.workspace()
