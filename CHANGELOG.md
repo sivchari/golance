@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.14](https://github.com/sivchari/golance/compare/v0.7.13...v0.7.14) - 2026-09-18
+- fix: exit the server when the editor client dies by @sivchari in https://github.com/sivchari/golance/pull/133
+
 ## [v0.7.13](https://github.com/sivchari/golance/compare/v0.7.12...v0.7.13) - 2026-09-18
 - fix: log whether the index was reused, discarded, or rebuilt on startup by @sivchari in https://github.com/sivchari/golance/pull/131
 
