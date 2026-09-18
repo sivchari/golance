@@ -25,6 +25,42 @@ import (
 	"github.com/sivchari/golance/internal/store"
 )
 
+// clientGoneExitTimeout backstops server.Options.ClientGone's own teardown:
+// if internal/rpc.Server's shutdown drain is itself wedged badly enough that
+// even its own drainTimeout does not save it (a bug there, not something
+// this constant is meant to routinely trigger), this forces the process to
+// exit rather than stay an orphan holding the shared index lock forever —
+// the exact failure this whole ClientGone mechanism exists to prevent.
+const clientGoneExitTimeout = 30 * time.Second
+
+// pollableStdin returns a version of stdin that supports SetReadDeadline,
+// converting it in place if necessary.
+//
+// A real editor-launched golance inherits fd 0 from its parent in blocking
+// mode, which the Go runtime never registers with its I/O poller; calling
+// SetReadDeadline on that *os.File is a silent no-op (returns
+// os.ErrNoDeadline internally, swallowed by ClientGone below), so it can
+// never unblock Serve's read loop. ClientGone's graceful teardown depends
+// entirely on stdin actually honoring a deadline — without this, every
+// client-death shutdown falls through to the time.AfterFunc os.Exit
+// backstop instead, which never gives the indexer subprocess a chance to be
+// killed via its own ctx cancellation.
+func pollableStdin(stdin io.Reader) io.Reader {
+	f, ok := stdin.(*os.File)
+	if !ok {
+		return stdin
+	}
+	// Fd() itself forces f into blocking mode as a side effect, so it must
+	// run before SetNonblock below, not after.
+	fd := f.Fd()
+	if err := syscall.SetNonblock(int(fd), true); err != nil {
+		return f
+	}
+	// NewFile observes the O_NONBLOCK flag just set above and registers fd
+	// with the runtime poller, which is what makes SetReadDeadline work.
+	return os.NewFile(fd, f.Name())
+}
+
 // run is main's testable body: it dispatches to the indexer subprocess
 // entry point when server.EnvIndexer is set, otherwise it parses flags and
 // serves LSP over stdin/stdout until the client disconnects or sends
@@ -33,6 +69,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if os.Getenv(server.EnvIndexer) == "1" {
 		return runIndexer(stdout, stderr)
 	}
+	stdin = pollableStdin(stdin)
 
 	fs := flag.NewFlagSet("golance", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -77,6 +114,22 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		MemLimit:      *memLimit,
 		Offline:       *offline,
 		WatchDebounce: time.Duration(*watchDebounceMS) * time.Millisecond,
+		ClientGone: func() {
+			// Unblocks Serve's read loop through its normal teardown path
+			// (an error from readFrame, which run's own serveErr handling
+			// below recognizes and treats as a clean exit) instead of
+			// killing the process out from under any in-flight handler.
+			if f, ok := stdin.(*os.File); ok {
+				_ = f.SetReadDeadline(time.Now())
+			}
+			// Backstop for a handler wedged badly enough that Serve's own
+			// bounded drain (internal/rpc.Server.drainTimeout) is not
+			// enough to save it.
+			time.AfterFunc(clientGoneExitTimeout, func() {
+				logger.Printf("golance: client is gone and shutdown did not complete in %s; forcing exit", clientGoneExitTimeout)
+				os.Exit(1)
+			})
+		},
 	})
 
 	// Bound to the process's own signals, the same way runIndexer's own
@@ -93,8 +146,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	if serveErr != nil {
 		var exitErr *rpc.ExitError
-		if errors.As(serveErr, &exitErr) {
+		switch {
+		case errors.As(serveErr, &exitErr):
 			return exitErr.Code
+		case errors.Is(serveErr, os.ErrDeadlineExceeded):
+			// ClientGone's own SetReadDeadline call above, not a real I/O
+			// error: the client process is already confirmed gone.
+			return 0
 		}
 		_, _ = fmt.Fprintf(logOut, "golance: serve: %v\n", serveErr)
 		return 1

@@ -74,6 +74,14 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 		return nil, err
 	}
 
+	// See watchClientProcess's own doc for why this is needed at all (a
+	// dead client's own EOF may never arrive). Bound to the session's own
+	// lifetime via s.rpc.Go, same as loadWorkspaceAsync below.
+	if p.ProcessID != nil {
+		pid := int(*p.ProcessID)
+		s.rpc.Go(func(ctx context.Context) { s.watchClientProcess(ctx, pid) })
+	}
+
 	// Bound to the session's own lifetime via s.rpc.Go — not this request's
 	// own ctx, which internal/rpc.Server cancels the moment this handler
 	// returns (see dispatchRequest) — and tracked by Serve's wg so shutdown
