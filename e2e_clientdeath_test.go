@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,6 +59,7 @@ func TestE2E_ServerExitsWhenClientProcessDies(t *testing.T) {
 		t.Fatalf("start helper process: %v", err)
 	}
 	t.Cleanup(func() { _ = helper.Process.Kill(); _ = helper.Wait() })
+	helperPID := clientDeathPID(t, helper.Process.Pid)
 
 	fakeHome := t.TempDir()
 	stderrPath := filepath.Join(fakeHome, "golance.stderr")
@@ -96,23 +98,7 @@ func TestE2E_ServerExitsWhenClientProcessDies(t *testing.T) {
 		}
 	})
 
-	// initDone reports the initialize response (or the drain's read error,
-	// if golance exits before ever answering); drainClientDeathStdout keeps
-	// consuming every frame after that too, so golance's own writes never
-	// block on a full pipe for the rest of the test.
-	initDone := make(chan error, 1)
-	go drainClientDeathStdout(bufio.NewReaderSize(stdout, 1<<20), initDone)
-
-	sendClientDeathInitialize(t, stdin, root, helper.Process.Pid)
-
-	select {
-	case err := <-initDone:
-		if err != nil {
-			t.Fatalf("initialize: %v", err)
-		}
-	case <-time.After(e2eRequestBudget):
-		t.Fatalf("golance did not respond to initialize within %s", e2eRequestBudget)
-	}
+	performClientDeathInitialize(t, stdin, stdout, root, helperPID)
 
 	helperKilledAt := time.Now()
 	if err := helper.Process.Kill(); err != nil {
@@ -120,27 +106,7 @@ func TestE2E_ServerExitsWhenClientProcessDies(t *testing.T) {
 	}
 	_ = helper.Wait()
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-
-	select {
-	case <-done:
-	case <-time.After(clientDeathExitBudget):
-		t.Fatalf("golance did not exit within %s of its watched client process dying", clientDeathExitBudget)
-	}
-	t.Logf("golance exited %s after its watched client process died", time.Since(helperKilledAt))
-
-	stderrBytes, err := os.ReadFile(filepath.Clean(stderrPath))
-	if err != nil {
-		t.Fatalf("read stderr log: %v", err)
-	}
-	stderr := string(stderrBytes)
-	if !strings.Contains(stderr, "client process") || !strings.Contains(stderr, "is gone") {
-		t.Fatalf("expected golance's stderr to log the client process going away, got:\n%s", stderr)
-	}
-	if strings.Contains(stderr, "forcing exit") {
-		t.Fatalf("golance hit its 30s os.Exit backstop instead of the graceful shutdown path:\n%s", stderr)
-	}
+	awaitClientDeathExitAndAssertLogs(t, cmd, stderrPath, helperKilledAt)
 }
 
 // writeClientDeathModule writes a minimal Go module: this test only needs a
@@ -157,13 +123,32 @@ func writeClientDeathModule(t *testing.T) string {
 	return root
 }
 
-// sendClientDeathInitialize writes an initialize request naming pid as
-// initialize's processId to w, under id clientDeathInitializeID.
-func sendClientDeathInitialize(t *testing.T, w io.Writer, root string, pid int) {
+// clientDeathPID converts pid (an OS process id, always non-negative) to
+// the int32 initialize's processId field requires. The bound check is the
+// in-range edge gosec's G115 needs to see for the int -> int32 narrowing.
+func clientDeathPID(t *testing.T, pid int) int32 {
 	t.Helper()
-	p := int32(pid)
+	if pid >= 0 && pid <= math.MaxInt32 {
+		return int32(pid)
+	}
+	t.Fatalf("pid %d out of int32 range", pid)
+	return 0
+}
+
+// performClientDeathInitialize builds and sends an initialize request
+// naming pid as initialize's processId, then blocks until golance answers
+// it (or e2eRequestBudget elapses). handleInitialize starts
+// watchClientProcess synchronously before that response is sent (see its
+// own doc), so once this returns, golance is guaranteed to already be
+// watching pid.
+func performClientDeathInitialize(t *testing.T, stdin io.Writer, stdout io.Reader, root string, pid int32) {
+	t.Helper()
+
+	initDone := make(chan error, 1)
+	go drainClientDeathStdout(bufio.NewReaderSize(stdout, 1<<20), initDone)
+
 	params := &protocol.InitializeParams{
-		ProcessID: &p,
+		ProcessID: &pid,
 		WorkspaceFoldersInitializeParams: protocol.WorkspaceFoldersInitializeParams{
 			WorkspaceFolders: protocol.NewNullable([]protocol.WorkspaceFolder{
 				{URI: uri.File(root), Name: filepath.Base(root)},
@@ -178,8 +163,17 @@ func sendClientDeathInitialize(t *testing.T, w io.Writer, root string, pid int) 
 	if err != nil {
 		t.Fatalf("marshal initialize request: %v", err)
 	}
-	if err := newFrameWriter(w).write(raw); err != nil {
+	if err := newFrameWriter(stdin).write(raw); err != nil {
 		t.Fatalf("write initialize request: %v", err)
+	}
+
+	select {
+	case err := <-initDone:
+		if err != nil {
+			t.Fatalf("initialize: %v", err)
+		}
+	case <-time.After(e2eRequestBudget):
+		t.Fatalf("golance did not respond to initialize within %s", e2eRequestBudget)
 	}
 }
 
@@ -187,9 +181,6 @@ func sendClientDeathInitialize(t *testing.T, w io.Writer, root string, pid int) 
 // stdout) for the life of the process, reporting on done exactly once: the
 // initialize response's error (nil on success) once clientDeathInitializeID
 // arrives, or the read error if golance exits before ever answering it.
-// handleInitialize starts watchClientProcess synchronously before that
-// response is sent (see its own doc), so by the time done receives nil,
-// golance is guaranteed to already be watching the pid the request named.
 func drainClientDeathStdout(r *bufio.Reader, done chan<- error) {
 	reported := false
 	for {
@@ -213,5 +204,36 @@ func drainClientDeathStdout(r *bufio.Reader, done chan<- error) {
 			continue
 		}
 		done <- nil
+	}
+}
+
+// awaitClientDeathExitAndAssertLogs waits for cmd to exit on its own
+// within clientDeathExitBudget of killedAt, then asserts golance's stderr
+// log (at stderrPath) recorded the graceful client-death shutdown path
+// (internal/server/clientwatch.go's "client process ... is gone" line)
+// rather than cmd/golance's 30s os.Exit backstop ("forcing exit").
+func awaitClientDeathExitAndAssertLogs(t *testing.T, cmd *exec.Cmd, stderrPath string, killedAt time.Time) {
+	t.Helper()
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case <-done:
+	case <-time.After(clientDeathExitBudget):
+		t.Fatalf("golance did not exit within %s of its watched client process dying", clientDeathExitBudget)
+	}
+	t.Logf("golance exited %s after its watched client process died", time.Since(killedAt))
+
+	stderrBytes, err := os.ReadFile(filepath.Clean(stderrPath))
+	if err != nil {
+		t.Fatalf("read stderr log: %v", err)
+	}
+	stderr := string(stderrBytes)
+	if !strings.Contains(stderr, "client process") || !strings.Contains(stderr, "is gone") {
+		t.Fatalf("expected golance's stderr to log the client process going away, got:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "forcing exit") {
+		t.Fatalf("golance hit its 30s os.Exit backstop instead of the graceful shutdown path:\n%s", stderr)
 	}
 }
