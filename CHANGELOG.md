@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.7.16](https://github.com/sivchari/golance/compare/v0.7.15...v0.7.16) - 2026-09-19
+- perf: convert references results per file instead of per location by @sivchari in https://github.com/sivchari/golance/pull/137
+
 ## [v0.7.15](https://github.com/sivchari/golance/compare/v0.7.14...v0.7.15) - 2026-09-18
 - fix: build-tag pollableStdin so the Windows release binaries compile again by @sivchari in https://github.com/sivchari/golance/pull/135
 
