@@ -104,19 +104,25 @@ func startAndAwaitIndex(t *testing.T, root, fakeHome, appFile string) (c *lspCli
 }
 
 // TestE2E_WorktreeSharesIndex verifies that a second golance session opened
-// against a git worktree of an already-indexed repository reuses the first
-// session's CAS content (internal/server's repoKey-keyed casDir) instead of
-// re-type-checking anything, and that an edit made only in that second
-// worktree is incrementally reindexed without touching the first
-// worktree's own per-root index.
+// against a git worktree of an already-indexed repository seeds its own
+// per-root index directly from the first session's already-built database
+// (internal/server's trySeedFromSibling, via the repoKey-keyed casDir's
+// member registry) instead of running an indexer subprocess build of its
+// own at all, and that an edit made only in that second worktree is
+// incrementally reindexed without touching the first worktree's own
+// per-root index.
 //
-// Unlike the pre-CAS design, the second worktree's own per-root index
-// database (indexDBFile) is always private — never shared — so it still
-// runs its own index build on first open; what the CAS buys it is that
-// this build never re-type-checks anything the first worktree's build
-// already processed, only resolves CAS hits and writes its own small
-// per-root pointer/index entries (see startAndAwaitIndex's stats.typeChecked
-// assertion below).
+// Worktree B's own per-root index database (indexDBFile) is still always
+// private to it — never shared — but Phase A2 means it no longer has to be
+// independently BUILT: cloning worktree A's bytes directly is strictly
+// cheaper than even a CAS-hit-only build, since it skips re-walking every
+// package. Because no indexer subprocess ever runs for worktree B, no
+// $/progress "golance/index" notification is ever sent for it either — see
+// startAndAwaitIndex's own doc, used only for worktree A below.
+// definitionAt/waitForNonEmptyLocations's own bounded retry is what
+// actually waits out the seed for worktree B, the same "warm reopen, no
+// progress" shape TestE2E_WorktreeSelfHealsMissingPackageFacts documents
+// for its own worktree B session.
 func TestE2E_WorktreeSharesIndex(t *testing.T) {
 	skipUnlessE2E(t)
 
@@ -136,19 +142,13 @@ func TestE2E_WorktreeSharesIndex(t *testing.T) {
 	a.stop(t)
 
 	// Worktree B: a second session, same repository (byte-identical
-	// content, different worktree root), different absolute root. It still
-	// runs its own index build (its per-root index database is private —
-	// see startAndAwaitIndex's doc), but every package's content was
-	// already processed for worktree A, so this build must complete via CAS
-	// hits alone — asserted directly on the build's own reported stats
-	// below, not inferred from how fast it happened to run; e2eIndexBudget
-	// here is only an upper bound against the build hanging outright.
+	// content, different worktree root), different absolute root — a cold
+	// start (its own per-root index does not exist yet) that seeds from
+	// worktree A's instead of building.
 	otherAppFile := strings.Replace(locs.appFile, mainRoot, otherRoot, 1)
-	b, bStats, elapsed := startAndAwaitIndex(t, otherRoot, fakeHome, otherAppFile)
-	t.Logf("worktree B: build finished in %s (%+v)", elapsed, bStats)
-	if bStats.typeChecked != 0 {
-		t.Errorf("worktree B: type-checked %d package(s), want 0 (every package's content was already processed for worktree A; this build must resolve via CAS hits alone)", bStats.typeChecked)
-	}
+	b := startClientIn(t, otherRoot, fakeHome)
+	b.initialize(t, otherRoot)
+	b.openFile(t, otherAppFile)
 
 	got = definitionAt(t, b, otherAppFile, locs.sumCallInApp)
 	if len(got) != 1 {
@@ -157,6 +157,14 @@ func TestE2E_WorktreeSharesIndex(t *testing.T) {
 	otherUtilFile := strings.Replace(locs.utilFile, mainRoot, otherRoot, 1)
 	if gotPath := got[0].URI.FsPath(); gotPath != otherUtilFile {
 		t.Fatalf("worktree B: definition file = %s, want %s (worktree B's own absolute path, not worktree A's)", gotPath, otherUtilFile)
+	}
+
+	// Worktree A already stopped above, so fakeHome's shared stderr log
+	// file is now exclusively worktree B's own — safe to assert on
+	// directly (see stderrLogContent's own doc on why that is not true
+	// while two sessions still share fakeHome concurrently).
+	if log := stderrLogContent(t, fakeHome); !strings.Contains(log, "seeded index from a sibling checkout's database") {
+		t.Errorf("worktree B's log does not show the sibling-seed path was taken:\n%s", log)
 	}
 
 	// Editing worktree B alone must incrementally reindex just that change
@@ -204,6 +212,16 @@ func TestE2E_WorktreeSharesIndex(t *testing.T) {
 // B could even open it), the CAS is lock-free and each worktree's own
 // per-root index database is private, so there is nothing for the two
 // sessions to contend over.
+//
+// Neither goroutine below waits on waitForIndexReady's $/progress
+// notification: with both sessions racing a genuinely simultaneous cold
+// start, which one — if either — happens to find the other's database
+// already registered as a seed candidate (trySeedFromSibling) by the time
+// its own tryWarmOpen runs is a real, unresolved race, and a seeded open
+// never sends that notification at all (see TestE2E_WorktreeSharesIndex).
+// definitionAt's own bounded retry works correctly regardless of which
+// path either session actually took, so it is the only readiness signal
+// this test relies on.
 func TestE2E_WorktreeSimultaneousStartup(t *testing.T) {
 	skipUnlessE2E(t)
 
@@ -224,11 +242,9 @@ func TestE2E_WorktreeSimultaneousStartup(t *testing.T) {
 	resA := make(chan protocol.LocationSlice, 1)
 	resB := make(chan protocol.LocationSlice, 1)
 	go func() {
-		a.waitForIndexReady(t)
 		resA <- definitionAt(t, a, locs.appFile, locs.sumCallInApp)
 	}()
 	go func() {
-		b.waitForIndexReady(t)
 		resB <- definitionAt(t, b, otherAppFile, locs.sumCallInApp)
 	}()
 
@@ -415,12 +431,18 @@ func TestE2E_WorktreeSelfHealsMissingPackageFacts(t *testing.T) {
 	a.stop(t)
 
 	// Worktree B's own first session: also a genuine cold start (its
-	// per-root facts index does not exist yet), which builds and installs
-	// it. This is the shared graph cache's first save from worktree B's own
-	// perspective, so it now reflects worktree B's current (still
-	// incomplete) package set.
+	// per-root facts index does not exist yet), which now seeds directly
+	// from worktree A's already-built database (trySeedFromSibling) rather
+	// than running an indexer subprocess build of its own — so, unlike
+	// before Phase A2, no $/progress notification is ever sent for it
+	// either (see TestE2E_WorktreeSharesIndex). Graph loading is
+	// independent of the facts-index seed, so this is still the shared
+	// graph cache's first save from worktree B's own perspective, and it
+	// still reflects worktree B's current (still incomplete) package set.
 	otherAppFile := strings.Replace(locs.appFile, mainRoot, otherRoot, 1)
-	b, _, _ := startAndAwaitIndex(t, otherRoot, fakeHome, otherAppFile)
+	b := startClientIn(t, otherRoot, fakeHome)
+	b.initialize(t, otherRoot)
+	b.openFile(t, otherAppFile)
 	if got := definitionAt(t, b, otherAppFile, locs.sumCallInApp); len(got) != 1 {
 		t.Fatalf("worktree B: want exactly 1 definition location, got %d: %+v", len(got), got)
 	}

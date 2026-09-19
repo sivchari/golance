@@ -302,6 +302,24 @@ func logFileContent(t *testing.T, label, path string) {
 	t.Logf("%s (%s):\n%s", label, path, b)
 }
 
+// stderrLogContent returns the captured contents of fakeHome's
+// golance.stderr file (see startClientIn), or "" if it does not exist yet —
+// for a test asserting on a specific server-side log line rather than only
+// dumping it on failure (see logFileContent). Safe only once every other
+// session sharing fakeHome has already stopped: two live sessions sharing
+// one fakeHome both truncate this same path on their own startClientIn
+// call (see its own doc), so reading it while a second session might still
+// be running risks reading a file it has since replaced out from under
+// this read.
+func stderrLogContent(t *testing.T, fakeHome string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Clean(filepath.Join(fakeHome, "golance.stderr")))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
 // readLoop dispatches frames from golance's stdout: responses to the
 // client's own requests are routed to their pending channel by id;
 // publishDiagnostics and $/progress notifications are queued on their own

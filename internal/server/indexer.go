@@ -275,7 +275,7 @@ func (s *Server) newResolver(db *store.DB, cas *store.CAS, snap *graph.Snapshot,
 func (s *Server) tryWarmOpen(root string) (*indexState, bool) {
 	dbPath := s.dbPath(root)
 	if _, err := os.Stat(dbPath); err != nil {
-		return nil, false
+		return s.trySeedFromSibling(root, dbPath)
 	}
 	db, err := store.Open(dbPath)
 	if err != nil {
@@ -352,6 +352,85 @@ func (s *Server) openWarmIndexState(root string, db *store.DB) (*indexState, boo
 	return &indexState{db: db, cas: cas, resolver: s.newResolver(db, cas, ws.snap, RelativeIndexPaths(root))}, true
 }
 
+// trySeedFromSibling is tryWarmOpen's cold-start recovery when root has no
+// index database of its own yet (dbPath does not exist): rather than
+// paying a full indexer-subprocess rebuild from scratch, it looks for a
+// sibling checkout of the same repository (a git worktree, or the main
+// checkout) that already has one, via the CAS members registry every
+// checkout sharing repoKey's identity already writes into (see
+// store.CASMembers/(*store.DB).PutCASDir) — the same registry internal/
+// server's CAS GC uses to find every database sharing a CAS directory
+// without opening any of them first. Only attempted when root's own index
+// would store relative paths (RelativeIndexPaths): a sibling's database
+// built with absolute paths would resolve every file to the WRONG
+// checkout's own filesystem location once cloned here. Any failure — no
+// eligible sibling, a clone failure, or a failed Open of the clone — is
+// logged (except the "no eligible sibling" case, which is the ordinary
+// first-ever build and not worth a log line of its own) and reported as
+// ok=false, falling through to today's cold full-build path exactly as
+// before this optimization existed.
+func (s *Server) trySeedFromSibling(root, dbPath string) (*indexState, bool) {
+	if !RelativeIndexPaths(root) {
+		return nil, false
+	}
+	siblingPath, err := findSiblingIndexDB(casDir(root), dbPath)
+	if err != nil {
+		s.logger.Printf("golance: find sibling index: %v", err)
+		return nil, false
+	}
+	if siblingPath == "" {
+		return nil, false
+	}
+	if err := cloneSharedIndex(siblingPath, dbPath); err != nil {
+		s.logger.Printf("golance: seed index from sibling: %v", err)
+		return nil, false
+	}
+	db, err := store.Open(dbPath)
+	if err != nil {
+		s.logger.Printf("golance: open seeded index: %v", err)
+		return nil, false
+	}
+	idx, ok := s.openWarmIndexState(root, db)
+	if !ok {
+		return nil, false
+	}
+	idx.seeded = true
+	s.logger.Printf("golance: seeded index from a sibling checkout's database")
+	return idx, true
+}
+
+// findSiblingIndexDB returns the most recently modified eligible candidate
+// among casDirPath's registered members (see store.CASMembers): every
+// checkout sharing this CAS directory that has ever built an index, minus
+// ownDBPath itself and any session-private index file (see
+// privateIndexInfix) — a private index is scoped to one session and root,
+// never a legitimate seed source for a different root's cold start. A
+// member whose file no longer exists is silently skipped (see CASMembers'
+// own doc on why a returned path is a candidate, not a guarantee). Returns
+// ("", nil) if no eligible candidate exists.
+func findSiblingIndexDB(casDirPath, ownDBPath string) (string, error) {
+	members, err := store.CASMembers(casDirPath)
+	if err != nil {
+		return "", err
+	}
+	var best string
+	var bestModTime time.Time
+	for _, path := range members {
+		if path == ownDBPath || strings.Contains(path, privateIndexInfix) {
+			continue
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if best == "" || fi.ModTime().After(bestModTime) {
+			best = path
+			bestModTime = fi.ModTime()
+		}
+	}
+	return best, nil
+}
+
 // indexRepairThreshold bounds how many stale root packages revalidateIndex
 // repairs in place (repairIndexPackagesLocked) rather than falling back to
 // a full close-and-rebuild (buildIndexLocked). A targeted repair walks each
@@ -364,6 +443,17 @@ func (s *Server) openWarmIndexState(root string, db *store.DB) (*indexState, boo
 // exercise the full-rebuild fallback without needing a fixture with 64+
 // stale packages.
 var indexRepairThreshold = 64
+
+// indexSeededRepairThreshold is indexRepairThreshold's counterpart for an
+// index this session seeded from a sibling checkout's database (see
+// trySeedFromSibling): the stale set immediately after a seed is whatever
+// changed between the sibling's branch and this checkout's own — often
+// larger than any ordinary same-branch staleness indexRepairThreshold was
+// tuned for — so a seeded open gets a higher ceiling before
+// chooseIndexRevalidateAction gives up on repairing in place and falls
+// back to a full rebuild, avoiding wasting the seed's own head start over a
+// branch diff that is still comfortably smaller than the whole workspace.
+var indexSeededRepairThreshold = 256
 
 // indexRevalidateAction is revalidateIndex's decision for what to do with a
 // staleIndexPackages result, split out via chooseIndexRevalidateAction so
@@ -381,16 +471,23 @@ const (
 
 // chooseIndexRevalidateAction decides revalidateIndex's branch from a
 // staleIndexPackages result: no-op when nothing is stale, a targeted
-// in-place repair when the stale set is small enough (indexRepairThreshold)
-// and the whole database is still trustworthy, or a full rebuild otherwise —
-// including whenever wholeDBStale is true, since Reindex never writes a
-// build fingerprint (see index.RevalidateStale's own doc) and so cannot
-// resolve that case no matter how few packages came back stale.
-func chooseIndexRevalidateAction(pkgs []string, wholeDBStale bool) indexRevalidateAction {
+// in-place repair when the stale set is small enough and the whole database
+// is still trustworthy, or a full rebuild otherwise — including whenever
+// wholeDBStale is true, since Reindex never writes a build fingerprint (see
+// index.RevalidateStale's own doc) and so cannot resolve that case no
+// matter how few packages came back stale. seeded selects which repair
+// ceiling applies: indexSeededRepairThreshold for an index this session
+// seeded from a sibling checkout (see trySeedFromSibling), indexRepairThreshold
+// otherwise.
+func chooseIndexRevalidateAction(pkgs []string, wholeDBStale, seeded bool) indexRevalidateAction {
 	if !wholeDBStale && len(pkgs) == 0 {
 		return indexRevalidateNone
 	}
-	if !wholeDBStale && len(pkgs) <= indexRepairThreshold {
+	threshold := indexRepairThreshold
+	if seeded {
+		threshold = indexSeededRepairThreshold
+	}
+	if !wholeDBStale && len(pkgs) <= threshold {
 		return indexRevalidateRepair
 	}
 	return indexRevalidateRebuild
@@ -462,7 +559,11 @@ func (s *Server) revalidateIndex(ctx context.Context, root string) {
 	s.idxMu.Lock()
 	defer s.idxMu.Unlock()
 	pkgs, wholeDBStale := s.staleIndexPackages(ctx)
-	action := chooseIndexRevalidateAction(pkgs, wholeDBStale)
+	seeded := false
+	if idx := s.idx.Load(); idx != nil {
+		seeded = idx.seeded
+	}
+	action := chooseIndexRevalidateAction(pkgs, wholeDBStale, seeded)
 	// A rebuild drops the open index (below), which makes every dependency
 	// import unresolvable until it finishes — the visible symptom being
 	// "invalid type" on files that were fine a moment ago. Log why it was

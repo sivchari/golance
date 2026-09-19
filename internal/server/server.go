@@ -119,6 +119,14 @@ type indexState struct {
 	db       *store.DB
 	cas      *store.CAS
 	resolver *xref.Resolver
+	// seeded records whether this index was installed via
+	// trySeedFromSibling (cloned from a sibling checkout's own database)
+	// rather than an ordinary warm open or indexer build: revalidateIndex's
+	// chooseIndexRevalidateAction uses this to apply
+	// indexSeededRepairThreshold's higher ceiling instead of
+	// indexRepairThreshold's ordinary one, since a freshly seeded index's
+	// staleness is a branch diff, not everyday same-branch drift.
+	seeded bool
 }
 
 // Server wires golance's independent internal packages into a running LSP
