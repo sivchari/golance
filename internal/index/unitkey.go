@@ -55,6 +55,15 @@ type depExportEntry struct {
 // key it already has a CAS hit for, and workspace/symbol would keep
 // silently missing that package's unexported symbols forever — this forces
 // exactly one real rebuild per package instead.
+//
+// This is the CAS key side of a two-constant bump discipline: a change to
+// the UnitBlob/index-entry encoding, or to what goes into a key at all,
+// bumps factsSchemaVersion here (forcing exactly one real rebuild per
+// package, as above); a change to fact-extraction semantics with the same
+// byte shape but different contents (e.g. a bug fix in what a pass
+// records) instead bumps factsRebuildEpoch in index.go, which invalidates
+// through DefaultToolchainFingerprint's whole-database check rather than
+// per-package CAS keys — see its own doc for why that split exists.
 const factsSchemaVersion uint16 = 4
 
 // computeUnitKey returns the CAS blob key for a package whose own source
