@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strconv"
 	"testing"
 
 	"github.com/sivchari/golance/internal/store"
@@ -306,27 +308,47 @@ func TestPackageChanged_UnknownPackage(t *testing.T) {
 	}
 }
 
-// TestRevalidateStale_GolanceUpgradeInvalidatesWholeDB pins the reason
-// DefaultToolchainFingerprint folds in golance's own version: an index
-// written by a DIFFERENT golance version (here simulated with an explicit
-// old fingerprint) must be judged wholeDBStale by the current binary, since
-// the facts it holds are a product of the old indexer's code — including
-// any extraction bugs fixed since.
-func TestRevalidateStale_GolanceUpgradeInvalidatesWholeDB(t *testing.T) {
+// TestRevalidateStale_FingerprintHalves pins the two independent halves
+// DefaultToolchainFingerprint folds together (see its doc): the Go
+// toolchain version and factsRebuildEpoch. A mismatch in either half alone
+// must report wholeDBStale, since either can mean the recorded facts no
+// longer match what this binary would extract; matching on both halves
+// must not, even though golance's own release version is no longer part of
+// the fingerprint at all.
+func TestRevalidateStale_FingerprintHalves(t *testing.T) {
 	snap := loadTestSnapshot(t)
-	db := openTestDB(t)
-	cas := openTestCAS(t)
 	ctx := context.Background()
 
-	if _, err := Build(ctx, snap, db, cas, &Options{ToolchainFingerprint: "go1.99.0 golance/0.0.1"}); err != nil {
-		t.Fatalf("Build: %v", err)
+	current := DefaultToolchainFingerprint()
+	epochSuffix := "facts-epoch/" + strconv.Itoa(factsRebuildEpoch)
+	otherGoVersion := "go1.99.0 " + epochSuffix
+	otherEpoch := runtime.Version() + " facts-epoch/" + strconv.Itoa(factsRebuildEpoch+1)
+
+	tests := []struct {
+		name      string
+		builtWith string
+		wantStale bool
+	}{
+		{"same fingerprint on both sides", current, false},
+		{"go-version-only mismatch", otherGoVersion, true},
+		{"epoch-only mismatch", otherEpoch, true},
 	}
 
-	_, wholeDBStale, err := RevalidateStale(ctx, snap, db, DefaultToolchainFingerprint(), "", false)
-	if err != nil {
-		t.Fatalf("RevalidateStale: %v", err)
-	}
-	if !wholeDBStale {
-		t.Error("RevalidateStale() wholeDBStale = false for an index built by a different golance version, want true")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := openTestDB(t)
+			cas := openTestCAS(t)
+			if _, err := Build(ctx, snap, db, cas, &Options{ToolchainFingerprint: tt.builtWith}); err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+
+			_, wholeDBStale, err := RevalidateStale(ctx, snap, db, current, "", false)
+			if err != nil {
+				t.Fatalf("RevalidateStale: %v", err)
+			}
+			if wholeDBStale != tt.wantStale {
+				t.Errorf("RevalidateStale() wholeDBStale = %v, want %v (built with %q, revalidated against %q)", wholeDBStale, tt.wantStale, tt.builtWith, current)
+			}
+		})
 	}
 }

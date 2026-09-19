@@ -7,12 +7,12 @@ import (
 	"log"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/semaphore"
 
-	"github.com/sivchari/golance"
 	"github.com/sivchari/golance/internal/depcheck"
 	"github.com/sivchari/golance/internal/depexport"
 	"github.com/sivchari/golance/internal/graph"
@@ -30,11 +30,8 @@ type Options struct {
 	BatchSize int
 	// ToolchainFingerprint is recorded in each package's UnitPointer and
 	// compared on a later Build to force a full revalidation pass after a
-	// toolchain upgrade. Defaults to DefaultToolchainFingerprint(), which
-	// folds in golance's own version: what the indexer extracts depends on
-	// its own code, so an index built by an older golance (e.g. one whose
-	// facts were incomplete due to a since-fixed bug) must not be trusted
-	// by a newer binary.
+	// toolchain upgrade or a fact-extraction semantics change. Defaults to
+	// DefaultToolchainFingerprint().
 	ToolchainFingerprint string
 	// BuildFlagsFingerprint is folded into each package's content hash so
 	// a build-flags change (e.g. -tags, GOOS/GOARCH, CGO_ENABLED)
@@ -104,16 +101,29 @@ func (o *Options) withDefaults() Options {
 	return d
 }
 
+// factsRebuildEpoch forces every package into RevalidateStale's wholeDBStale
+// path (see internal/index/revalidate.go) without a real content or
+// dependency-export change on disk. Bump it ONLY when a release changes
+// fact-extraction semantics — what checkOnePackage records for a given
+// source — without any change to how that record is encoded or keyed
+// (factsSchemaVersion in unitkey.go covers that case instead; see its doc
+// for the distinction). PR #117 instead folded golance's whole release
+// version into this fingerprint, so every release forced this same
+// wholeDBStale path regardless of whether fact-extraction semantics had
+// actually changed: CAS unit keys carry no version (see unitkey.go), so the
+// resulting "rebuild" never re-type-checked anything — it walked every
+// package, CAS-hit its byte-identical old blob, and rewrote only pointers,
+// costing minutes and gigabytes of heap on every upgrade for zero semantic
+// benefit. This constant is the precise replacement: a real fact-extraction
+// change bumps it, a release that merely changes unrelated code does not.
+const factsRebuildEpoch = 0
+
 // DefaultToolchainFingerprint returns the fingerprint Build records (and
 // Revalidate/PackageChanged callers must compare against) when
 // Options.ToolchainFingerprint is unset: the Go toolchain version plus
-// golance's own version. Including golance's version forces a full rebuild
-// on upgrade — the facts an index holds are a product of the indexer's own
-// code, not just the toolchain, so an index written by an older golance
-// (including one whose extraction was incomplete due to a since-fixed bug)
-// must not be warm-opened as current by a newer binary.
+// factsRebuildEpoch.
 func DefaultToolchainFingerprint() string {
-	return runtime.Version() + " golance/" + golance.Version
+	return runtime.Version() + " facts-epoch/" + strconv.Itoa(factsRebuildEpoch)
 }
 
 // Stats summarizes a completed Build or Reindex run.
