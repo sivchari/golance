@@ -340,6 +340,107 @@ func TestTryWarmOpen_OpensRegardlessOfFingerprint(t *testing.T) {
 	}
 }
 
+// TestTryWarmOpen_LockedSharedIndexClonesIntoPrivateIndex verifies Phase A1
+// of the shared-index-locked fallback: instead of paying a full
+// indexer-subprocess rebuild for content that is already on disk, a second
+// session finding the shared database locked clones it into its own
+// session-private path and opens the clone directly — tryWarmOpen itself
+// reports ok=true, with no call into buildIndex/runIndexBuild at all (the
+// only path in this package that ever launches the indexer subprocess).
+func TestTryWarmOpen_LockedSharedIndexClonesIntoPrivateIndex(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newWorkspaceOnlyServer(t)
+	root := s.workspace().root
+	snap := s.workspace().snap
+
+	sharedDBPath := indexDBFile(root)
+	if err := os.MkdirAll(filepath.Dir(sharedDBPath), 0o750); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+	cas, err := store.OpenCAS(casDir(root))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	buildTestIndexDB(t, snap, sharedDBPath, cas)
+
+	// Simulate a first live session already holding the shared database's
+	// exclusive lock (see store.Open's doc).
+	held, err := store.Open(sharedDBPath)
+	if err != nil {
+		t.Fatalf("store.Open (simulated first session): %v", err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+
+	idx, ok := s.tryWarmOpen(root)
+	if !ok || idx == nil {
+		t.Fatal("tryWarmOpen(shared locked) = not ok, want ok via a cloned private index")
+	}
+	t.Cleanup(func() { _ = idx.db.Close() })
+
+	if !s.usePrivateIndex.Load() {
+		t.Error("usePrivateIndex not set after cloning the locked shared index")
+	}
+	privatePath := s.dbPath(root)
+	if privatePath == sharedDBPath {
+		t.Fatalf("dbPath() after tryWarmOpen(locked) = %s, want the private path", privatePath)
+	}
+	if _, err := os.Stat(privatePath); err != nil {
+		t.Fatalf("cloned private index file missing: %v", err)
+	}
+
+	infos, err := idx.resolver.WorkspaceSymbol(context.Background(), "Hello")
+	if err != nil {
+		t.Fatalf("WorkspaceSymbol: %v", err)
+	}
+	if len(infos) == 0 {
+		t.Fatal(`WorkspaceSymbol("Hello") returned nothing from the cloned index, want it to resolve exactly as the shared index would`)
+	}
+}
+
+// TestTryWarmOpen_CloneFailureFallsBackToPrivateBuild verifies that a clone
+// failure (e.g. an unwritable destination) does not wedge the session: it
+// falls back to today's behavior — usePrivateIndex sticky, tryWarmOpen
+// reporting ok=false so the caller (buildIndexLocked) runs a full private
+// build instead.
+func TestTryWarmOpen_CloneFailureFallsBackToPrivateBuild(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	s := newWorkspaceOnlyServer(t)
+	root := s.workspace().root
+	snap := s.workspace().snap
+
+	sharedDBPath := indexDBFile(root)
+	if err := os.MkdirAll(filepath.Dir(sharedDBPath), 0o750); err != nil {
+		t.Fatalf("mkdir index dir: %v", err)
+	}
+	cas, err := store.OpenCAS(casDir(root))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	buildTestIndexDB(t, snap, sharedDBPath, cas)
+
+	held, err := store.Open(sharedDBPath)
+	if err != nil {
+		t.Fatalf("store.Open (simulated first session): %v", err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+
+	orig := cloneSharedIndex
+	cloneSharedIndex = func(string, string) error { return errors.New("simulated clone failure") }
+	t.Cleanup(func() { cloneSharedIndex = orig })
+
+	idx, ok := s.tryWarmOpen(root)
+	if ok || idx != nil {
+		t.Fatalf("tryWarmOpen(clone failure) = (%v, %v), want (nil, false)", idx, ok)
+	}
+	if !s.usePrivateIndex.Load() {
+		t.Error("usePrivateIndex not set after a failed clone attempt")
+	}
+	privatePath := s.dbPath(root)
+	if _, err := os.Stat(privatePath); !os.IsNotExist(err) {
+		t.Errorf("cloned private index file exists despite clone failure: err = %v, want IsNotExist", err)
+	}
+}
+
 // TestRevalidateIndex_UnchangedKeepsWarmOpenHandle verifies that when
 // nothing has changed since the database was built, revalidateIndex leaves
 // the warm-opened *indexState installed (same pointer identity — no

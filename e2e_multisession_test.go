@@ -38,6 +38,17 @@ func privateIndexFiles(t *testing.T, fakeHome string) []string {
 // falls back to its own session-private index and gets full functionality
 // from it — definition and references both answer correctly — and that
 // private index file is removed again once the session cleanly stops.
+//
+// Session B is deliberately not awaited via waitForIndexReady's $/progress
+// "end" notification: unlike the old full-rebuild fallback, tryWarmOpen now
+// clones the shared database's bytes directly into session B's private path
+// (internal/server's cloneLockedSharedIndex) and opens the clone, so no
+// indexer subprocess ever runs and no such notification is ever sent for
+// this session — the same "warm reopen, no $/progress" shape
+// TestE2E_WorktreeSelfHealsMissingPackageFacts documents for the
+// worktree-specific case. definitionAt/waitForNonEmptyLocations's own
+// bounded retry is what actually proves session B answers correctly, fast,
+// without ever paying for a rebuild of content already on disk.
 func TestE2E_SameWorkspaceConcurrentSessionsFallBackToPrivateIndex(t *testing.T) {
 	skipUnlessE2E(t)
 
@@ -61,11 +72,11 @@ func TestE2E_SameWorkspaceConcurrentSessionsFallBackToPrivateIndex(t *testing.T)
 
 	// Session B: a second session for the exact same root, started while A
 	// is still running and holding the shared index's lock. It must still
-	// reach full cross-reference functionality, via its own private index.
+	// reach full cross-reference functionality, via its own cloned private
+	// index.
 	b := startClientIn(t, root, fakeHome)
 	b.initialize(t, root)
 	b.openFile(t, locs.appFile)
-	b.waitForIndexReady(t)
 
 	if got := definitionAt(t, b, locs.appFile, locs.sumCallInApp); len(got) != 1 {
 		t.Fatalf("session B: want exactly 1 definition location, got %d: %+v", len(got), got)
