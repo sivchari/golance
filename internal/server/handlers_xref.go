@@ -108,14 +108,46 @@ func (s *Server) xrefPosition(path string, pos protocol.Position) (line, col int
 	return int(s.correctQueryLine(path, uint32(l))), c, true
 }
 
+// xrefCancelCheckInterval bounds how often toLSPLocations checks ctx.Err()
+// while converting a large result: often enough that a canceled request
+// stops promptly, rarely enough that the check itself is not the cost.
+const xrefCancelCheckInterval = 1024
+
 // toLSPLocations converts xref Locations to LSP Locations, applying dirty
-// correction per result file and dropping any that cannot be resolved.
-func (s *Server) toLSPLocations(locs []xref.Location) protocol.LocationSlice {
+// correction per result file and dropping any that cannot be resolved. It
+// reads and dirty-corrects each distinct file at most once via
+// xrefFileEntryFor, amortizing the conversion to O(distinct files +
+// results) instead of one file read plus several whole-file rescans per
+// location (see xrefFileEntry's doc) -- the cost that used to dominate a
+// large references result's response time far more than the facts-index
+// query itself.
+//
+// ctx is checked every xrefCancelCheckInterval locations and on every new
+// file; a canceled conversion returns nil rather than running to
+// completion, since the caller's existing empty-result handling already
+// covers nil and an LSP client that gives up on a slow request and retries
+// (as golance's own editor client does) would otherwise stack another full
+// conversion on top of the one still running for no benefit.
+func (s *Server) toLSPLocations(ctx context.Context, locs []xref.Location) protocol.LocationSlice {
+	files := make(map[string]*xrefFileEntry)
 	out := make(protocol.LocationSlice, 0, len(locs))
-	for _, loc := range locs {
-		if pl, ok := s.correctResultLocation(loc); ok {
-			out = append(out, pl)
+	lastFile := ""
+	for i, loc := range locs {
+		if loc.File != lastFile || i%xrefCancelCheckInterval == 0 {
+			if ctx.Err() != nil {
+				return nil
+			}
+			lastFile = loc.File
 		}
+		e := s.xrefFileEntryFor(loc.File, files)
+		if e == nil {
+			continue
+		}
+		rng, ok := e.rangeFor(loc.Line, loc.Col, loc.EndCol)
+		if !ok {
+			continue
+		}
+		out = append(out, protocol.Location{URI: uri.File(loc.File), Range: rng})
 	}
 	return out
 }
@@ -162,7 +194,7 @@ func (s *Server) handleDefinition(ctx context.Context, params json.RawMessage) (
 		// final.
 		return s.definitionFallback(ctx, p.TextDocument.URI, p.Position), nil
 	}
-	return s.toLSPLocations(locs), nil
+	return s.toLSPLocations(ctx, locs), nil
 }
 
 // definitionFallback answers handleDefinition entirely from the
@@ -187,10 +219,10 @@ func (s *Server) definitionFallback(ctx context.Context, u uri.URI, pos protocol
 		return nil
 	}
 	if loc, ok := s.importDefinition(cf); ok {
-		return s.toLSPLocations([]xref.Location{loc})
+		return s.toLSPLocations(ctx, []xref.Location{loc})
 	}
 	if loc, ok := s.builtinDefinition(cf); ok {
-		return s.toLSPLocations([]xref.Location{loc})
+		return s.toLSPLocations(ctx, []xref.Location{loc})
 	}
 	if info, err := langfeat.PackageNameDefinition(cf.cp, cf.path, cf.offset); err != nil {
 		s.logger.Printf("server: package name definition %s: %v", cf.path, err)
@@ -204,7 +236,7 @@ func (s *Server) definitionFallback(ctx context.Context, u uri.URI, pos protocol
 		return s.samePackageDefinitionLocation(info)
 	}
 	if loc, ok := s.dependencyDefinition(ctx, cf); ok {
-		return s.toLSPLocations([]xref.Location{loc})
+		return s.toLSPLocations(ctx, []xref.Location{loc})
 	}
 	return nil
 }
@@ -464,7 +496,8 @@ func (s *Server) handleReferences(ctx context.Context, params json.RawMessage) (
 			return fb, nil
 		}
 	}
-	return s.toLSPLocations(locs), nil
+	phaseTimerFrom(ctx).enter("toLSP")
+	return s.toLSPLocations(ctx, locs), nil
 }
 
 // packageNameReferencesFallback answers handleReferences' file-local
@@ -547,7 +580,8 @@ func (s *Server) handleImplementation(ctx context.Context, params json.RawMessag
 		}
 		return protocol.LocationSlice(nil), nil
 	}
-	return s.toLSPLocations(locs), nil
+	phaseTimerFrom(ctx).enter("toLSP")
+	return s.toLSPLocations(ctx, locs), nil
 }
 
 // implementationLiveFallback answers handleImplementation when
