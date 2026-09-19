@@ -1,5 +1,13 @@
 # Changelog
 
+## [v0.7.17](https://github.com/sivchari/golance/compare/v0.7.16...v0.7.17) - 2026-09-19
+- fix: drop the wall-clock bound from the transitive-thrash test by @sivchari in https://github.com/sivchari/golance/pull/139
+- fix: stop folding golance's release version into the index fingerprint by @sivchari in https://github.com/sivchari/golance/pull/141
+- fix: repair make lint-local and add client-death exit e2e coverage by @sivchari in https://github.com/sivchari/golance/pull/142
+- fix: clone the shared index instead of a full private rebuild by @sivchari in https://github.com/sivchari/golance/pull/143
+- fix: bound and parallelize the display-path query pipeline by @sivchari in https://github.com/sivchari/golance/pull/144
+- fix: seed a cold checkout's index from a sibling checkout's database by @sivchari in https://github.com/sivchari/golance/pull/145
+
 ## [v0.7.16](https://github.com/sivchari/golance/compare/v0.7.15...v0.7.16) - 2026-09-19
 - perf: convert references results per file instead of per location by @sivchari in https://github.com/sivchari/golance/pull/137
 
