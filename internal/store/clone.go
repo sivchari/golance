@@ -19,13 +19,8 @@ import (
 // self-heal (see Open's own doc), leaving an empty database no worse than
 // never having built one at all. Never opening src itself also means this
 // can never contend for, or otherwise disturb, whatever exclusive lock a
-// live writer holds on it. src/dst are cleaned once here (rather than at
-// each call site below) so both platformClone and streamCopy receive
-// already-cleaned paths, satisfying gosec's G304 for every OS this builds
-// on, not just the one being linted.
+// live writer holds on it.
 func ClonePath(src, dst string) error {
-	src = filepath.Clean(src)
-	dst = filepath.Clean(dst)
 	if err := platformClone(src, dst); err == nil {
 		return nil
 	}
@@ -36,13 +31,13 @@ func ClonePath(src, dst string) error {
 // failure) with no copy-on-write clone available: an ordinary whole-file
 // read/write, slower than platformClone but identical in outcome.
 func streamCopy(src, dst string) error {
-	in, err := os.Open(src)
+	in, err := os.Open(filepath.Clean(src))
 	if err != nil {
 		return fmt.Errorf("store: clone %s: %w", src, err)
 	}
 	defer func() { _ = in.Close() }()
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	out, err := os.OpenFile(filepath.Clean(dst), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("store: clone %s to %s: %w", src, dst, err)
 	}
