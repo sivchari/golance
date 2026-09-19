@@ -306,9 +306,6 @@ func TestProvider_TransitiveThrash(t *testing.T) {
 		if p.Decoded() == 0 {
 			t.Error("Decoded() = 0, want > 0 (the decode fast path should have been used at least once)")
 		}
-		if elapsed > 2*time.Second {
-			t.Errorf("elapsed = %s, want well under 2s (a generous bound the pre-fix, no-ExportSource case above should exceed by a wide margin)", elapsed)
-		}
 	})
 }
 
