@@ -8,9 +8,25 @@ import (
 	"time"
 )
 
-// clientWatchInterval is how often watchClientProcess polls whether
+// defaultClientWatchInterval is how often watchClientProcess polls whether
 // initialize's processId is still alive.
-const clientWatchInterval = 10 * time.Second
+const defaultClientWatchInterval = 10 * time.Second
+
+// clientWatchInterval is defaultClientWatchInterval, overridable via
+// GOLANCE_CLIENT_WATCH_INTERVAL (a time.Duration string, e.g. "1s"). Only
+// the e2e suite (TestE2E_ServerExitsWhenClientProcessDies) needs a faster
+// tick, to observe a real client-death shutdown without waiting out a real
+// 10 second poll.
+var clientWatchInterval = clientWatchIntervalFromEnv()
+
+func clientWatchIntervalFromEnv() time.Duration {
+	if v := os.Getenv("GOLANCE_CLIENT_WATCH_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return defaultClientWatchInterval
+}
 
 // processAlive reports whether the OS process pid still exists. Indirected
 // through a var, like lifecycle.go's graphLoad, so tests can substitute a

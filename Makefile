@@ -34,10 +34,17 @@ lint-fix:
 # with version: latest against go.mod's go directive), but forces a stock
 # go$(LINT_GO_VERSION) toolchain for the go/packages loader.
 #
-# Why: golangci-lint shells out to `go list -json` to load packages. If your
-# `go` in PATH is a non-release build (e.g. a `go1.27-devel` custom build),
-# that call can fail with "no go files to analyze" even though the code is
-# fine. Pointing GOROOT/PATH at a real release SDK fixes it.
+# Why: golangci-lint shells out to `go list` to load packages. If your `go`
+# in PATH is a non-release build (e.g. a `go1.27-devel` custom build), that
+# call can fail with "no go files to analyze" even though the code is fine.
+# Exporting GOROOT doesn't fix this on its own either: pairing an exported
+# GOROOT with any other `go` binary breaks go/packages loading with
+# "package unsafe is not in std (<toolchain>/src/unsafe)". The stock SDK
+# must be selected via PATH alone, with GOTOOLCHAIN=local so `go` doesn't
+# re-resolve a toolchain out from under us. Caches are isolated (fresh tmp
+# dirs for GOCACHE and GOLANGCI_LINT_CACHE) because the shared caches carry
+# build-cache entries from the devel toolchain that poison analysis under
+# the stock one.
 lint-local:
 	@goroot="$(LINT_TOOLCHAIN_GOROOT)"; \
 	if [ ! -x "$$goroot/bin/go" ]; then \
@@ -50,5 +57,6 @@ lint-local:
 			"$$bindir/go$(LINT_GO_VERSION)" download; \
 		fi; \
 	fi; \
-	echo "linting with GOROOT=$$goroot"; \
-	GOROOT="$$goroot" PATH="$$goroot/bin:$$PATH" golangci-lint run ./...
+	echo "linting with stock go$(LINT_GO_VERSION) at $$goroot/bin"; \
+	tmpbase="$$(mktemp -d "$${TMPDIR:-/tmp}/golance-lint-local.XXXXXX")"; \
+	PATH="$$goroot/bin:$$PATH" GOTOOLCHAIN=local GOCACHE="$$tmpbase/gocache" GOLANGCI_LINT_CACHE="$$tmpbase/lintcache" golangci-lint run ./...
