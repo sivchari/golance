@@ -67,8 +67,12 @@ func TestDispatchRequest_BackgroundTimesOut(t *testing.T) {
 		if !ok {
 			t.Fatalf("response = %v, want an error response", frames[0])
 		}
-		if int32(errObj["code"].(float64)) != requestCancelledCode {
-			t.Errorf("error code = %v, want requestCancelledCode (%d)", errObj["code"], requestCancelledCode)
+		code, ok := errObj["code"].(float64)
+		if !ok {
+			t.Fatalf("error code = %v, want a JSON number", errObj["code"])
+		}
+		if int32(code) != requestCancelledCode {
+			t.Errorf("error code = %v, want requestCancelledCode (%d)", code, requestCancelledCode)
 		}
 		if !strings.Contains(logBuf.String(), "timeout") {
 			t.Errorf("log output = %q, want it to mention the server-side timeout", logBuf.String())
@@ -145,8 +149,12 @@ func TestDispatchRequest_ClientCancelDoesNotLogTimeout(t *testing.T) {
 		if !ok {
 			t.Fatalf("response = %v, want an error response", frames[0])
 		}
-		if int32(errObj["code"].(float64)) != requestCancelledCode {
-			t.Errorf("error code = %v, want requestCancelledCode (%d)", errObj["code"], requestCancelledCode)
+		code, ok := errObj["code"].(float64)
+		if !ok {
+			t.Fatalf("error code = %v, want a JSON number", errObj["code"])
+		}
+		if int32(code) != requestCancelledCode {
+			t.Errorf("error code = %v, want requestCancelledCode (%d)", code, requestCancelledCode)
 		}
 		if strings.Contains(logBuf.String(), "timeout") {
 			t.Errorf("log output = %q, want no timeout line for an explicit client cancel", logBuf.String())

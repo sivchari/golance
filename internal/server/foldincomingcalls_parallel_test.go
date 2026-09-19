@@ -40,7 +40,7 @@ func referencesLocsFor(t *testing.T, s *Server, file string, pos protocol.Positi
 // file's goroutine happens to finish first, since every location's own
 // conversion (chSourceFileFor/xrefRangeToLSP/enclosingCallItem) is
 // unchanged by that refactor -- only the iteration order is.
-func sequentialFoldIncomingCalls(s *Server, ctx context.Context, locs []xref.Location) []protocol.CallHierarchyIncomingCall {
+func sequentialFoldIncomingCalls(ctx context.Context, s *Server, locs []xref.Location) []protocol.CallHierarchyIncomingCall {
 	files := make(map[string]*chSourceFile)
 	calls := make(map[protocol.Location]*protocol.CallHierarchyIncomingCall)
 	var order []protocol.Location
@@ -106,7 +106,7 @@ func TestFoldIncomingCalls_MatchesSequentialOracle(t *testing.T) {
 		t.Fatalf("references(Add) = %d locations, want at least 2 to exercise multiple call sites", len(locs))
 	}
 
-	want := sequentialFoldIncomingCalls(s, context.Background(), locs)
+	want := sequentialFoldIncomingCalls(context.Background(), s, locs)
 	if len(want) == 0 {
 		t.Fatal("sequentialFoldIncomingCalls(Add) = no calls, want at least one enclosing caller")
 	}
