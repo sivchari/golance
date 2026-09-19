@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 // ClonePath copies the bbolt database file at src to dst without ever
@@ -18,8 +19,13 @@ import (
 // self-heal (see Open's own doc), leaving an empty database no worse than
 // never having built one at all. Never opening src itself also means this
 // can never contend for, or otherwise disturb, whatever exclusive lock a
-// live writer holds on it.
+// live writer holds on it. src/dst are cleaned once here (rather than at
+// each call site below) so both platformClone and streamCopy receive
+// already-cleaned paths, satisfying gosec's G304 for every OS this builds
+// on, not just the one being linted.
 func ClonePath(src, dst string) error {
+	src = filepath.Clean(src)
+	dst = filepath.Clean(dst)
 	if err := platformClone(src, dst); err == nil {
 		return nil
 	}
