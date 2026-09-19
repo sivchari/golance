@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -438,6 +440,241 @@ func TestTryWarmOpen_CloneFailureFallsBackToPrivateBuild(t *testing.T) {
 	privatePath := s.dbPath(root)
 	if _, err := os.Stat(privatePath); !os.IsNotExist(err) {
 		t.Errorf("cloned private index file exists despite clone failure: err = %v, want IsNotExist", err)
+	}
+}
+
+// gitAddAndCommitAll stages every file under dir and commits it, unlike
+// repokey_test.go's gitCommitEmpty (--allow-empty, nothing ever staged):
+// the sibling-seeding tests below need a real, non-empty tree checked out
+// identically into both a git worktree pair's roots.
+func gitAddAndCommitAll(t *testing.T, dir string) {
+	t.Helper()
+	runGitCmd(t, dir, exec.Command("git", "add", "-A"))
+	runGitCmd(t, dir, exec.Command("git", "-c", "user.email=test@golance.test", "-c", "user.name=test", "commit", "-q", "-m", "init"))
+}
+
+// gitRepoWithModuleWorktree creates a git repository containing a minimal
+// committed Go module (populateTempModule) plus a second linked worktree of
+// it — a byte-identical sibling checkout of the same repository (both
+// resolve to the same repoKey/casDir, both RelativeIndexPaths=true; see
+// repokey_test.go's TestRepoKey_WorktreesShareOneCASButNotIndexDB) — for
+// tests exercising trySeedFromSibling against a REAL relative-path root
+// rather than testdata/module's incidental nesting inside golance's own
+// repository.
+func gitRepoWithModuleWorktree(t *testing.T) (mainRoot, otherRoot string) {
+	t.Helper()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve temp dir: %v", err)
+	}
+	mainRoot = filepath.Join(base, "main")
+	if err := os.MkdirAll(mainRoot, 0o750); err != nil {
+		t.Fatalf("mkdir %s: %v", mainRoot, err)
+	}
+	populateTempModule(t, mainRoot)
+	gitInit(t, mainRoot)
+	gitAddAndCommitAll(t, mainRoot)
+	otherRoot = gitWorktreeAddOther(t, mainRoot)
+	return mainRoot, otherRoot
+}
+
+// registerCASMember reopens the index database at dbPath and records
+// casDirPath as its own CAS directory (see (*store.DB).PutCASDir), so
+// store.CASMembers(casDirPath) reports dbPath as a candidate — the shape a
+// real indexer subprocess build already leaves behind (cmd/golance/run.go),
+// which buildTestIndexDB's own in-process build does not bother
+// replicating since most tests never need it.
+func registerCASMember(t *testing.T, dbPath, casDirPath string) {
+	t.Helper()
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open(%s): %v", dbPath, err)
+	}
+	if err := db.PutCASDir(casDirPath); err != nil {
+		t.Fatalf("PutCASDir: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+}
+
+// TestTryWarmOpen_ColdStartSeedsFromSiblingCheckout verifies Phase A2: a
+// cold start (this root's own index database does not exist yet) for a
+// repository that already has an indexed sibling checkout (a git worktree,
+// here — see gitRepoWithModuleWorktree) seeds this root's database by
+// cloning the sibling's instead of falling through to a full indexer-
+// subprocess build.
+func TestTryWarmOpen_ColdStartSeedsFromSiblingCheckout(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	mainRoot, otherRoot := gitRepoWithModuleWorktree(t)
+
+	mainSnap, err := graph.Load(graph.Options{Dir: mainRoot}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load(main): %v", err)
+	}
+	mainCAS, err := store.OpenCAS(casDir(mainRoot))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	buildTestIndexDB(t, mainSnap, indexDBFile(mainRoot), mainCAS)
+	registerCASMember(t, indexDBFile(mainRoot), casDir(mainRoot))
+
+	otherSnap, err := graph.Load(graph.Options{Dir: otherRoot}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load(other): %v", err)
+	}
+	s := newWorkspaceOnlyServerAt(t, otherRoot, otherSnap)
+
+	idx, ok := s.tryWarmOpen(otherRoot)
+	if !ok || idx == nil {
+		t.Fatal("tryWarmOpen(cold start, sibling worktree indexed) = not ok, want ok via seeding")
+	}
+	t.Cleanup(func() { _ = idx.db.Close() })
+
+	if !idx.seeded {
+		t.Error("idx.seeded = false, want true for a sibling-seeded index")
+	}
+	if _, err := os.Stat(indexDBFile(otherRoot)); err != nil {
+		t.Fatalf("seeded index file missing at otherRoot's own dbPath: %v", err)
+	}
+
+	infos, err := idx.resolver.WorkspaceSymbol(context.Background(), "Hello")
+	if err != nil {
+		t.Fatalf("WorkspaceSymbol: %v", err)
+	}
+	if len(infos) == 0 {
+		t.Fatal(`WorkspaceSymbol("Hello") returned nothing from the seeded index, want it to resolve exactly as the sibling's own index would`)
+	}
+}
+
+// TestTryWarmOpen_ColdStartIgnoresPrivateSiblingIndex verifies that a
+// session-private index file (see privateIndexInfix) registered under the
+// same CAS directory is never treated as a seed candidate: it is scoped to
+// one session and one root, not a legitimate stand-in for another root's
+// cold start.
+func TestTryWarmOpen_ColdStartIgnoresPrivateSiblingIndex(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	mainRoot, otherRoot := gitRepoWithModuleWorktree(t)
+
+	mainSnap, err := graph.Load(graph.Options{Dir: mainRoot}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load(main): %v", err)
+	}
+	mainCAS, err := store.OpenCAS(casDir(mainRoot))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	privatePath := privateIndexDBFile(mainRoot, "some-other-session")
+	buildTestIndexDB(t, mainSnap, privatePath, mainCAS)
+	registerCASMember(t, privatePath, casDir(mainRoot))
+
+	otherSnap, err := graph.Load(graph.Options{Dir: otherRoot}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load(other): %v", err)
+	}
+	s := newWorkspaceOnlyServerAt(t, otherRoot, otherSnap)
+
+	idx, ok := s.tryWarmOpen(otherRoot)
+	if ok || idx != nil {
+		t.Fatalf("tryWarmOpen(only a private sibling registered) = (%v, %v), want (nil, false)", idx, ok)
+	}
+}
+
+// TestTryWarmOpen_ColdStartNoSeedingForNonRepoRoot verifies that a cold
+// start never seeds for a root whose index would store absolute paths
+// (RelativeIndexPaths false): a sibling's relative-path database, cloned
+// here, would resolve every file to the WRONG checkout's own filesystem
+// location.
+func TestTryWarmOpen_ColdStartNoSeedingForNonRepoRoot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	populateTempModule(t, root)
+	snap, err := graph.Load(graph.Options{Dir: root}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load: %v", err)
+	}
+	if RelativeIndexPaths(root) {
+		t.Fatal("test root is unexpectedly inside a git repository; RelativeIndexPaths(root) = true, want false")
+	}
+	s := newWorkspaceOnlyServerAt(t, root, snap)
+
+	// Register a sibling anyway, to prove it is never even considered.
+	cas, err := store.OpenCAS(casDir(root))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	siblingPath := filepath.Join(t.TempDir(), "sibling.db")
+	buildTestIndexDB(t, snap, siblingPath, cas)
+	registerCASMember(t, siblingPath, casDir(root))
+
+	idx, ok := s.tryWarmOpen(root)
+	if ok || idx != nil {
+		t.Fatalf("tryWarmOpen(non-repo root, sibling registered) = (%v, %v), want (nil, false)", idx, ok)
+	}
+}
+
+// TestTryWarmOpen_ColdStartSeedCloneFailureFallsThrough verifies that a
+// seed clone failure does not wedge the cold start: it reports ok=false,
+// leaving nothing behind at this root's own dbPath, so the caller
+// (buildIndex) falls through to today's ordinary full build.
+func TestTryWarmOpen_ColdStartSeedCloneFailureFallsThrough(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	mainRoot, otherRoot := gitRepoWithModuleWorktree(t)
+
+	mainSnap, err := graph.Load(graph.Options{Dir: mainRoot}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load(main): %v", err)
+	}
+	mainCAS, err := store.OpenCAS(casDir(mainRoot))
+	if err != nil {
+		t.Fatalf("store.OpenCAS: %v", err)
+	}
+	buildTestIndexDB(t, mainSnap, indexDBFile(mainRoot), mainCAS)
+	registerCASMember(t, indexDBFile(mainRoot), casDir(mainRoot))
+
+	otherSnap, err := graph.Load(graph.Options{Dir: otherRoot}, "./...")
+	if err != nil {
+		t.Fatalf("graph.Load(other): %v", err)
+	}
+	s := newWorkspaceOnlyServerAt(t, otherRoot, otherSnap)
+
+	orig := cloneSharedIndex
+	cloneSharedIndex = func(string, string) error { return errors.New("simulated seed clone failure") }
+	t.Cleanup(func() { cloneSharedIndex = orig })
+
+	idx, ok := s.tryWarmOpen(otherRoot)
+	if ok || idx != nil {
+		t.Fatalf("tryWarmOpen(seed clone failure) = (%v, %v), want (nil, false)", idx, ok)
+	}
+	if _, err := os.Stat(indexDBFile(otherRoot)); !os.IsNotExist(err) {
+		t.Errorf("seeded index file exists despite clone failure: err = %v, want IsNotExist", err)
+	}
+}
+
+// TestChooseIndexRevalidateAction_SeededUsesHigherThreshold verifies that a
+// seeded index (see trySeedFromSibling) gets indexSeededRepairThreshold's
+// higher ceiling instead of indexRepairThreshold's ordinary one: a freshly
+// seeded index's staleness is a branch diff, often exceeding the everyday
+// same-branch threshold, and falling back to a full rebuild in that case
+// would waste the seed's own head start.
+func TestChooseIndexRevalidateAction_SeededUsesHigherThreshold(t *testing.T) {
+	below := make([]string, indexSeededRepairThreshold)
+	for i := range below {
+		below[i] = fmt.Sprintf("pkg%d", i)
+	}
+	above := make([]string, indexSeededRepairThreshold+1)
+	for i := range above {
+		above[i] = fmt.Sprintf("pkg%d", i)
+	}
+
+	if got := chooseIndexRevalidateAction(below, false, true); got != indexRevalidateRepair {
+		t.Errorf("chooseIndexRevalidateAction(%d stale, seeded) = %v, want indexRevalidateRepair at exactly indexSeededRepairThreshold=%d", len(below), got, indexSeededRepairThreshold)
+	}
+	if got := chooseIndexRevalidateAction(above, false, true); got != indexRevalidateRebuild {
+		t.Errorf("chooseIndexRevalidateAction(%d stale, seeded) = %v, want indexRevalidateRebuild once the stale count exceeds indexSeededRepairThreshold=%d", len(above), got, indexSeededRepairThreshold)
+	}
+	if got := chooseIndexRevalidateAction(below, false, false); got != indexRevalidateRebuild {
+		t.Errorf("chooseIndexRevalidateAction(%d stale, unseeded) = %v, want indexRevalidateRebuild: unseeded keeps indexRepairThreshold=%d, unaffected by the seeded ceiling", len(below), got, indexRepairThreshold)
 	}
 }
 
@@ -986,10 +1223,10 @@ func TestRevalidateIndex_LargeStaleSetFallsBackToFullRebuild(t *testing.T) {
 	t.Cleanup(func() { indexRepairThreshold = old })
 
 	pkgs := []string{"a", "b"}
-	if got := chooseIndexRevalidateAction(pkgs, false); got != indexRevalidateRebuild {
+	if got := chooseIndexRevalidateAction(pkgs, false, false); got != indexRevalidateRebuild {
 		t.Errorf("chooseIndexRevalidateAction(%d stale, wholeDBStale=false) = %v, want indexRevalidateRebuild once the stale count exceeds indexRepairThreshold=%d", len(pkgs), got, indexRepairThreshold)
 	}
-	if got := chooseIndexRevalidateAction(pkgs[:1], false); got != indexRevalidateRepair {
+	if got := chooseIndexRevalidateAction(pkgs[:1], false, false); got != indexRevalidateRepair {
 		t.Errorf("chooseIndexRevalidateAction(%d stale, wholeDBStale=false) = %v, want indexRevalidateRepair at exactly indexRepairThreshold=%d", 1, got, indexRepairThreshold)
 	}
 }
