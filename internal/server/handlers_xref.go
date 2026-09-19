@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -12,10 +13,12 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/tools/go/ast/astutil"
 
 	"github.com/sivchari/golance/internal/check"
@@ -109,47 +112,100 @@ func (s *Server) xrefPosition(path string, pos protocol.Position) (line, col int
 }
 
 // xrefCancelCheckInterval bounds how often toLSPLocations checks ctx.Err()
-// while converting a large result: often enough that a canceled request
-// stops promptly, rarely enough that the check itself is not the cost.
+// while converting one file's locations: often enough that a canceled
+// request stops promptly, rarely enough that the check itself is not the
+// cost.
 const xrefCancelCheckInterval = 1024
 
+// xrefConcurrencyLimit bounds how many files toLSPLocations/foldIncomingCalls
+// convert concurrently: enough parallelism to amortize a references result
+// spread across thousands of files, without spawning more goroutines than
+// this machine has cores to run them on.
+func xrefConcurrencyLimit() int {
+	if n := runtime.NumCPU(); n < 8 {
+		return n
+	}
+	return 8
+}
+
 // toLSPLocations converts xref Locations to LSP Locations, applying dirty
-// correction per result file and dropping any that cannot be resolved. It
-// reads and dirty-corrects each distinct file at most once via
-// xrefFileEntryFor, amortizing the conversion to O(distinct files +
-// results) instead of one file read plus several whole-file rescans per
-// location (see xrefFileEntry's doc) -- the cost that used to dominate a
-// large references result's response time far more than the facts-index
-// query itself.
+// correction per result file and dropping any that cannot be resolved.
+// Locations are grouped by file and each file's group converted in its own
+// goroutine (bounded by xrefConcurrencyLimit), since a large references
+// result can span thousands of distinct files on a big monorepo; each
+// file's own xrefFileEntry (read and dirty-corrected once, see its doc) is
+// built and used by exactly one goroutine, so no cache map is ever mutated
+// concurrently. Results are written into a slice pre-sized by locs' own
+// index and reassembled in that same order afterward, so the returned
+// slice matches locs' original order regardless of which file's goroutine
+// finished first.
 //
-// ctx is checked every xrefCancelCheckInterval locations and on every new
-// file; a canceled conversion returns nil rather than running to
-// completion, since the caller's existing empty-result handling already
-// covers nil and an LSP client that gives up on a slow request and retries
-// (as golance's own editor client does) would otherwise stack another full
-// conversion on top of the one still running for no benefit.
+// ctx is checked at the start of each file's conversion and every
+// xrefCancelCheckInterval locations within it; a canceled conversion
+// returns nil rather than running to completion, since the caller's
+// existing empty-result handling already covers nil and an LSP client that
+// gives up on a slow request and retries (as golance's own editor client
+// does) would otherwise stack another full conversion on top of the one
+// still running for no benefit.
 func (s *Server) toLSPLocations(ctx context.Context, locs []xref.Location) protocol.LocationSlice {
-	files := make(map[string]*xrefFileEntry)
-	out := make(protocol.LocationSlice, 0, len(locs))
-	lastFile := ""
+	byFile := make(map[string][]int, len(locs))
 	for i, loc := range locs {
-		if loc.File != lastFile || i%xrefCancelCheckInterval == 0 {
-			if ctx.Err() != nil {
-				return nil
+		byFile[loc.File] = append(byFile[loc.File], i)
+	}
+
+	results := make(protocol.LocationSlice, len(locs))
+	resolved := make([]bool, len(locs))
+
+	var g errgroup.Group
+	g.SetLimit(xrefConcurrencyLimit())
+	for file, idxs := range byFile {
+		g.Go(func() error {
+			return s.toLSPLocationsForFile(ctx, file, idxs, locs, results, resolved)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil
+	}
+
+	out := make(protocol.LocationSlice, 0, len(locs))
+	for i, ok := range resolved {
+		if ok {
+			out = append(out, results[i])
+		}
+	}
+	return out
+}
+
+// toLSPLocationsForFile converts file's own locations (locs[i] for i in
+// idxs), writing each successfully-resolved one into results[i]/resolved[i]
+// -- toLSPLocations' own pre-sized, index-addressed output, safe to write
+// from multiple concurrent goroutines since idxs across different files'
+// calls never overlap. Returns ctx's own error the moment it is observed,
+// letting toLSPLocations' errgroup.Wait report cancellation.
+func (s *Server) toLSPLocationsForFile(ctx context.Context, file string, idxs []int, locs []xref.Location, results protocol.LocationSlice, resolved []bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	cache := make(map[string]*xrefFileEntry, 1)
+	e := s.xrefFileEntryFor(file, cache)
+	if e == nil {
+		return nil
+	}
+	for n, idx := range idxs {
+		if n%xrefCancelCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			lastFile = loc.File
 		}
-		e := s.xrefFileEntryFor(loc.File, files)
-		if e == nil {
-			continue
-		}
+		loc := locs[idx]
 		rng, ok := e.rangeFor(loc.Line, loc.Col, loc.EndCol)
 		if !ok {
 			continue
 		}
-		out = append(out, protocol.Location{URI: uri.File(loc.File), Range: rng})
+		results[idx] = protocol.Location{URI: uri.File(loc.File), Range: rng}
+		resolved[idx] = true
 	}
-	return out
+	return nil
 }
 
 func (s *Server) correctResultLocation(loc xref.Location) (protocol.Location, bool) {
@@ -456,6 +512,18 @@ func packageClauseLocation(file string) (xref.Location, bool) {
 	}, true
 }
 
+// handleReferences answers textDocument/references. resolver.References'
+// error is split three ways: context.Canceled/DeadlineExceeded propagates
+// as-is (rpc's dispatchRequest already maps it to a requestCancelled
+// response, and there is nothing useful to fall back to for a request the
+// client itself gave up on); xref.ErrNoSymbolAt -- an ordinary "no symbol
+// at this position" miss -- keeps the pre-existing fallback-then-empty
+// behavior below, since a package-qualifier identifier is exactly such a
+// miss (the facts index never records a *types.PkgName as an indexable
+// symbol, see packageNameReferencesFallback's doc); any other error is a
+// genuine facts-read failure and is logged and surfaced to the client as an
+// InternalError instead of silently answering an empty result, which used
+// to make a real fault indistinguishable from a true "0 references" answer.
 func (s *Server) handleReferences(ctx context.Context, params json.RawMessage) (any, error) {
 	var p protocol.ReferenceParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
@@ -478,14 +546,13 @@ func (s *Server) handleReferences(ctx context.Context, params json.RawMessage) (
 	}
 	locs, err := resolver.References(ctx, path, line, col, p.Context.IncludeDeclaration)
 	if err != nil {
-		// See handleDefinition's comment: most errors here are an ordinary
-		// "no symbol at this position" miss, but log it anyway so a
-		// genuine facts-read failure does not vanish silently. A
-		// package-qualifier identifier is exactly such a miss -- the facts
-		// index never records a *types.PkgName as an indexable symbol (see
-		// packageNameReferencesFallback's doc) -- so try that fallback
-		// before giving up.
-		s.logger.Printf("server: references at %s:%d:%d: %v", path, line, col, err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		if !errors.Is(err, xref.ErrNoSymbolAt) {
+			s.logger.Printf("server: references at %s:%d:%d: %v", path, line, col, err)
+			return nil, err
+		}
 		if locs, ok := s.packageNameReferencesFallback(ctx, p.TextDocument.URI, p.Position, p.Context.IncludeDeclaration); ok {
 			return locs, nil
 		}
@@ -543,6 +610,16 @@ func (s *Server) packageNameReferencesFallback(ctx context.Context, u uri.URI, p
 	return out, true
 }
 
+// handleImplementation answers textDocument/implementation.
+// context.Canceled/DeadlineExceeded from resolver.Implementation propagates
+// as-is (rpc's dispatchRequest already maps it to a requestCancelled
+// response); every other error still tries implementationLiveFallback
+// before answering, since that fallback covers both an ordinary "no symbol
+// at this position" miss (xref.ErrNoSymbolAt) and the one genuine,
+// documented failure mode below -- only when the fallback ALSO finds
+// nothing does the error class decide the answer: an ordinary miss still
+// degrades to an empty success, while any other error is surfaced to the
+// client as an InternalError instead of silently answering empty.
 func (s *Server) handleImplementation(ctx context.Context, params json.RawMessage) (any, error) {
 	var p protocol.ImplementationParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
@@ -560,25 +637,38 @@ func (s *Server) handleImplementation(ctx context.Context, params json.RawMessag
 	phaseTimerFrom(ctx).enter("facts.Implementation")
 	locs, err := resolver.Implementation(ctx, path, line, col)
 	if err != nil {
-		// See handleDefinition's comment: most errors here are an ordinary
-		// "no symbol at this position" miss, but log it anyway so a
-		// genuine facts-read failure does not vanish silently. One
-		// specific, real failure mode is resolver.Implementation needing
-		// to decode the QUERIED interface/method's OWN declaring
-		// package's export data (never a candidate's, which
-		// implementingTypes/implementedInterfaces already tolerate -- see
-		// internal/xref's implDiag doc) -- a gap internal/xref's doc.go
-		// documents and deliberately defers, since that package never
-		// sees the LSP session's own live type-checked info. The file the
-		// cursor is in is, by construction, the one the user has open, so
-		// implementationLiveFallback answers straight from that live
-		// go/types data instead (see its own doc for exactly what it
-		// covers and what it still cannot).
-		s.logger.Printf("server: implementation at %s:%d:%d: %v", path, line, col, err)
+		// context.Canceled/DeadlineExceeded propagates as-is: rpc's
+		// dispatchRequest already maps it to a requestCancelled response,
+		// and there is nothing useful to fall back to for a request the
+		// client itself gave up on.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		// Every other error still tries implementationLiveFallback before
+		// deciding how to answer: most are an ordinary "no symbol at this
+		// position" miss (xref.ErrNoSymbolAt), but one specific, genuine
+		// failure mode is resolver.Implementation needing to decode the
+		// QUERIED interface/method's OWN declaring package's export data
+		// (never a candidate's, which implementingTypes/implementedInterfaces
+		// already tolerate -- see internal/xref's implDiag doc) -- a gap
+		// internal/xref's doc.go documents and deliberately defers, since
+		// that package never sees the LSP session's own live type-checked
+		// info. The file the cursor is in is, by construction, the one the
+		// user has open, so implementationLiveFallback answers straight
+		// from that live go/types data instead (see its own doc for
+		// exactly what it covers and what it still cannot) -- logged first
+		// so a genuine facts-read failure the fallback also fails to cover
+		// does not vanish silently.
+		if !errors.Is(err, xref.ErrNoSymbolAt) {
+			s.logger.Printf("server: implementation at %s:%d:%d: %v", path, line, col, err)
+		}
 		if fb, ok := s.implementationLiveFallback(ctx, p.TextDocument.URI, p.Position); ok {
 			return fb, nil
 		}
-		return protocol.LocationSlice(nil), nil
+		if errors.Is(err, xref.ErrNoSymbolAt) {
+			return protocol.LocationSlice(nil), nil
+		}
+		return nil, err
 	}
 	phaseTimerFrom(ctx).enter("toLSP")
 	return s.toLSPLocations(ctx, locs), nil

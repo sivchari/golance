@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"sync"
@@ -83,6 +84,13 @@ type Server struct {
 	// abandoning them, set by NewServer to defaultDrainTimeout.
 	drainTimeout time.Duration
 
+	// requestTimeout bounds how long a single Background-priority request
+	// (see dispatchRequest) may run before its context is canceled with
+	// context.DeadlineExceeded; Interactive requests are never bounded by
+	// it. Set once by NewServer from GOLANCE_REQUEST_TIMEOUT (or
+	// defaultRequestTimeout); <= 0 disables the bound entirely.
+	requestTimeout time.Duration
+
 	conn *conn
 }
 
@@ -132,6 +140,28 @@ func defaultBackgroundWorkers() int {
 // drain's own doc for why shutdown must not wait unboundedly.
 const defaultDrainTimeout = 30 * time.Second
 
+// defaultRequestTimeout is requestTimeout's default, set by NewServer.
+const defaultRequestTimeout = 60 * time.Second
+
+// requestTimeoutFromEnv reads requestTimeout's override, GOLANCE_REQUEST_TIMEOUT
+// (a time.Duration string, e.g. "90s"), once at NewServer rather than per
+// request: a request-scoped read would let the bound change mid-session for
+// no benefit, since nothing in this process ever needs to change it after
+// startup. An unset, empty, or unparseable value keeps
+// defaultRequestTimeout; a parsed value <= 0 disables the bound (see
+// requestTimeout's own doc).
+func requestTimeoutFromEnv() time.Duration {
+	v := os.Getenv("GOLANCE_REQUEST_TIMEOUT")
+	if v == "" {
+		return defaultRequestTimeout
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return defaultRequestTimeout
+	}
+	return d
+}
+
 // NewServer constructs a Server. Register handlers with Handle and
 // HandleNotification, then call Serve.
 func NewServer(opts ...Option) *Server {
@@ -143,9 +173,10 @@ func NewServer(opts ...Option) *Server {
 			Interactive: newPool(0),
 			Background:  newPool(defaultBackgroundWorkers()),
 		},
-		queues:       make(map[string]*notifQueue),
-		pending:      make(map[string]chan *message),
-		drainTimeout: defaultDrainTimeout,
+		queues:         make(map[string]*notifQueue),
+		pending:        make(map[string]chan *message),
+		drainTimeout:   defaultDrainTimeout,
+		requestTimeout: requestTimeoutFromEnv(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -329,7 +360,18 @@ func (s *Server) dispatchRequest(ctx context.Context, m *message) {
 		s.state.Store(int32(stateShuttingDown))
 	}
 
-	reqCtx, cancel := context.WithCancel(ctx)
+	// Only a Background request is ever given a deadline: Interactive
+	// carries latency-sensitive requests (completion, hover) a client is
+	// actively waiting on, which must run to completion or be canceled by
+	// the client itself, not cut off by a server-side guess at how long is
+	// too long.
+	var reqCtx context.Context
+	var cancel context.CancelFunc
+	if reg.priority == Background && s.requestTimeout > 0 {
+		reqCtx, cancel = context.WithTimeout(ctx, s.requestTimeout)
+	} else {
+		reqCtx, cancel = context.WithCancel(ctx)
+	}
 	idKey := string(m.ID)
 	id := append(json.RawMessage(nil), m.ID...)
 	method := m.Method
@@ -353,6 +395,14 @@ func (s *Server) dispatchRequest(ctx context.Context, m *message) {
 		// cancellation that arrives too late for the handler to see it
 		// correctly has no effect on the response.
 		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+			// reqCtx.Err() (not err) tells apart the two ways this branch is
+			// reached: an explicit $/cancelRequest calls cancel directly,
+			// leaving reqCtx.Err() == context.Canceled even when reqCtx was
+			// built with WithTimeout, while only the deadline itself
+			// actually firing ever sets it to DeadlineExceeded.
+			if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+				s.logger.Printf("rpc: request %s (id=%s) exceeded its %s timeout", method, idKey, s.requestTimeout)
+			}
 			s.respondError(id, NewError(requestCancelledCode, "request cancelled"))
 		case err != nil:
 			s.respondError(id, toWireError(err))

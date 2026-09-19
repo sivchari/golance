@@ -29,6 +29,7 @@ import (
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/tools/go/ast/astutil"
 
 	"github.com/sivchari/golance/internal/check"
@@ -299,29 +300,90 @@ type chSourceFile struct {
 	dirtyLinesOK bool
 }
 
+// incomingCallsPartial is foldIncomingCalls' per-file result, built by
+// exactly one goroutine (see its own doc) and merged into the caller's
+// shared calls/order after every file's goroutine has returned: since an
+// enclosing function declaration is always in the same file as the
+// reference it encloses (enclosingCallItem's own item.URI is always loc.File
+// -- see its doc), two different files' partials can never share a key,
+// so merging is a plain, lock-free append.
+type incomingCallsPartial struct {
+	calls map[protocol.Location]*protocol.CallHierarchyIncomingCall
+	order []protocol.Location
+}
+
 // foldIncomingCalls converts locs (raw reference locations from
 // resolver.References) into gopls's own IncomingCalls shape: one entry per
 // distinct enclosing function declaration, with FromRanges collecting every
 // reference inside it (enclosingCallItem's dedup key), sorted by that
-// declaration's own location for a deterministic result order. It parses
-// each distinct referencing file at most once (cached in files), matching
-// O(result files) rather than O(results). files is local to this one call
-// and discarded when it returns, never reused across requests -- see
-// chSourceFileFor's doc for why that is what makes caching a read/parse
-// failure there safe.
+// declaration's own location for a deterministic result order. Locations
+// are grouped by referencing file and each file's group folded in its own
+// goroutine (bounded by xrefConcurrencyLimit, shared with toLSPLocations),
+// parsing each distinct file at most once via its own chSourceFileFor cache
+// -- one goroutine per file, so no cache map is ever mutated concurrently --
+// matching O(result files) rather than O(results) the same way the
+// sequential version did.
 func (s *Server) foldIncomingCalls(ctx context.Context, locs []xref.Location) []protocol.CallHierarchyIncomingCall {
-	files := make(map[string]*chSourceFile)
+	byFile := make(map[string][]int, len(locs))
+	for i, loc := range locs {
+		byFile[loc.File] = append(byFile[loc.File], i)
+	}
+
+	files := make([]string, 0, len(byFile))
+	for f := range byFile {
+		files = append(files, f)
+	}
+	partials := make([]incomingCallsPartial, len(files))
+
+	var g errgroup.Group
+	g.SetLimit(xrefConcurrencyLimit())
+	for i, file := range files {
+		g.Go(func() error {
+			partials[i] = s.foldIncomingCallsForFile(ctx, file, byFile[file], locs)
+			return nil
+		})
+	}
+	_ = g.Wait() // foldIncomingCallsForFile never returns an error; ctx cancellation is checked per file instead (see its own doc).
+
 	calls := make(map[protocol.Location]*protocol.CallHierarchyIncomingCall)
 	var order []protocol.Location
+	for _, p := range partials {
+		for _, key := range p.order {
+			calls[key] = p.calls[key]
+		}
+		order = append(order, p.order...)
+	}
 
-	for _, loc := range locs {
-		if err := ctx.Err(); err != nil {
-			break
-		}
-		sf := s.chSourceFileFor(loc.File, files)
-		if sf == nil || sf.astFile == nil {
-			continue
-		}
+	sort.Slice(order, func(i, j int) bool { return compareLocation(order[i], order[j]) })
+	out := make([]protocol.CallHierarchyIncomingCall, 0, len(order))
+	for _, key := range order {
+		out = append(out, *calls[key])
+	}
+	return out
+}
+
+// foldIncomingCallsForFile is foldIncomingCalls' per-file worker: it folds
+// file's own locations (locs[i] for i in idxs) into a local
+// incomingCallsPartial, the same per-location logic the sequential version
+// used, scoped to one file so it owns its own chSourceFile cache with no
+// synchronization. ctx is checked once before starting file (matching the
+// sequential version's own per-location check, coarsened to per-file now
+// that files run concurrently) and does not stop mid-file otherwise, since a
+// single file's own reference count is always small relative to a whole
+// result -- unlike toLSPLocationsForFile, whose per-file location count can
+// itself be very large in a plain (non-folding) references result.
+func (s *Server) foldIncomingCallsForFile(ctx context.Context, file string, idxs []int, locs []xref.Location) incomingCallsPartial {
+	p := incomingCallsPartial{calls: make(map[protocol.Location]*protocol.CallHierarchyIncomingCall)}
+	if err := ctx.Err(); err != nil {
+		return p
+	}
+	cache := make(map[string]*chSourceFile, 1)
+	sf := s.chSourceFileFor(file, cache)
+	if sf == nil || sf.astFile == nil {
+		return p
+	}
+	for _, idx := range idxs {
+		loc := locs[idx]
 		line := loc.Line
 		if sf.dirtyLinesOK {
 			if mapped, ok := dirtyLineMap(sf.saved, sf.dirty, line); ok {
@@ -342,21 +404,15 @@ func (s *Server) foldIncomingCalls(ctx context.Context, locs []xref.Location) []
 		}
 
 		key := protocol.Location{URI: item.URI, Range: item.Range}
-		call, exists := calls[key]
+		call, exists := p.calls[key]
 		if !exists {
 			call = &protocol.CallHierarchyIncomingCall{From: item}
-			calls[key] = call
-			order = append(order, key)
+			p.calls[key] = call
+			p.order = append(p.order, key)
 		}
 		call.FromRanges = append(call.FromRanges, fromRange)
 	}
-
-	sort.Slice(order, func(i, j int) bool { return compareLocation(order[i], order[j]) })
-	out := make([]protocol.CallHierarchyIncomingCall, 0, len(order))
-	for _, key := range order {
-		out = append(out, *calls[key])
-	}
-	return out
+	return p
 }
 
 // chSourceFileFor returns path's cached chSourceFile, parsing it (via the

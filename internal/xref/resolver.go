@@ -294,12 +294,21 @@ type resolvedSymbol struct {
 	Name    string
 }
 
+// ErrNoSymbolAt marks resolveAt's "no symbol at this position" family of
+// misses -- file not part of any known package, no facts entry for it, or
+// its (line, col) matching no reference or definition -- wrapped into the
+// returned error rather than left as a bare fmt.Errorf string, so a caller
+// (internal/server's handleReferences/handleImplementation) can tell this
+// ordinary miss apart from a genuine facts-read failure via errors.Is
+// instead of matching message text.
+var ErrNoSymbolAt = errors.New("xref: no symbol at this position")
+
 // resolveAt resolves the symbol at (file, line, col): a reference there
 // resolves to what it points to; a definition there resolves to itself.
 func (r *Resolver) resolveAt(ctx context.Context, file string, line, col uint32) (resolvedSymbol, error) {
 	pkgPath, ok := r.pkgPathForFile(file)
 	if !ok {
-		return resolvedSymbol{}, fmt.Errorf("xref: %s is not part of any known package", file)
+		return resolvedSymbol{}, fmt.Errorf("xref: %s is not part of any known package: %w", file, ErrNoSymbolAt)
 	}
 	pkgHash := store.Hash(pkgPath)
 
@@ -313,14 +322,14 @@ func (r *Resolver) resolveAt(ctx context.Context, file string, line, col uint32)
 	}
 	fileIdx, ok := r.fileIndexOf(v, file)
 	if !ok {
-		return resolvedSymbol{}, fmt.Errorf("xref: %s has no entry in %s's facts", file, pkgPath)
+		return resolvedSymbol{}, fmt.Errorf("xref: %s has no entry in %s's facts: %w", file, pkgPath, ErrNoSymbolAt)
 	}
 
 	if ref, ok := v.RefsAt(fileIdx, line, col); ok {
 		out, err := r.resolveRefTarget(ctx, ref)
 		if err != nil {
 			if errors.Is(err, errSymbolNotFound) {
-				return resolvedSymbol{}, fmt.Errorf("xref: no symbol at %s:%d:%d", file, line, col)
+				return resolvedSymbol{}, fmt.Errorf("xref: no symbol at %s:%d:%d: %w", file, line, col, ErrNoSymbolAt)
 			}
 			return resolvedSymbol{}, err
 		}
@@ -329,7 +338,7 @@ func (r *Resolver) resolveAt(ctx context.Context, file string, line, col uint32)
 	if s, ok := symbolAtPosition(v, fileIdx, line, col); ok {
 		return resolvedSymbol{PkgHash: pkgHash, IDHash: s.IDHash(), Kind: s.Kind(), Name: s.Name()}, nil
 	}
-	return resolvedSymbol{}, fmt.Errorf("xref: no symbol at %s:%d:%d", file, line, col)
+	return resolvedSymbol{}, fmt.Errorf("xref: no symbol at %s:%d:%d: %w", file, line, col, ErrNoSymbolAt)
 }
 
 // resolveRefTarget looks up ref's target symbol's kind and name from its
