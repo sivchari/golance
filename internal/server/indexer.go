@@ -241,11 +241,14 @@ func (s *Server) switchToPrivateIndex() {
 // case the caller should fall back to buildIndex.
 //
 // If the shared database exists but is currently locked by another live
-// session (store.IsLocked), this switches the session over to its own
-// private index (switchToPrivateIndex) and reports ok=false exactly as the
-// "no database yet" case does: buildIndex's subsequent dbPath call then
-// resolves to the private path, so it builds and opens that instead of
-// repeating the same failed shared-path attempt.
+// session (store.IsLocked), this clones it into the session's own private
+// index and opens that instead (cloneLockedSharedIndex) — reusing bytes
+// already on disk rather than paying a full indexer-subprocess rebuild for
+// them. Only if that clone-and-open itself fails does this report ok=false
+// exactly as the "no database yet" case does: buildIndex's subsequent
+// dbPath call then resolves to the (already switched-to) private path, so
+// it builds and opens that instead of repeating the same failed
+// shared-path attempt.
 //
 // The database opened here may be stale — built under a different
 // toolchain, or missing changes made outside this session since it was
@@ -277,21 +280,9 @@ func (s *Server) tryWarmOpen(root string) (*indexState, bool) {
 	db, err := store.Open(dbPath)
 	if err != nil {
 		if store.IsLocked(err) {
-			s.switchToPrivateIndex()
-		} else {
-			s.logger.Printf("golance: warm-open index: %v", err)
+			return s.cloneLockedSharedIndex(root, dbPath)
 		}
-		return nil, false
-	}
-	cas, err := store.OpenCAS(casDir(root))
-	if err != nil {
-		s.logger.Printf("golance: warm-open CAS: %v", err)
-		_ = db.Close()
-		return nil, false
-	}
-	ws := s.workspace()
-	if ws == nil {
-		_ = db.Close()
+		s.logger.Printf("golance: warm-open index: %v", err)
 		return nil, false
 	}
 	// Say so: a warm open is otherwise silent, which makes "did it reuse the
@@ -303,6 +294,60 @@ func (s *Server) tryWarmOpen(root string) (*indexState, bool) {
 		s.logger.Printf("golance: index discarded: written by a different golance version or index format; rebuilding")
 	} else {
 		s.logger.Printf("golance: index opened from disk")
+	}
+	return s.openWarmIndexState(root, db)
+}
+
+// cloneSharedIndex indirects store.ClonePath, overridable in tests so
+// cloneLockedSharedIndex's failure path can be exercised without needing a
+// real clone failure — the same indirection pattern lifecycle.go's
+// graphLoad uses for an analogous reason.
+var cloneSharedIndex = store.ClonePath
+
+// cloneLockedSharedIndex is tryWarmOpen's recovery when the shared per-root
+// database at sharedPath is currently locked by another live session:
+// rather than paying a full indexer-subprocess rebuild for content that is
+// already on disk, it clones sharedPath's bytes into this session's own
+// private path (switchToPrivateIndex) and opens the clone directly. Any
+// failure along the way is logged and reported as ok=false, falling back to
+// buildIndexLocked's ordinary private-build path exactly as before this
+// optimization existed.
+func (s *Server) cloneLockedSharedIndex(root, sharedPath string) (*indexState, bool) {
+	s.switchToPrivateIndex()
+	privatePath := privateIndexDBFile(root, s.sessionID)
+	if err := cloneSharedIndex(sharedPath, privatePath); err != nil {
+		s.logger.Printf("golance: clone shared index: %v", err)
+		return nil, false
+	}
+	db, err := store.Open(privatePath)
+	if err != nil {
+		s.logger.Printf("golance: open cloned index: %v", err)
+		return nil, false
+	}
+	idx, ok := s.openWarmIndexState(root, db)
+	if !ok {
+		return nil, false
+	}
+	s.logger.Printf("golance: shared index locked; cloned it into a session-private copy")
+	return idx, true
+}
+
+// openWarmIndexState builds the CAS-backed indexState both tryWarmOpen's
+// ordinary success path and cloneLockedSharedIndex's cloned one share:
+// opening root's CAS directory and wiring a resolver over db. Closes db and
+// reports ok=false if CAS fails to open or the workspace has vanished (e.g.
+// a concurrent Stop) since the caller's own db.Open returned.
+func (s *Server) openWarmIndexState(root string, db *store.DB) (*indexState, bool) {
+	cas, err := store.OpenCAS(casDir(root))
+	if err != nil {
+		s.logger.Printf("golance: warm-open CAS: %v", err)
+		_ = db.Close()
+		return nil, false
+	}
+	ws := s.workspace()
+	if ws == nil {
+		_ = db.Close()
+		return nil, false
 	}
 	return &indexState{db: db, cas: cas, resolver: s.newResolver(db, cas, ws.snap, RelativeIndexPaths(root))}, true
 }
