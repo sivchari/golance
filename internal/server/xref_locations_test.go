@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"path/filepath"
 	"testing"
@@ -164,5 +165,69 @@ func TestToLSPLocations_CanceledContextReturnsNil(t *testing.T) {
 	locs := []xref.Location{{File: path, Line: 3, Col: 6, EndCol: 10}}
 	if got := s.toLSPLocations(ctx, locs); got != nil {
 		t.Fatalf("toLSPLocations with a canceled ctx = %+v, want nil", got)
+	}
+}
+
+// TestToLSPLocations_ManyFilesMatchesOracleAndIsDeterministic exercises
+// toLSPLocations' file-partitioned concurrent conversion (see its own doc):
+// locations spread across many distinct files must still come back in
+// exactly the original input order, matching the sequential
+// correctResultLocation oracle location-for-location, and identically
+// across repeated calls despite unordered goroutine completion.
+func TestToLSPLocations_ManyFilesMatchesOracleAndIsDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	s := &Server{overlay: newTestOverlay()}
+
+	const numFiles = 50
+	var locs []xref.Location
+	for i := range numFiles {
+		path := writeTempFile(t, dir, fmt.Sprintf("f%03d.go", i), asciiText)
+		locs = append(locs,
+			xref.Location{File: path, Line: 3, Col: 6, EndCol: 10}, // "main"
+			xref.Location{File: path, Line: 1, Col: 1, EndCol: 8},  // "package"
+			xref.Location{File: path, Line: 99, Col: 1, EndCol: 2}, // out of range -> dropped
+		)
+	}
+
+	var want protocol.LocationSlice
+	for _, loc := range locs {
+		if pl, ok := s.correctResultLocation(loc); ok {
+			want = append(want, pl)
+		}
+	}
+
+	for run := range 3 {
+		got := s.toLSPLocations(context.Background(), locs)
+		if len(got) != len(want) {
+			t.Fatalf("run %d: toLSPLocations returned %d locations, want %d", run, len(got), len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("run %d: toLSPLocations[%d] = %+v, want %+v", run, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// TestToLSPLocations_ManyFiles_CanceledContextReturnsNil is
+// TestToLSPLocations_CanceledContextReturnsNil's many-files counterpart,
+// pinning that cancellation still stops the whole (now file-parallel)
+// conversion rather than only the one file a single goroutine happened to
+// be working on.
+func TestToLSPLocations_ManyFiles_CanceledContextReturnsNil(t *testing.T) {
+	dir := t.TempDir()
+	s := &Server{overlay: newTestOverlay()}
+
+	var locs []xref.Location
+	for i := range 20 {
+		path := writeTempFile(t, dir, fmt.Sprintf("g%03d.go", i), asciiText)
+		locs = append(locs, xref.Location{File: path, Line: 3, Col: 6, EndCol: 10})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if got := s.toLSPLocations(ctx, locs); got != nil {
+		t.Fatalf("toLSPLocations with a canceled ctx (many files) = %+v, want nil", got)
 	}
 }

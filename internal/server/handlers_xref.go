@@ -13,10 +13,12 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/tools/go/ast/astutil"
 
 	"github.com/sivchari/golance/internal/check"
@@ -110,47 +112,100 @@ func (s *Server) xrefPosition(path string, pos protocol.Position) (line, col int
 }
 
 // xrefCancelCheckInterval bounds how often toLSPLocations checks ctx.Err()
-// while converting a large result: often enough that a canceled request
-// stops promptly, rarely enough that the check itself is not the cost.
+// while converting one file's locations: often enough that a canceled
+// request stops promptly, rarely enough that the check itself is not the
+// cost.
 const xrefCancelCheckInterval = 1024
 
+// xrefConcurrencyLimit bounds how many files toLSPLocations/foldIncomingCalls
+// convert concurrently: enough parallelism to amortize a references result
+// spread across thousands of files, without spawning more goroutines than
+// this machine has cores to run them on.
+func xrefConcurrencyLimit() int {
+	if n := runtime.NumCPU(); n < 8 {
+		return n
+	}
+	return 8
+}
+
 // toLSPLocations converts xref Locations to LSP Locations, applying dirty
-// correction per result file and dropping any that cannot be resolved. It
-// reads and dirty-corrects each distinct file at most once via
-// xrefFileEntryFor, amortizing the conversion to O(distinct files +
-// results) instead of one file read plus several whole-file rescans per
-// location (see xrefFileEntry's doc) -- the cost that used to dominate a
-// large references result's response time far more than the facts-index
-// query itself.
+// correction per result file and dropping any that cannot be resolved.
+// Locations are grouped by file and each file's group converted in its own
+// goroutine (bounded by xrefConcurrencyLimit), since a large references
+// result can span thousands of distinct files on a big monorepo; each
+// file's own xrefFileEntry (read and dirty-corrected once, see its doc) is
+// built and used by exactly one goroutine, so no cache map is ever mutated
+// concurrently. Results are written into a slice pre-sized by locs' own
+// index and reassembled in that same order afterward, so the returned
+// slice matches locs' original order regardless of which file's goroutine
+// finished first.
 //
-// ctx is checked every xrefCancelCheckInterval locations and on every new
-// file; a canceled conversion returns nil rather than running to
-// completion, since the caller's existing empty-result handling already
-// covers nil and an LSP client that gives up on a slow request and retries
-// (as golance's own editor client does) would otherwise stack another full
-// conversion on top of the one still running for no benefit.
+// ctx is checked at the start of each file's conversion and every
+// xrefCancelCheckInterval locations within it; a canceled conversion
+// returns nil rather than running to completion, since the caller's
+// existing empty-result handling already covers nil and an LSP client that
+// gives up on a slow request and retries (as golance's own editor client
+// does) would otherwise stack another full conversion on top of the one
+// still running for no benefit.
 func (s *Server) toLSPLocations(ctx context.Context, locs []xref.Location) protocol.LocationSlice {
-	files := make(map[string]*xrefFileEntry)
-	out := make(protocol.LocationSlice, 0, len(locs))
-	lastFile := ""
+	byFile := make(map[string][]int, len(locs))
 	for i, loc := range locs {
-		if loc.File != lastFile || i%xrefCancelCheckInterval == 0 {
-			if ctx.Err() != nil {
-				return nil
+		byFile[loc.File] = append(byFile[loc.File], i)
+	}
+
+	results := make(protocol.LocationSlice, len(locs))
+	resolved := make([]bool, len(locs))
+
+	var g errgroup.Group
+	g.SetLimit(xrefConcurrencyLimit())
+	for file, idxs := range byFile {
+		g.Go(func() error {
+			return s.toLSPLocationsForFile(ctx, file, idxs, locs, results, resolved)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil
+	}
+
+	out := make(protocol.LocationSlice, 0, len(locs))
+	for i, ok := range resolved {
+		if ok {
+			out = append(out, results[i])
+		}
+	}
+	return out
+}
+
+// toLSPLocationsForFile converts file's own locations (locs[i] for i in
+// idxs), writing each successfully-resolved one into results[i]/resolved[i]
+// -- toLSPLocations' own pre-sized, index-addressed output, safe to write
+// from multiple concurrent goroutines since idxs across different files'
+// calls never overlap. Returns ctx's own error the moment it is observed,
+// letting toLSPLocations' errgroup.Wait report cancellation.
+func (s *Server) toLSPLocationsForFile(ctx context.Context, file string, idxs []int, locs []xref.Location, results protocol.LocationSlice, resolved []bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	cache := make(map[string]*xrefFileEntry, 1)
+	e := s.xrefFileEntryFor(file, cache)
+	if e == nil {
+		return nil
+	}
+	for n, idx := range idxs {
+		if n%xrefCancelCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			lastFile = loc.File
 		}
-		e := s.xrefFileEntryFor(loc.File, files)
-		if e == nil {
-			continue
-		}
+		loc := locs[idx]
 		rng, ok := e.rangeFor(loc.Line, loc.Col, loc.EndCol)
 		if !ok {
 			continue
 		}
-		out = append(out, protocol.Location{URI: uri.File(loc.File), Range: rng})
+		results[idx] = protocol.Location{URI: uri.File(loc.File), Range: rng}
+		resolved[idx] = true
 	}
-	return out
+	return nil
 }
 
 func (s *Server) correctResultLocation(loc xref.Location) (protocol.Location, bool) {
