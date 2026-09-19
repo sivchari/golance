@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -456,6 +457,18 @@ func packageClauseLocation(file string) (xref.Location, bool) {
 	}, true
 }
 
+// handleReferences answers textDocument/references. resolver.References'
+// error is split three ways: context.Canceled/DeadlineExceeded propagates
+// as-is (rpc's dispatchRequest already maps it to a requestCancelled
+// response, and there is nothing useful to fall back to for a request the
+// client itself gave up on); xref.ErrNoSymbolAt -- an ordinary "no symbol
+// at this position" miss -- keeps the pre-existing fallback-then-empty
+// behavior below, since a package-qualifier identifier is exactly such a
+// miss (the facts index never records a *types.PkgName as an indexable
+// symbol, see packageNameReferencesFallback's doc); any other error is a
+// genuine facts-read failure and is logged and surfaced to the client as an
+// InternalError instead of silently answering an empty result, which used
+// to make a real fault indistinguishable from a true "0 references" answer.
 func (s *Server) handleReferences(ctx context.Context, params json.RawMessage) (any, error) {
 	var p protocol.ReferenceParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
@@ -478,14 +491,13 @@ func (s *Server) handleReferences(ctx context.Context, params json.RawMessage) (
 	}
 	locs, err := resolver.References(ctx, path, line, col, p.Context.IncludeDeclaration)
 	if err != nil {
-		// See handleDefinition's comment: most errors here are an ordinary
-		// "no symbol at this position" miss, but log it anyway so a
-		// genuine facts-read failure does not vanish silently. A
-		// package-qualifier identifier is exactly such a miss -- the facts
-		// index never records a *types.PkgName as an indexable symbol (see
-		// packageNameReferencesFallback's doc) -- so try that fallback
-		// before giving up.
-		s.logger.Printf("server: references at %s:%d:%d: %v", path, line, col, err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		if !errors.Is(err, xref.ErrNoSymbolAt) {
+			s.logger.Printf("server: references at %s:%d:%d: %v", path, line, col, err)
+			return nil, err
+		}
 		if locs, ok := s.packageNameReferencesFallback(ctx, p.TextDocument.URI, p.Position, p.Context.IncludeDeclaration); ok {
 			return locs, nil
 		}
@@ -543,6 +555,16 @@ func (s *Server) packageNameReferencesFallback(ctx context.Context, u uri.URI, p
 	return out, true
 }
 
+// handleImplementation answers textDocument/implementation.
+// context.Canceled/DeadlineExceeded from resolver.Implementation propagates
+// as-is (rpc's dispatchRequest already maps it to a requestCancelled
+// response); every other error still tries implementationLiveFallback
+// before answering, since that fallback covers both an ordinary "no symbol
+// at this position" miss (xref.ErrNoSymbolAt) and the one genuine,
+// documented failure mode below -- only when the fallback ALSO finds
+// nothing does the error class decide the answer: an ordinary miss still
+// degrades to an empty success, while any other error is surfaced to the
+// client as an InternalError instead of silently answering empty.
 func (s *Server) handleImplementation(ctx context.Context, params json.RawMessage) (any, error) {
 	var p protocol.ImplementationParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
@@ -560,25 +582,38 @@ func (s *Server) handleImplementation(ctx context.Context, params json.RawMessag
 	phaseTimerFrom(ctx).enter("facts.Implementation")
 	locs, err := resolver.Implementation(ctx, path, line, col)
 	if err != nil {
-		// See handleDefinition's comment: most errors here are an ordinary
-		// "no symbol at this position" miss, but log it anyway so a
-		// genuine facts-read failure does not vanish silently. One
-		// specific, real failure mode is resolver.Implementation needing
-		// to decode the QUERIED interface/method's OWN declaring
-		// package's export data (never a candidate's, which
-		// implementingTypes/implementedInterfaces already tolerate -- see
-		// internal/xref's implDiag doc) -- a gap internal/xref's doc.go
-		// documents and deliberately defers, since that package never
-		// sees the LSP session's own live type-checked info. The file the
-		// cursor is in is, by construction, the one the user has open, so
-		// implementationLiveFallback answers straight from that live
-		// go/types data instead (see its own doc for exactly what it
-		// covers and what it still cannot).
-		s.logger.Printf("server: implementation at %s:%d:%d: %v", path, line, col, err)
+		// context.Canceled/DeadlineExceeded propagates as-is: rpc's
+		// dispatchRequest already maps it to a requestCancelled response,
+		// and there is nothing useful to fall back to for a request the
+		// client itself gave up on.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+		// Every other error still tries implementationLiveFallback before
+		// deciding how to answer: most are an ordinary "no symbol at this
+		// position" miss (xref.ErrNoSymbolAt), but one specific, genuine
+		// failure mode is resolver.Implementation needing to decode the
+		// QUERIED interface/method's OWN declaring package's export data
+		// (never a candidate's, which implementingTypes/implementedInterfaces
+		// already tolerate -- see internal/xref's implDiag doc) -- a gap
+		// internal/xref's doc.go documents and deliberately defers, since
+		// that package never sees the LSP session's own live type-checked
+		// info. The file the cursor is in is, by construction, the one the
+		// user has open, so implementationLiveFallback answers straight
+		// from that live go/types data instead (see its own doc for
+		// exactly what it covers and what it still cannot) -- logged first
+		// so a genuine facts-read failure the fallback also fails to cover
+		// does not vanish silently.
+		if !errors.Is(err, xref.ErrNoSymbolAt) {
+			s.logger.Printf("server: implementation at %s:%d:%d: %v", path, line, col, err)
+		}
 		if fb, ok := s.implementationLiveFallback(ctx, p.TextDocument.URI, p.Position); ok {
 			return fb, nil
 		}
-		return protocol.LocationSlice(nil), nil
+		if errors.Is(err, xref.ErrNoSymbolAt) {
+			return protocol.LocationSlice(nil), nil
+		}
+		return nil, err
 	}
 	phaseTimerFrom(ctx).enter("toLSP")
 	return s.toLSPLocations(ctx, locs), nil
