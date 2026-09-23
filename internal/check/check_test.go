@@ -97,6 +97,39 @@ func TestEngine_Get_SyntaxErrorPartialAST(t *testing.T) {
 	}
 }
 
+// TestEngine_Get_UnusedImportIsSoftWarning pins Diagnostics' soft-error
+// downgrade (diagnostics.go) for go/types' "imported and not used" error: it
+// must surface as a Diag with SeverityWarning, not SeverityError, whenever
+// the import itself resolves successfully. The unused import lives in an
+// overlay-only file (rather than a committed testdata fixture) because a
+// local gofmt/goimports-on-write hook otherwise strips it before the test
+// ever runs.
+func TestEngine_Get_UnusedImportIsSoftWarning(t *testing.T) {
+	ov := overlay.New()
+	e, root := newTestEngine(t, ov, Options{})
+	path := filepath.Join(root, "unusedimport", "extra.go")
+	openOverlayOnly(ov, path, "package unusedimport\n\nimport \"fmt\"\n\nfunc G() {}\n")
+
+	cp, err := e.Get(context.Background(), path)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	diags := Diagnostics(cp, e.reader)
+	var found *Diag
+	for i := range diags {
+		if strings.Contains(diags[i].Message, "imported and not used") {
+			found = &diags[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("no \"imported and not used\" diagnostic among %+v", diags)
+	}
+	if found.Severity != SeverityWarning {
+		t.Errorf("severity = %v, want SeverityWarning", found.Severity)
+	}
+}
+
 // TestEngine_Get_AdhocPackage covers Phase 3 of design-adhoc-packages.md:
 // testdata/module/testdata/fixture is a directory graph.Load never reports
 // (the go tool always excludes "testdata" directories from "./..."
