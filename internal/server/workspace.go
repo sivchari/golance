@@ -860,9 +860,9 @@ func buildPkgNameIndex(snap *graph.Snapshot) map[string][]string {
 }
 
 // refreshOnWorkspaceReady tells a capability-declaring client that
-// workspace-wide state it may have cached (inlay hints, semantic tokens) can
-// now be re-requested, because setWorkspace just installed a new snapshot —
-// either the very first one (handleInitialize) or a later
+// workspace-wide state it may have cached (inlay hints, semantic tokens,
+// code lenses) can now be re-requested, because setWorkspace just installed
+// a new snapshot — either the very first one (handleInitialize) or a later
 // reload/revalidation (revalidateGraph). Without this, a client that asked
 // for inlay hints or semantic tokens before this workspace snapshot existed
 // gets one empty answer (see handleInlayHint/semanticTokensForFile's
@@ -899,6 +899,9 @@ func (s *Server) workspaceReadyRefreshes() []func(context.Context) {
 	}
 	if s.semanticTokensRefreshSupport.Load() {
 		refreshes = append(refreshes, s.refreshSemanticTokens)
+	}
+	if s.codeLensRefreshSupport.Load() {
+		refreshes = append(refreshes, s.refreshCodeLens)
 	}
 	return refreshes
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
@@ -85,6 +86,38 @@ func findCodeLensByTitle(lenses []protocol.CodeLens, title string) (protocol.Cod
 	return protocol.CodeLens{}, false
 }
 
+// pollCodeLensE2E polls textDocument/codeLens for path until ready reports
+// true for the result, or e2eIndexBudget elapses — the same "poll until
+// eventually consistent" idiom checkE2EDidSaveTestFileAddsNewSymbol
+// (e2e_test.go) already uses for workspace/symbol. A code lens on a file
+// whose package still has an unresolved dependency import (e.g. "testing",
+// for a fresh _test.go file opened during the workspace's first, still
+// cold-index-gated check — see internal/server/workspace.go's
+// coldGateSource doc) can legitimately come back incomplete on the very
+// first request: recheckOpenFilesAfterIndexReady (internal/server/
+// indexer.go) self-heals it once the facts index is ready and pushes
+// workspace/codeLens/refresh (see refreshCodeLens in
+// internal/server/diagnostics.go) — but only to a client that declared
+// workspace.codeLens.refreshSupport at initialize, which this file's own
+// initializeWithCodeLenses does not (mirroring every e2e client but
+// initializeWithInlayRefresh's own, narrower one — see its doc in
+// e2e_inlaylatency_test.go), so a caller here still needs to poll for the
+// eventual, accurate answer instead of trusting a single request.
+func pollCodeLensE2E(t *testing.T, c *lspClient, path string, ready func([]protocol.CodeLens) bool) []protocol.CodeLens {
+	t.Helper()
+	deadline := time.Now().Add(e2eIndexBudget)
+	for {
+		lenses := requestCodeLensE2E(t, c, path)
+		if ready(lenses) {
+			return lenses
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("codeLens for %s never became ready within %s; last result: %+v", path, e2eIndexBudget, lenses)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // TestE2E_CodeLens_Generate drives a real golance binary over stdio and
 // verifies textDocument/codeLens's default-on go:generate source: a plain
 // .go file with a "//go:generate" directive gets both a recursive and a
@@ -156,7 +189,10 @@ func TestAdd(t *testing.T) {
 	initializeWithCodeLenses(t, c, root, map[string]bool{"test": true})
 	c.openFile(t, testFile)
 
-	lenses := requestCodeLensE2E(t, c, testFile)
+	lenses := pollCodeLensE2E(t, c, testFile, func(lenses []protocol.CodeLens) bool {
+		_, ok := findCodeLensByTitle(lenses, "run test")
+		return ok
+	})
 	lens, ok := findCodeLensByTitle(lenses, "run test")
 	if !ok {
 		t.Fatalf("codeLens = %+v, want a %q entry", lenses, "run test")

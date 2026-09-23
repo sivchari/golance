@@ -69,6 +69,7 @@ func (s *Server) handleInitialize(_ context.Context, params json.RawMessage) (an
 	s.watchDynamicReg.Store(clientSupportsWatchedFilesRegistration(&p))
 	s.inlayHintRefreshSupport.Store(clientSupportsInlayHintRefresh(&p))
 	s.semanticTokensRefreshSupport.Store(clientSupportsSemanticTokensRefresh(&p))
+	s.codeLensRefreshSupport.Store(clientSupportsCodeLensRefresh(&p))
 	root, err := rootFromInitializeParams(&p, params)
 	if err != nil {
 		return nil, err
@@ -215,6 +216,18 @@ func clientSupportsSemanticTokensRefresh(p *protocol.InitializeParams) bool {
 		return false
 	}
 	rs := p.Capabilities.Workspace.SemanticTokens.RefreshSupport
+	return rs != nil && *rs
+}
+
+// clientSupportsCodeLensRefresh reports whether p's client capabilities
+// declare workspace.codeLens.refreshSupport: without it, a
+// workspace/codeLens/refresh request (see refreshCodeLens) would be sending
+// the client a request it never asked for and may not handle.
+func clientSupportsCodeLensRefresh(p *protocol.InitializeParams) bool {
+	if p.Capabilities.Workspace == nil || p.Capabilities.Workspace.CodeLens == nil {
+		return false
+	}
+	rs := p.Capabilities.Workspace.CodeLens.RefreshSupport
 	return rs != nil && *rs
 }
 

@@ -150,6 +150,7 @@ func (s *Server) handleCodeLens(ctx context.Context, params json.RawMessage) (an
 	}
 	text, ok := cp.FileText(path)
 	if !ok {
+		s.logger.Printf("server: %s has no text in its checked package %s", path, cp.PkgPath())
 		return []protocol.CodeLens(nil), nil
 	}
 	var out []protocol.CodeLens

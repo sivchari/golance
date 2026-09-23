@@ -234,6 +234,7 @@ type Server struct {
 
 	inlayHintRefreshSupport      atomic.Bool // client declared workspace.inlayHint.refreshSupport at initialize (see refreshInlayHints)
 	semanticTokensRefreshSupport atomic.Bool // client declared workspace.semanticTokens.refreshSupport at initialize (see refreshSemanticTokens)
+	codeLensRefreshSupport       atomic.Bool // client declared workspace.codeLens.refreshSupport at initialize (see refreshCodeLens)
 
 	// clientInitialized reports whether the client's "initialized"
 	// notification has been received (set by handleInitialized). The LSP

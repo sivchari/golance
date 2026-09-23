@@ -401,12 +401,14 @@ func parseHintsSettings(raw protocol.LSPAny) map[langfeat.HintKind]bool {
 }
 
 // handleDidChangeConfiguration answers workspace/didChangeConfiguration:
-// re-resolves the enabled inlay hint kinds from params.Settings, which
-// carries the same "hints" shape as initializationOptions (hintsSettings),
-// then pushes workspace/inlayHint/refresh (if the client declared support
-// for it; see refreshInlayHints) so open files' inlay hints re-request
-// themselves immediately instead of only picking up the change on their
-// next unrelated inlay hint request (e.g. on scroll or edit).
+// re-resolves the enabled inlay hint kinds and code lens sources from
+// params.Settings, which carries the same "hints"/codeLens shape as
+// initializationOptions (hintsSettings, codeLensSettings), then pushes
+// workspace/inlayHint/refresh and workspace/codeLens/refresh (for whichever
+// the client declared support for; see refreshInlayHints/refreshCodeLens) so
+// open files' inlay hints and code lenses re-request themselves immediately
+// instead of only picking up the change on their next unrelated request
+// (e.g. on scroll or edit).
 func (s *Server) handleDidChangeConfiguration(_ context.Context, params json.RawMessage) error {
 	var p protocol.DidChangeConfigurationParams
 	if err := protocol.Unmarshal(params, &p); err != nil {
@@ -416,6 +418,9 @@ func (s *Server) handleDidChangeConfiguration(_ context.Context, params json.Raw
 	s.setCodeLensesEnabled(parseCodeLensSettings(p.Settings))
 	if s.inlayHintRefreshSupport.Load() {
 		s.rpc.Go(s.refreshInlayHints)
+	}
+	if s.codeLensRefreshSupport.Load() {
+		s.rpc.Go(s.refreshCodeLens)
 	}
 	return nil
 }
