@@ -31,65 +31,22 @@ const refreshSemanticTokensTimeout = 5 * time.Second
 // a notification: files with diagnostics get them, and every other such
 // file gets an empty list — whether it previously had diagnostics that are
 // now gone, or it has never had any diagnostics at all — so the client can
-// tell a file is clean instead of hearing nothing. A file that is not open,
-// or that this unit is not authoritative for, is never notified: the
-// latter matters now that two units can share res.Dir, so one publishing
-// must not clear or otherwise speak for a file only the other one checked.
+// tell a file is clean instead of hearing nothing. The one exception is a
+// file gated this round (see below): it gets no notification at all, since
+// this recheck never actually determined whether it is clean. A file that
+// is not open, or that this unit is not authoritative for, is never
+// notified: the latter matters now that two units can share res.Dir, so one
+// publishing must not clear or otherwise speak for a file only the other
+// one checked.
 func (s *Server) publishDiagnostics(res *check.Result) {
-	// While the facts index is not yet ready (a cold build still running —
-	// see coldGateSource's own doc), depCacheHolder.importer resolves every
-	// workspace-dependency import through a gate that answers only from
-	// already-persisted data, by design: a miss there is routine and
-	// temporary, not a genuine problem with the file being checked. Without
-	// this filter, every open file importing another workspace package
-	// shows a "could not import" diagnostic for the whole span of the cold
-	// build, even though nothing is actually wrong — see
-	// recheckOpenFilesAfterIndexReady (internal/server/indexer.go) for how
-	// those same files get a fresh, accurate recheck the moment the index
-	// IS ready, so suppressing this now never hides a diagnostic
-	// permanently, only until there is a real answer for it.
-	indexReady := s.idx.Load() != nil
-	byFile := make(map[string][]protocol.Diagnostic)
-	for _, d := range res.Diags {
-		if !indexReady && isColdGateImportDiag(d.Message) {
-			continue
-		}
-		byFile[d.File] = append(byFile[d.File], protocol.Diagnostic{
-			Range: protocol.Range{
-				Start: protocol.Position{Line: d.StartLine, Character: d.StartCol},
-				End:   protocol.Position{Line: d.EndLine, Character: d.EndCol},
-			},
-			Severity: diagnosticSeverity(d.Severity),
-			Source:   protocol.NewOptional("golance"),
-			Message:  protocol.String(d.Message),
-		})
-	}
+	byFile, gated := groupDiagsByFile(res.Diags, s.idx.Load() != nil)
 
 	owned := make(map[string]bool, len(res.Files))
 	for _, f := range res.Files {
 		owned[f] = true
 	}
 
-	s.diagMu.Lock()
-	prev := s.diagFiles[res.PkgPath]
-	next := make(map[string]bool, len(byFile))
-	for file := range byFile {
-		next[file] = true
-	}
-	var empty []string
-	for file := range prev {
-		if !next[file] {
-			empty = append(empty, file)
-		}
-	}
-	for _, file := range s.overlay.OpenFilesInDir(res.Dir) {
-		if !owned[file] || next[file] || prev[file] {
-			continue
-		}
-		empty = append(empty, file)
-	}
-	s.diagFiles[res.PkgPath] = next
-	s.diagMu.Unlock()
+	empty := s.updateDiagFiles(res.PkgPath, res.Dir, owned, byFile, gated)
 
 	for _, file := range empty {
 		s.notifyDiagnostics(file, nil)
@@ -108,6 +65,79 @@ func (s *Server) publishDiagnostics(res *check.Result) {
 	if s.inlayHintRefreshSupport.Load() {
 		s.rpc.Go(s.refreshInlayHints)
 	}
+}
+
+// groupDiagsByFile buckets diags by file into protocol.Diagnostic values,
+// dropping (and recording in gated) any diagnostic caused by
+// depCacheHolder.importer's cold-build gate while indexReady is false — see
+// coldGateSource's own doc: a miss there is routine and temporary while the
+// facts index has not finished its first build, not a genuine problem with
+// the file being checked, and recheckOpenFilesAfterIndexReady
+// (internal/server/indexer.go) gives every such file a fresh, accurate
+// recheck the moment the index IS ready. gated matters beyond simple
+// filtering because an import go/types could not resolve is never also
+// reported as unused — it never gets far enough to determine that — so
+// updateDiagFiles must not treat a file whose only diagnostic was gated as
+// genuinely clean.
+func groupDiagsByFile(diags []check.Diag, indexReady bool) (byFile map[string][]protocol.Diagnostic, gated map[string]bool) {
+	byFile = make(map[string][]protocol.Diagnostic)
+	gated = make(map[string]bool)
+	for _, d := range diags {
+		if !indexReady && isColdGateImportDiag(d.Message) {
+			gated[d.File] = true
+			continue
+		}
+		byFile[d.File] = append(byFile[d.File], protocol.Diagnostic{
+			Range: protocol.Range{
+				Start: protocol.Position{Line: d.StartLine, Character: d.StartCol},
+				End:   protocol.Position{Line: d.EndLine, Character: d.EndCol},
+			},
+			Severity: diagnosticSeverity(d.Severity),
+			Source:   protocol.NewOptional("golance"),
+			Message:  protocol.String(d.Message),
+		})
+	}
+	return byFile, gated
+}
+
+// updateDiagFiles reconciles s.diagFiles[pkgPath] (the set of files pkgPath
+// last published diagnostics for) against byFile and gated, and returns
+// every owned file that must now be published an empty diagnostics list:
+// one that had diagnostics before but has none now, or that is open and
+// owned but has never been published anything. A gated file is excluded
+// from both: this round is not authoritative for it (see groupDiagsByFile's
+// doc), so whatever s.diagFiles already says about it is carried forward
+// unchanged rather than being overwritten with a false "clean" answer.
+func (s *Server) updateDiagFiles(pkgPath, dir string, owned map[string]bool, byFile map[string][]protocol.Diagnostic, gated map[string]bool) []string {
+	s.diagMu.Lock()
+	defer s.diagMu.Unlock()
+
+	prev := s.diagFiles[pkgPath]
+	next := make(map[string]bool, len(byFile))
+	for file := range byFile {
+		next[file] = true
+	}
+	for file := range gated {
+		if prev[file] {
+			next[file] = true
+		}
+	}
+
+	var empty []string
+	for file := range prev {
+		if !next[file] && !gated[file] {
+			empty = append(empty, file)
+		}
+	}
+	for _, file := range s.overlay.OpenFilesInDir(dir) {
+		if !owned[file] || next[file] || prev[file] || gated[file] {
+			continue
+		}
+		empty = append(empty, file)
+	}
+
+	s.diagFiles[pkgPath] = next
+	return empty
 }
 
 // refreshInlayHints sends workspace/inlayHint/refresh, asking the client to

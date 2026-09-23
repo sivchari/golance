@@ -118,3 +118,59 @@ func TestPublishDiagnostics_KeepsColdGateImportDiagOnceIndexReady(t *testing.T) 
 		t.Errorf("published diagnostics dropped the import-failure diagnostic once the index is ready, want it kept: %s", written)
 	}
 }
+
+// TestPublishDiagnostics_ColdGateOnlyDiagPublishesNothing pins the
+// unused-import regression this suite fixes: go/types never reports
+// "imported and not used" for an import it failed to resolve in the first
+// place (confirmed via a standalone types.Config.Check run against a
+// failing importer -- it reports only the import failure), so a file whose
+// sole diagnostic this recheck found is cold-gate-suppressed must not be
+// reported as clean. Before the fix, publishDiagnostics treated a file with
+// no diagnostics left after filtering exactly like a genuinely clean file
+// and sent an explicit empty publishDiagnostics notification for it,
+// permanently hiding the real "imported and not used" diagnostic the next,
+// index-ready recheck would otherwise have reported -- since
+// waitForDiagnostics-style callers act on the first notification for a URI,
+// not the first accurate one.
+func TestPublishDiagnostics_ColdGateOnlyDiagPublishesNothing(t *testing.T) {
+	var out bytes.Buffer
+	pr, pw := io.Pipe()
+	rpcServer := rpc.NewServer(rpc.WithLogger(newTestLogger(t)))
+
+	done := make(chan struct{})
+	go func() {
+		_ = rpcServer.Serve(context.Background(), pr, &out)
+		close(done)
+	}()
+	if err := pw.Close(); err != nil {
+		t.Fatalf("close pipe writer: %v", err)
+	}
+	<-done
+
+	s := New(rpcServer, Options{Logger: newTestLogger(t)})
+	file := filepath.Join(t.TempDir(), "unusedimport.go")
+	s.overlay.DidOpen(&protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{URI: uri.File(file), Version: 1, Text: "package unusedimport\n\nimport \"fmt\"\n"},
+	})
+	// s.idx is left nil: the facts index is not ready, so "fmt" itself is
+	// gated -- go/types then reports only the import failure, never the
+	// unused-import diagnostic a fully resolved import would have produced.
+
+	res := &check.Result{
+		PkgPath: "example.com/unusedimport",
+		Dir:     filepath.Dir(file),
+		Files:   []string{file},
+		Diags: []check.Diag{
+			{
+				File: file, StartLine: 2, StartCol: 0, EndLine: 2, EndCol: 12,
+				Message:  "could not import fmt (" + coldGateMissMarker + ": fmt)",
+				Severity: check.SeverityError,
+			},
+		},
+	}
+	s.publishDiagnostics(res)
+
+	if written := out.String(); written != "" {
+		t.Errorf("publishDiagnostics sent a notification for a file whose only diagnostic was cold-gate-suppressed, want none until a real recheck: %s", written)
+	}
+}

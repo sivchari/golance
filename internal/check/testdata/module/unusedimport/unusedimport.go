@@ -1,0 +1,3 @@
+package unusedimport
+
+func F() {}
