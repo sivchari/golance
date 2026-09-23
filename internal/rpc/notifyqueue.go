@@ -23,6 +23,19 @@ func (q *notifQueue) push(fn func()) {
 	go q.drain()
 }
 
+// join pushes a no-op onto q and returns a channel that closes once it has
+// run — i.e. once every func already pushed before this call has finished.
+// dispatchRequest uses this to make a request wait for a same-document
+// notification (didOpen/didChange/didSave) queued ahead of it on the wire,
+// closing a race where the two would otherwise run on independent
+// goroutines with no ordering guarantee between them (see dispatchRequest's
+// own doc).
+func (q *notifQueue) join() <-chan struct{} {
+	done := make(chan struct{})
+	q.push(func() { close(done) })
+	return done
+}
+
 func (q *notifQueue) drain() {
 	for {
 		q.mu.Lock()

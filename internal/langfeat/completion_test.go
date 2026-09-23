@@ -96,6 +96,61 @@ func TestCompletion_Lexical(t *testing.T) {
 	}
 }
 
+// TestCompletion_CrossPackageGenericInstantiation covers member completion
+// on a cross-package generic instantiation (auditsub.Box[int]) when the
+// file declaring the selector already exists on disk -- the baseline
+// TestCompletion_CrossPackageGenericInstantiationOverlay's overlay-only
+// case is compared against, to isolate whether a regression there is about
+// the overlay-only file itself or about instantiated-generic member
+// resolution in general (see e2e_gopls_parity_test.go's
+// TestE2E_GoplsParity_Completion, which found this missing for the
+// overlay-only case).
+func TestCompletion_CrossPackageGenericInstantiation(t *testing.T) {
+	reader := overlay.New()
+	cp, path := newCheckedPackage(t, reader, "auditfeat", "completiongeneric.go")
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "b.\n") + len("b.")
+
+	items, err := langfeat.Completion(cp, text, path, offset)
+	if err != nil {
+		t.Fatalf("Completion: %v", err)
+	}
+	if !hasLabel(items, "Value") {
+		t.Errorf("Completion results = %+v, want Box[int]'s Value field", items)
+	}
+}
+
+// TestCompletion_CrossPackageGenericInstantiationOverlay is
+// TestCompletion_CrossPackageGenericInstantiation's counterpart for a file
+// that exists only in the editor overlay, never on disk -- the exact shape
+// TestE2E_GoplsParity_Completion drives via openNewFile.
+func TestCompletion_CrossPackageGenericInstantiationOverlay(t *testing.T) {
+	reader := overlay.New()
+	content := "package auditfeat\n\n" +
+		"import \"example.com/langfeatmod/auditfeat/auditsub\"\n\n" +
+		"func useBoxCompletionOverlay() {\n" +
+		"\tb := auditsub.Box[int]{Value: 42}\n" +
+		"\t_ = b.\n" +
+		"}\n"
+	cp, path := newCheckedPackageOverlay(t, reader, "auditfeat", "zz_completion_scratch_overlay.go", content)
+	text, err := reader.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	offset := mustIndex(t, text, "b.\n") + len("b.")
+
+	items, err := langfeat.Completion(cp, text, path, offset)
+	if err != nil {
+		t.Fatalf("Completion: %v", err)
+	}
+	if !hasLabel(items, "Value") {
+		t.Errorf("Completion results = %+v, want Box[int]'s Value field", items)
+	}
+}
+
 // TestCompletion_BrokenSelector covers (d): a dangling selector ("f." with
 // nothing typed after the dot yet) still resolves x's type, because
 // parser.AllErrors keeps the SelectorExpr for "f." in the partial AST (with

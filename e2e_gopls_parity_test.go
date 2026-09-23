@@ -479,11 +479,31 @@ func TestE2E_GoplsParity_Completion(t *testing.T) {
 	gl.initialize(t, root)
 	gl.openNewFile(t, scratchFile, content)
 
+	// Member completion on a cross-package (root-package) generic
+	// instantiation resolves auditsub's import through the facts index —
+	// see internal/server's engineImporter, which deliberately leaves a
+	// root package's import unresolved while the index's first build is
+	// still running (avoiding duplicating the indexer subprocess's own
+	// type-checking work — see engineImporter's own doc). This is the
+	// same race class TestE2E_Hover_CrossPackageDoc_RacesIndexReady already
+	// documents for hover; the retry loop below mirrors that test's own,
+	// for the same reason: waitForIndexReady's own signal and this file's
+	// own recheck against the now-ready index are two separate events.
+	gl.waitForIndexReady(t)
+
 	gp := startGoplsClient(t, root)
 	gp.initialize(t, root)
 	gp.openNewFile(t, scratchFile, content)
 
-	glLabels := requestCompletion(t, gl, scratchFile, pos)
+	var glLabels []string
+	deadline := time.Now().Add(e2eRequestBudget)
+	for time.Now().Before(deadline) {
+		glLabels = requestCompletion(t, gl, scratchFile, pos)
+		if containsLabel(glLabels, "Value") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	gpLabels := requestCompletion(t, gp, scratchFile, pos)
 
 	if !containsLabel(gpLabels, "Value") {
