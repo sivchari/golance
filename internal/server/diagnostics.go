@@ -21,6 +21,11 @@ const refreshInlayHintsTimeout = 5 * time.Second
 // refreshInlayHintsTimeout's reasoning.
 const refreshSemanticTokensTimeout = 5 * time.Second
 
+// refreshCodeLensTimeout bounds how long refreshCodeLens waits for the
+// client's workspace/codeLens/refresh response, matching
+// refreshInlayHintsTimeout's reasoning.
+const refreshCodeLensTimeout = 5 * time.Second
+
 // publishDiagnostics is registered as check.Options.OnResult: it converts a
 // recheck's diagnostics into textDocument/publishDiagnostics notifications,
 // one per file. Every open file res is authoritative for — res.Files, the
@@ -98,15 +103,28 @@ func (s *Server) publishDiagnostics(res *check.Result) {
 		s.notifyDiagnostics(file, diags)
 	}
 
-	// Tell a client that declared workspace.inlayHint.refreshSupport its
-	// currently shown inlay hints may now be stale — e.g. res reflects an
-	// edit to a dependency, not the open file's own didChange, so the
-	// client's usual re-request-on-edit behavior never fires for it. Run
-	// via s.rpc.Go (detached, not awaited here): OnResult callers document
-	// that publishDiagnostics must not block for long, and Request itself
-	// blocks until the client responds.
+	s.pushPullBasedRefreshes()
+}
+
+// pushPullBasedRefreshes tells a client that declared refreshSupport for a
+// pull-based feature (inlay hints, code lens) that its currently shown
+// answer may now be stale — e.g. res reflects an edit to a dependency, not
+// the open file's own didChange, so the client's usual re-request-on-edit
+// behavior never fires for it. Each push runs via s.rpc.Go (detached, not
+// awaited here): publishDiagnostics, this method's only caller, must not
+// block for long, and Request itself blocks until the client responds.
+func (s *Server) pushPullBasedRefreshes() {
 	if s.inlayHintRefreshSupport.Load() {
 		s.rpc.Go(s.refreshInlayHints)
+	}
+	// A code lens computed off a since-fixed cold-gate import (e.g. a
+	// _test.go file's matchTestFunc signature check, see
+	// TestOpenIndexAfterBuild_RechecksCodeLensOnTestFile) needs the same
+	// unprompted nudge: codeLens is pull-based too, and a client is not
+	// expected to re-request it on its own just because an unrelated
+	// recheck happened.
+	if s.codeLensRefreshSupport.Load() {
+		s.rpc.Go(s.refreshCodeLens)
 	}
 }
 
@@ -131,6 +149,18 @@ func (s *Server) refreshSemanticTokens(ctx context.Context) {
 	defer cancel()
 	if _, err := s.rpc.Request(ctx, protocol.MethodWorkspaceSemanticTokensRefresh, nil); err != nil {
 		s.logger.Printf("server: refresh semantic tokens: %v", err)
+	}
+}
+
+// refreshCodeLens sends workspace/codeLens/refresh, asking the client to
+// re-request code lenses for every currently shown document. Per the LSP
+// spec this refresh is global (the request carries no params), matching
+// refreshInlayHints.
+func (s *Server) refreshCodeLens(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, refreshCodeLensTimeout)
+	defer cancel()
+	if _, err := s.rpc.Request(ctx, protocol.MethodWorkspaceCodeLensRefresh, nil); err != nil {
+		s.logger.Printf("server: refresh code lens: %v", err)
 	}
 }
 

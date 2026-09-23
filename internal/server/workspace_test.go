@@ -30,14 +30,16 @@ func TestWorkspaceReadyRefreshes(t *testing.T) {
 		clientInitialized  bool
 		inlayHintSupport   bool
 		semanticTokenSup   bool
+		codeLensSupport    bool
 		wantRefreshesCount int
 	}{
-		{"before initialized, no capabilities", false, false, false, 0},
-		{"before initialized, both capabilities", false, true, true, 0},
-		{"after initialized, no capabilities", true, false, false, 0},
-		{"after initialized, inlay hints only", true, true, false, 1},
-		{"after initialized, semantic tokens only", true, false, true, 1},
-		{"after initialized, both capabilities", true, true, true, 2},
+		{"before initialized, no capabilities", false, false, false, false, 0},
+		{"before initialized, all capabilities", false, true, true, true, 0},
+		{"after initialized, no capabilities", true, false, false, false, 0},
+		{"after initialized, inlay hints only", true, true, false, false, 1},
+		{"after initialized, semantic tokens only", true, false, true, false, 1},
+		{"after initialized, code lens only", true, false, false, true, 1},
+		{"after initialized, all capabilities", true, true, true, true, 3},
 	}
 
 	for _, tt := range tests {
@@ -46,6 +48,7 @@ func TestWorkspaceReadyRefreshes(t *testing.T) {
 			s.clientInitialized.Store(tt.clientInitialized)
 			s.inlayHintRefreshSupport.Store(tt.inlayHintSupport)
 			s.semanticTokensRefreshSupport.Store(tt.semanticTokenSup)
+			s.codeLensRefreshSupport.Store(tt.codeLensSupport)
 
 			got := s.workspaceReadyRefreshes()
 			if len(got) != tt.wantRefreshesCount {

@@ -311,3 +311,45 @@ func TestClientSupportsSemanticTokensRefresh(t *testing.T) {
 		})
 	}
 }
+
+// TestClientSupportsCodeLensRefresh mirrors TestClientSupportsInlayHintRefresh
+// for clientSupportsCodeLensRefresh — the gate refreshCodeLens relies on to
+// avoid sending a client a request it never declared support for.
+func TestClientSupportsCodeLensRefresh(t *testing.T) {
+	trueVal, falseVal := true, false
+
+	tests := []struct {
+		name string
+		p    *protocol.InitializeParams
+		want bool
+	}{
+		{"no workspace capabilities", &protocol.InitializeParams{}, false},
+		{
+			"workspace capabilities without codeLens",
+			&protocol.InitializeParams{Capabilities: protocol.ClientCapabilities{Workspace: &protocol.WorkspaceClientCapabilities{}}},
+			false,
+		},
+		{
+			"refreshSupport explicitly false",
+			&protocol.InitializeParams{Capabilities: protocol.ClientCapabilities{Workspace: &protocol.WorkspaceClientCapabilities{
+				CodeLens: &protocol.CodeLensWorkspaceClientCapabilities{RefreshSupport: &falseVal},
+			}}},
+			false,
+		},
+		{
+			"refreshSupport true",
+			&protocol.InitializeParams{Capabilities: protocol.ClientCapabilities{Workspace: &protocol.WorkspaceClientCapabilities{
+				CodeLens: &protocol.CodeLensWorkspaceClientCapabilities{RefreshSupport: &trueVal},
+			}}},
+			true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := clientSupportsCodeLensRefresh(tt.p); got != tt.want {
+				t.Errorf("clientSupportsCodeLensRefresh() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

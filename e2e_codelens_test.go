@@ -95,10 +95,14 @@ func findCodeLensByTitle(lenses []protocol.CodeLens, title string) (protocol.Cod
 // cold-index-gated check — see internal/server/workspace.go's
 // coldGateSource doc) can legitimately come back incomplete on the very
 // first request: recheckOpenFilesAfterIndexReady (internal/server/
-// indexer.go) self-heals it once the facts index is ready, but codeLens has
-// no server-pushed refresh notification to signal that, unlike inlay hints
-// or diagnostics, so a caller that needs the eventual, accurate answer must
-// poll for it instead of trusting a single request.
+// indexer.go) self-heals it once the facts index is ready and pushes
+// workspace/codeLens/refresh (see refreshCodeLens in
+// internal/server/diagnostics.go) — but only to a client that declared
+// workspace.codeLens.refreshSupport at initialize, which this file's own
+// initializeWithCodeLenses does not (mirroring every e2e client but
+// initializeWithInlayRefresh's own, narrower one — see its doc in
+// e2e_inlaylatency_test.go), so a caller here still needs to poll for the
+// eventual, accurate answer instead of trusting a single request.
 func pollCodeLensE2E(t *testing.T, c *lspClient, path string, ready func([]protocol.CodeLens) bool) []protocol.CodeLens {
 	t.Helper()
 	deadline := time.Now().Add(e2eIndexBudget)
