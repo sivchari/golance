@@ -378,38 +378,70 @@ func (s *Server) dispatchRequest(ctx context.Context, m *message) {
 	params := m.Params
 	s.cancels.register(idKey, cancel)
 	s.wg.Add(1)
+
+	// Joined here, synchronously in the read loop — not inside the pool
+	// goroutine runRequest runs in — so barrier's position in its document's
+	// notifQueue reflects the wire order this request actually arrived in:
+	// any same-document notification (didOpen/didChange/didSave) already
+	// dispatched ahead of it is guaranteed to run first (see
+	// notifQueue.join's doc for why dispatchRequest and dispatchNotification
+	// otherwise have no ordering guarantee between them at all).
+	barrier := s.queueFor(notificationQueueKey(params)).join()
+
 	s.pools[reg.priority].run(func() {
-		defer s.wg.Done()
-		defer s.cancels.unregister(idKey)
-		defer cancel()
-		result, err := s.callRequestHandler(reqCtx, method, reg.handler, params)
-		switch {
-		// Checking err here, not reqCtx.Err(), matters: a $/cancelRequest
-		// for this id can call cancel (and so close reqCtx.Done()) at any
-		// point, including in the narrow window after the handler already
-		// returned a valid result. Basing the decision on reqCtx.Err()
-		// would make that race discard an already-computed answer. err
-		// reflects what the handler itself observed — a handler that
-		// notices ctx.Done() is expected to return ctx.Err() (the
-		// convention every handler in this codebase follows) — so a
-		// cancellation that arrives too late for the handler to see it
-		// correctly has no effect on the response.
-		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
-			// reqCtx.Err() (not err) tells apart the two ways this branch is
-			// reached: an explicit $/cancelRequest calls cancel directly,
-			// leaving reqCtx.Err() == context.Canceled even when reqCtx was
-			// built with WithTimeout, while only the deadline itself
-			// actually firing ever sets it to DeadlineExceeded.
-			if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
-				s.logger.Printf("rpc: request %s (id=%s) exceeded its %s timeout", method, idKey, s.requestTimeout)
-			}
-			s.respondError(id, NewError(requestCancelledCode, "request cancelled"))
-		case err != nil:
-			s.respondError(id, toWireError(err))
-		default:
-			s.respondResult(id, result)
-		}
+		s.runRequest(reqCtx, cancel, barrier, idKey, id, method, params, reg.handler)
 	})
+}
+
+// runRequest is dispatchRequest's pool-dispatched half: it waits for
+// barrier (see dispatchRequest's own doc), invokes handler, and writes the
+// resulting response — split out of dispatchRequest itself to keep that
+// function's own job (validating and preparing one request) separate from
+// this one (actually running it).
+//
+// The wait for barrier is unconditional, not raced against reqCtx.Done():
+// handler must always be invoked at least once, exactly as before barrier
+// existed — a $/cancelRequest landing while still waiting must not skip
+// calling it, or TestCancelRequestDoesNotDiscardResultTheHandlerAlreadyComputed's
+// own invariant (a handler that already started must still get to finish and
+// have its result honored) would have no chance to hold in the first place.
+// Every notification handler in this codebase is fast and non-blocking (see
+// notifQueue's own doc), so this wait is bounded in practice; a handler that
+// itself watches ctx remains the only mechanism for bounding how long a
+// request runs once started, exactly as callRequestHandler's own doc
+// describes.
+func (s *Server) runRequest(reqCtx context.Context, cancel context.CancelFunc, barrier <-chan struct{}, idKey string, id json.RawMessage, method string, params json.RawMessage, handler RequestHandler) {
+	defer s.wg.Done()
+	defer s.cancels.unregister(idKey)
+	defer cancel()
+	<-barrier
+	result, err := s.callRequestHandler(reqCtx, method, handler, params)
+	switch {
+	// Checking err here, not reqCtx.Err(), matters: a $/cancelRequest
+	// for this id can call cancel (and so close reqCtx.Done()) at any
+	// point, including in the narrow window after the handler already
+	// returned a valid result. Basing the decision on reqCtx.Err()
+	// would make that race discard an already-computed answer. err
+	// reflects what the handler itself observed — a handler that
+	// notices ctx.Done() is expected to return ctx.Err() (the
+	// convention every handler in this codebase follows) — so a
+	// cancellation that arrives too late for the handler to see it
+	// correctly has no effect on the response.
+	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		// reqCtx.Err() (not err) tells apart the two ways this branch is
+		// reached: an explicit $/cancelRequest calls cancel directly,
+		// leaving reqCtx.Err() == context.Canceled even when reqCtx was
+		// built with WithTimeout, while only the deadline itself
+		// actually firing ever sets it to DeadlineExceeded.
+		if errors.Is(reqCtx.Err(), context.DeadlineExceeded) {
+			s.logger.Printf("rpc: request %s (id=%s) exceeded its %s timeout", method, idKey, s.requestTimeout)
+		}
+		s.respondError(id, NewError(requestCancelledCode, "request cancelled"))
+	case err != nil:
+		s.respondError(id, toWireError(err))
+	default:
+		s.respondResult(id, result)
+	}
 }
 
 func (s *Server) dispatchNotification(ctx context.Context, m *message) {
