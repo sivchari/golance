@@ -374,11 +374,29 @@ func TestE2E_GoplsParity_InlayHint_GenericCall(t *testing.T) {
 	initializeWithHints(t, gp, root, map[string]bool{"functionTypeParameters": true})
 	gp.openFile(t, testFile)
 
-	glHints := requestInlayHints(t, gl, testFile, fullRange)
 	gpHints := requestInlayHints(t, gp, testFile, fullRange)
-
 	if !hasInlayHintLabelText(gpHints, "[int]") {
 		t.Fatalf("gopls (oracle) has no %q inlay hint for the Sum(1, 2, 3) call either — fixture problem: %+v", "[int]", gpHints)
+	}
+
+	// Poll golance's own side only: gopls has no cold-index-build gate (see
+	// pollCodeLensE2E's own doc in e2e_codelens_test.go), so its answer is
+	// already final above; golance's first inlay hint request on
+	// auditfeat_test.go races the workspace's first, still cold-index-gated
+	// check — its own imports ("testing" and the root "auditfeat" package
+	// this generic call needs) can legitimately still be unresolved on that
+	// very first request, degrading the Sum(1, 2, 3) call's inferred type
+	// argument to "invalid type" until recheckOpenFilesAfterIndexReady
+	// (internal/server/indexer.go) self-heals it once the facts index is
+	// ready.
+	deadline := time.Now().Add(e2eIndexBudget)
+	var glHints []protocol.InlayHint
+	for {
+		glHints = requestInlayHints(t, gl, testFile, fullRange)
+		if hasInlayHintLabelText(glHints, "[int]") || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if !hasInlayHintLabelText(glHints, "[int]") {
 		t.Errorf("golance is missing the %q functionTypeParameters inlay hint gopls gives for the generic Sum(1, 2, 3) call: %+v", "[int]", glHints)

@@ -94,3 +94,68 @@ func TestOpenIndexAfterBuild_RechecksOpenFilesWithoutEditOrSave(t *testing.T) {
 		}
 	})
 }
+
+// TestOpenIndexAfterBuild_RechecksCodeLensOnTestFile is
+// TestOpenIndexAfterBuild_RechecksOpenFilesWithoutEditOrSave's own scenario
+// for a _test.go file's own code lens rather than a hover on a
+// cross-package identifier: codelens_test.go's TestAdd resolves its sole
+// parameter's type through "testing", a dependency import that (like a ROOT
+// import, see depCacheHolder.importer's own doc) stays unresolved for the
+// whole span of a cold index build (coldGateSource) -- degrading
+// matchTestFunc's *testing.T signature check (internal/langfeat/
+// codelens.go) to false and so silently dropping the "run test" lens,
+// exactly as an interactive textDocument/codeLens request racing the
+// workspace's still-building facts index would. This pins that
+// recheckOpenFilesAfterIndexReady's self-heal (already proven for hover
+// above) covers code lens too.
+func TestOpenIndexAfterBuild_RechecksCodeLensOnTestFile(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		s, snap := newTestServerNoIndex(t)
+		s.setCodeLensesEnabled(map[codeLensSource]bool{codeLensTest: true})
+		root := s.workspace().root
+
+		testFile := filepath.Join(root, "codelens", "codelens_test.go")
+		text, err := os.ReadFile(filepath.Clean(testFile))
+		if err != nil {
+			t.Fatalf("read %s: %v", testFile, err)
+		}
+		openDoc(t, s, testFile, string(text))
+		synctest.Wait() // let the initial (cold) recheck complete
+
+		before := requestCodeLens(t, s, testFile)
+		t.Logf("codeLens before index ready: %+v", before)
+
+		dbPath := indexDBFile(root)
+		if err := os.MkdirAll(filepath.Dir(dbPath), 0o750); err != nil {
+			t.Fatalf("mkdir index dir: %v", err)
+		}
+		cas, err := store.OpenCAS(casDir(root))
+		if err != nil {
+			t.Fatalf("store.OpenCAS: %v", err)
+		}
+		buildTestIndexDB(t, snap, dbPath, cas)
+
+		if s.openIndexAfterBuild(context.Background(), dbPath, nil, "", 0) {
+			t.Fatal("openIndexAfterBuild locked = true, want false")
+		}
+		idx := s.idx.Load()
+		if idx == nil {
+			t.Fatal("s.idx is nil after openIndexAfterBuild")
+		}
+		t.Cleanup(func() { _ = idx.db.Close() })
+
+		synctest.Wait() // let recheckOpenFilesAfterIndexReady's own recheck complete
+
+		after := requestCodeLens(t, s, testFile)
+		found := false
+		for i := range after {
+			if after[i].Command.Title == "run test" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("codeLens after index ready and recheckOpenFilesAfterIndexReady = %+v, want a %q entry", after, "run test")
+		}
+	})
+}

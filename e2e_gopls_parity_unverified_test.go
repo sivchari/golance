@@ -202,7 +202,23 @@ func TestE2E_GoplsParity_CodeLens(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			gpTitles := codeLensTitles(requestCodeLensE2E(t, gp, tc.file))
-			glTitles := codeLensTitles(requestCodeLensE2E(t, gl, tc.file))
+			// Poll golance's own side only: gopls has no cold-index-build
+			// gate (see pollCodeLensE2E's own doc), so its answer is
+			// already final in one request; golance's first codeLens on a
+			// file whose package still has an unresolved dependency import
+			// (e.g. "testing", for the TestAndBenchmark case's _test.go
+			// file, opened right after the workspace's first, still
+			// cold-index-gated check) can legitimately need one more
+			// request once the facts index becomes ready.
+			glTitles := codeLensTitles(pollCodeLensE2E(t, gl, tc.file, func(lenses []protocol.CodeLens) bool {
+				titles := codeLensTitles(lenses)
+				for _, want := range tc.titles {
+					if !containsTitle(titles, want) {
+						return false
+					}
+				}
+				return true
+			}))
 
 			for _, want := range tc.titles {
 				if !containsTitle(gpTitles, want) {
