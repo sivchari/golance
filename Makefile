@@ -18,8 +18,10 @@ build:
 test:
 	go test -race -short ./...
 
+# GOLANCE_E2E=1 is what actually arms the suite (skipUnlessE2E); without it
+# every TestE2E silently skips and this target tests nothing.
 test-e2e:
-	go test -race -run TestE2E -timeout 20m ./...
+	GOLANCE_E2E=1 go test -race -count=1 -run TestE2E -timeout 20m .
 
 bench:
 	go test -bench=. -benchmem -run=^$$ ./internal/store/...

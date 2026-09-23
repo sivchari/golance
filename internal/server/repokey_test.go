@@ -14,6 +14,10 @@ import (
 func runGitCmd(t *testing.T, dir string, cmd *exec.Cmd) {
 	t.Helper()
 	cmd.Dir = dir
+	// The developer's global/system git config must not leak into the
+	// fixture repo: commit signing in particular makes the fixture's
+	// commits fail on machines whose signing key the test cannot read.
+	cmd.Env = append(cmd.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(cmd.Args[1:], " "), err, out)
 	}
