@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.7.18](https://github.com/sivchari/golance/compare/v0.7.17...v0.7.18) - 2026-09-23
+- fix: never report a file clean when its diagnostics were cold-gate-suppressed by @sivchari in https://github.com/sivchari/golance/pull/146
+- fix: make a request wait for same-document notifications dispatched before it by @sivchari in https://github.com/sivchari/golance/pull/148
+- fix: push workspace/codeLens/refresh and poll cold-gate races in e2e by @sivchari in https://github.com/sivchari/golance/pull/149
+- ci: run the e2e suite on every build and revive make test-e2e by @sivchari in https://github.com/sivchari/golance/pull/150
+
 ## [v0.7.17](https://github.com/sivchari/golance/compare/v0.7.16...v0.7.17) - 2026-09-19
 - fix: drop the wall-clock bound from the transitive-thrash test by @sivchari in https://github.com/sivchari/golance/pull/139
 - fix: stop folding golance's release version into the index fingerprint by @sivchari in https://github.com/sivchari/golance/pull/141
