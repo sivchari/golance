@@ -34,6 +34,7 @@ import (
 
 	"github.com/sivchari/golance/internal/check"
 	"github.com/sivchari/golance/internal/langfeat"
+	"github.com/sivchari/golance/internal/overlay"
 	"github.com/sivchari/golance/internal/xref"
 )
 
@@ -285,19 +286,58 @@ func (s *Server) handleIncomingCalls(ctx context.Context, params json.RawMessage
 
 // chSourceFile is foldIncomingCalls' per-file cache entry: text and its
 // parsed AST (current overlay content if open, disk otherwise -- see
-// s.overlay.ReadFile), plus the dirty-buffer line correction inputs
-// (correctResultRange's identical dirtyLines/dirtyLineMap pair) computed
-// once and reused for every reference the file contributes, rather than
-// once per reference the way toLSPLocations' own correctResultLocation
-// calls do for a plain (non-folding) references result.
+// s.overlay.ReadFile), a line-start table and UTF16PositionConverter built
+// once from it (mirroring xrefFileEntry's identical pair for the plain
+// references path, see position.go), plus the dirty-buffer line correction
+// inputs (correctResultRange's identical dirtyLines/dirtyLineMap pair) --
+// all computed once and reused for every reference the file contributes,
+// rather than once per reference the way rangeAndOffset's own predecessor
+// (xrefRangeToLSP + byteOffsetForPosition) otherwise recomputes from byte 0
+// every time.
 type chSourceFile struct {
 	text         []byte
 	fset         *token.FileSet
 	astFile      *ast.File // nil if file could not be parsed at all
 	pkgPath      string
+	lineStarts   []int
+	conv         *overlay.UTF16PositionConverter
 	saved        []byte
 	dirty        []byte
 	dirtyLinesOK bool
+}
+
+// rangeAndOffset converts a facts-index span (line, [col, endCol) 1-based
+// byte columns) on sf's file into an LSP Range plus its start byte offset,
+// applying sf's dirty-buffer line correction first -- sf's own cached
+// counterpart to xrefRangeToLSP followed by byteOffsetForPosition on its
+// Start, the pair foldIncomingCallsForFile used to rescan text from byte 0
+// per location before this cache existed. Mirrors xrefFileEntry.rangeFor's
+// identical mechanism for the plain references path (position.go), also
+// returning the start offset since enclosingCallItem needs it directly
+// rather than re-deriving it from the Range just computed.
+func (sf *chSourceFile) rangeAndOffset(line, col, endCol uint32) (protocol.Range, int, bool) {
+	if sf.dirtyLinesOK {
+		if mapped, ok := dirtyLineMap(sf.saved, sf.dirty, line); ok {
+			line = mapped
+		}
+	}
+	startOff, ok := offsetForLineCol(sf.lineStarts, len(sf.text), line, col)
+	if !ok {
+		return protocol.Range{}, 0, false
+	}
+	endOff, ok := offsetForLineCol(sf.lineStarts, len(sf.text), line, endCol)
+	if !ok {
+		return protocol.Range{}, 0, false
+	}
+	start, ok := sf.conv.Position(startOff)
+	if !ok {
+		return protocol.Range{}, 0, false
+	}
+	end, ok := sf.conv.Position(endOff)
+	if !ok {
+		return protocol.Range{}, 0, false
+	}
+	return protocol.Range{Start: start, End: end}, startOff, true
 }
 
 // incomingCallsPartial is foldIncomingCalls' per-file result, built by
@@ -364,14 +404,16 @@ func (s *Server) foldIncomingCalls(ctx context.Context, locs []xref.Location) []
 
 // foldIncomingCallsForFile is foldIncomingCalls' per-file worker: it folds
 // file's own locations (locs[i] for i in idxs) into a local
-// incomingCallsPartial, the same per-location logic the sequential version
-// used, scoped to one file so it owns its own chSourceFile cache with no
-// synchronization. ctx is checked once before starting file (matching the
-// sequential version's own per-location check, coarsened to per-file now
-// that files run concurrently) and does not stop mid-file otherwise, since a
-// single file's own reference count is always small relative to a whole
-// result -- unlike toLSPLocationsForFile, whose per-file location count can
-// itself be very large in a plain (non-folding) references result.
+// incomingCallsPartial, converting each via sf's own rangeAndOffset (O(line)
+// per location against sf's cached line-start table and position converter,
+// rather than rescanning file from byte 0 per location), scoped to one file
+// so it owns its own chSourceFile cache with no synchronization. ctx is
+// checked once before starting file (matching the sequential version's own
+// per-location check, coarsened to per-file now that files run
+// concurrently) and does not stop mid-file otherwise, since a single file's
+// own reference count is always small relative to a whole result -- unlike
+// toLSPLocationsForFile, whose per-file location count can itself be very
+// large in a plain (non-folding) references result.
 func (s *Server) foldIncomingCallsForFile(ctx context.Context, file string, idxs []int, locs []xref.Location) incomingCallsPartial {
 	p := incomingCallsPartial{calls: make(map[protocol.Location]*protocol.CallHierarchyIncomingCall)}
 	if err := ctx.Err(); err != nil {
@@ -384,17 +426,7 @@ func (s *Server) foldIncomingCallsForFile(ctx context.Context, file string, idxs
 	}
 	for _, idx := range idxs {
 		loc := locs[idx]
-		line := loc.Line
-		if sf.dirtyLinesOK {
-			if mapped, ok := dirtyLineMap(sf.saved, sf.dirty, line); ok {
-				line = mapped
-			}
-		}
-		fromRange, ok := xrefRangeToLSP(sf.text, line, loc.Col, loc.EndCol)
-		if !ok {
-			continue
-		}
-		offset, ok := byteOffsetForPosition(sf.text, fromRange.Start)
+		fromRange, offset, ok := sf.rangeAndOffset(loc.Line, loc.Col, loc.EndCol)
 		if !ok {
 			continue
 		}
@@ -450,7 +482,17 @@ func (s *Server) chSourceFileFor(path string, cache map[string]*chSourceFile) *c
 		s.logger.Printf("server: call hierarchy incoming calls: parse %s: %v (every reference in this file is dropped from the result)", path, err)
 	}
 	pkgPath, _ := s.pkgPathForFile(path)
-	sf := &chSourceFile{text: text, fset: fset, astFile: astFile, pkgPath: pkgPath, saved: saved, dirty: dirty, dirtyLinesOK: dirtyOK}
+	sf := &chSourceFile{
+		text:         text,
+		fset:         fset,
+		astFile:      astFile,
+		pkgPath:      pkgPath,
+		lineStarts:   buildLineStarts(text),
+		conv:         overlay.NewUTF16PositionConverter(text),
+		saved:        saved,
+		dirty:        dirty,
+		dirtyLinesOK: dirtyOK,
+	}
 	cache[path] = sf
 	return sf
 }
