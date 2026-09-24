@@ -3,6 +3,7 @@
 ## [v0.7.19](https://github.com/sivchari/golance/compare/v0.7.18...v0.7.19) - 2026-09-24
 
 - ci: bump every pinned action to its latest release by @sivchari in https://github.com/sivchari/golance/pull/151
+- perf: make foldIncomingCalls per-location work O(line), not O(file) by @sivchari in https://github.com/sivchari/golance/pull/153
 
 ## [v0.7.18](https://github.com/sivchari/golance/compare/v0.7.17...v0.7.18) - 2026-09-23
 - fix: never report a file clean when its diagnostics were cold-gate-suppressed by @sivchari in https://github.com/sivchari/golance/pull/146
