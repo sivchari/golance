@@ -8,6 +8,7 @@ import (
 
 	"go.lsp.dev/protocol"
 
+	"github.com/sivchari/golance/internal/overlay"
 	"github.com/sivchari/golance/internal/xref"
 )
 
@@ -115,5 +116,53 @@ func TestFoldIncomingCalls_MatchesSequentialOracle(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("run %d: foldIncomingCalls = %+v, want %+v", run, got, want)
 		}
+	}
+}
+
+// TestChSourceFileRangeAndOffset_MatchesOracle checks, for every (line, col,
+// endCol) combination in and around each equivalenceFixtures fixture's
+// bounds, that a clean (no dirty-buffer correction) chSourceFile's
+// rangeAndOffset returns exactly what the oracle it replaces returns: its
+// Range must match xrefRangeToLSP (the same oracle
+// TestXrefFileEntryRangeFor_MatchesXrefRangeToLSP already pins the plain
+// references path's own per-file cache against), and its start offset must
+// match byteOffsetForLineCol(b, line, col) directly -- the ground-truth byte
+// offset a valid (line, col) names -- rather than round-tripping back
+// through byteOffsetForPosition on the Range's Start the way
+// foldIncomingCallsForFile used to derive it: that round trip is lossy for a
+// col that does not land on a rune boundary (impossible for a real
+// resolver.References location, which always names a token start, but very
+// much reachable by this sweep's exhaustive col values), and rangeAndOffset
+// -- like offsetForLineCol it is built on -- returns the exact byte offset a
+// column names instead of silently rounding it down to the nearest
+// preceding rune boundary.
+func TestChSourceFileRangeAndOffset_MatchesOracle(t *testing.T) {
+	for name, text := range equivalenceFixtures {
+		t.Run(name, func(t *testing.T) {
+			b := []byte(text)
+			sf := &chSourceFile{
+				text:       b,
+				lineStarts: buildLineStarts(b),
+				conv:       overlay.NewUTF16PositionConverter(b),
+			}
+			maxLine := sweepBound(t, len(sf.lineStarts))
+			maxCol := sweepBound(t, len(b))
+			for line := uint32(0); line <= maxLine; line++ {
+				for col := uint32(0); col <= maxCol; col++ {
+					for endCol := col; endCol <= maxCol; endCol++ {
+						wantRange, wantOK := xrefRangeToLSP(b, line, col, endCol)
+						var wantOffset int
+						if wantOK {
+							wantOffset, _ = byteOffsetForLineCol(b, line, col)
+						}
+						gotRange, gotOffset, ok := sf.rangeAndOffset(line, col, endCol)
+						if ok != wantOK || (ok && (gotRange != wantRange || gotOffset != wantOffset)) {
+							t.Fatalf("rangeAndOffset(%d,%d,%d) = (%+v,%d,%v), want (%+v,%d,%v)",
+								line, col, endCol, gotRange, gotOffset, ok, wantRange, wantOffset, wantOK)
+						}
+					}
+				}
+			}
+		})
 	}
 }
