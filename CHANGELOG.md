@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.7.20](https://github.com/sivchari/golance/compare/v0.7.19...v0.7.20) - 2026-09-25
+
+- ci: pin golangci-lint to v2.13.2 instead of latest by @sivchari in https://github.com/sivchari/golance/pull/155
+
 ## [v0.7.19](https://github.com/sivchari/golance/compare/v0.7.18...v0.7.19) - 2026-09-24
 
 - ci: bump every pinned action to its latest release by @sivchari in https://github.com/sivchari/golance/pull/151
