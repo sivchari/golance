@@ -20,4 +20,8 @@ jobs:
           go-version-file: 'go.mod'
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: latest
+          # Pinned like every action SHA in this repo: "latest" made a
+          # golangci-lint release (v2.14.0's new G703) turn main red with
+          # zero code change. New linter versions are adopted by bumping
+          # this deliberately and addressing new findings in the same PR.
+          version: v2.13.2
