@@ -35,17 +35,75 @@ type TypeHierarchyItemInfo struct {
 // the interfaces it embeds.
 func (r *Resolver) Supertypes(ctx context.Context, file string, line, col int) ([]TypeHierarchyItemInfo, error) {
 	ctx = r.pinExportCache(ctx)
-	named, key, err := r.typeHierarchyTarget(ctx, file, line, col)
+	target, err := r.typeHierarchyTarget(ctx, file, line, col)
 	if err != nil {
 		return nil, err
 	}
 
-	queryType := methodSetType(named)
-	ms := types.NewMethodSet(queryType)
-	if ms.Len() == 0 {
+	entries, err := r.ownMethodEntries(ctx, target.PkgHash, target.IDHash)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
 		// A type with no methods trivially implements every zero-method
 		// interface (chiefly interface{}/any); no point reporting that,
 		// mirroring interfacesImplementedBy's identical guard.
+		return nil, nil
+	}
+	if entriesAllGeneric(entries) {
+		return r.supertypesByDecode(ctx, target)
+	}
+
+	key := candidateKey{PkgHash: target.PkgHash, TypeSymbolIDHash: target.IDHash}
+	names := methodSymbolEntryNames(entries)
+	diag := newImplDiag(names)
+	ifaces, err := r.implementedInterfacesByKey(ctx, key, names, diag)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []TypeHierarchyItemInfo
+	for k := range ifaces {
+		if k == key {
+			continue // never report the queried type as its own supertype
+		}
+		iname, _, loc, err := r.symbolByHash(ctx, k.PkgHash, k.TypeSymbolIDHash)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				diag.skipCandidate(k, err)
+				continue
+			}
+			return nil, err
+		}
+		ipath, ok := r.pkgPathByHash[k.PkgHash]
+		if !ok {
+			diag.skipCandidate(k, errUnknownDefiningPackage)
+			continue
+		}
+		out = append(out, TypeHierarchyItemInfo{Name: iname, PkgPath: ipath, IsInterface: true, Location: loc})
+	}
+	sortTypeHierarchyItemInfos(out)
+	if len(out) == 0 {
+		r.logImplDiag("type hierarchy supertypes of "+target.Name, diag)
+	}
+	return out, nil
+}
+
+// supertypesByDecode is Supertypes' pre-fix decode-based path, kept as the
+// fallback for a generic target (entriesAllGeneric): registerMethodSet/
+// registerInterfaceMethodSet never fingerprint a generic receiver's methods
+// (see their doc), so the facts-only confirmation above cannot be trusted
+// for it.
+func (r *Resolver) supertypesByDecode(ctx context.Context, target resolvedSymbol) ([]TypeHierarchyItemInfo, error) {
+	named, err := r.typeHierarchyNamed(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	key := candidateKey{PkgHash: target.PkgHash, TypeSymbolIDHash: target.IDHash}
+
+	queryType := methodSetType(named)
+	ms := types.NewMethodSet(queryType)
+	if ms.Len() == 0 {
 		return nil, nil
 	}
 	names := make([]string, ms.Len())
@@ -134,26 +192,56 @@ func (r *Resolver) confirmSupertypeCandidate(ctx context.Context, k candidateKey
 // method set alike, with no kind filter of its own).
 func (r *Resolver) Subtypes(ctx context.Context, file string, line, col int) ([]TypeHierarchyItemInfo, error) {
 	ctx = r.pinExportCache(ctx)
-	named, key, err := r.typeHierarchyTarget(ctx, file, line, col)
+	target, err := r.typeHierarchyTarget(ctx, file, line, col)
 	if err != nil {
 		return nil, err
 	}
-	iface, ok := named.Underlying().(*types.Interface)
-	if !ok {
+	if target.Kind != index.KindInterface {
 		return nil, nil // concrete query type: no subtypes, matching gopls
 	}
-	if iface.NumMethods() == 0 {
+
+	entries, err := r.ownMethodEntries(ctx, target.PkgHash, target.IDHash)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
 		// interface{}/any: every type in the workspace trivially qualifies,
 		// not a useful result -- mirrors implementationsOfInterface's
 		// identical guard for "Go to Implementations".
 		return nil, nil
 	}
-	names := make([]string, iface.NumMethods())
-	for i := range names {
-		names[i] = iface.Method(i).Name()
+	if entriesAllGeneric(entries) {
+		return r.subtypesByDecode(ctx, target)
 	}
-	generic := named.TypeParams().Len() > 0
-	ifaceFPs := interfaceFingerprints(iface, generic)
+	return r.subtypesByFacts(ctx, target, entries)
+}
+
+// subtypesByFacts is Subtypes' facts-only path, for a target whose own
+// method set is real (not entriesAllGeneric): the queried interface's own
+// export data is never decoded up front, only lazily and at most once, as
+// confirmSubtypeCandidate's own last-resort fallback for a candidate whose
+// fingerprint alone does not confirm.
+func (r *Resolver) subtypesByFacts(ctx context.Context, target resolvedSymbol, entries []store.MethodSymbolEntry) ([]TypeHierarchyItemInfo, error) {
+	key := candidateKey{PkgHash: target.PkgHash, TypeSymbolIDHash: target.IDHash}
+	names := methodSymbolEntryNames(entries)
+	ifaceFPs := make(map[string]uint64, len(entries))
+	for _, e := range entries {
+		if e.Entry.Fingerprint != 0 {
+			ifaceFPs[e.Name] = e.Entry.Fingerprint
+		}
+	}
+	pkgPath, ok := r.pkgPathByHash[target.PkgHash]
+	if !ok {
+		return nil, fmt.Errorf("xref: unknown defining package for hash %d", target.PkgHash)
+	}
+	resolveTargetIface := func() (*types.Interface, bool) {
+		named, ok := r.resolveNamedOK(ctx, pkgPath, target.Name)
+		if !ok {
+			return nil, false
+		}
+		iface, ok := named.Underlying().(*types.Interface)
+		return iface, ok
+	}
 
 	diag := newImplDiag(names)
 	candidates, err := r.candidatesByAllMethodsEitherKind(ctx, names, diag)
@@ -166,7 +254,58 @@ func (r *Resolver) Subtypes(ctx context.Context, file string, line, col int) ([]
 		if k == key {
 			continue // never report the queried interface as its own subtype
 		}
-		info, ok, err := r.confirmSubtypeCandidate(ctx, k, byName, iface, names, ifaceFPs, generic, diag)
+		info, ok, err := r.confirmSubtypeCandidate(ctx, k, byName, resolveTargetIface, names, ifaceFPs, false, diag)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, info)
+		}
+	}
+	sortTypeHierarchyItemInfos(out)
+	if len(out) == 0 {
+		r.logImplDiag("type hierarchy subtypes of "+target.Name, diag)
+	}
+	return out, nil
+}
+
+// subtypesByDecode is Subtypes' pre-fix decode-based path, kept as the
+// fallback for a generic target (entriesAllGeneric): registerInterfaceMethodSet
+// never fingerprints a generic interface's methods (see its doc), so the
+// facts-only confirmation above cannot be trusted for it.
+func (r *Resolver) subtypesByDecode(ctx context.Context, target resolvedSymbol) ([]TypeHierarchyItemInfo, error) {
+	named, err := r.typeHierarchyNamed(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	key := candidateKey{PkgHash: target.PkgHash, TypeSymbolIDHash: target.IDHash}
+	iface, ok := named.Underlying().(*types.Interface)
+	if !ok {
+		return nil, nil
+	}
+	if iface.NumMethods() == 0 {
+		return nil, nil
+	}
+	names := make([]string, iface.NumMethods())
+	for i := range names {
+		names[i] = iface.Method(i).Name()
+	}
+	generic := named.TypeParams().Len() > 0
+	ifaceFPs := interfaceFingerprints(iface, generic)
+	resolveTargetIface := func() (*types.Interface, bool) { return iface, true }
+
+	diag := newImplDiag(names)
+	candidates, err := r.candidatesByAllMethodsEitherKind(ctx, names, diag)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []TypeHierarchyItemInfo
+	for k, byName := range candidates {
+		if k == key {
+			continue // never report the queried interface as its own subtype
+		}
+		info, ok, err := r.confirmSubtypeCandidate(ctx, k, byName, resolveTargetIface, names, ifaceFPs, generic, diag)
 		if err != nil {
 			return nil, err
 		}
@@ -206,7 +345,13 @@ func interfaceFingerprints(iface *types.Interface, generic bool) map[string]uint
 // Implementations" -- see its own doc for the soundness argument and why an
 // unexported candidate is resolvable this way), falling back to a live
 // types.Implements decode when generic or the fingerprints do not confirm.
-func (r *Resolver) confirmSubtypeCandidate(ctx context.Context, k candidateKey, byName map[string][]store.MethodEntry, iface *types.Interface, names []string, ifaceFPs map[string]uint64, generic bool, diag *implDiag) (TypeHierarchyItemInfo, bool, error) {
+// resolveTargetIface lazily decodes the queried interface itself -- called
+// at most once, only for a candidate that reaches the decode fallback --
+// letting Subtypes' facts-only path (target's own export data never
+// decoded up front) share this confirmation with subtypesByDecode's
+// pre-fix path (target already decoded, so its own closure just returns it
+// directly).
+func (r *Resolver) confirmSubtypeCandidate(ctx context.Context, k candidateKey, byName map[string][]store.MethodEntry, resolveTargetIface func() (*types.Interface, bool), names []string, ifaceFPs map[string]uint64, generic bool, diag *implDiag) (TypeHierarchyItemInfo, bool, error) {
 	cname, ckind, loc, err := r.symbolByHash(ctx, k.PkgHash, k.TypeSymbolIDHash)
 	if err != nil {
 		if errors.Is(err, errSymbolNotFound) {
@@ -228,6 +373,17 @@ func (r *Resolver) confirmSubtypeCandidate(ctx context.Context, k candidateKey, 
 	if err := ctx.Err(); err != nil {
 		return TypeHierarchyItemInfo{}, false, err
 	}
+	iface, ok := resolveTargetIface()
+	if !ok {
+		// The queried interface itself cannot be decoded (unexported or
+		// _test.go-declared, and this candidate's own fingerprint did not
+		// confirm -- e.g. its receiver is generic): the rare, doubly-affected
+		// hole this fix's own test plan leaves intentionally open, since
+		// there is no sound way to confirm satisfaction without decoding at
+		// least one side.
+		diag.fingerprintMismatch++
+		return TypeHierarchyItemInfo{}, false, nil
+	}
 	cnamed, err := r.resolveNamed(ctx, cpath, cname)
 	if err != nil {
 		diag.skip(cpath, cname, err)
@@ -242,32 +398,35 @@ func (r *Resolver) confirmSubtypeCandidate(ctx context.Context, k candidateKey, 
 }
 
 // typeHierarchyTarget resolves the type/interface at (file, line, col) --
-// shared by Supertypes/Subtypes -- returning its *types.Named plus its own
-// candidateKey, so the caller can exclude the query type from its own
-// result set (a concern implementingTypes/implementedInterfaces never have,
-// since each of those searches a kind bucket disjoint from the query's
-// own).
-func (r *Resolver) typeHierarchyTarget(ctx context.Context, file string, line, col int) (*types.Named, candidateKey, error) {
+// shared by Supertypes/Subtypes -- as a resolvedSymbol, deferring any export
+// data decode to typeHierarchyNamed (only needed for a generic target; see
+// entriesAllGeneric) instead of decoding unconditionally the way this used
+// to via resolveNamed, which fails structurally for a target that is
+// unexported or declared in a _test.go file.
+func (r *Resolver) typeHierarchyTarget(ctx context.Context, file string, line, col int) (resolvedSymbol, error) {
 	l, c, err := toUint32Pos(line, col)
 	if err != nil {
-		return nil, candidateKey{}, err
+		return resolvedSymbol{}, err
 	}
 	target, err := r.resolveAt(ctx, file, l, c)
 	if err != nil {
-		return nil, candidateKey{}, err
+		return resolvedSymbol{}, err
 	}
 	if target.Kind != index.KindType && target.Kind != index.KindInterface {
-		return nil, candidateKey{}, fmt.Errorf("xref: type hierarchy query not supported for symbol kind %d", target.Kind)
+		return resolvedSymbol{}, fmt.Errorf("xref: type hierarchy query not supported for symbol kind %d", target.Kind)
 	}
+	return target, nil
+}
+
+// typeHierarchyNamed decodes target's own export data, for
+// supertypesByDecode/subtypesByDecode's generic-target fallback (the only
+// remaining caller that needs target itself as a live *types.Named).
+func (r *Resolver) typeHierarchyNamed(ctx context.Context, target resolvedSymbol) (*types.Named, error) {
 	pkgPath, ok := r.pkgPathByHash[target.PkgHash]
 	if !ok {
-		return nil, candidateKey{}, fmt.Errorf("xref: unknown defining package for hash %d", target.PkgHash)
+		return nil, fmt.Errorf("xref: unknown defining package for hash %d", target.PkgHash)
 	}
-	named, err := r.resolveNamed(ctx, pkgPath, target.Name)
-	if err != nil {
-		return nil, candidateKey{}, err
-	}
-	return named, candidateKey{PkgHash: target.PkgHash, TypeSymbolIDHash: target.IDHash}, nil
+	return r.resolveNamed(ctx, pkgPath, target.Name)
 }
 
 // methodSetType returns the type to compute a method set over, or pass as
