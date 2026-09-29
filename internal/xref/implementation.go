@@ -189,7 +189,7 @@ func (r *Resolver) interfacesImplementedByTarget(ctx context.Context, pkgPath st
 // the identical way selfCandidateKey derives one from a live *types.Named,
 // so the two paths' memo entries for the same real type can never collide
 // or diverge.
-func (r *Resolver) implementedInterfacesByKey(ctx context.Context, key candidateKey, methodNames []string, diag *implDiag) (map[candidateKey]*types.Interface, error) {
+func (r *Resolver) implementedInterfacesByKey(ctx context.Context, key candidateKey, methodNames []string, diag *implDiag) (candidateOccurrences, error) {
 	if v, hit := r.implementedInterfacesMemo.get(key); hit {
 		return v, nil
 	}
@@ -204,57 +204,36 @@ func (r *Resolver) implementedInterfacesByKey(ctx context.Context, key candidate
 
 // implementedInterfacesConfirmByKey is implementedInterfacesConfirm's
 // facts-only counterpart: key identifies a type/interface whose own export
-// data cannot be decoded, so confirmation calls
-// receiverSatisfiesInterfaceByFingerprint(key, iface) instead of
-// types.Implements(pointer(named), iface) -- key's own recorded method
-// fingerprints (already known non-zero; entriesAllGeneric routes a generic
-// key to the decode-based path before this runs) are exactly as sound a
-// confirmation as decoding key itself would be (see
-// implementingTypesConfirm's own soundness argument, applied here in the
-// opposite direction). Candidate gathering is otherwise identical to
-// implementedInterfacesConfirm, and candidates are still decoded --
-// interfaces are conventionally exported, so this asymmetry is unaffected.
-func (r *Resolver) implementedInterfacesConfirmByKey(ctx context.Context, key candidateKey, methodNames []string, diag *implDiag) (map[candidateKey]*types.Interface, error) {
+// data cannot be decoded, so confirmation falls back to
+// confirmImplementedInterfaceCandidate's facts-only path
+// (receiverSatisfiesInterfaceByFingerprint against a decoded candidate, or
+// receiverSatisfiesMethodEntries when the candidate ALSO cannot decode --
+// see its own doc) instead of ever calling types.Implements(pointer(named),
+// iface), since there is no live *types.Named for key here at all. key's
+// own recorded method fingerprints (already known non-zero;
+// entriesAllGeneric routes a generic key to the decode-based path before
+// this runs) are exactly as sound a confirmation as decoding key itself
+// would be. Candidate gathering is otherwise identical to
+// implementedInterfacesConfirm.
+func (r *Resolver) implementedInterfacesConfirmByKey(ctx context.Context, key candidateKey, methodNames []string, diag *implDiag) (candidateOccurrences, error) {
 	candidates, err := r.candidatesByAnyMethod(ctx, methodNames, index.KindInterface, diag)
 	if err != nil {
 		return nil, err
 	}
+	noReceiver := func() (*types.Named, bool) { return nil, false }
 
-	out := make(map[candidateKey]*types.Interface)
-	for ck := range candidates {
+	out := make(candidateOccurrences, len(candidates))
+	for ck, byName := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		iname, _, _, err := r.symbolByHash(ctx, ck.PkgHash, ck.TypeSymbolIDHash)
-		if err != nil {
-			if !errors.Is(err, errSymbolNotFound) {
-				return nil, err
-			}
-			diag.skipCandidate(ck, err)
-			continue
-		}
-		ipath, ok := r.pkgPathByHash[ck.PkgHash]
-		if !ok {
-			diag.skipCandidate(ck, errUnknownDefiningPackage)
-			continue
-		}
-		inamed, err := r.resolveNamed(ctx, ipath, iname)
-		if err != nil {
-			diag.skip(ipath, iname, err)
-			continue
-		}
-		iface, ok := inamed.Underlying().(*types.Interface)
-		if !ok {
-			continue
-		}
-		satisfied, err := r.receiverSatisfiesInterfaceByFingerprint(ctx, key, iface)
+		confirmed, err := r.confirmImplementedInterfaceCandidate(ctx, key, noReceiver, ck, diag)
 		if err != nil {
 			return nil, err
 		}
-		if !satisfied {
-			continue
+		if confirmed {
+			out[ck] = byName
 		}
-		out[ck] = iface
 	}
 	diag.survivors += len(out)
 	return out, nil
@@ -597,43 +576,74 @@ func (r *Resolver) interfacesSatisfiedByMethodByKeyConfirm(ctx context.Context, 
 	}
 
 	var out []resolvedSymbol
-	for ikey := range candidates {
+	for ikey, methodEntries := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		iname, _, _, err := r.symbolByHash(ctx, ikey.PkgHash, ikey.TypeSymbolIDHash)
-		if err != nil {
-			if errors.Is(err, errSymbolNotFound) {
-				continue
-			}
-			return nil, err
-		}
-		ipath, ok := r.pkgPathByHash[ikey.PkgHash]
-		if !ok {
-			continue
-		}
-		inamed, err := r.resolveNamed(ctx, ipath, iname)
-		if err != nil {
-			continue
-		}
-		iface, ok := inamed.Underlying().(*types.Interface)
-		if !ok {
-			continue
-		}
-		satisfied, err := r.receiverSatisfiesInterfaceByFingerprint(ctx, key, iface)
+		satisfied, err := r.receiverSatisfiesCandidateInterface(ctx, key, ikey)
 		if err != nil {
 			return nil, err
 		}
-		if !satisfied {
+		if !satisfied || len(methodEntries) == 0 {
 			continue
 		}
-		sym, ok := r.interfaceMethodSymbol(iface, methodName)
-		if !ok {
-			continue
-		}
-		out = append(out, sym)
+		e := methodEntries[0]
+		out = append(out, resolvedSymbol{PkgHash: e.MethodPkgHash, IDHash: e.MethodIDHash, Kind: index.KindMethod, Name: methodName})
 	}
 	return out, nil
+}
+
+// receiverSatisfiesCandidateInterface reports whether key's receiver
+// satisfies the interface candidate ikey: it decodes ikey when possible
+// (interfaces are conventionally exported) and confirms via
+// receiverSatisfiesInterfaceByFingerprint, falling back to
+// receiverSatisfiesMethodEntries against ikey's own full facts method set
+// (ownMethodEntries) when ikey's own export data cannot be decoded
+// (unexported, or declared in a _test.go file -- the F6 gap this closes).
+func (r *Resolver) receiverSatisfiesCandidateInterface(ctx context.Context, key, ikey candidateKey) (bool, error) {
+	iname, _, _, err := r.symbolByHash(ctx, ikey.PkgHash, ikey.TypeSymbolIDHash)
+	if err != nil {
+		if errors.Is(err, errSymbolNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	ipath, ok := r.pkgPathByHash[ikey.PkgHash]
+	if !ok {
+		return false, nil
+	}
+	inamed, err := r.resolveNamed(ctx, ipath, iname)
+	if err != nil {
+		entries, oerr := r.ownMethodEntries(ctx, ikey.PkgHash, ikey.TypeSymbolIDHash)
+		if oerr != nil {
+			return false, oerr
+		}
+		return r.receiverSatisfiesMethodEntries(ctx, key, entries)
+	}
+	iface, ok := inamed.Underlying().(*types.Interface)
+	if !ok {
+		return false, nil
+	}
+	return r.receiverSatisfiesInterfaceByFingerprint(ctx, key, iface)
+}
+
+// receiverHasFingerprint reports whether key's receiver has a method named
+// name with canonical signature fingerprint want recorded under
+// bucketMethod -- the single per-method comparison
+// receiverSatisfiesInterfaceByFingerprint and receiverSatisfiesMethodEntries
+// both build on, whether the interface side they check against comes from a
+// live decoded *types.Interface or from facts-only method entries.
+func (r *Resolver) receiverHasFingerprint(ctx context.Context, key candidateKey, name string, want uint64) (bool, error) {
+	entries, err := r.db.LookupMethod(ctx, name)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		if e.PkgHash == key.PkgHash && e.TypeSymbolIDHash == key.TypeSymbolIDHash && e.Fingerprint != 0 && e.Fingerprint == want {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // receiverSatisfiesInterfaceByFingerprint reports whether key's receiver
@@ -652,23 +662,94 @@ func (r *Resolver) receiverSatisfiesInterfaceByFingerprint(ctx context.Context, 
 		if !ok {
 			return false, nil
 		}
-		want := index.MethodFingerprint(sig)
-		entries, err := r.db.LookupMethod(ctx, fn.Name())
+		matched, err := r.receiverHasFingerprint(ctx, key, fn.Name(), index.MethodFingerprint(sig))
 		if err != nil {
 			return false, err
-		}
-		matched := false
-		for _, e := range entries {
-			if e.PkgHash == key.PkgHash && e.TypeSymbolIDHash == key.TypeSymbolIDHash && e.Fingerprint != 0 && e.Fingerprint == want {
-				matched = true
-				break
-			}
 		}
 		if !matched {
 			return false, nil
 		}
 	}
 	return true, nil
+}
+
+// receiverSatisfiesMethodEntries is receiverSatisfiesInterfaceByFingerprint's
+// facts-only counterpart: entries is a CANDIDATE interface's own full
+// method set (see ownMethodEntries), used when that candidate's own export
+// data cannot be decoded (unexported, or declared in a _test.go file) --
+// implementedInterfacesConfirm/implementedInterfacesConfirmByKey's
+// candidate-side fix, mirroring implementingTypesConfirm's fingerprint fast
+// path in the opposite direction. A generic candidate method
+// (Fingerprint == 0, registerInterfaceMethodSet's exclusion) can never be
+// confirmed this way -- since the candidate itself is what cannot decode
+// here, there is no types.Implements fallback available either, so this
+// reports false rather than a false positive.
+func (r *Resolver) receiverSatisfiesMethodEntries(ctx context.Context, key candidateKey, entries []store.MethodSymbolEntry) (bool, error) {
+	for _, m := range entries {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if m.Entry.Fingerprint == 0 {
+			return false, nil
+		}
+		matched, err := r.receiverHasFingerprint(ctx, key, m.Name, m.Entry.Fingerprint)
+		if err != nil {
+			return false, err
+		}
+		if !matched {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// confirmImplementedInterfaceCandidate confirms whether the receiver
+// identified by recvKey implements the candidate interface identified by
+// candKey, for implementedInterfacesConfirm/implementedInterfacesConfirmByKey.
+// It decodes the candidate when possible (interfaces are conventionally
+// exported, so this is the common case) and confirms via types.Implements,
+// using resolveReceiver to lazily obtain the receiver's own live
+// *types.Named for that comparison -- ok is false when the caller has none
+// to give (implementedInterfacesConfirmByKey's own facts-only receiver), in
+// which case this falls back to receiverSatisfiesInterfaceByFingerprint
+// instead. When the CANDIDATE's own export data cannot be decoded
+// (unexported, or declared in a _test.go file -- the F6/F7 gap this closes),
+// this falls back to receiverSatisfiesMethodEntries: a pure facts
+// fingerprint comparison against the candidate's own ownMethodEntries,
+// needing no decode of either side. Soundness mirrors
+// implementingTypesConfirm's fingerprint fast path, applied here in the
+// opposite direction.
+func (r *Resolver) confirmImplementedInterfaceCandidate(ctx context.Context, recvKey candidateKey, resolveReceiver func() (*types.Named, bool), candKey candidateKey, diag *implDiag) (bool, error) {
+	iname, _, _, err := r.symbolByHash(ctx, candKey.PkgHash, candKey.TypeSymbolIDHash)
+	if err != nil {
+		if !errors.Is(err, errSymbolNotFound) {
+			return false, err
+		}
+		diag.skipCandidate(candKey, err)
+		return false, nil
+	}
+	ipath, ok := r.pkgPathByHash[candKey.PkgHash]
+	if !ok {
+		diag.skipCandidate(candKey, errUnknownDefiningPackage)
+		return false, nil
+	}
+	inamed, err := r.resolveNamed(ctx, ipath, iname)
+	if err != nil {
+		entries, oerr := r.ownMethodEntries(ctx, candKey.PkgHash, candKey.TypeSymbolIDHash)
+		if oerr != nil {
+			return false, oerr
+		}
+		return r.receiverSatisfiesMethodEntries(ctx, recvKey, entries)
+	}
+	iface, ok := inamed.Underlying().(*types.Interface)
+	if !ok {
+		return false, nil
+	}
+	named, ok := resolveReceiver()
+	if !ok {
+		return r.receiverSatisfiesInterfaceByFingerprint(ctx, recvKey, iface)
+	}
+	return types.Implements(types.NewPointer(named), iface), nil
 }
 
 // methodMemoKey identifies one interfacesSatisfiedByMethod memo entry (see
@@ -1374,8 +1455,8 @@ func (r *Resolver) methodInterfaceSymbols(ctx context.Context, named *types.Name
 		return nil, err
 	}
 	var out []resolvedSymbol
-	for _, iface := range ifaces {
-		sym, ok := r.interfaceMethodSymbol(iface, methodName)
+	for _, byName := range ifaces {
+		sym, ok := candidateMethodSymbol(byName, methodName)
 		if !ok {
 			continue
 		}
@@ -1389,70 +1470,60 @@ func (r *Resolver) methodInterfaceSymbols(ctx context.Context, named *types.Name
 
 // implementedInterfaces is implementedInterfacesConfirm's memoized
 // entrypoint; see memoizeByOwnIdentity's doc.
-func (r *Resolver) implementedInterfaces(ctx context.Context, named *types.Named, methodNames []string, diag *implDiag) (map[candidateKey]*types.Interface, error) {
-	return memoizeByOwnIdentity(r, named, r.implementedInterfacesMemo, func() (map[candidateKey]*types.Interface, error) {
+func (r *Resolver) implementedInterfaces(ctx context.Context, named *types.Named, methodNames []string, diag *implDiag) (candidateOccurrences, error) {
+	return memoizeByOwnIdentity(r, named, r.implementedInterfacesMemo, func() (candidateOccurrences, error) {
 		return r.implementedInterfacesConfirm(ctx, named, methodNames, diag)
 	})
 }
 
 // implementedInterfacesConfirm unions [store.DB.LookupMethod] candidates
 // across every name in methodNames (an interface named satisfies must have
-// at least one method named also has), then confirms each survivor with
-// types.Implements -- which also rejects the interfaces the first pass
-// over-approximated -- returning the ones that pass alongside their
-// resolved *types.Interface.
+// at least one method named also has), then confirms each survivor via
+// confirmImplementedInterfaceCandidate -- which also rejects the interfaces
+// the first pass over-approximated -- returning the ones that pass
+// alongside their store.MethodEntry occurrences (see candidateOccurrences'
+// doc), the same shape implementingTypesConfirm's callers already work
+// with.
 //
 // Unlike implementingTypesConfirm's interface -> implementers direction,
-// this stays on the decode-based confirmation deliberately: unioning only
-// named's own method names finds every candidate interface that shares AT
-// LEAST ONE name with named, but never rules out a candidate that
-// additionally requires some OTHER method named does not have -- only fully
-// decoding the candidate's own method set (via resolveNamed, then
-// types.Implements) answers that. Fingerprint-confirming this direction
-// soundly would need an index of each interface's TOTAL method count (or
-// full name set) to bound it, which is disproportionate scope for a
-// direction the reported bug never actually implicated: the "unexported
-// struct implements an exported interface" pattern this fix targets means
-// the candidates on THIS side are interfaces, conventionally exported and
-// so already decodable in practice. ctx is checked once per candidate,
-// mirroring implementingTypesConfirm's decode fallback.
-func (r *Resolver) implementedInterfacesConfirm(ctx context.Context, named *types.Named, methodNames []string, diag *implDiag) (map[candidateKey]*types.Interface, error) {
+// candidate gathering here stays name-based rather than fingerprint-based:
+// unioning only named's own method names finds every candidate interface
+// that shares AT LEAST ONE name with named, but never rules out a candidate
+// that additionally requires some OTHER method named does not have -- only
+// fully decoding the candidate's own method set (via resolveNamed, then
+// types.Implements) answers that in the general case. Fingerprint-confirming
+// this direction's candidate GATHERING soundly would need an index of each
+// interface's TOTAL method count (or full name set) to bound it, which is
+// disproportionate scope for a direction the reported bug never actually
+// implicated. ctx is checked once per candidate, mirroring
+// implementingTypesConfirm's decode fallback.
+func (r *Resolver) implementedInterfacesConfirm(ctx context.Context, named *types.Named, methodNames []string, diag *implDiag) (candidateOccurrences, error) {
 	candidates, err := r.candidatesByAnyMethod(ctx, methodNames, index.KindInterface, diag)
 	if err != nil {
 		return nil, err
 	}
+	recvKey, haveRecvKey := selfCandidateKey(named)
+	resolveReceiver := func() (*types.Named, bool) { return named, true }
 
-	out := make(map[candidateKey]*types.Interface)
-	for key := range candidates {
+	out := make(candidateOccurrences, len(candidates))
+	for key, byName := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		iname, _, _, err := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
+		if !haveRecvKey {
+			// named has no package (the predeclared scope): structurally
+			// impossible for a real workspace type reaching this call (see
+			// selfCandidateKey's doc), but skip rather than confirm against
+			// a meaningless zero key.
+			continue
+		}
+		confirmed, err := r.confirmImplementedInterfaceCandidate(ctx, recvKey, resolveReceiver, key, diag)
 		if err != nil {
-			if !errors.Is(err, errSymbolNotFound) {
-				return nil, err
-			}
-			diag.skipCandidate(key, err)
-			continue
+			return nil, err
 		}
-		ipath, ok := r.pkgPathByHash[key.PkgHash]
-		if !ok {
-			diag.skipCandidate(key, errUnknownDefiningPackage)
-			continue
+		if confirmed {
+			out[key] = byName
 		}
-		inamed, err := r.resolveNamed(ctx, ipath, iname)
-		if err != nil {
-			diag.skip(ipath, iname, err)
-			continue
-		}
-		iface, ok := inamed.Underlying().(*types.Interface)
-		if !ok {
-			continue
-		}
-		if !types.Implements(types.NewPointer(named), iface) {
-			continue
-		}
-		out[key] = iface
 	}
 	diag.survivors += len(out)
 	return out, nil

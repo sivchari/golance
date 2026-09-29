@@ -122,7 +122,7 @@ func (r *Resolver) supertypesByDecode(ctx context.Context, target resolvedSymbol
 		if k == key {
 			continue // never report the queried type as its own supertype
 		}
-		info, ok, err := r.confirmSupertypeCandidate(ctx, k, queryType, diag)
+		info, ok, err := r.confirmSupertypeCandidate(ctx, key, k, queryType, diag)
 		if err != nil {
 			return nil, err
 		}
@@ -140,9 +140,13 @@ func (r *Resolver) supertypesByDecode(ctx context.Context, target resolvedSymbol
 // confirmSupertypeCandidate resolves and confirms one Supertypes candidate
 // k: k qualifies once its decoded *types.Interface is genuinely implemented
 // by queryType, mirroring interfacesImplementedBy's identical decode-based
-// confirmation (no fingerprint fast path on this side -- see
-// implementedInterfaces' own doc for why that asymmetry is intentional).
-func (r *Resolver) confirmSupertypeCandidate(ctx context.Context, k candidateKey, queryType types.Type, diag *implDiag) (TypeHierarchyItemInfo, bool, error) {
+// confirmation. Unlike interfacesImplementedBy's own candidate confirmation
+// though, k's own export data may itself be undecodable (unexported, or
+// declared in a _test.go file); recvKey (queryType's own identity) lets
+// this fall back to receiverSatisfiesMethodEntries against k's facts-only
+// method set instead of dropping k outright -- the same candidate-side fix
+// confirmImplementedInterfaceCandidate applies for Implementation.
+func (r *Resolver) confirmSupertypeCandidate(ctx context.Context, recvKey, k candidateKey, queryType types.Type, diag *implDiag) (TypeHierarchyItemInfo, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return TypeHierarchyItemInfo{}, false, err
 	}
@@ -161,8 +165,20 @@ func (r *Resolver) confirmSupertypeCandidate(ctx context.Context, k candidateKey
 	}
 	inamed, err := r.resolveNamed(ctx, ipath, iname)
 	if err != nil {
-		diag.skip(ipath, iname, err)
-		return TypeHierarchyItemInfo{}, false, nil
+		entries, oerr := r.ownMethodEntries(ctx, k.PkgHash, k.TypeSymbolIDHash)
+		if oerr != nil {
+			return TypeHierarchyItemInfo{}, false, oerr
+		}
+		satisfied, serr := r.receiverSatisfiesMethodEntries(ctx, recvKey, entries)
+		if serr != nil {
+			return TypeHierarchyItemInfo{}, false, serr
+		}
+		if !satisfied {
+			diag.skip(ipath, iname, err)
+			return TypeHierarchyItemInfo{}, false, nil
+		}
+		diag.survivors++
+		return TypeHierarchyItemInfo{Name: iname, PkgPath: ipath, IsInterface: true, Location: loc}, true, nil
 	}
 	iface, ok := inamed.Underlying().(*types.Interface)
 	if !ok {

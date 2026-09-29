@@ -89,7 +89,7 @@ type Resolver struct {
 	// generation's type identity, never a mix.
 	implementingTypesMemo           *confirmMemo[candidateKey, candidateOccurrences]
 	embeddingInterfacesMemo         *confirmMemo[candidateKey, candidateOccurrences]
-	implementedInterfacesMemo       *confirmMemo[candidateKey, map[candidateKey]*types.Interface]
+	implementedInterfacesMemo       *confirmMemo[candidateKey, candidateOccurrences]
 	interfacesSatisfiedByMethodMemo *confirmMemo[methodMemoKey, []resolvedSymbol]
 	confirmRuns                     atomic.Int64 // confirmation-run counter; see confirmRunCount
 
@@ -148,7 +148,7 @@ func WithConfirmMemoCapacity(n int) Option {
 	return func(r *Resolver) {
 		r.implementingTypesMemo = newConfirmMemo[candidateKey, candidateOccurrences](n)
 		r.embeddingInterfacesMemo = newConfirmMemo[candidateKey, candidateOccurrences](n)
-		r.implementedInterfacesMemo = newConfirmMemo[candidateKey, map[candidateKey]*types.Interface](n)
+		r.implementedInterfacesMemo = newConfirmMemo[candidateKey, candidateOccurrences](n)
 		r.interfacesSatisfiedByMethodMemo = newConfirmMemo[methodMemoKey, []resolvedSymbol](n)
 	}
 }
@@ -214,7 +214,7 @@ func New(db *store.DB, cas *store.CAS, snap *graph.Snapshot, relative bool, opts
 		units:                           newUnitCache(defaultUnitCacheBytes),
 		implementingTypesMemo:           newConfirmMemo[candidateKey, candidateOccurrences](confirmMemoCapacity),
 		embeddingInterfacesMemo:         newConfirmMemo[candidateKey, candidateOccurrences](confirmMemoCapacity),
-		implementedInterfacesMemo:       newConfirmMemo[candidateKey, map[candidateKey]*types.Interface](confirmMemoCapacity),
+		implementedInterfacesMemo:       newConfirmMemo[candidateKey, candidateOccurrences](confirmMemoCapacity),
 		interfacesSatisfiedByMethodMemo: newConfirmMemo[methodMemoKey, []resolvedSymbol](confirmMemoCapacity),
 		fileToPkg:                       fileToPkg,
 		dirToPkg:                        dirToPkg,
