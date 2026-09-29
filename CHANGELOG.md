@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.7.21](https://github.com/sivchari/golance/compare/v0.7.20...v0.7.21) - 2026-09-29
+
+- fix: resolve method references from the facts index instead of export data by @sivchari in https://github.com/sivchari/golance/pull/157
+
 ## [v0.7.20](https://github.com/sivchari/golance/compare/v0.7.19...v0.7.20) - 2026-09-25
 
 - ci: pin golangci-lint to v2.13.2 instead of latest by @sivchari in https://github.com/sivchari/golance/pull/155
