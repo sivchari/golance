@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.7.22](https://github.com/sivchari/golance/compare/v0.7.21...v0.7.22) - 2026-09-29
+
+- fix: resolve implementation and type hierarchy from the facts index by @sivchari in https://github.com/sivchari/golance/pull/159
+
 ## [v0.7.21](https://github.com/sivchari/golance/compare/v0.7.20...v0.7.21) - 2026-09-29
 
 - fix: resolve method references from the facts index instead of export data by @sivchari in https://github.com/sivchari/golance/pull/157
