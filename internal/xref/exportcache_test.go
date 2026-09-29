@@ -70,10 +70,14 @@ func TestResolveNamed_ExportCacheReusedAcrossRepeatDecodes(t *testing.T) {
 // TestReferences_InterfaceMethod_ReusesDecodedExportAcrossRepeatQueries
 // extends TestImplementation_ReusesDecodedUnitsAcrossCandidates' coverage to
 // References on an interface method (correspondingMethodSymbols ->
-// methodReceiver -> methodImplementationSymbols), the call chain the field
-// report's phase timer singled out (dominant_phase=resolve, see
-// correspondingMethodSymbols' doc): a repeat query performs zero additional
-// gcexportdata decodes and returns the identical result set. Reuses
+// methodImplementationSymbolsByKey), the call chain the field report's
+// phase timer singled out (dominant_phase=resolve, see
+// correspondingMethodSymbols' doc). Since the facts-only fix for F5 (an
+// unexported/_test.go-declared interface's method set is no longer resolved
+// by decoding it), NEITHER the first nor a repeat query decodes any export
+// data at all for this fixture -- decoding here would only ever be a
+// fallback for a generic interface's method set (see
+// correspondingMethodSymbols' own doc), not this ordinary case. Reuses
 // TestReferences_InterfaceMethodIncludesDirectConcreteCallSite's own
 // fixture, which already establishes the non-empty 2-result baseline this
 // test's own decode-count assertions build on.
@@ -121,8 +125,8 @@ func CallConcrete() string {
 		t.Fatalf("References (first query) = %+v, want 2 (interface-typed call + concrete-typed call)", first)
 	}
 	decodesAfterFirst := r.cache.Decodes()
-	if decodesAfterFirst == 0 {
-		t.Errorf("cache.Decodes() after first query = 0, want > 0 (resolving Talker.Say's own receiver decodes iface's export data)")
+	if decodesAfterFirst != 0 {
+		t.Errorf("cache.Decodes() after first query = %d, want 0 (Talker.Say's own receiver is resolved from facts alone, never decoded)", decodesAfterFirst)
 	}
 
 	second, err := r.References(ctx, ifaceFile, line, col, false)
