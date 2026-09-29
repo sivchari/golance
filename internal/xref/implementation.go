@@ -43,11 +43,7 @@ func (r *Resolver) Implementation(ctx context.Context, file string, line, col in
 	case index.KindType:
 		return r.interfacesImplementedByTarget(ctx, pkgPath, target)
 	case index.KindInterface:
-		named, err := r.resolveNamed(ctx, pkgPath, target.Name)
-		if err != nil {
-			return nil, err
-		}
-		return r.implementationsOfInterface(ctx, named)
+		return r.implementationsOfInterfaceTarget(ctx, pkgPath, target)
 	default:
 		return nil, fmt.Errorf("xref: implementation query not supported for symbol kind %d", target.Kind)
 	}
@@ -416,6 +412,83 @@ func (r *Resolver) implementingTypesConfirmByFacts(ctx context.Context, ifaceMet
 		}
 		out[key] = byName
 		diag.survivors++
+	}
+	return out, nil
+}
+
+// embeddingInterfacesByKey is embeddingInterfacesConfirmByFacts' memoized
+// entrypoint, sharing r.embeddingInterfacesMemo with embeddingInterfaces
+// (see memoizeByOwnIdentity's doc): ifaceKey is computed the identical way
+// selfCandidateKey derives one from a live *types.Named, so the two paths'
+// memo entries for the same real interface can never collide or diverge.
+func (r *Resolver) embeddingInterfacesByKey(ctx context.Context, ifaceKey candidateKey, ifaceMethods []store.MethodSymbolEntry, resolveIface func() (*types.Interface, bool), diag *implDiag) (candidateOccurrences, error) {
+	if v, hit := r.embeddingInterfacesMemo.get(ifaceKey); hit {
+		return v, nil
+	}
+	out, err := r.embeddingInterfacesConfirmByFacts(ctx, ifaceKey, ifaceMethods, resolveIface, diag)
+	if err != nil {
+		return nil, err
+	}
+	r.confirmRuns.Add(1)
+	r.embeddingInterfacesMemo.put(ifaceKey, out)
+	return out, nil
+}
+
+// embeddingInterfacesConfirmByFacts is embeddingInterfacesConfirm's
+// facts-only counterpart, mirroring implementingTypesConfirmByFacts's own
+// relationship to implementingTypesConfirm: ifaceMethods is the queried
+// interface's own full method set read from facts (see ownMethodEntries)
+// instead of a decoded *types.Interface, candidates are gathered from
+// index.KindInterface instead of index.KindType, ifaceKey itself is
+// excluded from its own candidates (mirroring embeddingInterfacesConfirm's
+// identical selfKey exclusion -- ifaceKey trivially has all of its own
+// methods), and the decode fallback (confirmEmbeddingCandidate) compares an
+// interface candidate directly rather than through a *types.Pointer.
+func (r *Resolver) embeddingInterfacesConfirmByFacts(ctx context.Context, ifaceKey candidateKey, ifaceMethods []store.MethodSymbolEntry, resolveIface func() (*types.Interface, bool), diag *implDiag) (candidateOccurrences, error) {
+	methodNames := methodSymbolEntryNames(ifaceMethods)
+	ifaceFPs := make(map[string]uint64, len(ifaceMethods))
+	for _, m := range ifaceMethods {
+		if m.Entry.Fingerprint != 0 {
+			ifaceFPs[m.Name] = m.Entry.Fingerprint
+		}
+	}
+
+	candidates, err := r.candidatesByAllMethods(ctx, methodNames, index.KindInterface, diag)
+	if err != nil {
+		return nil, err
+	}
+
+	var iface *types.Interface
+	var ifaceResolved bool
+	out := make(candidateOccurrences, len(candidates))
+	for key, byName := range candidates {
+		if key == ifaceKey {
+			continue
+		}
+		if fingerprintsConfirm(byName, methodNames, ifaceFPs) {
+			out[key] = byName
+			diag.survivors++
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !ifaceResolved {
+			iface, _ = resolveIface()
+			ifaceResolved = true
+		}
+		if iface == nil {
+			diag.fingerprintMismatch++
+			continue
+		}
+		confirmed, err := r.confirmEmbeddingCandidate(ctx, key, iface, diag)
+		if err != nil {
+			return nil, err
+		}
+		if confirmed {
+			out[key] = byName
+			diag.survivors++
+		}
 	}
 	return out, nil
 }
@@ -969,6 +1042,65 @@ func (r *Resolver) implementationsOfInterface(ctx context.Context, named *types.
 	sortLocations(out)
 	if len(out) == 0 {
 		r.logImplDiag("implementations of interface "+named.Obj().Name(), diag)
+	}
+	return out, nil
+}
+
+// implementationsOfInterfaceTarget is implementationsOfInterface's
+// facts-only counterpart, for a target.Kind == index.KindInterface query
+// whose own type cannot be decoded (unexported, or declared in a _test.go
+// file -- see resolveNamed's doc for why that lookup fails structurally).
+// Both directions implementationsOfInterface computes are resolved from
+// facts here too (implementingTypesByKey/embeddingInterfacesByKey, built on
+// ownMethodEntries instead of a decoded *types.Interface), with
+// resolveIface as their shared, lazy, at-most-once decode fallback for a
+// generic candidate on either side.
+func (r *Resolver) implementationsOfInterfaceTarget(ctx context.Context, pkgPath string, target resolvedSymbol) ([]Location, error) {
+	entries, err := r.ownMethodEntries(ctx, target.PkgHash, target.IDHash)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	if entriesAllGeneric(entries) {
+		named, err := r.resolveNamed(ctx, pkgPath, target.Name)
+		if err != nil {
+			return nil, err
+		}
+		return r.implementationsOfInterface(ctx, named)
+	}
+
+	key := candidateKey{PkgHash: target.PkgHash, TypeSymbolIDHash: target.IDHash}
+	resolveIface := func() (*types.Interface, bool) {
+		named, ok := r.resolveNamedOK(ctx, pkgPath, target.Name)
+		if !ok {
+			return nil, false
+		}
+		iface, ok := named.Underlying().(*types.Interface)
+		return iface, ok
+	}
+	diag := newImplDiag(methodSymbolEntryNames(entries))
+	impls, err := r.implementingTypesByKey(ctx, key, entries, resolveIface, diag)
+	if err != nil {
+		return nil, err
+	}
+	embedders, err := r.embeddingInterfacesByKey(ctx, key, entries, resolveIface, diag)
+	if err != nil {
+		return nil, err
+	}
+	var out []Location
+	out, err = r.appendCandidateLocations(ctx, out, impls, diag)
+	if err != nil {
+		return nil, err
+	}
+	out, err = r.appendCandidateLocations(ctx, out, embedders, diag)
+	if err != nil {
+		return nil, err
+	}
+	sortLocations(out)
+	if len(out) == 0 {
+		r.logImplDiag("implementations of interface "+target.Name, diag)
 	}
 	return out, nil
 }
