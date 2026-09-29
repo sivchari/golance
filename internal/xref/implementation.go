@@ -113,18 +113,190 @@ func (r *Resolver) methodReceiver(ctx context.Context, pkgPath string, target re
 // latter's doc for why that direction no longer carries the cost that used
 // to keep it out of References.
 func (r *Resolver) correspondingMethodSymbols(ctx context.Context, target resolvedSymbol) ([]resolvedSymbol, error) {
-	pkgPath, ok := r.pkgPathByHash[target.PkgHash]
-	if !ok {
-		return nil, fmt.Errorf("xref: unknown defining package for hash %d", target.PkgHash)
-	}
-	named, err := r.methodReceiver(ctx, pkgPath, target)
+	key, fingerprint, ok, err := r.methodReceiverKey(ctx, target)
 	if err != nil {
 		return nil, err
 	}
-	if types.IsInterface(named) {
+	if !ok {
+		return nil, nil
+	}
+	recvName, recvKind, _, err := r.symbolByHash(ctx, key.PkgHash, key.TypeSymbolIDHash)
+	if err != nil {
+		if errors.Is(err, errSymbolNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	recvPkgPath, ok := r.pkgPathByHash[key.PkgHash]
+	if !ok {
+		return nil, nil
+	}
+
+	if recvKind == index.KindInterface {
+		// The receiver interface's own export data may be undecodable
+		// (unexported, or declared in a _test.go file), in which case the
+		// facts index alone cannot recover its full method set, which this
+		// direction needs to find every implementer. Degrade to no
+		// corresponding methods rather than failing the query.
+		named, ok := r.resolveNamedOK(ctx, recvPkgPath, recvName)
+		if !ok {
+			return nil, nil
+		}
 		return r.methodImplementationSymbols(ctx, named, target.Name)
 	}
-	return r.interfacesSatisfiedByMethod(ctx, named, target.Name)
+
+	if fingerprint == 0 {
+		// The receiver has type parameters (registerMethodSet's generic
+		// exclusion): its methods are never fingerprinted, so the
+		// facts-only confirmation below cannot be trusted. Fall back to
+		// the pre-fix decode-based path, unaffected for this pre-existing,
+		// already-working (and necessarily exported, for decode to
+		// succeed) case.
+		named, err := r.methodReceiver(ctx, recvPkgPath, target)
+		if err != nil {
+			return nil, err
+		}
+		return r.interfacesSatisfiedByMethod(ctx, named, target.Name)
+	}
+	return r.interfacesSatisfiedByMethodByKey(ctx, key, target.Name)
+}
+
+// methodReceiverKey resolves target's receiver type identity and target's
+// own method fingerprint directly from the facts index -- the reverse of
+// candidateMethodSymbol: among target.Name's own bucketMethod postings
+// (store.DB.LookupMethod), it finds the single entry recorded for target's
+// own (MethodPkgHash, MethodIDHash) and returns its receiver's candidateKey
+// plus Fingerprint. This needs no export data at all, unlike
+// resolveMethodFunc's objectpath-over-export lookup, which fails
+// structurally for a method whose receiver type is unexported (export data
+// never carries an unexported package-scope type) or declared in a
+// _test.go file (Export is always built from non-test files alone -- see
+// internal/index's checkOnePackage). ok is false when no entry matches,
+// e.g. target predates the method index or was since removed.
+func (r *Resolver) methodReceiverKey(ctx context.Context, target resolvedSymbol) (key candidateKey, fingerprint uint64, ok bool, err error) {
+	entries, err := r.db.LookupMethod(ctx, target.Name)
+	if err != nil {
+		return candidateKey{}, 0, false, err
+	}
+	for _, e := range entries {
+		if e.MethodPkgHash == target.PkgHash && e.MethodIDHash == target.IDHash {
+			return candidateKey{PkgHash: e.PkgHash, TypeSymbolIDHash: e.TypeSymbolIDHash}, e.Fingerprint, true, nil
+		}
+	}
+	return candidateKey{}, 0, false, nil
+}
+
+// interfacesSatisfiedByMethodByKey is interfacesSatisfiedByMethod's
+// facts-only counterpart: it confirms candidate interfaces against key (a
+// concrete receiver's candidateKey) without ever decoding key's own export
+// data, mirroring implementingTypesConfirm's fingerprint approach but
+// inverted onto one fixed candidate instead of iterating many. Shares
+// interfacesSatisfiedByMethodMemo with the decode-based path: key is
+// computed the identical way selfCandidateKey derives one from a live
+// *types.Named, so the two paths' memo entries for the same real type can
+// never collide or diverge.
+func (r *Resolver) interfacesSatisfiedByMethodByKey(ctx context.Context, key candidateKey, methodName string) ([]resolvedSymbol, error) {
+	mkey := methodMemoKey{Type: key, Method: methodName}
+	if v, hit := r.interfacesSatisfiedByMethodMemo.get(mkey); hit {
+		return v, nil
+	}
+	out, err := r.interfacesSatisfiedByMethodByKeyConfirm(ctx, key, methodName)
+	if err != nil {
+		return nil, err
+	}
+	r.confirmRuns.Add(1)
+	r.interfacesSatisfiedByMethodMemo.put(mkey, out)
+	return out, nil
+}
+
+// interfacesSatisfiedByMethodByKeyConfirm gathers candidate interfaces from
+// the same single-name LookupMethod posting list interfacesSatisfiedByMethodConfirm
+// does (see its doc for why that bound is sound), decodes each candidate
+// interface as before (interfaces are conventionally exported, so this
+// keeps working in practice), but confirms satisfaction via
+// receiverHasFingerprint instead of types.Implements -- the only change
+// needed to make this direction work for a receiver whose own export data
+// can never be decoded.
+func (r *Resolver) interfacesSatisfiedByMethodByKeyConfirm(ctx context.Context, key candidateKey, methodName string) ([]resolvedSymbol, error) {
+	diag := newImplDiag([]string{methodName})
+	candidates, err := r.methodEntriesOfKind(ctx, methodName, index.KindInterface, diag)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []resolvedSymbol
+	for ikey := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		iname, _, _, err := r.symbolByHash(ctx, ikey.PkgHash, ikey.TypeSymbolIDHash)
+		if err != nil {
+			if errors.Is(err, errSymbolNotFound) {
+				continue
+			}
+			return nil, err
+		}
+		ipath, ok := r.pkgPathByHash[ikey.PkgHash]
+		if !ok {
+			continue
+		}
+		inamed, err := r.resolveNamed(ctx, ipath, iname)
+		if err != nil {
+			continue
+		}
+		iface, ok := inamed.Underlying().(*types.Interface)
+		if !ok {
+			continue
+		}
+		satisfied, err := r.receiverSatisfiesInterfaceByFingerprint(ctx, key, iface)
+		if err != nil {
+			return nil, err
+		}
+		if !satisfied {
+			continue
+		}
+		sym, ok := r.interfaceMethodSymbol(iface, methodName)
+		if !ok {
+			continue
+		}
+		out = append(out, sym)
+	}
+	return out, nil
+}
+
+// receiverSatisfiesInterfaceByFingerprint reports whether key's receiver
+// has every one of iface's declared methods, by name and canonical
+// signature fingerprint (index.MethodFingerprint), recorded under
+// bucketMethod -- the same comparison implementingTypesConfirm makes for a
+// candidate implementer, applied here to a single, already-known
+// candidateKey instead of a name-based shortlist.
+func (r *Resolver) receiverSatisfiesInterfaceByFingerprint(ctx context.Context, key candidateKey, iface *types.Interface) (bool, error) {
+	for i := 0; i < iface.NumMethods(); i++ {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		fn := iface.Method(i)
+		sig, ok := fn.Type().(*types.Signature)
+		if !ok {
+			return false, nil
+		}
+		want := index.MethodFingerprint(sig)
+		entries, err := r.db.LookupMethod(ctx, fn.Name())
+		if err != nil {
+			return false, err
+		}
+		matched := false
+		for _, e := range entries {
+			if e.PkgHash == key.PkgHash && e.TypeSymbolIDHash == key.TypeSymbolIDHash && e.Fingerprint != 0 && e.Fingerprint == want {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // methodMemoKey identifies one interfacesSatisfiedByMethod memo entry (see

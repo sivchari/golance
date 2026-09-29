@@ -107,9 +107,18 @@ func (r *Resolver) References(ctx context.Context, file string, line, col int, i
 	if target.Kind == index.KindMethod {
 		corresponding, err := r.correspondingMethodSymbols(ctx, target)
 		if err != nil {
-			return nil, err
+			// target's own direct postings (below) do not depend on this
+			// lookup at all, so a failure here -- e.g. the receiver's
+			// export data cannot be decoded, structurally impossible for
+			// an unexported type or a _test.go-only declaration -- must
+			// not fail the whole call over a part it was never going to
+			// be able to answer.
+			if r.logger != nil {
+				r.logger.Printf("xref: %s: corresponding methods unavailable: %v", target.Name, err)
+			}
+		} else {
+			wanted = append(wanted, corresponding...)
 		}
-		wanted = append(wanted, corresponding...)
 	}
 
 	var out []Location
