@@ -553,6 +553,17 @@ func (r *Resolver) resolveNamed(ctx context.Context, pkgPath, name string) (*typ
 	return named, nil
 }
 
+// resolveNamedOK is resolveNamed's boolean-result counterpart, for a caller
+// that treats a decode failure as an ordinary "cannot resolve" outcome to
+// degrade past, rather than an error to propagate.
+func (r *Resolver) resolveNamedOK(ctx context.Context, pkgPath, name string) (*types.Named, bool) {
+	named, err := r.resolveNamed(ctx, pkgPath, name)
+	if err != nil {
+		return nil, false
+	}
+	return named, true
+}
+
 // SetLogger installs l as r's diagnostic logger for implementation-query
 // failures (see implementation.go's implDiag/logImplDiag): an empty
 // "Go to Implementation" result is otherwise indistinguishable, from the
