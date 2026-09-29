@@ -497,13 +497,21 @@ func (r *Resolver) correspondingMethodSymbols(ctx context.Context, target resolv
 	}
 
 	if recvKind == index.KindInterface {
-		// The receiver interface's own export data may be undecodable
-		// (unexported, or declared in a _test.go file), in which case the
-		// facts index alone cannot recover its full method set, which this
-		// direction needs to find every implementer. Degrade to no
-		// corresponding methods rather than failing the query.
+		if fingerprint != 0 {
+			return r.methodImplementationSymbolsByKey(ctx, key, recvPkgPath, recvName, target.Name)
+		}
+		// The receiver interface itself has type parameters
+		// (registerInterfaceMethodSet's generic exclusion), so the
+		// facts-only fingerprint machinery above cannot be trusted: fall
+		// back to the pre-fix decode-based path. Unlike the pre-fix
+		// behavior (which silently returned no corresponding methods with
+		// no way to tell a genuine decode failure apart from "target
+		// implements nothing"), a decode failure here is logged once.
 		named, ok := r.resolveNamedOK(ctx, recvPkgPath, recvName)
 		if !ok {
+			if r.logger != nil {
+				r.logger.Printf("xref: corresponding methods of %s.%s: generic interface could not be resolved, degrading to none", recvPkgPath, recvName)
+			}
 			return nil, nil
 		}
 		return r.methodImplementationSymbols(ctx, named, target.Name)
