@@ -127,12 +127,12 @@ func (r *Resolver) implementationOfMethodByKey(ctx context.Context, key candidat
 // cannot be decoded (unexported, or declared in a _test.go file -- see
 // resolveNamed's doc for why that lookup fails structurally): target's own
 // method set is read via ownMethodEntries instead of a decoded
-// *types.Named's method set, and each candidate interface is confirmed via
-// receiverSatisfiesInterfaceByFingerprint instead of types.Implements,
-// mirroring interfacesSatisfiedByMethodByKeyConfirm's identical trade (the
-// candidate interfaces themselves are still decoded -- interfaces are
-// conventionally exported, see implementedInterfacesConfirm's own doc for
-// why that side stays decode-based).
+// *types.Named's method set. Candidate confirmation goes through
+// implementedInterfacesByKey/confirmImplementedInterfaceCandidate, which
+// tries a decode first (interfaces are conventionally exported, so this is
+// the common case) and falls back to a facts-only fingerprint comparison
+// (receiverSatisfiesMethodEntries) when a candidate interface ALSO cannot
+// decode -- see confirmImplementedInterfaceCandidate's own doc.
 func (r *Resolver) interfacesImplementedByTarget(ctx context.Context, pkgPath string, target resolvedSymbol) ([]Location, error) {
 	entries, err := r.ownMethodEntries(ctx, target.PkgHash, target.IDHash)
 	if err != nil {
