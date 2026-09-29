@@ -258,19 +258,29 @@ func (r *Resolver) unitBlob(ctx context.Context, pkgHash uint64) (store.UnitBlob
 	if u, ok := r.units.get(ptr.BlobKey); ok {
 		return u, nil
 	}
-	blob, ok, err := r.cas.Get(ctx, ptr.BlobKey)
-	if err != nil {
-		return store.UnitBlob{}, err
-	}
-	if !ok {
-		return store.UnitBlob{}, fmt.Errorf("xref: facts blob %x missing from CAS for %s: %w", ptr.BlobKey, r.pkgPathForHash(pkgHash), store.ErrNotFound)
-	}
-	u, err := store.DecodeUnitBlob(blob)
+	u, err := r.decodeUnitBlob(ctx, pkgHash, ptr.BlobKey)
 	if err != nil {
 		return store.UnitBlob{}, err
 	}
 	r.units.put(ptr.BlobKey, &u)
 	return u, nil
+}
+
+// decodeUnitBlob fetches and decodes blobKey's blob straight from r.cas,
+// bypassing r.units' Facts/Export-only cache (see its doc): a caller
+// needing a blob's full Index section (ownMethodEntries) cannot go through
+// r.units at all, since a cache hit there would silently return an
+// Index-less UnitBlob from whatever earlier call first warmed it. pkgHash
+// is only used to name the package in an error message.
+func (r *Resolver) decodeUnitBlob(ctx context.Context, pkgHash, blobKey uint64) (store.UnitBlob, error) {
+	blob, ok, err := r.cas.Get(ctx, blobKey)
+	if err != nil {
+		return store.UnitBlob{}, err
+	}
+	if !ok {
+		return store.UnitBlob{}, fmt.Errorf("xref: facts blob %x missing from CAS for %s: %w", blobKey, r.pkgPathForHash(pkgHash), store.ErrNotFound)
+	}
+	return store.DecodeUnitBlob(blob)
 }
 
 // pkgPathForHash returns pkgHash's import path via r.pkgPathByHash, falling
@@ -562,6 +572,44 @@ func (r *Resolver) resolveNamedOK(ctx context.Context, pkgPath, name string) (*t
 		return nil, false
 	}
 	return named, true
+}
+
+// ownMethodEntries returns every store.MethodSymbolEntry pkgHash's own
+// facts recorded for the type/interface identified by typeIDHash -- its own
+// declared method set (names plus canonical fingerprints), read directly
+// from its defining package's own facts blob (u.Index.Methods) rather than
+// the cross-package bucketMethod name index LookupMethod queries. Unlike
+// LookupMethod, this needs no method name known in advance and no export
+// data at all: a package's own facts cover every type or interface it
+// declares, exported or not, and declared in a _test.go file or not (see
+// internal/index's checkOnePackage) -- making this the tool for deriving an
+// otherwise-undecodable type's full method set for the fingerprint
+// machinery implementation.go/typehierarchy.go build on.
+//
+// This deliberately does not go through r.unitBlob: r.units' cache retains
+// only a blob's Facts and Export (see its own doc), so a pkgHash whose blob
+// another call already warmed the cache for would otherwise silently come
+// back with an empty Index here instead of an error, for the exact same
+// bytes a fresh decode would have shown Index populated in.
+func (r *Resolver) ownMethodEntries(ctx context.Context, pkgHash, typeIDHash uint64) ([]store.MethodSymbolEntry, error) {
+	ptr, err := r.db.GetUnit(ctx, pkgHash)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, fmt.Errorf("xref: no facts recorded for %s: %w", r.pkgPathForHash(pkgHash), store.ErrNotFound)
+		}
+		return nil, err
+	}
+	u, err := r.decodeUnitBlob(ctx, pkgHash, ptr.BlobKey)
+	if err != nil {
+		return nil, err
+	}
+	var out []store.MethodSymbolEntry
+	for _, m := range u.Index.Methods {
+		if m.Entry.TypeSymbolIDHash == typeIDHash {
+			out = append(out, m)
+		}
+	}
+	return out, nil
 }
 
 // SetLogger installs l as r's diagnostic logger for implementation-query
