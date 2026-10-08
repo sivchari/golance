@@ -22,12 +22,15 @@ package depcheck
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"go/types"
+	"strings"
 	"sync"
+	"unicode"
 
 	"golang.org/x/sync/singleflight"
 	"golang.org/x/tools/go/ast/astutil"
@@ -112,6 +115,17 @@ type CheckedPackage struct {
 	info       *types.Info
 	incomplete bool   // see Incomplete's doc
 	firstError string // see FirstError's doc
+
+	// importFailed marks a package whose check resolved at least one
+	// import — its own or a transitive one — to a closure-scoped
+	// placeholder (see closureScope.placeholderFor). Such a package must
+	// never enter either LRU (see put/putFull): the placeholder is only
+	// identity-consistent within the closureScope that created it, so a
+	// cached copy would hand later closures an instance that is
+	// non-identical to both their own placeholder and any later real
+	// resolution of the same path — the exact duplicate-import-path
+	// corruption typecheck.DuplicateImportPath rejects.
+	importFailed bool
 }
 
 // PkgPath returns the package's import path.
@@ -549,10 +563,19 @@ func (p *Provider) get(pkgPath string) (*CheckedPackage, bool) {
 // the entire window between here and each singleflight-collapsed caller's
 // own, separately-locked pin call, during which any unrelated concurrent
 // put's own evictOldest could remove it.
+//
+// A cp carrying a closure-scoped placeholder (see
+// CheckedPackage.importFailed) is counted but never stored: the pin
+// mechanism cannot protect a placeholder (it is not an LRU entry), so
+// caching such a cp would leak a this-closure-only instance into every
+// later closure that tryPins it.
 func (p *Provider) put(pkgPath string, cp *CheckedPackage) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.checked++
+	if cp.importFailed {
+		return
+	}
 	p.lru.put(pkgPath, cp)
 	if p.waiters[pkgPath] > 0 {
 		p.lru.pin(pkgPath)
@@ -571,11 +594,15 @@ func (p *Provider) getFull(pkgPath string) (*CheckedPackage, bool) {
 
 // putFull stores cp in the full-body LRU under pkgPath and records that a
 // fresh full-body check happened (see CheckedWithBodies) — see put's own
-// doc for the birth-pin mechanism this mirrors, keyed against fullWaiters.
+// doc for the birth-pin mechanism this mirrors, keyed against fullWaiters,
+// and for why an importFailed cp is counted but never stored.
 func (p *Provider) putFull(pkgPath string, cp *CheckedPackage) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.fullChecked++
+	if cp.importFailed {
+		return
+	}
 	p.fullLRU.put(pkgPath, cp)
 	if p.fullWaiters[pkgPath] > 0 {
 		p.fullLRU.pin(pkgPath)
@@ -814,7 +841,19 @@ func (p *Provider) check(ctx context.Context, pkgPath string, withBodies bool, s
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &CheckedPackage{pkgPath: pkgPath, dir: dir, files: files, pkg: pkg, info: info, incomplete: hadErr || imp.importIncomplete, firstError: firstErr}, nil
+	if firstErr == "" {
+		// A blank import of an unresolvable path produces no type error at
+		// all once the placeholder stands in for go/types' own "could not
+		// import" report — sample the importer's failure instead so
+		// FirstError still names what degraded this check.
+		firstErr = imp.failedImportErr
+	}
+	return &CheckedPackage{
+		pkgPath: pkgPath, dir: dir, files: files, pkg: pkg, info: info,
+		incomplete:   hadErr || imp.importIncomplete || imp.failedImport,
+		firstError:   firstErr,
+		importFailed: imp.failedImport,
+	}, nil
 }
 
 // ctxImporter implements types.ImporterFrom by resolving each import back
@@ -855,6 +894,26 @@ type ctxImporter struct {
 	// ImportFrom synchronously (see this type's own doc), so no
 	// synchronization is needed for this field.
 	importIncomplete bool
+
+	// failedImport is set once ImportFrom hands the check a closure-scoped
+	// placeholder — because resolving an import failed outright here, or
+	// because a package resolved through any tier already carries one (see
+	// CheckedPackage.importFailed) — so check can mark the result both
+	// Incomplete and uncacheable. Same synchronization story as
+	// importIncomplete. failedImportErr samples the first such failure for
+	// FirstError, since the placeholder suppresses the "could not import"
+	// type error go/types used to report for it.
+	failedImport    bool
+	failedImportErr string
+}
+
+// noteFailedImport records that path could not be resolved during this
+// check (see the failedImport field's doc).
+func (imp *ctxImporter) noteFailedImport(path string, err error) {
+	imp.failedImport = true
+	if imp.failedImportErr == "" {
+		imp.failedImportErr = fmt.Sprintf("could not resolve import %q: %v", path, err)
+	}
 }
 
 // closureScope pins every distinct import path one top-level
@@ -938,11 +997,83 @@ type closureScope struct {
 	// CheckedPackage this scope never actually resolves through either LRU
 	// at all, so there is nothing to release for it.
 	pins map[string]*lruCache
+	// placeholders holds one synthetic *types.Package per import path this
+	// closure failed to resolve (see placeholderFor). Scope-local on
+	// purpose: go/types fabricates a DISTINCT fake package per failing
+	// Config.Check call for the same path, so two members of one closure
+	// importing the same unresolvable path used to embed two non-identical
+	// packages under one PkgPath — the exact corruption
+	// typecheck.DuplicateImportPath rejects, and the confirmed cause of
+	// internal/depexport's "would reference two non-identical packages
+	// both named ..." field failure (observed against
+	// github.com/snowflakedb/gosnowflake/v2's closure). Sharing one
+	// placeholder per path per closure keeps the closure's own graph
+	// consistent; never caching a placeholder-carrying result (see
+	// CheckedPackage.importFailed) keeps it from outliving the closure.
+	placeholders map[string]*types.Package
 }
 
 // newClosureScope returns an empty closureScope.
 func newClosureScope() *closureScope {
 	return &closureScope{pkgs: make(map[string]*CheckedPackage), pins: make(map[string]*lruCache)}
+}
+
+// placeholder returns the placeholder already created for pkgPath in this
+// scope, if any.
+func (s *closureScope) placeholder(pkgPath string) (*types.Package, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pkg, ok := s.placeholders[pkgPath]
+	return pkg, ok
+}
+
+// placeholderFor returns this scope's placeholder package for pkgPath,
+// creating it on first use (see the placeholders field's doc). The
+// placeholder is empty and MarkComplete'd: a reference to any of its
+// symbols fails with an ordinary "not declared by package" type error —
+// the same degraded-but-usable outcome go/types' own per-check fake gave —
+// while a blank import produces no error at all, which is why
+// ctxImporter.failedImport exists on top (see check).
+func (s *closureScope) placeholderFor(pkgPath string) *types.Package {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if pkg, ok := s.placeholders[pkgPath]; ok {
+		return pkg
+	}
+	pkg := types.NewPackage(pkgPath, placeholderName(pkgPath))
+	pkg.MarkComplete()
+	if s.placeholders == nil {
+		s.placeholders = make(map[string]*types.Package)
+	}
+	s.placeholders[pkgPath] = pkg
+	return pkg
+}
+
+// placeholderName derives a plausible package name from pkgPath for a
+// placeholder (see placeholderFor): the last path segment, skipping a
+// major-version suffix ("…/v2"), with non-identifier characters replaced —
+// only used by the degraded check's error messages and unnamed-import
+// resolution, so a mismatch with the real package's name costs at most one
+// more type error in an already-Incomplete check.
+func placeholderName(pkgPath string) string {
+	segments := strings.Split(pkgPath, "/")
+	name := segments[len(segments)-1]
+	if len(segments) > 1 && len(name) > 1 && name[0] == 'v' && strings.TrimLeft(name[1:], "0123456789") == "" {
+		name = segments[len(segments)-2]
+	}
+	var b strings.Builder
+	for i, r := range name {
+		switch {
+		case r == '_' || unicode.IsLetter(r) || (i > 0 && unicode.IsDigit(r)):
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "_"
+	}
+	return b.String()
 }
 
 // get returns pkgPath's pinned CheckedPackage, if s already holds one.
@@ -1028,15 +1159,24 @@ func (imp *ctxImporter) ImportFrom(path, _ string, _ types.ImportMode) (*types.P
 		return types.Unsafe, nil
 	}
 	if cp, ok := imp.scope.get(path); ok {
-		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
+		imp.noteResolved(cp)
 		return cp.Types(), nil
 	}
+	if pkg, ok := imp.scope.placeholder(path); ok {
+		// path already failed earlier in this closure: stay on the one
+		// shared placeholder for the scope's whole lifetime, even if a
+		// concurrent closure has since cached a real instance — mixing the
+		// two in one graph is the duplicate-import-path corruption the
+		// placeholder exists to prevent.
+		imp.noteFailedImport(path, errFailedEarlierInClosure)
+		return pkg, nil
+	}
 	if cp, ok := imp.p.tryPinFull(path, imp.scope); ok {
-		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
+		imp.noteResolved(cp)
 		return cp.Types(), nil
 	}
 	if cp, ok := imp.p.tryPin(path, imp.scope); ok {
-		imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
+		imp.noteResolved(cp)
 		return cp.Types(), nil
 	}
 	if r := imp.p.exportResolverFor(); r != nil {
@@ -1052,10 +1192,37 @@ func (imp *ctxImporter) ImportFrom(path, _ string, _ types.ImportMode) (*types.P
 	}
 	cp, err := imp.p.packageScoped(imp.ctx, path, imp.scope)
 	if err != nil {
-		return nil, err
+		if imp.ctx.Err() != nil {
+			return nil, err
+		}
+		// Returning the error would make go/types fabricate its own,
+		// per-check fake package for path (one DISTINCT instance per
+		// failing Config.Check call — see closureScope.placeholders's doc
+		// for the duplicate-import-path corruption that caused). Degrade
+		// to the closure's shared placeholder instead; failedImport makes
+		// the result Incomplete and uncacheable (see check and put).
+		imp.noteFailedImport(path, err)
+		return imp.scope.placeholderFor(path), nil
 	}
-	imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
+	imp.noteResolved(cp)
 	return cp.Types(), nil
+}
+
+// errFailedEarlierInClosure is noteFailedImport's diagnostic stand-in when
+// a path's failure was recorded by an earlier check in the same closure,
+// so this check never saw the original error itself.
+var errFailedEarlierInClosure = errors.New("resolution already failed earlier in this closure")
+
+// noteResolved folds a successfully resolved import's own degradation
+// flags into the check currently underway: Incomplete propagates as
+// before (see the importIncomplete field's doc), and a package carrying a
+// closure-scoped placeholder (importFailed) makes this check's own result
+// uncacheable too, since its graph now embeds that placeholder as well.
+func (imp *ctxImporter) noteResolved(cp *CheckedPackage) {
+	imp.importIncomplete = imp.importIncomplete || cp.Incomplete()
+	if cp.importFailed {
+		imp.noteFailedImport(cp.pkgPath, errFailedEarlierInClosure)
+	}
 }
 
 // Decl locates obj's declaring identifier inside pkgPath's source-checked
