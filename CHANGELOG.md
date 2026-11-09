@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.7.24](https://github.com/sivchari/golance/compare/v0.7.23...v0.7.24) - 2026-11-09
+
+- ci: switch read-only checks from pull_request_target to pull_request by @sivchari in https://github.com/sivchari/golance/pull/164
+
 ## [v0.7.23](https://github.com/sivchari/golance/compare/v0.7.22...v0.7.23) - 2026-10-08
 
 - fix(depcheck): share one placeholder per unresolvable import per closure by @sivchari in https://github.com/sivchari/golance/pull/161
