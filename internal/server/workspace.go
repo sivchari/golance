@@ -9,6 +9,7 @@ import (
 	"go/types"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -784,10 +785,16 @@ func (s *Server) setWorkspace(root string, snap *graph.Snapshot) {
 		depCache: depCache, depProvider: depProvider, pkgNameIndex: pkgNameIndex,
 	}
 	s.ws.Store(newWS)
+	// Any failure failWorkspaceLoad recorded is now moot: requests stop
+	// reporting it and go.mod changes go back to the ordinary reload path.
+	s.wsLoadErr.Store(nil)
 	// Unblocks any waitWorkspace caller (checkedFile) parked from before
 	// this, the workspace's first ever install — a no-op on every later
 	// setWorkspace call (revalidateGraph, a watched-files-triggered
-	// reload), since the channel is already closed by then. s.wsReady is
+	// reload), or after failWorkspaceLoad already released the channel
+	// (such a caller only ever gets a nil workspace from that earlier
+	// release; later callers see s.workspace() directly), since the channel
+	// is already closed by then. s.wsReady is
 	// nil for a Server built by test code as a bare &Server{...} literal
 	// rather than through New (a pattern several existing unit tests use
 	// for a minimal server with only the fields their own test needs) —
@@ -968,6 +975,7 @@ func (s *Server) handleDidChangeWatchedFiles(_ context.Context, params json.RawM
 	}
 	ws := s.workspace()
 	if ws == nil {
+		s.retryFailedWorkspaceLoad(p.Changes)
 		return nil
 	}
 	for _, ch := range p.Changes {
@@ -1012,6 +1020,31 @@ func (s *Server) handleDidChangeWatchedFiles(_ context.Context, params json.RawM
 		s.watch.onEvent(ws.root, reload)
 	}
 	return nil
+}
+
+// retryFailedWorkspaceLoad re-runs the whole initial load (import graph, then
+// facts index) when the initial load failed (see failWorkspaceLoad) and
+// changes includes a module-structural file: the failure was most likely
+// that file's content (e.g. an untidy go.mod), and without a retry the
+// session would stay unusable until the editor restarted, since the
+// ordinary reload path (revalidateGraph) needs a workspace to reload.
+//
+// At most one retry runs at a time (s.wsLoadRetrying); an event arriving
+// meanwhile is dropped, as the in-flight retry already reads the files as
+// they are now. A retry that fails again calls failWorkspaceLoad itself,
+// which re-notifies the user.
+func (s *Server) retryFailedWorkspaceLoad(changes []protocol.FileEvent) {
+	failed := s.wsLoadErr.Load()
+	if failed == nil || !slices.ContainsFunc(changes, func(ch protocol.FileEvent) bool { return isModuleFile(ch.URI.FsPath()) }) {
+		return
+	}
+	if !s.wsLoadRetrying.CompareAndSwap(false, true) {
+		return
+	}
+	s.rpc.Go(func(ctx context.Context) {
+		defer s.wsLoadRetrying.Store(false)
+		s.loadWorkspaceAsync(ctx, failed.root)
+	})
 }
 
 // isModuleFile reports whether path is one of the module-structural files

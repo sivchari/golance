@@ -8,6 +8,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"path/filepath"
 	"sync"
@@ -271,15 +272,31 @@ type Server struct {
 	// same package again.
 	dirtyPkgs map[string]bool
 
-	// wsReady is closed exactly once, by the first setWorkspace call to
-	// install a workspace (see waitWorkspace) — signaling any blocked
-	// caller that s.workspace() will now return non-nil. Relevant only
-	// during the async window between handleInitialize returning and its
-	// background loadWorkspaceAsync call finishing; an already-ready
+	// wsReady is closed exactly once, by whichever comes first: the first
+	// setWorkspace call to install a workspace, or failWorkspaceLoad
+	// recording that the initial load failed (see waitWorkspace) —
+	// signaling any blocked caller that it should re-read s.workspace(),
+	// which is non-nil after an install and nil after a failure. Relevant
+	// only during the async window between handleInitialize returning and
+	// its background loadWorkspaceAsync call finishing; an already-ready
 	// session never observes it closed, since waitWorkspace checks
 	// s.workspace() itself first.
 	wsReady     chan struct{}
 	wsReadyOnce sync.Once
+
+	// wsLoadErr records why the initial workspace load failed (e.g. an untidy
+	// go.mod: `go: updates to go.mod needed`) while s.workspace() is still
+	// nil, or nil when no failure is outstanding. Set by failWorkspaceLoad,
+	// cleared by setWorkspace once any load finally succeeds. Read by
+	// indexUnavailableError so a request reports the real cause instead of a
+	// misleading "index still building", and by handleDidChangeWatchedFiles
+	// to know a go.mod/go.sum/go.work change should retry the load.
+	wsLoadErr atomic.Pointer[workspaceLoadError]
+	// wsLoadRetrying is true while a go.mod-triggered retry of the failed
+	// initial load is in flight, so a burst of watched-file events (an editor
+	// saving go.mod and go.sum together) starts one retry, not several
+	// racing loadWorkspaceAsync runs against the same index database.
+	wsLoadRetrying atomic.Bool
 
 	// pendingOpensMu guards pendingOpens.
 	pendingOpensMu sync.Mutex
@@ -444,8 +461,36 @@ func (s *Server) Stop() {
 // "initialize" request has completed.
 func (s *Server) workspace() *workspace { return s.ws.Load() }
 
+// workspaceLoadError is a failed initial workspace load: the root it was
+// attempted for (so a retry targets the same root) and its cause.
+type workspaceLoadError struct {
+	root string
+	err  error
+}
+
+// failWorkspaceLoad records that loading root's import graph failed with err,
+// releases every current and future waitWorkspace caller (which then sees a
+// nil workspace right away instead of waiting out its request timeout),
+// and tells the user, since the log alone never reaches the editor. The
+// message names the recovery step because handleDidChangeWatchedFiles retries
+// the load on the next go.mod/go.sum/go.work change.
+//
+// Safe to call again after a failed retry: wsReadyOnce makes the release a
+// no-op the second time, and the user gets a fresh message for the new
+// failure.
+func (s *Server) failWorkspaceLoad(root string, err error) {
+	s.wsLoadErr.Store(&workspaceLoadError{root: root, err: err})
+	// s.wsReady is nil for a Server built as a bare &Server{...} literal
+	// rather than through New; see setWorkspace's identical guard.
+	if s.wsReady != nil {
+		s.wsReadyOnce.Do(func() { close(s.wsReady) })
+	}
+	s.showMessage(protocol.MessageTypeError, fmt.Sprintf("golance: failed to load workspace packages: %v; fix it (e.g. run `go mod tidy`) and save go.mod to retry", err))
+}
+
 // waitWorkspace returns the current workspace, blocking until one becomes
-// available or ctx is done, whichever comes first, if none is loaded yet.
+// available, the initial load fails (see failWorkspaceLoad), or ctx is done,
+// whichever comes first, if none is loaded yet; the last two return nil.
 // checkedFile — the resolution chokepoint behind hover, completion,
 // signature help, and textDocument/definition's index-unavailable fallback
 // — uses this instead of workspace() so a request arriving during
