@@ -74,7 +74,16 @@ func (s *Server) resolverOrWarn() (*xref.Resolver, bool) {
 // inaccurate and mislead a caller into thinking a retry will eventually
 // succeed on its own. feature names the specific request kind (e.g.
 // "references") for the message.
+//
+// A failed initial workspace load (s.wsLoadErr, see failWorkspaceLoad) takes
+// precedence over both: no index build is even attempted without a loaded
+// import graph, so "still building" would be false and a retry of the same
+// request cannot succeed until the user fixes the cause (e.g. an untidy
+// go.mod) — which the message reports verbatim.
 func (s *Server) indexUnavailableError(feature string) error {
+	if e := s.wsLoadErr.Load(); e != nil {
+		return rpc.NewError(int32(protocol.LSPErrorCodesRequestFailed), fmt.Sprintf("golance: the workspace failed to load (%v); %s is unavailable until it loads", e.err, feature))
+	}
 	if s.indexFailedWarned.Load() {
 		return rpc.NewError(int32(protocol.LSPErrorCodesRequestFailed), fmt.Sprintf("golance: the workspace index failed to build; %s is unavailable until the next successful build", feature))
 	}
@@ -223,7 +232,14 @@ func (s *Server) handleDefinition(ctx context.Context, params json.RawMessage) (
 	}
 	resolver, ok := s.resolverOrWarn()
 	if !ok {
-		return s.definitionFallback(ctx, p.TextDocument.URI, p.Position), nil
+		locs := s.definitionFallback(ctx, p.TextDocument.URI, p.Position)
+		// The fallback needs a loaded workspace; with none because the load
+		// failed, an empty result would read as "no definition here" rather
+		// than "golance is broken until go.mod is fixed".
+		if len(locs) == 0 && s.wsLoadErr.Load() != nil {
+			return nil, s.indexUnavailableError("definition")
+		}
+		return locs, nil
 	}
 	path := p.TextDocument.URI.FsPath()
 	line, col, ok := s.xrefPosition(path, p.Position)

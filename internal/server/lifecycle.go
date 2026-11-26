@@ -148,6 +148,10 @@ func (s *Server) loadWorkspaceAsync(ctx context.Context, root string) {
 		snap, err = graphLoad(loadOpts, patterns...)
 		if err != nil {
 			s.logger.Printf("server: initialize: load import graph: %v", err)
+			// Logging alone leaves every waitWorkspace caller parked until its
+			// request timeout and the client none the wiser; see
+			// failWorkspaceLoad.
+			s.failWorkspaceLoad(root, err)
 			return
 		}
 		if err := graph.SaveCache(root, patterns, loadOpts.BuildFlags, snap); err != nil {
